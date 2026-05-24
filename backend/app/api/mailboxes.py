@@ -38,6 +38,7 @@ class ParsedMailbox:
     refresh_token: str | None
     provider: str
     custom_fetch_url: str | None = None
+    access_token: str | None = None
 
 
 @router.get("", response_model=list[MailboxCredentialOut])
@@ -70,6 +71,7 @@ async def import_mailboxes(
         existing.encrypted_password = encrypt_text(item.password)
         existing.encrypted_client_id = encrypt_text(item.client_id)
         existing.encrypted_refresh_token = encrypt_text(item.refresh_token)
+        existing.encrypted_access_token = encrypt_text(item.access_token)
         existing.custom_fetch_url = item.custom_fetch_url
         existing.disabled = False
         existing.last_error = None
@@ -112,6 +114,8 @@ async def list_mailbox_messages(
         stored.last_success_at = utcnow()
         if result.new_refresh_token:
             stored.encrypted_refresh_token = encrypt_text(result.new_refresh_token)
+        if result.new_access_token:
+            stored.encrypted_access_token = encrypt_text(result.new_access_token)
         await db.commit()
     return [
         MailMessageOut(
@@ -186,6 +190,26 @@ def _parse_parts(parts: list[str], default_provider: str) -> ParsedMailbox | Non
             if not provider or (provider == "custom" and not custom_url):
                 return None
             return ParsedMailbox(gpt_email, mailbox_email, core[2], core[3], core[4], provider, custom_url)
+        if len(core) == 6:
+            maybe_mailbox_email = _maybe_email(core[1])
+            if maybe_mailbox_email:
+                gpt_email = _email(core[0])
+                mailbox = maybe_mailbox_email
+                password = core[2]
+                client_id = core[3]
+                refresh_token = core[4]
+                access_token = core[5]
+            else:
+                gpt_email = _email(core[0])
+                mailbox = gpt_email
+                password = core[2]
+                client_id = core[3]
+                refresh_token = core[4]
+                access_token = core[5]
+            provider = _resolve_provider(mailbox, default_provider, explicit_provider)
+            if not provider or (provider == "custom" and not custom_url):
+                return None
+            return ParsedMailbox(gpt_email, mailbox, password, client_id, refresh_token, provider, custom_url, access_token)
     except ValueError:
         return None
     return None
@@ -223,3 +247,10 @@ def _detect_provider(mailbox_email: str) -> str | None:
 
 def _email(value: str) -> str:
     return str(email_adapter.validate_python(value)).lower()
+
+
+def _maybe_email(value: str) -> str | None:
+    try:
+        return _email(value)
+    except ValueError:
+        return None

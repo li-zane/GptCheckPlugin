@@ -1,4 +1,4 @@
-# Sub2API AT Guardian
+# sub2api AT 刷新机
 
 一个用于 sub2api 的本地外挂管理服务：定时读取 sub2api 里导入的 GPT 账号，发现错误账号后用 Playwright 登录 ChatGPT，读取 `https://chatgpt.com/api/auth/session` 中的 `accessToken`，再把新的 AT 写回 sub2api 对应账号。
 

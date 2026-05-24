@@ -37,6 +37,7 @@ class MailFetchResult:
     error: str | None = None
     provider_status: str | None = None
     new_refresh_token: str | None = None
+    new_access_token: str | None = None
 
 
 @dataclass
@@ -59,6 +60,7 @@ class MailMessagesResult:
     error: str | None = None
     provider_status: str | None = None
     new_refresh_token: str | None = None
+    new_access_token: str | None = None
 
 
 @dataclass
@@ -106,11 +108,14 @@ class OutlookGraphAdapter:
 
     async def fetch_code(self, credential: MailboxCredential, after: datetime) -> MailFetchResult:
         new_refresh_token: str | None = None
+        new_access_token: str | None = None
         last_error: str | None = None
         for folder in ("inbox", "junk"):
             result = await self.fetch_messages(credential, folder, 10)
             if result.new_refresh_token:
                 new_refresh_token = result.new_refresh_token
+            if result.new_access_token:
+                new_access_token = result.new_access_token
             if result.status != "ok":
                 last_error = result.error
                 if folder == "inbox":
@@ -119,6 +124,7 @@ class OutlookGraphAdapter:
                         error=result.error,
                         provider_status=result.provider_status,
                         new_refresh_token=new_refresh_token,
+                        new_access_token=new_access_token,
                     )
                 continue
 
@@ -132,18 +138,25 @@ class OutlookGraphAdapter:
                     continue
                 code = message.code or extract_code(message.subject, message.body_preview, message.text)
                 if code:
-                    return MailFetchResult(status="ok", code=code, new_refresh_token=new_refresh_token)
+                    return MailFetchResult(
+                        status="ok",
+                        code=code,
+                        new_refresh_token=new_refresh_token,
+                        new_access_token=new_access_token,
+                    )
 
         if last_error:
             return MailFetchResult(
                 status="not_found",
                 error=f"No fresh verification code message was found. Last mailbox error: {last_error}",
                 new_refresh_token=new_refresh_token,
+                new_access_token=new_access_token,
             )
         return MailFetchResult(
             status="not_found",
             error="No fresh verification code message was found.",
             new_refresh_token=new_refresh_token,
+            new_access_token=new_access_token,
         )
 
     async def fetch_messages(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
@@ -160,13 +173,37 @@ class OutlookGraphAdapter:
             )
 
     async def _fetch_messages_inner(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
-        client_id = (decrypt_text(credential.encrypted_client_id) or "").strip()
-        refresh_token = (decrypt_text(credential.encrypted_refresh_token) or "").strip()
+        decrypted_client_id = decrypt_text(credential.encrypted_client_id)
+        decrypted_refresh_token = decrypt_text(credential.encrypted_refresh_token)
+        encrypted_access_token = getattr(credential, "encrypted_access_token", None)
+        decrypted_access_token = decrypt_text(encrypted_access_token)
+        if (credential.encrypted_client_id and decrypted_client_id is None) or (
+            credential.encrypted_refresh_token and decrypted_refresh_token is None
+        ) or (
+            encrypted_access_token and decrypted_access_token is None
+        ):
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error="Mailbox credentials could not be decrypted. Restore the original APP_ENCRYPTION_KEY or reimport this mailbox.",
+            )
+        client_id = (decrypted_client_id or "").strip()
+        refresh_token = (decrypted_refresh_token or "").strip()
+        access_token = (decrypted_access_token or "").strip()
+        errors: list[str] = []
+        if access_token:
+            result = await self._fetch_with_stored_access_token(access_token, folder, limit)
+            if result.status == "ok":
+                return result
+            if result.error:
+                errors.append(result.error)
         if not client_id or not refresh_token:
-            return MailMessagesResult(status="failed", messages=[], error="Missing client_id or refresh_token.")
+            error = "Missing client_id or refresh_token."
+            if errors:
+                error = f"{error} Stored access_token also failed: {' | '.join(errors[-2:])}"
+            return MailMessagesResult(status="failed", messages=[], error=error)
 
         base_cache_key = self._base_cache_key(credential, client_id)
-        errors: list[str] = []
 
         for strategy in self._strategy_order(base_cache_key):
             if strategy in {"graph_imap", "o2_wl_imap"} and _has_imap_network_failure(errors):
@@ -177,8 +214,6 @@ class OutlookGraphAdapter:
                 return result
             if result.error:
                 errors.append(result.error)
-            if strategy == "o2_imap" and _has_imap_network_failure(result.error):
-                break
 
         return MailMessagesResult(
             status="failed",
@@ -187,11 +222,37 @@ class OutlookGraphAdapter:
         )
 
     def _strategy_order(self, base_cache_key: str) -> list[str]:
-        default_order = ["outlook_rest", "graph", "o2_imap", "graph_imap", "o2_wl_imap"]
+        default_order = [
+            "graph_no_scope",
+            "consumer_graph_no_scope",
+            "outlook_rest",
+            "graph",
+            "o2_imap",
+            "graph_imap",
+            "o2_wl_imap",
+            "password_imap",
+            "external_api",
+        ]
         preferred = self._strategy_cache.get(base_cache_key)
         if preferred not in default_order:
             return default_order
         return [preferred, *[strategy for strategy in default_order if strategy != preferred]]
+
+    async def _fetch_with_stored_access_token(self, access_token: str, folder: str, limit: int) -> MailMessagesResult:
+        graph_result = await self._fetch_graph_messages(access_token, folder, limit)
+        if graph_result.status == "ok":
+            return graph_result
+
+        rest_result = await self._fetch_outlook_rest_messages(access_token, folder, limit)
+        if rest_result.status == "ok":
+            return rest_result
+
+        errors = [error for error in (graph_result.error, rest_result.error) if error]
+        return MailMessagesResult(
+            status="failed",
+            messages=[],
+            error="Stored access_token could not read mailbox. " + " | ".join(errors[-2:]),
+        )
 
     async def _fetch_with_strategy(
         self,
@@ -203,6 +264,46 @@ class OutlookGraphAdapter:
         base_cache_key: str,
         strategy: str,
     ) -> MailMessagesResult:
+        if strategy == "external_api":
+            return await self._fetch_external_mail_messages(credential, folder, limit, client_id, refresh_token)
+
+        if strategy == "password_imap":
+            return await self._fetch_password_imap_messages(credential, folder, limit)
+
+        if strategy in {"graph_no_scope", "consumer_graph_no_scope"}:
+            token_result = await self._cached_access_token(
+                base_cache_key=base_cache_key,
+                refresh_token=refresh_token,
+                strategy=strategy,
+                client_id=client_id,
+                token_url=self.settings.graph_consumer_token_url
+                if strategy == "consumer_graph_no_scope"
+                else self.settings.graph_token_url,
+                scope=None,
+                label="Graph/no-scope" if strategy == "graph_no_scope" else "Graph consumers/no-scope",
+            )
+            if token_result.status != "ok" or not token_result.access_token:
+                return MailMessagesResult(
+                    status="failed",
+                    messages=[],
+                    error=token_result.error or "Graph no-scope token refresh failed.",
+                    provider_status=token_result.provider_status,
+                )
+            graph_result = await self._fetch_graph_messages(token_result.access_token, folder, limit)
+            if graph_result.status == "ok":
+                graph_result.new_refresh_token = token_result.new_refresh_token
+                graph_result.new_access_token = token_result.access_token
+                return graph_result
+
+            rest_result = await self._fetch_outlook_rest_messages(token_result.access_token, folder, limit)
+            rest_result.new_refresh_token = token_result.new_refresh_token
+            rest_result.new_access_token = token_result.access_token
+            if rest_result.status != "ok":
+                self._drop_cached_access_token(base_cache_key, refresh_token, strategy)
+                if graph_result.error and rest_result.error:
+                    rest_result.error = f"{graph_result.error} | {rest_result.error}"
+            return rest_result
+
         if strategy == "outlook_rest":
             token_result = await self._cached_access_token(
                 base_cache_key=base_cache_key,
@@ -222,6 +323,7 @@ class OutlookGraphAdapter:
                 )
             rest_result = await self._fetch_outlook_rest_messages(token_result.access_token, folder, limit)
             rest_result.new_refresh_token = token_result.new_refresh_token
+            rest_result.new_access_token = token_result.access_token
             if rest_result.status != "ok":
                 self._drop_cached_access_token(base_cache_key, refresh_token, strategy)
             return rest_result
@@ -245,6 +347,7 @@ class OutlookGraphAdapter:
                 )
             graph_result = await self._fetch_graph_messages(token_result.access_token, folder, limit)
             graph_result.new_refresh_token = token_result.new_refresh_token
+            graph_result.new_access_token = token_result.access_token
             if graph_result.status != "ok":
                 self._drop_cached_access_token(base_cache_key, refresh_token, strategy)
             return graph_result
@@ -280,6 +383,7 @@ class OutlookGraphAdapter:
             )
         imap_result = await self._fetch_imap_messages(credential, token_result.access_token, folder, limit)
         imap_result.new_refresh_token = token_result.new_refresh_token
+        imap_result.new_access_token = token_result.access_token
         if imap_result.status != "ok" and not _has_imap_network_failure(imap_result.error):
             self._drop_cached_access_token(base_cache_key, refresh_token, strategy)
         return imap_result
@@ -471,8 +575,123 @@ class OutlookGraphAdapter:
         ]
         return MailMessagesResult(status="ok", messages=messages[:limit])
 
+    async def _fetch_external_mail_messages(
+        self,
+        credential: MailboxCredential,
+        folder: str,
+        limit: int,
+        client_id: str,
+        refresh_token: str,
+    ) -> MailMessagesResult:
+        base_url = str(self.settings.external_mail_api_base or "").strip().rstrip("/")
+        if not base_url:
+            return MailMessagesResult(status="failed", messages=[], error="External mail API is not configured.")
+
+        result = await self._request_external_mail_messages(
+            base_url=base_url,
+            email_address=credential.mailbox_email,
+            client_id=client_id,
+            refresh_token=refresh_token,
+            folder=folder,
+            limit=limit,
+        )
+        if (
+            result.status == "failed"
+            and result.new_refresh_token
+            and result.new_refresh_token != refresh_token
+        ):
+            retry_result = await self._request_external_mail_messages(
+                base_url=base_url,
+                email_address=credential.mailbox_email,
+                client_id=client_id,
+                refresh_token=result.new_refresh_token,
+                folder=folder,
+                limit=limit,
+            )
+            if retry_result.status == "ok":
+                retry_result.new_refresh_token = retry_result.new_refresh_token or result.new_refresh_token
+                return retry_result
+        return result
+
+    async def _request_external_mail_messages(
+        self,
+        *,
+        base_url: str,
+        email_address: str,
+        client_id: str,
+        refresh_token: str,
+        folder: str,
+        limit: int,
+    ) -> MailMessagesResult:
+        mailbox_name = "Junk" if folder == "junk" else "INBOX"
+        url = f"{base_url}/api/mail-all"
+        params = {
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "email": email_address,
+            "mailbox": mailbox_name,
+        }
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0",
+            "Referer": f"{base_url}/mail.html",
+            "Origin": base_url,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.external_mail_timeout_seconds) as client:
+                response = await client.get(url, params=params, headers=headers)
+        except httpx.HTTPError as exc:
+            return MailMessagesResult(status="failed", messages=[], error=f"External mail API request failed: {exc}")
+
+        new_refresh_token: str | None = None
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            payload = response.text
+
+        if isinstance(payload, dict):
+            new_refresh_token = _pick_mail_value(payload, "new_refresh_token")
+            data = payload.get("data")
+            if isinstance(data, dict):
+                new_refresh_token = _pick_mail_value(data, "new_refresh_token") or new_refresh_token
+
+        if response.status_code >= 400:
+            detail = _external_mail_error(payload) or response.reason_phrase or response.text[:300]
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error=f"External mail API read failed: HTTP {response.status_code}: {detail}",
+                provider_status=response.text[:500],
+                new_refresh_token=new_refresh_token,
+            )
+
+        try:
+            raw_messages, payload_refresh_token = _unwrap_external_mail_items(payload)
+        except ValueError as exc:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error=f"External mail API response format is invalid: {exc}",
+                provider_status=response.text[:500],
+                new_refresh_token=new_refresh_token,
+            )
+        new_refresh_token = payload_refresh_token or new_refresh_token
+        messages = [
+            _external_message_to_mail_message(message, "junk" if folder == "junk" else "inbox", index)
+            for index, message in enumerate(raw_messages[: max(1, min(int(limit), 100))], start=1)
+        ]
+        return MailMessagesResult(
+            status="ok",
+            messages=messages,
+            new_refresh_token=new_refresh_token if new_refresh_token and new_refresh_token != refresh_token else None,
+        )
+
     async def _fetch_imap_messages(self, credential: MailboxCredential, access_token: str, folder: str, limit: int) -> MailMessagesResult:
         return await asyncio.to_thread(self._fetch_imap_messages_sync, credential, access_token, folder, limit)
+
+    async def _fetch_password_imap_messages(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
+        return await asyncio.to_thread(self._fetch_password_imap_messages_sync, credential, folder, limit)
 
     def _fetch_imap_messages_sync(self, credential: MailboxCredential, access_token: str, folder: str, limit: int) -> MailMessagesResult:
         errors: list[str] = []
@@ -495,6 +714,42 @@ class OutlookGraphAdapter:
                 return MailMessagesResult(status="ok", messages=messages)
             except imaplib.IMAP4.error as exc:
                 errors.append(f"{host}: IMAP OAuth failed: {exc}")
+            except OSError as exc:
+                errors.append(f"{host}: IMAP connection failed: {exc}")
+                if _is_imap_cooldown_error(exc):
+                    self._imap_host_cooldown[host] = time.monotonic() + self.settings.outlook_imap_failure_cooldown_seconds
+            finally:
+                if client is not None:
+                    try:
+                        client.logout()
+                    except imaplib.IMAP4.error:
+                        pass
+        return MailMessagesResult(status="failed", messages=[], error="; ".join(errors))
+
+    def _fetch_password_imap_messages_sync(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
+        password = (decrypt_text(credential.encrypted_password) or "").strip()
+        if not password:
+            return MailMessagesResult(status="failed", messages=[], error="Missing mailbox password for IMAP password fallback.")
+
+        errors: list[str] = []
+        hosts = self._available_imap_hosts()
+        if not hosts:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error="IMAP hosts are cooling down after recent connection timeouts.",
+            )
+
+        for host in hosts:
+            client: imaplib.IMAP4_SSL | None = None
+            try:
+                client = imaplib.IMAP4_SSL(host, self.settings.outlook_imap_port, timeout=self.settings.outlook_imap_timeout_seconds)
+                client.login(credential.mailbox_email, password)
+                messages = self._read_imap_messages(client, folder, limit)
+                self._imap_host_cooldown.pop(host, None)
+                return MailMessagesResult(status="ok", messages=messages)
+            except imaplib.IMAP4.error as exc:
+                errors.append(f"{host}: IMAP password login failed: {exc}")
             except OSError as exc:
                 errors.append(f"{host}: IMAP connection failed: {exc}")
                 if _is_imap_cooldown_error(exc):
@@ -750,6 +1005,125 @@ def _custom_message_to_mail_message(message: Any, folder: str) -> MailMessage:
     )
 
 
+def _external_message_to_mail_message(message: Any, folder: str, index: int) -> MailMessage:
+    if not isinstance(message, dict):
+        text = str(message)
+        return MailMessage(
+            id=f"external-mail-{index}",
+            folder=folder,
+            subject=None,
+            sender_name=None,
+            sender_address=None,
+            body_preview=_truncate(text),
+            received_at=None,
+            text=text,
+            code=extract_code(text),
+        )
+
+    raw = message.get("raw") if isinstance(message.get("raw"), dict) else {}
+    sender = message.get("from") or message.get("from_info") or message.get("sender") or raw.get("from") or raw.get("sender")
+    sender_name, sender_address = _external_sender_parts(sender)
+    text_content = _pick_mail_value(
+        message,
+        "text",
+        "text_content",
+        "plain",
+        "plain_text",
+        "body",
+        "body_text",
+    )
+    html_content = _pick_mail_value(message, "html", "html_content", "htmlBody", "body_html")
+    text_source = text_content or (_strip_html(html_content) if html_content else None)
+    snippet = _pick_mail_value(message, "snippet", "summary", "preview") or _truncate(text_source)
+    subject = _pick_mail_value(message, "subject", "title") or "(No subject)"
+    code = _pick_mail_value(message, "code", "verification_code", "otp", "captcha") or extract_code(
+        subject,
+        snippet,
+        text_source,
+        html_content,
+    )
+
+    return MailMessage(
+        id=_pick_mail_value(message, "id", "message_id", "uid", "mail_id", "messageId") or f"external-mail-{index}",
+        folder=folder,
+        subject=subject,
+        sender_name=sender_name,
+        sender_address=sender_address,
+        body_preview=snippet,
+        received_at=_parse_mail_time(_pick_mail_value(message, "date", "received_at", "sent_at", "created_at", "internalDate")),
+        text=text_source,
+        code=code,
+    )
+
+
+def _external_sender_parts(sender: Any) -> tuple[str | None, str | None]:
+    if isinstance(sender, dict):
+        name = _pick_mail_value(sender, "name", "display_name")
+        address = _pick_mail_value(sender, "address", "email", "mail")
+        return name, address
+    text = str(sender or "").strip()
+    if not text:
+        return None, None
+    name, address = parseaddr(text)
+    return name or None, address or text
+
+
+def _unwrap_external_mail_items(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)], None
+    if not isinstance(payload, dict):
+        raise ValueError("payload is not a JSON object or list")
+
+    next_refresh_token = _pick_mail_value(payload, "new_refresh_token")
+    data = payload.get("data", payload)
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)], next_refresh_token
+    if isinstance(data, dict):
+        if data.get("error"):
+            raise ValueError(str(data.get("error")))
+        if any(key in data for key in {"subject", "text", "html", "send", "date"}):
+            return [data], next_refresh_token or _pick_mail_value(data, "new_refresh_token")
+        nested = data.get("items") or data.get("messages") or data.get("mails")
+        if isinstance(nested, list):
+            return [item for item in nested if isinstance(item, dict)], next_refresh_token or _pick_mail_value(data, "new_refresh_token")
+        if isinstance(nested, dict):
+            return [nested], next_refresh_token or _pick_mail_value(data, "new_refresh_token")
+    if payload.get("success") is False:
+        detail = _external_mail_error(payload)
+        raise ValueError(detail or "provider returned success=false")
+    raise ValueError("missing message list")
+
+
+def _external_mail_error(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("error", "detail", "message"):
+            value = _pick_mail_value(payload, key)
+            if value:
+                return value
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("error", "detail", "message"):
+                value = _pick_mail_value(data, key)
+                if value:
+                    return value
+    if isinstance(payload, str):
+        return payload[:300]
+    return None
+
+
+def _pick_mail_value(mail: Any, *keys: str) -> str | None:
+    if not isinstance(mail, dict):
+        return None
+    for key in keys:
+        value = mail.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def _imap_message_to_mail_message(raw: bytes, fallback_id: str, folder: str) -> MailMessage:
     message = message_from_bytes(raw)
     sender_name, sender_address = parseaddr(_decode_header_value(message.get("From")))
@@ -890,6 +1264,27 @@ def _parse_email_time(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _parse_mail_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    graph_time = _parse_graph_time(value)
+    if graph_time is not None:
+        return graph_time
+    email_time = _parse_email_time(value)
+    if email_time is not None:
+        return email_time
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp = timestamp / 1000
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OSError, ValueError):
+        return None
 
 
 def _microsoft_error(value: str) -> str:

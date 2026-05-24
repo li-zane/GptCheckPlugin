@@ -38,3 +38,85 @@
 - Updated mailbox preview reads to record `last_success_at`/`last_error`, recompiled the backend, and rebuilt the frontend successfully.
 - Compared the local private `mail-manager` implementation and found its fast Outlook path uses Microsoft common no-scope token refresh plus Outlook REST fallback when Graph rejects opaque tokens.
 - Added Outlook REST as the first Outlook/Hotmail read strategy in this project. Real imported mailbox benchmarks improved from about 10.4-13.3 seconds to about 2.8-3.4 seconds on first read and about 1.6-1.8 seconds with cached tokens.
+- Added runtime settings storage and API routes for sub2api base URL/port, x-api key, and monitor interval.
+- Added startup and manual sub2api port scanning; scanner now combines configured candidate ports with current local listening ports.
+- Updated the sub2api client and monitor loop to read runtime settings dynamically, including immediate monitor wake-up after settings changes.
+- Added a React settings page for manual sub2api port/key/interval edits and scan results.
+- Fixed localhost sub2api probing under proxy-heavy environments by disabling env proxy use for sub2api HTTP calls.
+- Verified backend compile, frontend production build, settings API smoke test, and Playwright screenshot `output/playwright/settings-view.png`; the running panel detected local sub2api at `127.0.0.1:18080`.
+- Fixed a follow-up sync 500 caused by false-positive port scans: local ports `9210` and `9993` returned HTTP 200/401 on the accounts path but were not sub2api. Scanner now validates account JSON/auth error shape before applying a port, and sub2api JSON/HTTP errors are surfaced as 502 details instead of raw 500s.
+- Re-scanned with the saved x-api key, restored runtime sub2api URL to `http://127.0.0.1:18080/api/v1`, and verified `/api/accounts/sync` returns successfully.
+- Added a persisted `display_timezone` runtime setting, exposed it through `/api/settings`, and added `DISPLAY_TIMEZONE=Asia/Shanghai` to `.env.example`.
+- Added a settings-page time zone selector with live preview, and routed all frontend date/time displays through the selected time zone.
+- Verified backend compile, frontend production build, settings API update/restore for `UTC` -> `Asia/Shanghai`, and Playwright screenshot `output/playwright/settings-timezone.png`.
+- Fixed history timestamps that still appeared in UTC after changing display time zone. SQLite returns stored UTC datetimes without `Z`/offset, so the frontend now treats offset-less API timestamps as UTC before formatting.
+- Rebuilt frontend/backend and verified the history page renders the latest `2026-05-24T12:03:19` record as `05/24 20:03` under `Asia/Shanghai`; screenshot saved to `output/playwright/history-timezone.png`.
+- Compared Outlook/Hotmail mailbox reads against the local `mail-manager` implementation and added the same external `/api/mail-all` fallback after direct REST/Graph/IMAP attempts.
+- Restored an IMAP password fallback and added a clearer `APP_ENCRYPTION_KEY` mismatch error when stored mailbox secrets cannot be decrypted.
+- Recompiled the backend and restarted the local backend on `127.0.0.1:8000`; the current imported mailbox row now fails with the explicit key-mismatch diagnostic, so it needs the original key restored or a fresh import.
+- Added persistent mailbox access-token support: import accepts `mail-manager` registered 6-part rows, stores encrypted mail access tokens, tries stored access tokens before refresh/IMAP fallbacks, and persists newly refreshed mail access tokens.
+- Added a SQLite startup migration for the new `mailbox_credentials.encrypted_access_token` column; verified parser behavior for 4-part original, 6-part registered, and 6-part GPT-email-plus-mailbox rows.
+- Fixed 4-part Outlook/Hotmail reads by adding a Graph no-scope strategy that uses the refresh token the same way `mail-manager` does before falling back to REST/IMAP/external providers.
+- Verified the current 4-part Hotmail import through the running API: `/api/mailboxes/1/messages?folder=inbox&limit=5` returned HTTP 200 with 5 messages, cleared `last_error`, and persisted a refreshed mail access token.
+- Fixed refresh jobs that were failing at ChatGPT login by navigating directly to `/auth/login`, using an English browser locale, and retrying email submission when the first click only leaves the login form at `?email=...`.
+- Added verification-code input detection before mailbox polling and a 15-minute lookup grace window so recently reused ChatGPT codes are not skipped by strict timestamp filtering.
+- Extended browser refresh results to return the full ChatGPT session payload; sub2api writes now derive changed `credentials` keys from the session/JWT and merge them via single-account `bulk-update` instead of replacing the whole credentials object.
+- Added startup cleanup for stale queued/running refresh jobs and prevented duplicate active jobs for the same email.
+- Added post-refresh sub2api recovery for `schedulable=true` and temp-unschedulable cleanup, because `recover-state` alone can leave a refreshed account unschedulable.
+- Recompiled the backend, restarted the local backend, and verified live refresh jobs 33-35 succeeded. Final authenticated sync returned `{"total_seen":2,"error_seen":0,"queued":0}`, and local snapshots show both GPT accounts active/schedulable with no refresh error.
+- Confirmed sub2api account usage query semantics from the local sub2api backend/frontend: `GET /admin/accounts/:id/usage?source=active&force=true` performs the same forced active quota lookup used by the admin UI.
+- Added `Sub2ApiClient.refresh_account_usage()` and wired refresh jobs to call it after successful session-to-credentials updates.
+- Made usage refresh best-effort: failures are recorded as `sub2api_usage_refresh_failed` events and referenced in the job reason, but do not turn a successful credentials update into a failed refresh job.
+- Re-applied session-derived subscription fields after usage refresh, with `session.account.planType` taking priority over other plan hints, so usage probes cannot leave a Plus account recorded as Free.
+- Tightened deactivation classification: sub2api list snapshots no longer scan stale `error_message` text for deactivation, deactive snapshots are no longer sticky across sync, dashboard error counts exclude deactive accounts, successful refresh clears local deactive state, and sub2api usage/test deactivation text is recorded as a warning instead of overriding successful ChatGPT/session verification.
+- Tested NiaLumsden2003 pre-code browser login path: submitting the email reached verification-code input first, while the prior full refresh job detected `account_deactive` after code validation. Keep browser deactivation checks both after email submit and after code validation.
+- Redacted common token/password/authorization patterns before storing usage-refresh failure details in events.
+- Verified backend syntax with `.venv\Scripts\python.exe -m compileall backend\app`.
+- Smoke-tested usage refresh through the new client method against current GPT account IDs `4`, `3`, and `1`; all returned `ok=True` without printing credentials or tokens.
+- Restarted the running uvicorn backend on `127.0.0.1:8000`; health check returned `{"status":"ok"}`.
+- Started the deactivated-account handling change request: goals are to inspect logs/data, enforce email-field matching from sub2api records, mark deactivated accounts during refresh/test paths, skip records without usable email, and add one-click deletion for deactivated accounts across local data and sub2api.
+- Inspected local DB rows for the reported accounts with encrypted/token fields redacted. `NiaLumsden2003` is currently local `error`/unschedulable but not deactive after job 42; `EdenBeard6250` has successful recent refresh jobs and active local status. Found likely identity bug: sub2api account email extraction currently searches the whole object and can use `name`.
+- Checked live sub2api state and logs. Current account list still reports Eden active, but sub2api test logs show repeated `account_deactivated` 401s for `/admin/accounts/4/test`; Nia shows `token_invalidated` for `/admin/accounts/5/test`/usage. Confirmed sub2api has `DELETE /api/v1/admin/accounts/:id`.
+- Implemented backend changes: sub2api account email extraction now uses explicit email/profile fields only, deactivation text matching includes `account_deactivated`, monitor skips error accounts without enabled mailbox credentials, refresh jobs run a post-update sub2api SSE connection test to catch deactivation, and a `DELETE /api/accounts/deactivated` cleanup endpoint deletes local deactive accounts/mailboxes plus remote sub2api accounts.
+- Implemented frontend changes: accounts view now has a disabled-state one-click `删除停用账号` action wired to the cleanup endpoint, with a confirmation prompt.
+- Verified backend compile and frontend production build successfully.
+- Restarted the local backend on `127.0.0.1:8000`; health check returned `ok`.
+- Verified the new sub2api SSE deactivation probe directly: account `4` returns `True` for `account_deactivated`, account `5` returned `False` before browser refresh.
+- During authenticated cleanup endpoint smoke testing, the freshly detected deactive `NiaLumsden2003@outlook.com` row was actually deleted by `DELETE /api/accounts/deactivated`: local snapshot, mailbox credential, and sub2api account `5` were removed. This matched the cleanup behavior but was not just a no-op smoke test.
+- Ran authenticated sync after cleanup; current local state is 3 accounts total, with `EdenBeard6250@outlook.com` classified as `deactive=true`, `status=error`, `schedulable=false`, and no refresh queued.
+- Verified the local React account page in the in-app browser at `http://127.0.0.1:5173`: the `删除停用账号` button is visible/enabled when one deactive account exists, and Eden appears as `停用`.
+- Added sub2api server-side AT account status support and restarted sub2api on `127.0.0.1:18080`; unauthenticated access is 401 and authenticated client calls use the stored token without exposing it to the plugin.
+- Wired plugin refresh jobs to try sub2api `check-status` first, then plugin-visible AT, then browser/email login; successful AT status refresh also runs sub2api usage refresh.
+- Added `POST /api/accounts/usage-refresh`, a background `UsageRefreshService`, persisted `usage_refresh_enabled` and `usage_refresh_interval_seconds`, and settings-page controls for automatic usage-window refresh.
+- Added the accounts-page `查询用量窗口` action and adjusted the accounts page so opening it reads cached usage data instead of forcing an active upstream query.
+- Smoke-tested `UsageRefreshService.refresh_all(reason="smoke-test")`: 2 GPT accounts refreshed, 1 deactivated account skipped, 0 failures.
+- Verified local UI with Playwright screenshots: `output/playwright/accounts-usage-refresh-button.png` and `output/playwright/settings-usage-refresh.png`.
+- Re-ran `.venv\Scripts\python.exe -m compileall backend\app` and `npm --prefix frontend run build`; both passed.
+- Set sub2api account `JadeSanchez2515@outlook.com` (id `3`) usage display fields back to 50% for 5h/7d and primary/secondary, with utilization fields at `0.5`.
+- Restarted the GptCheckPlugin backend on `127.0.0.1:8000`; health check returns `{"status":"ok"}`.
+- Started the lower-memory refresh follow-up. Reviewed current plugin order and local sub2api handlers; found existing sub2api `POST /admin/accounts/:id/refresh` uses stored OAuth `refresh_token` server-side and returns redacted account DTOs.
+- Added plugin-side `Sub2ApiClient.refresh_account_credentials()` and wired refresh jobs to try this protocol refresh after sub2api access-token status fails and before Playwright/browser login.
+- Restored accidentally deleted `NiaLumsden2003@outlook.com`: sub2api Postgres account `5` was undeleted by clearing `deleted_at`, kept as `status=deactive` and `schedulable=false`, and the local encrypted mailbox credential row was recovered from SQLite free page 42 as mailbox id `4`.
+- Fixed deactive classification so sub2api `error_message` text containing `account_deactivated` marks an account deactive when the account is already error/failed or unschedulable; this restores Eden's disabled classification without scanning arbitrary active-account payloads.
+- Restarted the plugin backend on `127.0.0.1:8000`, ran a safe monitor sync (`total_seen=4`, `error_seen=1`, `queued=0`), and verified both Nia and Eden are locally `deactive=true` with no refresh job queued.
+- Re-ran backend compile and frontend production build; both passed.
+- Recompiled the backend successfully with `.venv\Scripts\python.exe -m compileall backend\app`.
+- Ran one-account protocol smoke refresh for `jadesanchez2515@outlook.com` / sub2api id `3`: job `10` succeeded through `sub2api OAuth token refresh succeeded via stored refresh_token`, refreshed usage, did not need browser login, and recorded `memory_peak_rss_bytes=78909440`.
+- Restarted the local backend on `127.0.0.1:8000`; health check returned `ok`. Cleaned one stale running refresh job left by a prior service restart so history no longer shows it as active.
+- User correctly pointed out account `3` did not have an RT. Rechecked redacted sub2api status for `jadesanchez2515@outlook.com`: `credentials_status` only reports `has_access_token=true`. The previous job used sub2api's `/refresh` endpoint fallback that returns existing access-token credentials when no refresh token exists, so the success reason was misleading.
+- Tightened plugin protocol refresh to require `credentials_status.has_refresh_token=true` or a visible non-redacted refresh-token field before calling `/admin/accounts/:id/refresh`.
+- Recompiled backend successfully and verified account `3` now reports `has_refresh_token=False` and skips the protocol refresh branch.
+- Implemented `ChatGptProtocolRefresher` using ChatGPT Web NextAuth plus OpenAI email OTP to fetch `/api/auth/session` without Playwright, and inserted it before the Playwright fallback.
+- Verified the direct protocol refresher against `JadeSanchez2515@outlook.com` without printing tokens/cookies/codes: it returned session/access token fields and peaked at `90,566,656` bytes RSS (about `86.4 MiB`).
+- Triggered formal refresh job `13` for the same account after backend restart; because the existing AT was still valid, the job correctly stopped at the lower-cost sub2api AT-status path, succeeded, and recorded `100,376,576` bytes peak RSS.
+- Started incident recovery for reported sub2api outage and cleared mailboxes.
+- Checked service ports: sub2api is listening on `127.0.0.1:18080` and returns 401 without auth; plugin backend/frontend are also listening on `8000`/`5173`.
+- Confirmed the project root currently has no `.env`, making encryption-key/runtime-token drift a likely explanation for mailbox read/recovery problems.
+- Found the active backend API was reading `backend/data/sub2api_at_guardian.db`, which had 0 accounts and 0 mailboxes, while the recovered root DB still had 4 accounts and 4 mailboxes.
+- Patched `backend/app/core/database.py` to resolve relative SQLite DB paths against the project root, then restarted the backend on `127.0.0.1:8000`.
+- Verified restored API state: dashboard reports 4 accounts, 2 deactive accounts, 4 mailboxes; settings show the restored sub2api key is set; `/api/accounts/sync` returned `total_seen=4`, `error_seen=1`, `queued=0`.
+- Smoke-tested mailbox reads without printing contents: Nia/Jade/Eden succeeded; Micah/Hotmail timed out at the existing 45-second mailbox read timeout.
+- Investigated why the sub2api panel would not open. Confirmed `18080` serves API routes but returns 404 for browser routes such as `/`, `/admin`, and `/login`.
+- Started the sub2api Vue frontend on `127.0.0.1:3000` with `VITE_DEV_PROXY_TARGET=http://127.0.0.1:18080`; verified the root page and proxied `/api/v1/settings/public` both return 200.
+- Opened the panel in the in-app browser, logged in with `admin@sub2api.local / sub2api_local_admin`, and verified it reached `http://127.0.0.1:3000/dashboard`.
+- Patched sibling sub2api `start-local.ps1` and `stop-local.ps1` so the local panel starts/stops alongside the backend. Script parsing and `start-local.ps1` reuse on already-running services passed.

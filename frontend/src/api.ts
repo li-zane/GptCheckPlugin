@@ -1,4 +1,19 @@
-import type { Account, AppEvent, Mailbox, MailboxImportResult, MailMessage, RefreshJob, Summary, SyncResult } from "./types";
+import type {
+  Account,
+  AppEvent,
+  AppSettings,
+  AppSettingsUpdate,
+  DeactivatedCleanupResult,
+  Mailbox,
+  MailboxImportResult,
+  MailMessage,
+  RefreshJob,
+  Sub2ApiPortScanResult,
+  Summary,
+  SyncResult,
+  UsageEstimate,
+  UsageRefreshResult,
+} from "./types";
 
 async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 30_000): Promise<T> {
   const controller = new AbortController();
@@ -48,13 +63,32 @@ export const api = {
   summary: () => request<Summary>("/api/dashboard/summary"),
   accounts: () => request<Account[]>("/api/accounts"),
   sync: () => request<SyncResult>("/api/accounts/sync", { method: "POST" }),
+  usageEstimate: (refresh = true) =>
+    request<UsageEstimate>(`/api/accounts/usage-estimate?refresh=${refresh ? "true" : "false"}`, {}, 180_000),
+  refreshUsageWindows: () =>
+    request<UsageRefreshResult>("/api/accounts/usage-refresh", { method: "POST" }, 180_000),
+  updateAccountUsageEstimate: (id: number, enabled: boolean) =>
+    request<{ message: string }>(`/api/accounts/${id}/usage-estimate`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
   refresh: (email: string) =>
     request<RefreshJob>("/api/accounts/refresh", {
       method: "POST",
       body: JSON.stringify({ email }),
     }),
+  deleteDeactivatedAccounts: () =>
+    request<DeactivatedCleanupResult>("/api/accounts/deactivated", { method: "DELETE" }),
   jobs: () => request<RefreshJob[]>("/api/accounts/jobs"),
   events: () => request<AppEvent[]>("/api/accounts/events"),
+  clearHistory: () => request<{ message: string }>("/api/accounts/history", { method: "DELETE" }),
+  settings: () => request<AppSettings>("/api/settings"),
+  updateSettings: (payload: AppSettingsUpdate) =>
+    request<AppSettings>("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  scanSub2Api: () => request<Sub2ApiPortScanResult>("/api/settings/scan-sub2api", { method: "POST" }),
   mailboxes: () => request<Mailbox[]>("/api/mailboxes"),
   mailboxMessages: (id: number, folder: "inbox" | "junk") =>
     request<MailMessage[]>(`/api/mailboxes/${id}/messages?folder=${folder}&limit=10`, {}, 50_000),

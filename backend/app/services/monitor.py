@@ -4,10 +4,11 @@ from sqlalchemy import select
 
 from app.core.config import Settings, get_settings
 from app.core.database import AsyncSessionLocal
-from app.models import AccountSnapshot, utcnow
+from app.models import AccountSnapshot, MailboxCredential, utcnow
 from app.schemas import Sub2ApiSyncResult
 from app.services.events import record_event
 from app.services.refresh import RefreshService, get_refresh_service
+from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient, sanitize_payload
 
 
@@ -16,8 +17,10 @@ class MonitorService:
         self.settings = settings or get_settings()
         self.sub2api = Sub2ApiClient(self.settings)
         self.refresh_service = refresh_service or get_refresh_service()
+        self.runtime_config = get_runtime_config_service()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()
 
     def start(self) -> None:
         if self.settings.monitor_enabled and self._task is None:
@@ -25,8 +28,12 @@ class MonitorService:
 
     async def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         if self._task:
             await self._task
+
+    def wake(self) -> None:
+        self._wake.set()
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
@@ -35,10 +42,23 @@ class MonitorService:
             except Exception as exc:
                 async with AsyncSessionLocal() as db:
                     await record_event(db, "monitor_failed", f"Monitor failed: {exc}")
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self.settings.monitor_interval_seconds)
-            except asyncio.TimeoutError:
-                continue
+            await self._wait_for_next_run()
+
+    async def _wait_for_next_run(self) -> None:
+        interval = await self.runtime_config.get_monitor_interval_seconds()
+        stop_task = asyncio.create_task(self._stop.wait())
+        wake_task = asyncio.create_task(self._wake.wait())
+        try:
+            await asyncio.wait(
+                {stop_task, wake_task},
+                timeout=interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            stop_task.cancel()
+            wake_task.cancel()
+            await asyncio.gather(stop_task, wake_task, return_exceptions=True)
+            self._wake.clear()
 
     async def sync_once(self, reason: str = "manual") -> Sub2ApiSyncResult:
         accounts = await self.sub2api.list_accounts()
@@ -61,6 +81,9 @@ class MonitorService:
             if is_error:
                 error_seen += 1
                 if not is_deactive:
+                    if not await self._has_enabled_mailbox(normalized):
+                        await self._mark_missing_mailbox(normalized)
+                        continue
                     job_id = await self.refresh_service.enqueue(account, reason=f"{reason}: sub2api reported error")
                     if job_id is not None:
                         queued += 1
@@ -77,18 +100,40 @@ class MonitorService:
     async def _upsert_snapshot(self, email: str, account: dict, is_deactive: bool) -> None:
         async with AsyncSessionLocal() as db:
             snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
+            was_deactive = snapshot.deactive if snapshot is not None else False
             if snapshot is None:
                 snapshot = AccountSnapshot(email=email)
+                snapshot.usage_estimate_enabled = not is_deactive
                 db.add(snapshot)
+            elif is_deactive and not was_deactive:
+                snapshot.usage_estimate_enabled = False
             snapshot.sub2api_account_id = self.sub2api.account_id(account)
             snapshot.platform = self.sub2api.account_platform(account)
             snapshot.account_type = self.sub2api.account_type(account)
             snapshot.status = self.sub2api.account_status(account)
             snapshot.schedulable = self.sub2api.account_schedulable(account)
-            snapshot.deactive = snapshot.deactive or is_deactive
+            snapshot.deactive = is_deactive
             snapshot.raw = sanitize_payload(account)
             snapshot.last_seen_at = utcnow()
             await db.commit()
+
+    async def _has_enabled_mailbox(self, email: str) -> bool:
+        async with AsyncSessionLocal() as db:
+            credential = await db.scalar(select(MailboxCredential).where(MailboxCredential.gpt_email == email))
+            return credential is not None and not credential.disabled
+
+    async def _mark_missing_mailbox(self, email: str) -> None:
+        reason = "No enabled mailbox credential exists for this GPT account; account was checked only and refresh was not queued."
+        async with AsyncSessionLocal() as db:
+            snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
+            should_record = snapshot is not None and snapshot.last_error != reason
+            if snapshot:
+                snapshot.refreshing = False
+                snapshot.last_error = reason
+            if should_record:
+                await record_event(db, "refresh_skipped_missing_mailbox", reason, email)
+            else:
+                await db.commit()
 
 
 _monitor_service: MonitorService | None = None

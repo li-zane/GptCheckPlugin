@@ -24,6 +24,7 @@ async def dashboard_summary(
         select(func.count())
         .select_from(AccountSnapshot)
         .where(
+            AccountSnapshot.deactive.is_(False),
             or_(
                 AccountSnapshot.last_error.is_not(None),
                 lowered_status.like("%error%"),

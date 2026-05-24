@@ -16,6 +16,7 @@ __pycache__/
 data/
 output/
 playwright/.cache/
+.playwright-cli/
 
 node_modules/
 dist/
