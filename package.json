@@ -1,0 +1,11 @@
+{
+  "name": "sub2api-at-guardian",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "backend:dev": "python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000",
+    "backend:prod": "python -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000"
+  }
+}
