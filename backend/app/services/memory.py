@@ -60,25 +60,29 @@ def process_tree_rss_bytes(root_pid: int | None = None) -> int:
     return _procfs_tree_rss_bytes(pid)
 
 
+def available_system_memory_bytes() -> int | None:
+    psutil_value = _psutil_available_memory_bytes()
+    if sys.platform.startswith("win"):
+        return psutil_value if psutil_value is not None else _windows_available_memory_bytes()
+
+    procfs_value = psutil_value if psutil_value is not None else _procfs_available_memory_bytes()
+    cgroup_value = _cgroup_available_memory_bytes()
+    if procfs_value is not None and cgroup_value is not None:
+        return min(procfs_value, cgroup_value)
+    return cgroup_value if cgroup_value is not None else procfs_value
+
+
 _PSUTIL_IMPORT_ATTEMPTED = False
 _PSUTIL = None
 
 
 def _psutil_tree_rss_bytes(root_pid: int) -> int | None:
-    global _PSUTIL_IMPORT_ATTEMPTED, _PSUTIL
-    if not _PSUTIL_IMPORT_ATTEMPTED:
-        _PSUTIL_IMPORT_ATTEMPTED = True
-        try:
-            import psutil  # type: ignore[import-not-found]
-
-            _PSUTIL = psutil
-        except Exception:
-            _PSUTIL = None
-    if _PSUTIL is None:
+    psutil = _get_psutil()
+    if psutil is None:
         return None
 
     try:
-        root = _PSUTIL.Process(root_pid)
+        root = psutil.Process(root_pid)
         processes = [root, *_safe_children(root)]
         total = 0
         for process in processes:
@@ -91,11 +95,90 @@ def _psutil_tree_rss_bytes(root_pid: int) -> int | None:
         return None
 
 
+def _psutil_available_memory_bytes() -> int | None:
+    psutil = _get_psutil()
+    if psutil is None:
+        return None
+    try:
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _get_psutil():
+    global _PSUTIL_IMPORT_ATTEMPTED, _PSUTIL
+    if not _PSUTIL_IMPORT_ATTEMPTED:
+        _PSUTIL_IMPORT_ATTEMPTED = True
+        try:
+            import psutil  # type: ignore[import-not-found]
+
+            _PSUTIL = psutil
+        except Exception:
+            _PSUTIL = None
+    return _PSUTIL
+
+
 def _safe_children(process) -> list:
     try:
         return process.children(recursive=True)
     except Exception:
         return []
+
+
+def _procfs_available_memory_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="utf-8", errors="ignore") as handle:
+            values: dict[str, int] = {}
+            for line in handle:
+                key, _, rest = line.partition(":")
+                parts = rest.strip().split()
+                if not parts:
+                    continue
+                try:
+                    values[key] = int(parts[0]) * 1024
+                except ValueError:
+                    continue
+    except OSError:
+        return None
+
+    if values.get("MemAvailable") is not None:
+        return values["MemAvailable"]
+    free = values.get("MemFree")
+    buffers = values.get("Buffers", 0)
+    cached = values.get("Cached", 0)
+    if free is None:
+        return None
+    return free + buffers + cached
+
+
+def _cgroup_available_memory_bytes() -> int | None:
+    limit = _read_cgroup_memory_value(
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    )
+    usage = _read_cgroup_memory_value(
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    )
+    if limit is None or usage is None or limit >= 1 << 60:
+        return None
+    return max(0, limit - usage)
+
+
+def _read_cgroup_memory_value(*paths: str) -> int | None:
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as handle:
+                value = handle.read().strip()
+        except OSError:
+            continue
+        if not value or value == "max":
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return None
 
 
 def _procfs_tree_rss_bytes(root_pid: int) -> int:
@@ -256,3 +339,33 @@ def _windows_working_set_bytes(pid: int, kernel32, psapi, ctypes, wintypes) -> i
         return int(counters.WorkingSetSize)
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _windows_available_memory_bytes() -> int | None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except Exception:
+        return None
+    return int(status.ullAvailPhys)

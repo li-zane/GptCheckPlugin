@@ -78,3 +78,79 @@
 - Follow-up panel issue: `http://127.0.0.1:18080/`, `/admin`, `/dashboard`, and `/login` all return 404 because the local sub2api binary is serving API routes only. The Vue panel must be run from `sub2api/frontend` on port `3000` with `VITE_DEV_PROXY_TARGET=http://127.0.0.1:18080`.
 - Started the sub2api frontend on `http://127.0.0.1:3000`; verified the public settings API proxies through Vite to `18080` and logged in to the dashboard with the local admin credentials.
 - Updated sibling project scripts `C:\Users\zanez\Documents\agent_playground\sub2api\start-local.ps1` and `stop-local.ps1` so future local starts/stops include the frontend panel. That sibling directory is not a git repository.
+
+## 2026-05-25 Memory Guard and Split Concurrency
+
+- `RefreshService` currently samples RSS for the backend process tree, so Playwright/Chromium child processes are included in `memory_peak_rss_bytes`; protocol-only refreshes should stay much lower than browser fallbacks.
+- The existing `refresh_max_concurrency` controls all refresh jobs together. To avoid browser fallback spikes, protocol work and Playwright browser login need separate limiters.
+- The browser guard should check available system memory, not current app RSS: if available memory is below 500 MiB by default, the browser fallback should fail fast and leave protocol/sub2api paths unaffected.
+- In containerized Linux, host `/proc/meminfo` can overstate available memory. The guard now takes the smaller value between procfs/psutil available memory and cgroup memory headroom when cgroup limits are present.
+- Existing persisted `refresh_max_concurrency` remains a compatibility alias for protocol concurrency; browser fallback uses its own `browser_refresh_max_concurrency` key.
+
+## 2026-05-25 Recovery Toggle and File-backed Settings
+
+- The recovery behavior is sub2api post-update recovery: clear error, call `recover-state`, set `schedulable=true`, and delete temporary unschedulable state.
+- The broader account recovery task is the plugin refresh/repair queue. Disabling it should prevent automatic monitor enqueueing and reject manual refresh requests.
+- The initial implementation defaulted `recovery_enabled` to true when no DB/config value existed, so a missing setting row meant manual sync still queued recovery. The default must be false to match an unchecked settings toggle.
+- Runtime settings were stored in SQLite `app_settings`; if the database is recreated or a different working directory is used on redeploy, admin-panel settings can appear reset.
+- Pydantic previously read `.env` relative to the process working directory. Loading it from the project root avoids a backend-start-directory mismatch.
+- Admin-panel settings now write to project-root `.env`, preserving existing unrelated lines and writing x-api key only to the ignored config file.
+
+## 2026-05-25 Bulk Delete Problem Accounts Button
+
+- The top-right accounts button was disabled because it counted only `deactive` accounts. The current sub2api state has many GPT accounts in `status=error`, but none with local `deactive=true`.
+- User clarified ordinary remote `status=error` accounts may recover after reauthorization and must not be directly deleted.
+- The intended bulk cleanup target is a duplicate email group with a usable account plus an unusable duplicate. Delete only the abnormal duplicate when the group has a non-error, non-deactivated primary replacement.
+- `remote_error` is still useful for display, but it must not by itself imply `can_delete_remote` or bulk deletion eligibility.
+
+## 2026-05-25 OAuth RT Acquisition
+
+- Current plugin refresh already has a low-memory ChatGPT Web protocol login path, but it fetches `/api/auth/session` and usually only yields an access token, not an OAuth refresh token.
+- sub2api account detection already recognizes `credentials.refresh_token`, `credentials.refreshToken`, and `credentials.rt`; writeback currently standardizes on `refresh_token` when a session exposes a refresh token.
+- To obtain durable GPT RTs, the plugin should drive OpenAI OAuth with PKCE, capture the callback `code` without exposing tokens, exchange it server-side, then write the resulting `access_token`, `refresh_token`, and `id_token` into sub2api credentials.
+- A protocol implementation can likely reuse the existing `auth.openai.com/api/accounts/authorize/continue` and `email-otp/validate` requests. Browser automation remains useful as a fallback when the protocol flow encounters unsupported page states or Cloudflare.
+- Protocol OAuth smoke test for `annamason5243@outlook.com` reached `sign_in_with_chatgpt_codex_consent` after email OTP, then stopped because the consent page is a JS-rendered React/Remix page rather than a simple form/API continuation. Keep pure protocol OAuth disabled by default until that consent action is mapped.
+- Browser OAuth smoke test for the same account succeeded after adding request/frame callback capture. Chromium navigated to the local callback and then `chromewebdata` because no listener exists on port 1455, so the code must be captured before the error page replaces the URL.
+- Successful browser OAuth smoke test wrote back `access_token`, `refresh_token`, `id_token`, `email`, and expiry through the existing sub2api credentials patch path without printing secrets. Peak process-tree RSS was about `834.9 MiB`.
+- Existing RT refresh for `annamason5243@outlook.com` through sub2api remained low-memory, peaking around `77.4 MiB`.
+- Refresh ordering should be RT-first when a refresh token exists: sub2api `/refresh` now runs before AT status check so accounts with RT actively rotate/refresh through the intended token path instead of stopping early on a still-valid AT.
+
+## 2026-05-25 Usage Estimate Availability
+
+- The sub2api usage endpoint succeeded for all 42 deduped GPT accounts during diagnosis and returned `cost` for every account, so the main issue was not upstream fetch failure.
+- Many accounts were marked not estimable because the estimator used `raw_spent - baseline_spent` as the numerator. On first enable or after no new usage, this delta is zero, even though official current-window raw usage and official used percent are enough to estimate remaining quota.
+- The correct remaining-quota estimate should use the current official window raw usage divided by official used percent. The baseline remains useful for showing "new usage since tracking started", but should not gate the remaining-quota estimate.
+- The accounts page initially calls the usage estimate API with `refresh=false`; without cached raw cost from the last usage refresh, it can only see percentages from account fields and cannot estimate. Cached `UsageWindowState.last_raw_spent` and matching cached percent should be used for that lightweight view.
+
+## 2026-05-27 Calibrated Usage Quota Display
+
+- The robust place to update quota-limit samples is every path that obtains active usage-window data: quota estimate refresh, manual/automatic usage-window refresh, and post-account-refresh usage refresh.
+- A conservative sample trigger is needed so ordinary mid-window observations do not pollute the limit table. The implementation records samples when official usage percent is at least `99%` or when usage/window/account status text carries rate-limit/quota-exhaustion markers.
+- Before enough samples exist, default clamp ranges should prevent obviously inflated reverse limits: 5h uses `$15-$25`; 7d uses `$100-$140`.
+
+## 2026-05-27 Usage Estimate History
+
+- Superseded: the requested history is not aggregate estimate history. The UI should show the actual 5h/7d limit samples used to calibrate the official-window quota estimate.
+- The sidebar issue comes from the whole shell scrolling together. Desktop layout should lock the sidebar to viewport height and make only `.workspace` scroll.
+
+## 2026-05-27 Account Rate-Limit Distinction
+
+- The account table previously treated active/schedulable accounts as simply available even when their 5h/7d usage window had reached the practical limit.
+- Existing usage-estimate/sample logic already identifies rate-limited windows via official used percent >= `99%` or rate-limit/quota markers in usage/account payloads, so the UI distinction should reuse that signal instead of adding a separate probe.
+- The accounts page can combine backend account-level rate-limit flags with cached usage-estimate window flags, because opening the accounts page intentionally reads cached usage data without forcing an active upstream query.
+
+## 2026-05-28 Refresh Restart Loop
+
+- The backend service had entered a systemd restart loop with thousands of restarts. The immediate repeated startup failure was `address already in use` for `127.0.0.1:8000` because an orphaned uvicorn process from the project was still listening outside the active systemd control flow.
+- The earlier trigger was `sqlite3.OperationalError: database is locked` while refresh background tasks were writing optional `refresh_memory_peak` events. That exception escaped during asyncio shutdown and caused the backend process to exit.
+- Uvicorn runs FastAPI lifespan startup before binding the listening socket. When the port was already occupied, the monitor loop could still run, sync sub2api, enqueue refresh jobs, then the process would fail binding and restart. This produced repeated `Service restarted before refresh finished` jobs.
+- After the service was stabilized, the latest real refresh attempts did not fail from restart anymore. They completed as `deactive` because OpenAI OAuth OTP validation returned `account_deactive` for the affected accounts.
+- The sub2api stored-token refresh path returned Cloudflare HTTP 502 from `https://ai.duckduckport.top/api/v1/admin/accounts/:id/refresh`, so refresh jobs correctly fell back to the mailbox/OAuth path before detecting deactivation.
+
+## 2026-06-05 Local OpenAI RT/AT Refresh Port
+
+- `mail-console-x1` contains a direct OpenAI token refresh implementation that posts `grant_type=refresh_token` to `https://auth.openai.com/oauth/token`, then immediately validates the returned access token through ChatGPT `accounts/check` before updating local state.
+- The current plugin previously had OAuth code exchange and ChatGPT access-token checks, but it did not have a local cached GPT refresh-token store or a direct OpenAI `refresh_token` refresh path.
+- sub2api admin account payloads are redacted, so a local direct OpenAI RT refresh path is only feasible if the plugin securely caches GPT OAuth tokens from prior successful OAuth/browser refresh outcomes.
+- Minimal port strategy: store encrypted GPT `refresh_token` / `access_token` / `id_token` / `client_id` plus expiry on `account_snapshots`, then try local cached OpenAI RT refresh before falling back to sub2api check-status, plugin-visible AT checks, ChatGPT protocol login, and browser OAuth.
+- For no-mailbox accounts, monitor auto-queue logic must treat local cached GPT tokens as a protocol-capable recovery path; otherwise those accounts would still be skipped before the new RT/AT flow can run.

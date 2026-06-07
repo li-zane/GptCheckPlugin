@@ -126,3 +126,111 @@ Create a runnable sub2api companion plugin that monitors imported GPT accounts, 
 - [x] Check whether missing `.env` or encryption-key mismatch is hiding mailbox rows.
 - [x] Recover mailbox/account data from local DB/sub2api storage if rows were deleted.
 - [x] Restart affected services and verify UI/API health.
+
+## Change Request: Memory Guard and Split Refresh Concurrency
+
+- [x] Explain high refresh-job memory peaks from browser process-tree RSS sampling.
+- [x] Add a browser fallback guard that skips Playwright when available system memory is below the configured threshold.
+- [x] Split refresh concurrency settings for protocol refresh work and browser login work.
+- [x] Expose the new settings through backend schemas/runtime settings and the React settings page.
+- [x] Compile/build-check backend and frontend.
+
+## Latest Errors Encountered
+
+- Tried to run `.venv/bin/python` from the `backend` directory; that relative path does not exist there. Re-ran the memory-helper smoke check from the project root with `PYTHONPATH=backend`.
+- Tried to define `async def` directly after semicolons in `python -c`; Python rejected the syntax. Re-ran the settings smoke check with `exec(...)`.
+
+## Change Request: Recovery Toggle and File-backed Settings
+
+- [x] Add a settings-page toggle for the post-refresh sub2api recovery behavior.
+- [x] Add a settings-page toggle for the account recovery task itself.
+- [x] Make runtime sub2api config read the recovery toggle dynamically.
+- [x] Persist admin-panel settings to the project-root `.env` file.
+- [x] Make `Settings` always load the project-root `.env`, independent of uvicorn working directory.
+- [x] Compile/build-check backend and frontend.
+
+## Change Request: Account and Mailbox Search
+
+- [x] Add local search to the account list.
+- [x] Add local search to the mailbox credential list.
+- [x] Style search controls to match existing toolbar and panel design.
+- [x] Build-check frontend.
+
+## Change Request: Skip Existing Mailboxes on Import
+
+- [x] Detect existing mailbox credentials before importing.
+- [x] Skip rows whose GPT email or retrieval mailbox email already exists.
+- [x] Skip duplicate GPT/retrieval mailbox emails inside the same import payload.
+- [x] Keep invalid-line reporting and include duplicate skips in the skipped count.
+- [x] Compile-check backend.
+
+## Fix: Bulk Delete Problem Accounts Button
+
+- [x] Diagnose why the top-right delete button was disabled.
+- [x] Keep ordinary remote error accounts non-deletable because they may recover after reauthorization.
+- [x] Make the frontend count only deactivated accounts and duplicate abnormal accounts with a safe primary replacement.
+- [x] Make the bulk delete endpoint delete only deactivated accounts and duplicate abnormal accounts with a healthy primary replacement.
+- [x] Compile/build-check backend and frontend, and smoke-check duplicate cleanup eligibility.
+
+## Change Request: OAuth Refresh Token Acquisition
+
+- [x] Add OpenAI OAuth PKCE token exchange that can obtain and write a GPT `refresh_token`.
+- [x] Probe protocol automation for OAuth login and keep it behind an experimental toggle because the consent page currently requires JS.
+- [x] Reuse the existing mailbox email-code reader and stop immediately on add-phone / phone-number-required pages.
+- [x] Preserve memory safety by using the existing browser memory guard before Playwright OAuth fallback.
+- [x] Verify with compile checks and cautious single-account smoke tests for `annamason5243@outlook.com`.
+
+## Change Request: Port mail-console-x1 GPT RT/AT Refresh
+
+- [x] Compare the current plugin refresh flow with `mail-console-x1` direct OpenAI RT/AT refresh implementation.
+- [x] Add secure local storage for GPT OAuth tokens needed for direct OpenAI refresh.
+- [x] Port a minimal OpenAI token/profile refresh service into the plugin backend.
+- [x] Integrate the new local RT/AT paths into refresh orchestration without removing existing fallbacks.
+- [x] Run migration/compile/static verification and record the outcome.
+
+## Fix: Usage Estimate Availability
+
+- [x] Diagnose why many accounts showed as not estimable.
+- [x] Use current official window raw usage, not only baseline delta, to estimate remaining quota.
+- [x] Keep baseline delta as display-only "new usage since enable" information.
+- [x] Use cached usage-window state when the accounts page loads estimates with `refresh=false`.
+- [x] Compile/build-check backend and frontend.
+
+## Change Request: Calibrated Usage Quota Display
+
+- [x] Add local 5h/7d limit sample storage for accounts observed at or near usage limits.
+- [x] Keep at most the middle 100 samples per window after sorting by observed limit.
+- [x] Clamp inferred window totals to a 3 sigma range once 100 samples exist; before that, use 5h `$15-$25` and 7d `$100-$140` default ranges.
+- [x] Update sample collection when active usage-window data is fetched.
+- [x] Replace per-account quota text with progress-bar usage display and remove "新增" from the UI.
+- [x] Compile/build-check backend and frontend.
+
+## Change Request: Usage Estimate History
+
+- [x] Replaced by the usage limit sample page request below; UI/API/save logic removed.
+
+## Change Request: Usage Limit Sample Page and Fixed Sidebar
+
+- [x] Remove the aggregate usage estimate history panel and API added in the prior step.
+- [x] Add an authenticated usage-limit-samples API exposing the current 5h/7d sample rows and calibration range.
+- [x] Add a standalone `样本` page showing the up-to-100 rows used for official-window quota estimation.
+- [x] Fix layout so the sidebar stays fixed while the right workspace scrolls independently on desktop.
+- [x] Compile/build-check backend and frontend, run database migration validation, validate sample response model, and restart services.
+
+## Change Request: Account Rate-Limit Distinction
+
+- [x] Reuse existing 5h/7d rate-limit detection from usage-window/sample logic.
+- [x] Expose `rate_limited` and `rate_limited_windows` in account and usage-estimate API responses.
+- [x] Show rate-limited accounts as `限流`/warn in the account list and make account search match `限流` / `rate limited`.
+- [x] Mark limited quota progress bars with warning styling.
+- [x] Split account-list limit labels into separate `5h限流` and `7d限流` items and show estimated recovery timing below each item.
+- [x] Compile/build-check backend and frontend, run helper smoke test, and run `git diff --check`.
+
+## Incident: Refresh Failures and Backend Restart Loop
+
+- [x] Inspect latest refresh jobs, app events, systemd state, and backend journal.
+- [x] Confirm the restart loop was caused by SQLite lock exceptions during refresh memory/event writes, followed by an orphaned uvicorn process keeping port `8000` occupied.
+- [x] Make refresh finalization/event writes non-fatal and split critical job-state commits from optional app-event commits.
+- [x] Enable SQLite busy timeout and WAL mode to reduce write-lock contention.
+- [x] Delay scheduled monitor sync briefly after startup so a failed port bind cannot enqueue refresh jobs before uvicorn exits.
+- [x] Terminate the stale backend process, restart `gptcheckplugin.service`, and verify health, port ownership, and refresh-job convergence.

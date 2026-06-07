@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -22,15 +24,23 @@ from app.models import AppSetting, utcnow
 KEY_SUB2API_BASE_URL = "sub2api_base_url"
 KEY_SUB2API_BASE_URL_SOURCE = "sub2api_base_url_source"
 KEY_SUB2API_X_API_KEY = "sub2api_x_api_key"
+KEY_SUB2API_AUTO_RECOVER_STATE = "sub2api_auto_recover_state"
 KEY_MONITOR_INTERVAL_SECONDS = "monitor_interval_seconds"
 KEY_USAGE_REFRESH_ENABLED = "usage_refresh_enabled"
 KEY_USAGE_REFRESH_INTERVAL_SECONDS = "usage_refresh_interval_seconds"
+KEY_RECOVERY_ENABLED = "recovery_enabled"
 KEY_REFRESH_MAX_CONCURRENCY = "refresh_max_concurrency"
+KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY = "protocol_refresh_max_concurrency"
+KEY_BROWSER_REFRESH_MAX_CONCURRENCY = "browser_refresh_max_concurrency"
+KEY_BROWSER_MIN_AVAILABLE_MEMORY_MB = "browser_min_available_memory_mb"
+KEY_SUBSCRIPTION_REFRESH_BATCH_SIZE = "subscription_refresh_batch_size"
+KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY = "subscription_refresh_max_concurrency"
 KEY_LAST_SCAN_AT = "sub2api_last_scan_at"
 KEY_LAST_SCAN_STATUS = "sub2api_last_scan_status"
 KEY_LAST_SCAN_MESSAGE = "sub2api_last_scan_message"
 KEY_DISPLAY_TIMEZONE = "display_timezone"
 KEY_SITE_NAME = "site_name"
+KEY_AUTOMATION_PAUSED = "automation_paused"
 SUB2API_API_PREFIX = "/api/v1"
 
 
@@ -78,12 +88,23 @@ class RuntimeConfigService:
             accounts_path=self.settings.sub2api_accounts_path,
             access_token_path=self.settings.sub2api_access_token_path,
             auto_clear_error=self.settings.sub2api_auto_clear_error,
-            auto_recover_state=self.settings.sub2api_auto_recover_state,
+            auto_recover_state=_bool_or_default(
+                values.get(KEY_SUB2API_AUTO_RECOVER_STATE),
+                self.settings.sub2api_auto_recover_state,
+            ),
         )
 
     async def get_monitor_interval_seconds(self) -> int:
         values = await self._load_values()
         return _int_or_default(values.get(KEY_MONITOR_INTERVAL_SECONDS), self.settings.monitor_interval_seconds)
+
+    async def get_automation_paused(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(values.get(KEY_AUTOMATION_PAUSED), self.settings.automation_paused)
+
+    async def get_recovery_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(values.get(KEY_RECOVERY_ENABLED), self.settings.recovery_enabled)
 
     async def get_usage_refresh_enabled(self) -> bool:
         values = await self._load_values()
@@ -97,12 +118,51 @@ class RuntimeConfigService:
         )
 
     async def get_refresh_max_concurrency(self) -> int:
+        return await self.get_protocol_refresh_max_concurrency()
+
+    async def get_protocol_refresh_max_concurrency(self) -> int:
         values = await self._load_values()
         return _bounded_int_or_default(
-            values.get(KEY_REFRESH_MAX_CONCURRENCY),
-            self.settings.refresh_max_concurrency,
+            values.get(KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY) or values.get(KEY_REFRESH_MAX_CONCURRENCY),
+            self._default_protocol_refresh_max_concurrency(),
             1,
             50,
+        )
+
+    async def get_browser_refresh_max_concurrency(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_BROWSER_REFRESH_MAX_CONCURRENCY),
+            self.settings.browser_refresh_max_concurrency,
+            1,
+            50,
+        )
+
+    async def get_browser_min_available_memory_mb(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_BROWSER_MIN_AVAILABLE_MEMORY_MB),
+            self.settings.browser_min_available_memory_mb,
+            0,
+            1_048_576,
+        )
+
+    async def get_subscription_refresh_batch_size(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_SUBSCRIPTION_REFRESH_BATCH_SIZE),
+            self.settings.subscription_refresh_batch_size,
+            1,
+            100,
+        )
+
+    async def get_subscription_refresh_max_concurrency(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY),
+            self.settings.subscription_refresh_max_concurrency,
+            1,
+            20,
         )
 
     async def get_public_settings(self) -> dict:
@@ -117,6 +177,18 @@ class RuntimeConfigService:
             "sub2api_base_url_source": values.get(KEY_SUB2API_BASE_URL_SOURCE) or "env",
             "sub2api_x_api_key_set": bool(effective_x_api_key),
             "sub2api_x_api_key_hint": redact(effective_x_api_key) if effective_x_api_key else None,
+            "sub2api_auto_recover_state": _bool_or_default(
+                values.get(KEY_SUB2API_AUTO_RECOVER_STATE),
+                self.settings.sub2api_auto_recover_state,
+            ),
+            "automation_paused": _bool_or_default(
+                values.get(KEY_AUTOMATION_PAUSED),
+                self.settings.automation_paused,
+            ),
+            "recovery_enabled": _bool_or_default(
+                values.get(KEY_RECOVERY_ENABLED),
+                self.settings.recovery_enabled,
+            ),
             "monitor_interval_seconds": _int_or_default(
                 values.get(KEY_MONITOR_INTERVAL_SECONDS),
                 self.settings.monitor_interval_seconds,
@@ -130,10 +202,40 @@ class RuntimeConfigService:
                 self.settings.usage_refresh_interval_seconds,
             ),
             "refresh_max_concurrency": _bounded_int_or_default(
-                values.get(KEY_REFRESH_MAX_CONCURRENCY),
-                self.settings.refresh_max_concurrency,
+                values.get(KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY) or values.get(KEY_REFRESH_MAX_CONCURRENCY),
+                self._default_protocol_refresh_max_concurrency(),
                 1,
                 50,
+            ),
+            "protocol_refresh_max_concurrency": _bounded_int_or_default(
+                values.get(KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY) or values.get(KEY_REFRESH_MAX_CONCURRENCY),
+                self._default_protocol_refresh_max_concurrency(),
+                1,
+                50,
+            ),
+            "browser_refresh_max_concurrency": _bounded_int_or_default(
+                values.get(KEY_BROWSER_REFRESH_MAX_CONCURRENCY),
+                self.settings.browser_refresh_max_concurrency,
+                1,
+                50,
+            ),
+            "browser_min_available_memory_mb": _bounded_int_or_default(
+                values.get(KEY_BROWSER_MIN_AVAILABLE_MEMORY_MB),
+                self.settings.browser_min_available_memory_mb,
+                0,
+                1_048_576,
+            ),
+            "subscription_refresh_batch_size": _bounded_int_or_default(
+                values.get(KEY_SUBSCRIPTION_REFRESH_BATCH_SIZE),
+                self.settings.subscription_refresh_batch_size,
+                1,
+                100,
+            ),
+            "subscription_refresh_max_concurrency": _bounded_int_or_default(
+                values.get(KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY),
+                self.settings.subscription_refresh_max_concurrency,
+                1,
+                20,
             ),
             "last_scan_at": _datetime_or_none(values.get(KEY_LAST_SCAN_AT)),
             "last_scan_status": values.get(KEY_LAST_SCAN_STATUS),
@@ -147,6 +249,7 @@ class RuntimeConfigService:
         current_base_url = _normalize_base_url(
             current_values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url
         )
+        x_api_key_for_file = self._x_api_key_for_file(payload, current_values)
 
         async with AsyncSessionLocal() as db:
             if payload.get("sub2api_base_url") is not None or payload.get("sub2api_port") is not None:
@@ -159,6 +262,12 @@ class RuntimeConfigService:
             if payload.get("monitor_interval_seconds") is not None:
                 await self._put(db, KEY_MONITOR_INTERVAL_SECONDS, str(int(payload["monitor_interval_seconds"])))
 
+            if payload.get("automation_paused") is not None:
+                await self._put(db, KEY_AUTOMATION_PAUSED, "true" if payload["automation_paused"] else "false")
+
+            if payload.get("recovery_enabled") is not None:
+                await self._put(db, KEY_RECOVERY_ENABLED, "true" if payload["recovery_enabled"] else "false")
+
             if payload.get("usage_refresh_enabled") is not None:
                 await self._put(db, KEY_USAGE_REFRESH_ENABLED, "true" if payload["usage_refresh_enabled"] else "false")
 
@@ -169,8 +278,48 @@ class RuntimeConfigService:
                     str(int(payload["usage_refresh_interval_seconds"])),
                 )
 
-            if payload.get("refresh_max_concurrency") is not None:
-                await self._put(db, KEY_REFRESH_MAX_CONCURRENCY, str(int(payload["refresh_max_concurrency"])))
+            if payload.get("sub2api_auto_recover_state") is not None:
+                await self._put(
+                    db,
+                    KEY_SUB2API_AUTO_RECOVER_STATE,
+                    "true" if payload["sub2api_auto_recover_state"] else "false",
+                )
+
+            protocol_concurrency = payload.get("protocol_refresh_max_concurrency")
+            if protocol_concurrency is None:
+                protocol_concurrency = payload.get("refresh_max_concurrency")
+            if protocol_concurrency is not None:
+                value = str(int(protocol_concurrency))
+                await self._put(db, KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY, value)
+                await self._put(db, KEY_REFRESH_MAX_CONCURRENCY, value)
+
+            if payload.get("browser_refresh_max_concurrency") is not None:
+                await self._put(
+                    db,
+                    KEY_BROWSER_REFRESH_MAX_CONCURRENCY,
+                    str(int(payload["browser_refresh_max_concurrency"])),
+                )
+
+            if payload.get("browser_min_available_memory_mb") is not None:
+                await self._put(
+                    db,
+                    KEY_BROWSER_MIN_AVAILABLE_MEMORY_MB,
+                    str(int(payload["browser_min_available_memory_mb"])),
+                )
+
+            if payload.get("subscription_refresh_batch_size") is not None:
+                await self._put(
+                    db,
+                    KEY_SUBSCRIPTION_REFRESH_BATCH_SIZE,
+                    str(int(payload["subscription_refresh_batch_size"])),
+                )
+
+            if payload.get("subscription_refresh_max_concurrency") is not None:
+                await self._put(
+                    db,
+                    KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY,
+                    str(int(payload["subscription_refresh_max_concurrency"])),
+                )
 
             if payload.get("display_timezone") is not None:
                 await self._put(db, KEY_DISPLAY_TIMEZONE, _clean_timezone(str(payload["display_timezone"])))
@@ -187,7 +336,9 @@ class RuntimeConfigService:
 
             await db.commit()
 
-        return await self.get_public_settings()
+        settings = await self.get_public_settings()
+        self._persist_settings_file(settings, x_api_key_for_file)
+        return settings
 
     async def scan_sub2api_ports(self, apply: bool = False) -> dict:
         config = await self.get_sub2api_config()
@@ -214,7 +365,7 @@ class RuntimeConfigService:
             await self._put(db, KEY_LAST_SCAN_MESSAGE, message)
             await db.commit()
 
-        return {
+        result = {
             "found": bool(hit),
             "base_url": base_url,
             "port": port,
@@ -223,6 +374,13 @@ class RuntimeConfigService:
             "checked_ports": checked_ports,
             "applied": bool(hit and apply),
         }
+        if hit and apply:
+            current_values = await self._load_values()
+            self._persist_settings_file(
+                await self.get_public_settings(),
+                self._x_api_key_for_file({}, current_values),
+            )
+        return result
 
     async def auto_detect_sub2api(self) -> None:
         values = await self._load_values()
@@ -310,6 +468,51 @@ class RuntimeConfigService:
             result = await db.execute(select(AppSetting))
             return {item.key: item.value for item in result.scalars().all()}
 
+    def _x_api_key_for_file(self, payload: dict, current_values: dict[str, str | None]) -> str | None:
+        if payload.get("clear_sub2api_x_api_key"):
+            return ""
+        raw_key = payload.get("sub2api_x_api_key")
+        if isinstance(raw_key, str) and raw_key.strip():
+            return raw_key.strip()
+        return decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY)) or self._env_x_api_key() or None
+
+    def _persist_settings_file(self, settings: dict[str, Any], x_api_key: str | None) -> None:
+        path = self.settings.project_root / ".env"
+        values: dict[str, str | None] = {
+            "APP_NAME": str(settings["site_name"]),
+            "SUB2API_BASE_URL": str(settings["sub2api_base_url"]),
+            "SUB2API_AUTO_RECOVER_STATE": _env_bool(bool(settings["sub2api_auto_recover_state"])),
+            "AUTOMATION_PAUSED": _env_bool(bool(settings["automation_paused"])),
+            "RECOVERY_ENABLED": _env_bool(bool(settings["recovery_enabled"])),
+            "MONITOR_INTERVAL_SECONDS": str(int(settings["monitor_interval_seconds"])),
+            "USAGE_REFRESH_ENABLED": _env_bool(bool(settings["usage_refresh_enabled"])),
+            "USAGE_REFRESH_INTERVAL_SECONDS": str(int(settings["usage_refresh_interval_seconds"])),
+            "REFRESH_MAX_CONCURRENCY": str(int(settings["protocol_refresh_max_concurrency"])),
+            "PROTOCOL_REFRESH_MAX_CONCURRENCY": str(int(settings["protocol_refresh_max_concurrency"])),
+            "BROWSER_REFRESH_MAX_CONCURRENCY": str(int(settings["browser_refresh_max_concurrency"])),
+            "BROWSER_MIN_AVAILABLE_MEMORY_MB": str(int(settings["browser_min_available_memory_mb"])),
+            "SUBSCRIPTION_REFRESH_BATCH_SIZE": str(int(settings["subscription_refresh_batch_size"])),
+            "SUBSCRIPTION_REFRESH_MAX_CONCURRENCY": str(int(settings["subscription_refresh_max_concurrency"])),
+            "DISPLAY_TIMEZONE": str(settings["display_timezone"]),
+        }
+        if x_api_key == "":
+            values.update(
+                {
+                    "SUB2API_AUTH_TOKEN": None,
+                    "SUB2API_AUTH_HEADER": None,
+                    "SUB2API_AUTH_SCHEME": None,
+                }
+            )
+        elif x_api_key is not None:
+            values.update(
+                {
+                    "SUB2API_AUTH_TOKEN": x_api_key,
+                    "SUB2API_AUTH_HEADER": "x-api-key",
+                    "SUB2API_AUTH_SCHEME": "",
+                }
+            )
+        _write_env_file(path, values)
+
     async def _put(self, db: AsyncSession, key: str, value: str | None) -> None:
         setting = await db.get(AppSetting, key)
         if setting is None:
@@ -327,6 +530,9 @@ class RuntimeConfigService:
         if header in {"x-api-key", "x-api", "x-api_key"}:
             return self.settings.sub2api_auth_token.strip()
         return ""
+
+    def _default_protocol_refresh_max_concurrency(self) -> int:
+        return self.settings.protocol_refresh_max_concurrency or self.settings.refresh_max_concurrency
 
 
 def _headers_for_probe(config: EffectiveSub2ApiConfig) -> dict[str, str]:
@@ -409,6 +615,74 @@ def _bool_or_default(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _write_env_file(path: Path, values: dict[str, str | None]) -> None:
+    existing = ""
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"Could not read runtime config file {path}.") from exc
+
+    next_text = _merge_env_text(existing, values)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        tmp_path.write_text(next_text, encoding="utf-8")
+        try:
+            tmp_path.chmod(0o600)
+        except OSError:
+            pass
+        tmp_path.replace(path)
+    except OSError as exc:
+        raise RuntimeError(f"Could not write runtime config file {path}.") from exc
+
+
+def _merge_env_text(existing: str, values: dict[str, str | None]) -> str:
+    remaining = dict(values)
+    lines: list[str] = []
+    for line in existing.splitlines():
+        key = _env_line_key(line)
+        if key is None or key not in remaining:
+            lines.append(line)
+            continue
+        value = remaining.pop(key)
+        if value is not None:
+            lines.append(f"{key}={_format_env_value(value)}")
+
+    if remaining:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("# Runtime settings saved from the admin panel")
+        for key, value in remaining.items():
+            if value is not None:
+                lines.append(f"{key}={_format_env_value(value)}")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _env_line_key(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key = stripped.split("=", 1)[0].strip()
+    if key.startswith("export "):
+        key = key[7:].strip()
+    return key if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) else None
+
+
+def _format_env_value(value: str) -> str:
+    if value == "":
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_./:+,@%-]+", value):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _datetime_or_none(value: str | None) -> datetime | None:

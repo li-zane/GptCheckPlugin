@@ -120,3 +120,77 @@
 - Started the sub2api Vue frontend on `127.0.0.1:3000` with `VITE_DEV_PROXY_TARGET=http://127.0.0.1:18080`; verified the root page and proxied `/api/v1/settings/public` both return 200.
 - Opened the panel in the in-app browser, logged in with `admin@sub2api.local / sub2api_local_admin`, and verified it reached `http://127.0.0.1:3000/dashboard`.
 - Patched sibling sub2api `start-local.ps1` and `stop-local.ps1` so the local panel starts/stops alongside the backend. Script parsing and `start-local.ps1` reuse on already-running services passed.
+
+## 2026-05-25
+
+- Started memory/concurrency follow-up. Confirmed refresh jobs wrap the whole process tree in `ProcessMemorySampler`, which explains high peaks when Playwright/Chromium starts after protocol fallback failure.
+- Confirmed the current refresh queue uses one `_active_refreshes` counter backed by runtime setting `refresh_max_concurrency`; browser and protocol work are not independently limited yet.
+- Added available-memory detection with psutil, procfs, cgroup, and Windows fallbacks. Browser fallback now skips Playwright if available memory is below the configured threshold, defaulting to 500 MiB.
+- Split refresh execution into protocol and browser concurrency slots. Protocol work reads `protocol_refresh_max_concurrency`; browser fallback reads `browser_refresh_max_concurrency`; legacy `refresh_max_concurrency` remains a protocol-compatible alias.
+- Exposed the new settings through backend schemas/runtime config, `.env.example`, README, TypeScript types, and the React settings view.
+- Verified `.venv/bin/python -m compileall backend/app`, `npm --prefix frontend run build`, `git diff --check`, and a smoke import of `available_system_memory_bytes()` from the project root. The first memory-helper smoke command failed only because it was run from `backend` with the wrong relative `.venv` path, then passed from the root.
+- Added `sub2api_auto_recover_state` as a runtime setting and settings-page toggle. `Sub2ApiClient` now reads it through `EffectiveSub2ApiConfig` instead of only from static env settings.
+- Added `recovery_enabled` as the account recovery task switch. When disabled, monitor sync still updates snapshots but does not enqueue recovery jobs, and manual refresh returns a 409 conflict.
+- Fixed the recovery switch default: missing `recovery_enabled` now means false, not true. Persisted the current local setting to false so the running app stops enqueueing recovery on manual sync.
+- Added account and mailbox list search boxes. Account search matches account email, mailbox email, status, schedulable state, sub2api ID, platform/type, duplicate/error flags, and last error. Mailbox search matches GPT email, mailbox email, provider, enabled/disabled state, success time, and last error.
+- Verified `npm --prefix frontend run build` and `git diff --check` after the search UI changes.
+- Updated mailbox import so existing records are ignored instead of overwritten. Import now skips rows when the GPT email or retrieval mailbox email already exists, and skips duplicate GPT/retrieval mailbox emails within the same pasted batch.
+- Verified backend compile, mailbox import parser smoke check, and `git diff --check` after the import change.
+- Corrected the accounts-page bulk delete button semantics. It now targets deactivated accounts and duplicate abnormal accounts only when the duplicate group has a non-error, non-deactivated primary replacement; ordinary `status=error` accounts are preserved for possible reauthorization recovery.
+- Verified backend compile, frontend production build, a duplicate-cleanup helper smoke check, and `git diff --check` after the bulk delete correction.
+- Added `.env` persistence for admin-panel settings, including sub2api URL, x-api key, recovery toggle, automation toggles, intervals, concurrency, memory threshold, display time zone, and site name. `.env` is read from the project root regardless of current working directory.
+- Verified backend compile, frontend production build, env merge helper, public settings field smoke check, recovery settings field smoke check, and `git diff --check`.
+- Started OAuth RT acquisition integration. Reviewed the existing refresh chain, sub2api credential write paths, current protocol ChatGPT login, and the reference mail-console OAuth flow. The main gap is OAuth PKCE token exchange and refresh-token writeback, not email-code retrieval.
+- Added OpenAI OAuth PKCE support with token exchange and sub2api credential writeback. The OAuth path reuses existing mailbox-code polling, writes standard `refresh_token`, and only writes `rt` when the source account already uses that alias or reports `has_rt=true`.
+- Probed pure protocol OAuth for `annamason5243@outlook.com`; it reached the email OTP and Codex consent page at about `88.4 MiB`. OAuth RT acquisition now tries this `curl_cffi` protocol path first and falls back to Playwright browser OAuth if the protocol path cannot complete.
+- Fixed browser OAuth callback capture for the local `http://localhost:1455/auth/callback` redirect. Without a local listener Chromium changes to `chromewebdata`, so the code is captured from request/frame navigation first.
+- Verified browser OAuth fallback for `annamason5243@outlook.com`: got AT/RT/ID token, wrote credentials back through sub2api without printing secrets, and observed about `834.9 MiB` peak RSS.
+- Verified the existing sub2api RT refresh path still works for account `548` and stays low-memory at about `77.4 MiB` peak RSS.
+- Adjusted refresh ordering so accounts that have RT call the sub2api `/refresh` path before AT status check. This makes manual/scheduled refresh actually use RT instead of returning early when the current AT is still valid.
+- Reviewed the OAuth browser helper after smoke testing and hardened button clicks so provider SSO buttons such as Google/Apple/Microsoft are skipped even when the label is exposed through accessibility attributes.
+- Redacted token-like substrings in additional refresh failure reasons before storing them on jobs/events. Targeted py-compile, full backend compile, and `git diff --check` passed after these review patches.
+- Diagnosed usage-estimate availability. The live usage fetch returned `cost` for all 42 deduped GPT accounts, but the old estimator required baseline-delta usage to be positive, causing first-enable/no-new-usage accounts to show as not estimable.
+- Changed remaining-quota estimation to use current official window raw usage and official used percent, while keeping baseline delta for display. Added cached usage-window fallback so the accounts page can show estimates consistently when it calls the endpoint with `refresh=false`.
+- After the usage-estimate fix, validation showed 5h estimable accounts improved from 26 to 40 and 7d from 27 to 41 on refreshed data; cached `refresh=false` results matched those counts. Backend compile, frontend build, response-model validation, and `git diff --check` passed.
+- Deployed the current working tree by rebuilding the frontend and restarting the existing `gptcheckplugin.service` and `gptcheckplugin-frontend.service` systemd units. Verified backend health, frontend `index-C2rsiITv.js` serving on `127.0.0.1:5173`, and cached quota aggregate counts at 5h=40 / 7d=40 participating estimable accounts.
+
+## 2026-05-27
+
+- Started calibrated quota request. Added a `usage_limit_samples` SQLite table/model for 5h/7d observed window-limit samples.
+- Usage estimates now save limit samples from active usage fetches, keep the middle 100 samples per window, and clamp inferred totals to either a 3 sigma sample window or the default 5h `$15-$25` / 7d `$100-$140` ranges while samples are insufficient.
+- Updated quota estimation so displayed used percent is based on the calibrated total, not the raw official percentage that caused inflated totals.
+- Updated account and quota detail UI cells to show a progress bar plus `已用` and `未用` labels, and removed the previous `新增` wording from the UI.
+- Manual account sync now also runs a usage-window refresh and uses the same active usage data to update local limit samples; the frontend sync request timeout was raised to match usage refresh timeouts.
+- Verified backend compile, frontend production build, usage-calibration smoke checks, database init migration, service import graph, usage-estimate response-model validation, and `git diff --check`. The first response-model validation command failed only because Python does not allow `async def` directly after semicolons in `-c`; reran it with `exec(...)` successfully. After wiring manual sync to usage refresh, reran backend compile, frontend build, import graph check, response-model validation, and `git diff --check` successfully.
+- Reworked the history request after clarification. Removed the aggregate history UI/API/save path and added a dedicated `样本` page instead.
+- Added `GET /api/accounts/usage-limit-samples`, returning current 5h/7d local sample rows, the calibration source, sample count, active lower/upper bounds, default bounds, mean, and sigma.
+- Added frontend `UsageLimitSamples` types/API and the standalone `样本` navigation item/page. Each window shows the exact rows used to estimate official-window quota: email/account id, observed limit, raw spent, official used percent, reset time, and record time.
+- Fixed desktop layout so `.shell` has viewport height, `.sidebar` is sticky/fixed-height without participating in page scrolling, and `.workspace` scrolls independently. Mobile layout falls back to normal document scrolling.
+- Verified backend compile, frontend production build, database migration validation, usage-limit sample response validation, and `git diff --check`.
+- Added rate-limit distinction to account data and UI. Backend account/usage-estimate responses now expose `rate_limited` and `rate_limited_windows`; the accounts table/search combines those fields with cached usage windows and shows limited accounts as `限流` with warn styling instead of plain `可用`.
+- Verification: `python3 -m compileall backend/app`, `npm --prefix frontend run build`, `.venv/bin/python` helper smoke test for rate-limit window detection, and `git diff --check` passed. A system `python3` helper import attempt failed because the system interpreter lacks backend dependencies such as SQLAlchemy; reran the smoke test with the project virtualenv successfully.
+- Split the account-list rate-limit display into separate `5h限流` and `7d限流` badges. Each badge now shows recovery timing from cached usage window `remaining_seconds` or `reset_at`, falling back to `恢复时间待查询` when no cached window time is available. Frontend build and `git diff --check` passed after the UI update.
+- Deployed the rate-limit UI changes by running `python3 -m compileall backend/app`, `npm --prefix frontend run build`, and restarting `gptcheckplugin.service` plus `gptcheckplugin-frontend.service`. Verified both services are active, backend health returns `{"status":"ok"}`, and the frontend root serves the new `index-DPL1GpkO.js` / `index-CIVQez17.css` build assets.
+
+## 2026-05-28
+
+- Investigated reported repeated refresh failures and backend restarts. `gptcheckplugin.service` was in auto-restart with thousands of restarts, and the backend journal showed SQLite `database is locked` exceptions while inserting `refresh_memory_peak` events.
+- Found a stale project uvicorn process still listening on `127.0.0.1:8000`, which made every new systemd-started backend fail with `address already in use` after lifespan startup completed.
+- Patched SQLite setup to use a 30-second busy timeout and WAL mode, reducing write-lock contention for concurrent refresh/job/event writes.
+- Patched refresh finalization so critical job/snapshot state commits are separate from optional app-event commits. Memory peak and warning event writes are now non-fatal, so an event write lock cannot crash the refresh task or backend process.
+- Added a 10-second monitor startup delay so if uvicorn cannot bind its port, scheduled sync does not enqueue fresh refresh jobs before the process exits.
+- Stopped the restart loop, terminated the stale uvicorn process with `TERM`, restarted `gptcheckplugin.service`, and verified `/api/health` returned `ok` with only the new systemd PID listening on port `8000`.
+- Waited for the next sync/refresh window. The service stayed active with `NRestarts=0`; latest jobs `4103`-`4111` all completed as `deactive` from OpenAI OAuth OTP validation rather than `Service restarted before refresh finished`, and `active_jobs=0`.
+- Verified backend compile, `git diff --check`, service health, port ownership, and post-startup monitor sync (`queued=0`).
+
+## 2026-06-05
+
+- Ported the `mail-console-x1` style direct OpenAI GPT token refresh path into the plugin backend.
+- Added encrypted local cache fields on `account_snapshots` for GPT `refresh_token`, `access_token`, `id_token`, `client_id`, and token expiry; added the SQLite migration in `init_db()` and verified the new columns exist in `data/sub2api_at_guardian.db`.
+- Added `backend/app/services/openai_token_service.py` with two direct OpenAI/ChatGPT operations: `refresh_token` using `grant_type=refresh_token` against `https://auth.openai.com/oauth/token`, and `fetch_profile` using ChatGPT `accounts/check` with the resulting access token.
+- Refactored refresh orchestration so session-success finalization is shared across ChatGPT protocol refresh, browser refresh, OAuth refresh-token acquisition, local cached OpenAI RT refresh, and local cached AT profile validation.
+- Inserted the new recovery order into `RefreshService`: sub2api `/refresh` first when remote RT exists, then local cached OpenAI RT refresh, then sub2api `check-status`, then plugin-visible AT check, then local cached AT check, then the existing mailbox/ChatGPT/OpenAI fallback paths.
+- Stored local GPT tokens after successful OAuth refresh outcomes and after successful session/AT flows so later runs can refresh or validate accounts even when sub2api only exposes redacted credentials.
+- Updated monitor protocol-capability detection so accounts without mailbox credentials are still auto-queueable when the plugin has a local cached GPT RT/AT for that email.
+- Added local-token failure events and summary mapping so final account errors can now mention failed local cached OpenAI RT/AT paths before the existing mailbox/browser message.
+- Verified the backend with `.venv/bin/python -m compileall backend/app`, ran `init_db()` through the project virtualenv, confirmed migrated `account_snapshots` columns through SQLite `PRAGMA table_info`, and ran `git diff --check` successfully.

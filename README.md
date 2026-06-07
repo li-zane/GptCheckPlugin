@@ -51,7 +51,7 @@ SUB2API_AUTH_TOKEN=your-sub2api-admin-token
 
 ## 邮箱导入格式
 
-面板支持批量导入，一行一个；空行和 `#` 开头的行会被忽略。每行支持 `----`、`|`、`,` 三种分隔符。默认会按取件邮箱后缀自动识别 `outlook` / `hotmail`。推荐格式：
+面板支持批量导入，一行一个；空行和 `#` 开头的行会被忽略。每行支持 `----`、`|`、`,` 三种分隔符。默认会按取件邮箱后缀自动识别 `outlook` / `hotmail` / `gmail`。推荐格式：
 
 ```text
 gpt@example.com----mail@hotmail.com----mail_password----client_id----refresh_token
@@ -65,6 +65,34 @@ mail@example.com----mail_password----client_id----refresh_token
 ```
 
 `hotmail.*` 会识别为 `hotmail`；`outlook.com`、`outlook.com.cn`、`live.com`、`live.cn`、`msn.com` 等会识别为 `outlook`。两者会优先尝试 Microsoft Graph `Mail.Read`，失败后自动尝试 O2/IMAP (`IMAP.AccessAsUser.All` / `wl.imap`)。取件失败会写入邮箱记录的 `last_error`，不会让刷新任务崩溃。
+
+### Cloudflare 转发到 Gmail 的自定义域名邮箱
+
+像 `edu.rainynight.me` 这种通过 Cloudflare Email Routing 转发到 Google 邮箱的账号，可以直接导入成 `gmail` 类型。推荐 3 列格式：
+
+```text
+custom@edu.rainynight.me----yourname@gmail.com----gmail_app_password
+```
+
+含义是：
+
+- 第 1 列：GPT / 原始收件邮箱，也就是域名邮箱地址。
+- 第 2 列：实际取件邮箱，也就是接收转发邮件的 Gmail 或 Google Workspace 邮箱。
+- 第 3 列：该 Gmail 邮箱的 IMAP App Password。
+
+如果转发目标不是 `@gmail.com`，而是 Google Workspace 自定义域名邮箱，也可以在面板里把识别方式手动选成 `Gmail / Google Workspace` 后导入同样的 3 列格式。
+
+后端会登录这个 Gmail 收件箱，并从邮件头里的 `Delivered-To`、`X-Original-To`、`Original-Recipient`、`X-Forwarded-To`、`To` 等字段中提取原始收件人，只返回真正发给该域名邮箱地址的邮件。这样即使同一个 Gmail 里混有多个转发别名，也不会把别人的验证码串进来。
+
+`gmail` 类型支持读取收件箱和垃圾邮件；验证码轮询也会同时检查这两个文件夹。使用前请确认目标 Google 邮箱已开启 IMAP，并使用 App Password，而不是账号登录密码。
+
+如果你本机同时部署了 `mail-manager`，还可以把它的路由配置文件接进来，让当前项目在账号同步时自动为命中域名的新 GPT 账号创建 Gmail mailbox 绑定：
+
+```env
+MAIL_MANAGER_ROUTE_CONFIG_PATH=/root/apps/mail-console-x1/config/mail-routing.json
+```
+
+当前自动绑定逻辑会读取 `mail_route_domains` 和其首个可用的 `imap` 路由账号；如果该账号是 Gmail IMAP 路由，就会自动把命中域名的新账号绑定为 `gmail` provider，并同步复用它的 App Password 和代理地址。
 
 ## 自定义取件接口
 
@@ -129,11 +157,21 @@ gpt@example.com----mail@example.com----password----client_id----refresh_token---
 1. 后端定时调用 sub2api 账号列表接口。
 2. 以账号邮箱作为 ID，更新本地账号快照。
 3. 对 `status` 包含 `error/fail/invalid/expired/disabled` 或 `schedulable=false` 的 GPT 账号创建刷新任务。
-4. Playwright 打开 ChatGPT 登录页，输入邮箱，等待邮箱验证码。
-5. 取件适配器轮询最新验证码邮件。
-6. 登录成功后访问 session 接口并提取 `accessToken`。
-7. 后端把新 AT 写回 sub2api，然后尝试调用 clear-error 和 recover-state。
-8. 如果页面或 session 结果出现 `account_deactive`，本地标记为 deactive，后续不再重复刷新。
+4. 如果账号已有 `credentials.refresh_token` / `refreshToken` / `rt`，后端先调用 sub2api 的账号刷新接口，尽量直接用 RT 刷新 AT。
+5. 如果缺少可用 RT 或 RT 刷新失败，后端会创建 OpenAI OAuth PKCE 流程，用邮箱验证码登录并用 `code + code_verifier` 换取 `access_token`、`refresh_token`、`id_token`。
+6. 默认先用 `curl_cffi` 协议流程尝试完成 OpenAI OAuth，协议失败后再用 Playwright 浏览器完成 consent/callback；遇到 `add phone` / `phone number required` 会直接失败，不接码。
+7. 如果 OAuth 仍失败，再回退到旧的 ChatGPT session 刷 AT 路径。
+8. 取件适配器轮询最新邮箱验证码邮件。
+9. 登录或 OAuth 成功后，后端把新 AT/RT/ID token 和账号信息写回 sub2api，然后尝试调用 clear-error 和 recover-state。
+10. 如果页面或 session 结果出现 `account_deactive`，本地标记为 deactive，后续不再重复刷新。
+
+OAuth 写回会标准保存 `credentials.refresh_token`。如果原账号使用 `rt` 字段，或 sub2api 的隐藏敏感字段状态表明现有 RT 可能不是标准 `refresh_token` 字段，也会同步写入 `credentials.rt` 兼容旧数据。
+
+协议刷新并发和浏览器登录并发可以分开设置：`PROTOCOL_REFRESH_MAX_CONCURRENCY` 控制协议路径，`BROWSER_REFRESH_MAX_CONCURRENCY` 控制 Playwright 回退，旧的 `REFRESH_MAX_CONCURRENCY` 会作为协议并发的兼容默认值。
+
+OpenAI OAuth 默认使用 Codex CLI 客户端配置：`OPENAI_OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann`，回调地址为 `http://localhost:1455/auth/callback`。后端会先用 `curl_cffi` 协议流程尝试获取 callback `code`，失败后再回退到浏览器流程；浏览器路径优先使用 Camoufox Firefox 持久化上下文，并复用 `data/browser-profiles/<email>/` 下的账号 profile，在进入 OAuth 页后先等待 Cloudflare challenge 清掉，再继续邮箱验证码与 consent 流程；若 Camoufox 当前不可用，再回退到普通 Playwright Chromium。浏览器路径会直接截获回调 URL 中的 `code`，不需要本机真的监听 `1455` 端口。
+
+管理面板保存运行设置时，会同步写入项目根目录 `.env`。这包括 sub2api 地址、x-api key、账号恢复任务总开关、刷新成功后的 sub2api 状态恢复开关、自动任务开关、并发数、浏览器内存阈值、显示时区和站点名；`.env` 已在 `.gitignore` 中，生产部署时建议把项目根目录或 `.env` 作为持久化配置挂载。
 
 ## 安全边界
 

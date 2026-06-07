@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import hashlib
 import html
 import imaplib
 import json
 import re
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,6 +13,7 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, ClassVar, Protocol
+from urllib import parse as urllib_parse
 
 import httpx
 
@@ -21,6 +24,7 @@ from app.models import MailboxCredential
 
 CODE_RE = re.compile(r"\b(\d{6})\b")
 IMAP_UID_RE = re.compile(rb"\bUID\s+(\d+)\b")
+EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
 FOLDER_MAP = {
     "inbox": "inbox",
     "junk": "junkemail",
@@ -28,6 +32,8 @@ FOLDER_MAP = {
     "Junk": "junkemail",
 }
 OUTLOOK_REST_BASE = "https://outlook.office.com/api/v2.0"
+GMAIL_IMAP_HOST = "imap.gmail.com"
+GMAIL_IMAP_PORT = 993
 
 
 @dataclass
@@ -867,6 +873,168 @@ class CustomHttpMailAdapter:
         return MailMessagesResult(status=str(data.get("status") or "ok"), messages=messages, error=data.get("error"))
 
 
+class GmailImapAdapter:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+
+    async def fetch_code(self, credential: MailboxCredential, after: datetime) -> MailFetchResult:
+        last_error: str | None = None
+        for folder in ("inbox", "junk"):
+            result = await self.fetch_messages(credential, folder, 20)
+            if result.status != "ok":
+                last_error = result.error or last_error
+                if folder == "inbox":
+                    return MailFetchResult(status="failed", error=result.error, provider_status=result.provider_status)
+                continue
+
+            messages = sorted(
+                result.messages,
+                key=lambda item: item.received_at or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            for message in messages:
+                if message.received_at and message.received_at < after:
+                    continue
+                code = message.code or extract_code(message.subject, message.body_preview, message.text)
+                if code:
+                    return MailFetchResult(status="ok", code=code)
+
+        if last_error:
+            return MailFetchResult(
+                status="not_found",
+                error=f"No fresh verification code message was found. Last mailbox error: {last_error}",
+            )
+        return MailFetchResult(status="not_found", error="No fresh verification code message was found.")
+
+    async def fetch_messages(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_messages_sync, credential, folder, limit),
+                timeout=self.settings.mail_read_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error=f"Mailbox read timed out after {self.settings.mail_read_timeout_seconds} seconds.",
+            )
+
+    def _fetch_messages_sync(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
+        encrypted_password = getattr(credential, "encrypted_password", None)
+        decrypted_password = decrypt_text(encrypted_password)
+        if encrypted_password and decrypted_password is None:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error="Mailbox credentials could not be decrypted. Restore the original APP_ENCRYPTION_KEY or reimport this mailbox.",
+            )
+
+        password = (decrypted_password or "").strip()
+        if not password:
+            return MailMessagesResult(status="failed", messages=[], error="Missing mailbox password for Gmail IMAP.")
+
+        client: imaplib.IMAP4_SSL | None = None
+        original_socket = socket.socket
+        original_getaddrinfo = socket.getaddrinfo
+        proxy_url = str(getattr(credential, "proxy_url", None) or "").strip() or None
+        try:
+            if proxy_url:
+                import socks
+
+                parsed_proxy = urllib_parse.urlparse(proxy_url)
+                scheme = (parsed_proxy.scheme or "").lower()
+                proxy_type = socks.PROXY_TYPE_HTTP if scheme in {"http", "https"} else socks.SOCKS5
+                rdns = scheme == "socks5h"
+                socks.set_default_proxy(
+                    proxy_type,
+                    parsed_proxy.hostname,
+                    parsed_proxy.port,
+                    rdns=rdns,
+                    username=urllib_parse.unquote(parsed_proxy.username) if parsed_proxy.username else None,
+                    password=urllib_parse.unquote(parsed_proxy.password) if parsed_proxy.password else None,
+                )
+                socket.socket = _ipv4_only_socket_factory(socks.socksocket)
+                socket.getaddrinfo = _ipv4_only_getaddrinfo_factory(original_getaddrinfo)
+            client = imaplib.IMAP4_SSL(
+                GMAIL_IMAP_HOST,
+                GMAIL_IMAP_PORT,
+                timeout=self.settings.outlook_imap_timeout_seconds,
+            )
+            client.login(credential.mailbox_email, password)
+            messages = self._read_filtered_messages(client, credential, folder, limit)
+            return MailMessagesResult(status="ok", messages=messages)
+        except imaplib.IMAP4.error as exc:
+            return MailMessagesResult(status="failed", messages=[], error=f"Gmail IMAP login failed: {exc}")
+        except OSError as exc:
+            return MailMessagesResult(status="failed", messages=[], error=f"Gmail IMAP connection failed: {exc}")
+        finally:
+            if client is not None:
+                try:
+                    client.logout()
+                except imaplib.IMAP4.error:
+                    pass
+            if proxy_url:
+                with contextlib.suppress(Exception):
+                    import socks
+
+                    socks.set_default_proxy()
+                socket.socket = original_socket
+                socket.getaddrinfo = original_getaddrinfo
+
+    def _read_filtered_messages(
+        self,
+        client: imaplib.IMAP4_SSL,
+        credential: MailboxCredential,
+        folder: str,
+        limit: int,
+    ) -> list[MailMessage]:
+        selected = False
+        for candidate in self._imap_folder_candidates(folder):
+            status, _ = client.select(candidate, readonly=True)
+            if status == "OK":
+                selected = True
+                break
+        if not selected:
+            raise imaplib.IMAP4.error(f"IMAP folder not found for {folder}.")
+
+        status, data = client.uid("SEARCH", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            return []
+
+        all_uids = [uid for uid in data[0].split() if uid]
+        if not all_uids:
+            return []
+
+        search_window = min(max(max(1, min(limit, 50)) * 10, 50), 200)
+        fetch_uids = all_uids[-search_window:]
+        uid_set = b",".join(fetch_uids).decode("ascii", errors="ignore")
+        fetch_spec = "(UID BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.4096>)"
+        fetch_status, fetch_data = client.uid("FETCH", uid_set, fetch_spec)
+        if fetch_status != "OK":
+            return []
+
+        grouped_parts = _group_imap_fetch_parts(fetch_data)
+        target_recipient = credential.gpt_email.lower().strip()
+        messages: list[MailMessage] = []
+        for uid in reversed(fetch_uids):
+            uid_text = uid.decode("ascii", errors="ignore")
+            chunks = grouped_parts.get(uid_text)
+            if not chunks:
+                continue
+            message = _imap_chunks_to_mail_message(chunks, uid_text, folder)
+            if not _imap_chunks_match_recipient(chunks, target_recipient):
+                continue
+            messages.append(message)
+            if len(messages) >= max(1, min(limit, 50)):
+                break
+        return messages
+
+    def _imap_folder_candidates(self, folder: str) -> list[str]:
+        if folder == "junk":
+            return ['"[Gmail]/Spam"', '"[Google Mail]/Spam"', '"Spam"']
+        return ["INBOX"]
+
+
 class ManualMailAdapter:
     async def fetch_code(self, credential: MailboxCredential, after: datetime) -> MailFetchResult:
         return MailFetchResult(status="not_found", error="Manual provider cannot fetch codes automatically.")
@@ -878,9 +1046,11 @@ class ManualMailAdapter:
 class MailAdapterRegistry:
     def __init__(self) -> None:
         outlook = OutlookGraphAdapter()
+        gmail = GmailImapAdapter()
         self.adapters: dict[str, MailAdapter] = {
             "outlook": outlook,
             "hotmail": outlook,
+            "gmail": gmail,
             "custom": CustomHttpMailAdapter(),
             "manual": ManualMailAdapter(),
         }
@@ -1126,9 +1296,10 @@ def _pick_mail_value(mail: Any, *keys: str) -> str | None:
 
 def _imap_message_to_mail_message(raw: bytes, fallback_id: str, folder: str) -> MailMessage:
     message = message_from_bytes(raw)
+    text_content, html_content = _message_texts(message)
+    body_text = text_content or (_strip_html(html_content) if html_content else None)
     sender_name, sender_address = parseaddr(_decode_header_value(message.get("From")))
     subject = _decode_header_value(message.get("Subject"))
-    body_text = _message_preview(message)
     return MailMessage(
         id=message.get("Message-ID") or fallback_id,
         folder="junk" if folder == "junk" else "inbox",
@@ -1138,8 +1309,22 @@ def _imap_message_to_mail_message(raw: bytes, fallback_id: str, folder: str) -> 
         body_preview=_truncate(body_text),
         received_at=_parse_email_time(message.get("Date")),
         text=body_text,
-        code=extract_code(subject, body_text),
+        code=extract_code(subject, body_text, html_content),
     )
+
+
+def _imap_chunks_to_raw_message(chunks: list[bytes]) -> bytes:
+    header = chunks[0] if chunks else b""
+    body = b"\r\n".join(chunks[1:])
+    return header.rstrip() + b"\r\n\r\n" + body if body else header
+
+
+def _imap_chunks_match_recipient(chunks: list[bytes], recipient_email: str) -> bool:
+    if not recipient_email:
+        return False
+    message = message_from_bytes(_imap_chunks_to_raw_message(chunks))
+    text_content, html_content = _message_texts(message)
+    return recipient_email in _extract_original_recipients_from_message(message, text_content, html_content)
 
 
 def _group_imap_fetch_parts(fetch_data: list[Any]) -> dict[str, list[bytes]]:
@@ -1170,10 +1355,7 @@ def _group_imap_fetch_parts(fetch_data: list[Any]) -> dict[str, list[bytes]]:
 
 
 def _imap_chunks_to_mail_message(chunks: list[bytes], fallback_id: str, folder: str) -> MailMessage:
-    header = chunks[0] if chunks else b""
-    body = b"\r\n".join(chunks[1:])
-    raw = header.rstrip() + b"\r\n\r\n" + body if body else header
-    return _imap_message_to_mail_message(raw, fallback_id, folder)
+    return _imap_message_to_mail_message(_imap_chunks_to_raw_message(chunks), fallback_id, folder)
 
 
 def _is_imap_cooldown_error(exc: OSError) -> bool:
@@ -1200,9 +1382,10 @@ def _decode_header_value(value: str | None) -> str | None:
         return value
 
 
-def _message_preview(message: Any) -> str | None:
+def _message_texts(message: Any) -> tuple[str | None, str | None]:
     parts = message.walk() if message.is_multipart() else [message]
-    html_fallback = None
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
     for part in parts:
         if part.get_content_maintype() == "multipart":
             continue
@@ -1217,10 +1400,118 @@ def _message_preview(message: Any) -> str | None:
         except LookupError:
             text = payload.decode("utf-8", errors="replace")
         if part.get_content_type() == "text/plain":
-            return _truncate(text)
-        if part.get_content_type() == "text/html" and html_fallback is None:
-            html_fallback = _truncate(_strip_html(text))
-    return html_fallback
+            stripped = text.strip()
+            if stripped:
+                plain_parts.append(stripped)
+        elif part.get_content_type() == "text/html":
+            stripped = text.strip()
+            if stripped:
+                html_parts.append(stripped)
+    plain_text = "\n\n".join(plain_parts) or None
+    html_text = "\n\n".join(html_parts) or None
+    return plain_text, html_text
+
+
+def _message_preview(message: Any) -> str | None:
+    plain_text, html_text = _message_texts(message)
+    if plain_text:
+        return _truncate(plain_text)
+    if html_text:
+        return _truncate(_strip_html(html_text))
+    return None
+
+
+def _extract_email_candidates(value: Any) -> set[str]:
+    candidates: set[str] = set()
+    if value is None:
+        return candidates
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    if isinstance(value, str):
+        for match in EMAIL_RE.finditer(value):
+            candidates.add(match.group(0).lower())
+        return candidates
+    if isinstance(value, dict):
+        for child in value.values():
+            candidates.update(_extract_email_candidates(child))
+        return candidates
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            candidates.update(_extract_email_candidates(item))
+    return candidates
+
+
+def _ipv4_only_socket_factory(base_socket_type: Any):
+    def create_socket(family: int = socket.AF_INET, type: int = socket.SOCK_STREAM, proto: int = 0, fileno: int | None = None):
+        target_family = socket.AF_INET if family == socket.AF_UNSPEC else family
+        if target_family == socket.AF_INET6:
+            target_family = socket.AF_INET
+        if fileno is None:
+            return base_socket_type(target_family, type, proto)
+        return base_socket_type(target_family, type, proto, fileno)
+
+    return create_socket
+
+
+def _ipv4_only_getaddrinfo_factory(original_getaddrinfo: Any):
+    def getaddrinfo(host: str, port: int, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0):
+        target_family = socket.AF_INET if family in {0, socket.AF_UNSPEC, socket.AF_INET6} else family
+        return original_getaddrinfo(host, port, target_family, type, proto, flags)
+
+    return getaddrinfo
+
+
+def _extract_original_recipients_from_message(
+    message: Any,
+    text_content: str | None = None,
+    html_content: str | None = None,
+) -> set[str]:
+    candidates: set[str] = set()
+    header_names = (
+        "To",
+        "Cc",
+        "Delivered-To",
+        "X-Original-To",
+        "Original-Recipient",
+        "Final-Recipient",
+        "Envelope-To",
+        "X-Envelope-To",
+        "X-Forwarded-To",
+        "X-MS-Exchange-Organization-OriginalEnvelopeRecipients",
+    )
+    for header_name in header_names:
+        for value in message.get_all(header_name, []):
+            candidates.update(_extract_email_candidates(_decode_header_value(value) or value))
+
+    source = "\n".join(
+        filter(
+            None,
+            [
+                _decode_header_value(message.get("Subject")),
+                text_content,
+                _strip_html(html_content) if html_content else None,
+            ],
+        )
+    )
+    for label in (
+        "Delivered-To",
+        "X-Original-To",
+        "Original-Recipient",
+        "Final-Recipient",
+        "Envelope-To",
+        "X-Envelope-To",
+        "X-Forwarded-To",
+        "To",
+        "收件人",
+        "收件邮箱",
+    ):
+        pattern = re.compile(
+            rf"{re.escape(label)}\s*[:：]\s*[<\"']?([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{{2,}})",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(source):
+            candidates.add(match.group(1).lower())
+    return candidates
 
 
 def _strip_html(value: str | None) -> str:

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from app.core.config import Settings, get_settings
+from app.services.camoufox_browser import launch_browser_context
 from app.services.sub2api import looks_deactive_text
 
 
@@ -33,12 +34,8 @@ class ChatGptBrowserRefresher:
             return BrowserRefreshOutcome(status="failed", error="Playwright is not installed.")
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=self.settings.playwright_headless,
-                slow_mo=self.settings.playwright_slow_mo_ms,
-            )
-            context = await browser.new_context(locale="en-US")
-            page = await context.new_page()
+            handle = await launch_browser_context(p, email, self.settings)
+            page = await handle.context.new_page()
             page.set_default_timeout(self.settings.playwright_timeout_ms)
             try:
                 await self._open_login_form(page)
@@ -87,16 +84,17 @@ class ChatGptBrowserRefresher:
                     return BrowserRefreshOutcome(status="deactive", error=f"Browser refresh reported account_deactivated: {exc}")
                 return BrowserRefreshOutcome(status="failed", error=f"Browser refresh failed: {exc}")
             finally:
-                await context.close()
-                await browser.close()
+                await handle.close()
 
     async def _open_login_form(self, page) -> None:
         login_url = f"{self.settings.chatgpt_base_url.rstrip('/')}/auth/login"
         await page.goto(login_url, wait_until="domcontentloaded")
+        await self._wait_for_cloudflare_to_clear(page)
         if await self._has_email_input(page, timeout_ms=12_000):
             return
 
         await page.goto(self.settings.chatgpt_base_url, wait_until="domcontentloaded")
+        await self._wait_for_cloudflare_to_clear(page)
         await self._click_login(page)
         await self._first_visible(self._email_input_candidates(page), "email input", timeout_ms=20_000)
 
@@ -170,6 +168,19 @@ class ChatGptBrowserRefresher:
         except Exception:
             return False
         return looks_deactive_text(text)
+
+    async def _wait_for_cloudflare_to_clear(self, page, timeout_ms: int = 45_000) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                text = await page.locator("body").inner_text(timeout=3000)
+            except Exception:
+                text = ""
+            lowered = text.lower()
+            if "performing security verification" not in lowered and "verify you are not a bot" not in lowered and "cloudflare" not in lowered:
+                return
+            await page.wait_for_timeout(1500)
+        raise RuntimeError("Cloudflare challenge did not clear before ChatGPT login.")
 
     async def _has_email_input(self, page, timeout_ms: int) -> bool:
         try:

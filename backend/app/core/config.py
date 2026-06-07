@@ -6,6 +6,9 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
 class Settings(BaseSettings):
     app_name: str = "sub2api AT 刷新机"
     app_env: Literal["development", "production", "test"] = "development"
@@ -18,6 +21,7 @@ class Settings(BaseSettings):
     display_timezone: str = "Asia/Shanghai"
 
     database_url: str = "sqlite+aiosqlite:///./data/sub2api_at_guardian.db"
+    mail_manager_route_config_path: str = ""
 
     sub2api_base_url: str = "http://localhost:8080/api/v1"
     sub2api_auth_token: str = ""
@@ -47,17 +51,30 @@ class Settings(BaseSettings):
     sub2api_scan_timeout_seconds: float = 0.8
 
     monitor_enabled: bool = True
+    automation_paused: bool = False
+    recovery_enabled: bool = False
     monitor_interval_seconds: int = 300
     monitor_page_size: int = 100
     usage_refresh_enabled: bool = False
     usage_refresh_interval_seconds: int = 3600
     refresh_max_concurrency: int = 1
+    protocol_refresh_max_concurrency: int | None = None
+    browser_refresh_max_concurrency: int = 1
+    browser_min_available_memory_mb: int = 500
+    subscription_refresh_batch_size: int = 3
+    subscription_refresh_max_concurrency: int = 1
 
     playwright_headless: bool = True
     playwright_slow_mo_ms: int = 0
     playwright_timeout_ms: int = 90_000
     chatgpt_base_url: str = "https://chatgpt.com"
     chatgpt_session_url: str = "https://chatgpt.com/api/auth/session"
+    openai_oauth_authorize_url: str = "https://auth.openai.com/oauth/authorize"
+    openai_oauth_token_url: str = "https://auth.openai.com/oauth/token"
+    openai_oauth_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+    openai_oauth_redirect_uri: str = "http://localhost:1455/auth/callback"
+    openai_oauth_scopes: str = "openid profile email offline_access"
+    openai_oauth_user_agent: str = "codex_cli_rs/0.104.0"
     verification_code_timeout_seconds: int = 180
     verification_code_poll_seconds: int = 6
     verification_code_lookup_grace_seconds: int = 900
@@ -80,7 +97,7 @@ class Settings(BaseSettings):
     external_mail_timeout_seconds: int = 30
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -100,7 +117,7 @@ class Settings(BaseSettings):
 
     @property
     def project_root(self) -> Path:
-        return Path(__file__).resolve().parents[3]
+        return PROJECT_ROOT
 
     @property
     def session_cookie_name(self) -> str:

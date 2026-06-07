@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import EmailStr, TypeAdapter
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_text
@@ -17,7 +17,7 @@ from app.services.mail import MailAdapterRegistry
 router = APIRouter()
 
 email_adapter = TypeAdapter(EmailStr)
-PROVIDERS = {"outlook", "hotmail", "custom", "manual"}
+PROVIDERS = {"outlook", "hotmail", "gmail", "custom", "manual"}
 OUTLOOK_DOMAINS = {
     "outlook.com",
     "outlook.com.cn",
@@ -27,6 +27,7 @@ OUTLOOK_DOMAINS = {
     "passport.com",
     "windowslive.com",
 }
+GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
 
 
 @dataclass
@@ -60,29 +61,58 @@ async def import_mailboxes(
     if not parsed:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid mailbox rows were found.")
 
+    parsed_gpt_emails = [item.gpt_email for item in parsed]
+    parsed_mailbox_emails = [item.mailbox_email for item in parsed]
+    existing_result = await db.execute(
+        select(MailboxCredential.gpt_email, MailboxCredential.mailbox_email).where(
+            or_(
+                MailboxCredential.gpt_email.in_(parsed_gpt_emails),
+                MailboxCredential.mailbox_email.in_(parsed_mailbox_emails),
+            )
+        )
+    )
+    existing_rows = existing_result.all()
+    existing_gpt_emails = {gpt_email.lower() for gpt_email, _ in existing_rows}
+    existing_mailbox_emails = {mailbox_email.lower() for _, mailbox_email in existing_rows}
+    seen_import_gpt_emails: set[str] = set()
+    seen_import_mailbox_emails: set[str] = set()
+    duplicate_skipped = 0
     imported = 0
     for item in parsed:
-        existing = await db.scalar(select(MailboxCredential).where(MailboxCredential.gpt_email == item.gpt_email))
-        if existing is None:
-            existing = MailboxCredential(gpt_email=item.gpt_email, mailbox_email=item.mailbox_email)
-            db.add(existing)
-        existing.mailbox_email = item.mailbox_email
-        existing.provider = item.provider
-        existing.encrypted_password = encrypt_text(item.password)
-        existing.encrypted_client_id = encrypt_text(item.client_id)
-        existing.encrypted_refresh_token = encrypt_text(item.refresh_token)
-        existing.encrypted_access_token = encrypt_text(item.access_token)
-        existing.custom_fetch_url = item.custom_fetch_url
-        existing.disabled = False
-        existing.last_error = None
+        normalized_gpt_email = item.gpt_email.lower()
+        normalized_mailbox_email = item.mailbox_email.lower()
+        if (
+            normalized_gpt_email in existing_gpt_emails
+            or normalized_mailbox_email in existing_mailbox_emails
+            or normalized_gpt_email in seen_import_gpt_emails
+            or normalized_mailbox_email in seen_import_mailbox_emails
+        ):
+            duplicate_skipped += 1
+            continue
+        seen_import_gpt_emails.add(normalized_gpt_email)
+        seen_import_mailbox_emails.add(normalized_mailbox_email)
+
+        credential = MailboxCredential(gpt_email=item.gpt_email, mailbox_email=item.mailbox_email)
+        credential.provider = item.provider
+        credential.encrypted_password = encrypt_text(item.password)
+        credential.encrypted_client_id = encrypt_text(item.client_id)
+        credential.encrypted_refresh_token = encrypt_text(item.refresh_token)
+        credential.encrypted_access_token = encrypt_text(item.access_token)
+        credential.custom_fetch_url = item.custom_fetch_url
+        credential.disabled = False
+        credential.last_error = None
+        db.add(credential)
         imported += 1
     await db.commit()
-    skipped = len(invalid_lines)
+    skipped = len(invalid_lines) + duplicate_skipped
     message = f"Imported {imported} mailbox credential(s)."
+    if duplicate_skipped:
+        message = f"{message} Skipped {duplicate_skipped} existing or duplicate mailbox row(s)."
     if skipped:
         lines = ", ".join(str(line) for line in invalid_lines[:10])
-        suffix = "..." if skipped > 10 else ""
-        message = f"{message} Skipped {skipped} invalid line(s): {lines}{suffix}."
+        suffix = "..." if len(invalid_lines) > 10 else ""
+        if invalid_lines:
+            message = f"{message} Skipped {len(invalid_lines)} invalid line(s): {lines}{suffix}."
     return MailboxImportResult(message=message, imported=imported, skipped=skipped, invalid_lines=invalid_lines)
 
 
@@ -97,7 +127,7 @@ async def list_mailbox_messages(
     credential = await db.get(MailboxCredential, credential_id)
     if credential is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox credential not found.")
-    if credential.provider not in {"outlook", "hotmail"} and folder == "junk":
+    if credential.provider not in {"outlook", "hotmail", "gmail"} and folder == "junk":
         return []
 
     db.expunge(credential)
@@ -125,6 +155,7 @@ async def list_mailbox_messages(
             sender_name=message.sender_name,
             sender_address=message.sender_address,
             body_preview=message.body_preview,
+            code=message.code,
             received_at=message.received_at,
         )
         for message in result.messages
@@ -177,6 +208,13 @@ def _split_line(line: str) -> list[str]:
 def _parse_parts(parts: list[str], default_provider: str) -> ParsedMailbox | None:
     try:
         core, explicit_provider, custom_url = _split_provider_tail(parts)
+        if len(core) == 3:
+            gpt_email = _email(core[0])
+            mailbox_email = _email(core[1])
+            provider = _resolve_provider(mailbox_email, default_provider, explicit_provider)
+            if not provider or (provider == "custom" and not custom_url) or provider in {"outlook", "hotmail"}:
+                return None
+            return ParsedMailbox(gpt_email, mailbox_email, core[2], None, None, provider, custom_url)
         if len(core) == 4:
             mailbox = _email(core[0])
             provider = _resolve_provider(mailbox, default_provider, explicit_provider)
@@ -216,9 +254,9 @@ def _parse_parts(parts: list[str], default_provider: str) -> ParsedMailbox | Non
 
 
 def _split_provider_tail(parts: list[str]) -> tuple[list[str], str | None, str | None]:
-    if len(parts) >= 6 and _is_provider(parts[-2]):
+    if len(parts) >= 5 and _is_provider(parts[-2]):
         return parts[:-2], parts[-2].lower(), parts[-1] or None
-    if len(parts) >= 5 and _is_provider(parts[-1]):
+    if len(parts) >= 4 and _is_provider(parts[-1]):
         return parts[:-1], parts[-1].lower(), None
     return parts, None, None
 
@@ -242,6 +280,8 @@ def _detect_provider(mailbox_email: str) -> str | None:
         return "hotmail"
     if domain in OUTLOOK_DOMAINS:
         return "outlook"
+    if domain in GMAIL_DOMAINS:
+        return "gmail"
     return None
 
 

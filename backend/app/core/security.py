@@ -44,7 +44,16 @@ def verify_admin_key(candidate: str) -> bool:
     return bool(candidate) and hmac.compare_digest(candidate, expected)
 
 
-def issue_session(response: Response) -> None:
+def _request_is_secure(request: Request | None) -> bool:
+    if request is None:
+        return False
+    proto = str(request.headers.get("x-forwarded-proto") or "").strip().lower()
+    if proto:
+        return proto == "https"
+    return str(request.url.scheme).lower() == "https"
+
+
+def issue_session(response: Response, request: Request | None = None) -> None:
     settings = get_settings()
     now = int(time.time())
     token = _encode(
@@ -60,7 +69,7 @@ def issue_session(response: Response) -> None:
         token,
         max_age=settings.app_session_ttl_seconds,
         httponly=True,
-        secure=settings.cookie_secure,
+        secure=bool(settings.cookie_secure and _request_is_secure(request)),
         samesite="strict",
         path="/",
     )

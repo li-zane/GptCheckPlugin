@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from app.core.security import clear_session, issue_session, require_admin, verify_admin_key
 from app.schemas import LoginRequest, MessageResponse
@@ -7,10 +7,10 @@ router = APIRouter()
 
 
 @router.post("/login", response_model=MessageResponse)
-async def login(payload: LoginRequest, response: Response) -> MessageResponse:
+async def login(payload: LoginRequest, response: Response, request: Request) -> MessageResponse:
     if not verify_admin_key(payload.admin_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin key.")
-    issue_session(response)
+    issue_session(response, request)
     return MessageResponse(message="Logged in.")
 
 

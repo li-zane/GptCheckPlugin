@@ -1,5 +1,6 @@
 import type {
   Account,
+  AccountExceptionRecord,
   AppEvent,
   AppSettings,
   AppSettingsUpdate,
@@ -7,11 +8,16 @@ import type {
   Mailbox,
   MailboxImportResult,
   MailMessage,
+  PhoneImportResult,
+  PhoneNumber,
   RefreshJob,
+  SelectedAccountDeleteItem,
   Sub2ApiPortScanResult,
+  SubscriptionRefreshResult,
   Summary,
   SyncResult,
   UsageEstimate,
+  UsageLimitSamples,
   UsageRefreshResult,
 } from "./types";
 
@@ -62,11 +68,14 @@ export const api = {
   logout: () => request<{ message: string }>("/api/auth/logout", { method: "POST" }),
   summary: () => request<Summary>("/api/dashboard/summary"),
   accounts: () => request<Account[]>("/api/accounts"),
-  sync: () => request<SyncResult>("/api/accounts/sync", { method: "POST" }),
+  sync: () => request<SyncResult>("/api/accounts/sync", { method: "POST" }, 180_000),
   usageEstimate: (refresh = true) =>
     request<UsageEstimate>(`/api/accounts/usage-estimate?refresh=${refresh ? "true" : "false"}`, {}, 180_000),
+  usageLimitSamples: () => request<UsageLimitSamples>("/api/accounts/usage-limit-samples"),
   refreshUsageWindows: () =>
     request<UsageRefreshResult>("/api/accounts/usage-refresh", { method: "POST" }, 180_000),
+  refreshSubscriptions: () =>
+    request<SubscriptionRefreshResult>("/api/accounts/subscription-refresh", { method: "POST" }, 180_000),
   updateAccountUsageEstimate: (id: number, enabled: boolean) =>
     request<{ message: string }>(`/api/accounts/${id}/usage-estimate`, {
       method: "PATCH",
@@ -78,9 +87,32 @@ export const api = {
       body: JSON.stringify({ email }),
     }),
   deleteDeactivatedAccounts: () =>
-    request<DeactivatedCleanupResult>("/api/accounts/deactivated", { method: "DELETE" }),
+    request<DeactivatedCleanupResult>("/api/accounts/deactivated", { method: "DELETE" }, 180_000),
+  deleteSelectedAccounts: (accounts: SelectedAccountDeleteItem[]) =>
+    request<DeactivatedCleanupResult>(
+      "/api/accounts/delete-selected",
+      {
+        method: "POST",
+        body: JSON.stringify({ accounts }),
+      },
+      180_000,
+    ),
+  deleteRemoteAccount: (accountId: string) =>
+    request<{ message: string }>(`/api/accounts/remote/${encodeURIComponent(accountId)}`, { method: "DELETE" }),
+  updateRemoteAccountDeleteLock: (accountId: string, unlocked: boolean) =>
+    request<{ message: string }>(`/api/accounts/remote/${encodeURIComponent(accountId)}/delete-lock`, {
+      method: "PUT",
+      body: JSON.stringify({ unlocked }),
+    }),
+  updateAccountRefreshLock: (accountId: number, unlocked: boolean) =>
+    request<{ message: string }>(`/api/accounts/${accountId}/refresh-lock`, {
+      method: "PUT",
+      body: JSON.stringify({ unlocked }),
+    }),
   jobs: () => request<RefreshJob[]>("/api/accounts/jobs"),
   events: () => request<AppEvent[]>("/api/accounts/events"),
+  exceptionRecords: () => request<AccountExceptionRecord[]>("/api/accounts/exception-records"),
+  deleteExceptionRecord: (id: number) => request<{ message: string }>(`/api/accounts/exception-records/${id}`, { method: "DELETE" }),
   clearHistory: () => request<{ message: string }>("/api/accounts/history", { method: "DELETE" }),
   settings: () => request<AppSettings>("/api/settings"),
   updateSettings: (payload: AppSettingsUpdate) =>
@@ -98,4 +130,18 @@ export const api = {
       body: JSON.stringify({ content, default_provider: defaultProvider }),
     }),
   deleteMailbox: (id: number) => request<{ message: string }>(`/api/mailboxes/${id}`, { method: "DELETE" }),
+  phones: () => request<PhoneNumber[]>("/api/phones"),
+  exportPhones: () => request<{ message: string }>("/api/phones/export"),
+  importPhones: (content: string) =>
+    request<PhoneImportResult>("/api/phones/import", {
+      method: "POST",
+      body: JSON.stringify({ content }),
+    }),
+  refreshPhoneStatuses: () => request<{ message: string }>("/api/phones/status-refresh", { method: "POST" }, 180_000),
+  updatePhoneBindings: (id: number, accountEmails: string[]) =>
+    request<{ message: string }>(`/api/phones/${id}/bindings`, {
+      method: "PUT",
+      body: JSON.stringify({ account_emails: accountEmails }),
+    }),
+  deletePhone: (id: number) => request<{ message: string }>(`/api/phones/${id}`, { method: "DELETE" }),
 };

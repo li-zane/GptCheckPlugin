@@ -1,8 +1,9 @@
 import base64
+import calendar
 import copy
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -111,6 +112,14 @@ def extract_email(value: Any) -> str | None:
     return None
 
 
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def looks_deactive_text(value: Any) -> bool:
     if value is None:
         return False
@@ -128,7 +137,7 @@ def sanitize_payload(value: Any) -> Any:
         sanitized: dict[str, Any] = {}
         for key, child in value.items():
             lowered = str(key).lower()
-            if any(marker in lowered for marker in ("token", "secret", "password", "cookie", "authorization")):
+            if lowered == "rt" or any(marker in lowered for marker in ("token", "secret", "password", "cookie", "authorization")):
                 sanitized[key] = "***redacted***" if child else child
             else:
                 sanitized[key] = sanitize_payload(child)
@@ -141,6 +150,7 @@ def sanitize_payload(value: Any) -> Any:
 SENSITIVE_CREDENTIAL_KEYS = {
     "access_token",
     "refresh_token",
+    "rt",
     "id_token",
     "api_key",
     "session_key",
@@ -152,7 +162,17 @@ SENSITIVE_CREDENTIAL_KEYS = {
     "private_key",
 }
 REDACTED_VALUES = {"***redacted***", "[redacted]", "[REDACTED]", "***", "********"}
-SUBSCRIPTION_CREDENTIAL_KEYS = ("plan_type", "subscription_expires_at")
+SUBSCRIPTION_CREDENTIAL_KEYS = (
+    "plan_type",
+    "subscription_starts_at",
+    "subscription_expires_at",
+    "subscription_renews_at",
+    "subscription_cancels_at",
+    "subscription_billing_period",
+    "subscription_plan",
+    "has_active_subscription",
+)
+HEALTHY_ACCOUNT_STATUSES = {"active", "ok", "ready", "normal", "recovered", "healthy", "valid"}
 
 
 def _path_get(data: Any, path: tuple[str, ...]) -> Any:
@@ -224,6 +244,44 @@ def _coerce_rfc3339(value: Any) -> str | None:
     return None
 
 
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _shift_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _subscription_starts_at(end_at: str | None, billing_period: str | None) -> str | None:
+    end = _parse_datetime(end_at)
+    if end is None or not billing_period:
+        return None
+    period = billing_period.strip().lower()
+    if period in {"monthly", "month"}:
+        return _format_datetime(_shift_months(end, -1))
+    if period in {"yearly", "annual", "annually", "year"}:
+        return _format_datetime(_shift_months(end, -12))
+    if period in {"weekly", "week"}:
+        return _format_datetime(end - timedelta(days=7))
+    return None
+
+
 def _time_to_epoch(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -249,7 +307,7 @@ def _time_to_epoch(value: Any) -> int | None:
 
 
 def _credential_values_equal(key: str, current: Any, candidate: Any) -> bool:
-    if key in {"expires_at", "subscription_expires_at"}:
+    if key in {"expires_at", "subscription_expires_at", "subscription_renews_at", "subscription_cancels_at"}:
         current_epoch = _time_to_epoch(current)
         candidate_epoch = _time_to_epoch(candidate)
         if current_epoch is not None and candidate_epoch is not None:
@@ -346,11 +404,26 @@ class Sub2ApiClient:
 
     async def list_accounts(self) -> list[dict[str, Any]]:
         config = await get_runtime_config_service().get_sub2api_config()
-        payload = await self._request("GET", config.accounts_path, config=config)
+        payload = await self._request("GET", config.accounts_path, config=config, params={"page": 1, "page_size": 100})
         accounts = self._unwrap(payload)
-        if isinstance(accounts, list):
-            return [item for item in accounts if isinstance(item, dict)]
-        return []
+        if not isinstance(accounts, list):
+            return []
+
+        result = [item for item in accounts if isinstance(item, dict)]
+        data = payload.get("data") if isinstance(payload, dict) else None
+        pages = _positive_int(data.get("pages") if isinstance(data, dict) else None)
+        if pages is not None and pages > 1:
+            for page in range(2, pages + 1):
+                page_payload = await self._request(
+                    "GET",
+                    config.accounts_path,
+                    config=config,
+                    params={"page": page, "page_size": 100},
+                )
+                page_accounts = self._unwrap(page_payload)
+                if isinstance(page_accounts, list):
+                    result.extend(item for item in page_accounts if isinstance(item, dict))
+        return result
 
     async def list_groups(self) -> list[dict[str, Any]]:
         config = await get_runtime_config_service().get_sub2api_config()
@@ -393,7 +466,7 @@ class Sub2ApiClient:
         payload: dict[str, Any]
         if token_path == "credentials.access_token":
             await self._update_credentials_patch(account, {"access_token": access_token}, config)
-            await self._after_account_credentials_update(account_id, config)
+            await self._after_account_credentials_update(account, account_id, config)
             return
         if token_path.startswith("credentials."):
             credentials = copy.deepcopy(account.get("credentials") or {})
@@ -404,7 +477,7 @@ class Sub2ApiClient:
             _deep_set(payload, token_path, access_token)
 
         await self._request("PUT", f"{config.accounts_path}/{account_id}", config=config, json=payload)
-        await self._after_account_credentials_update(account_id, config)
+        await self._after_account_credentials_update(account, account_id, config)
 
     async def update_credentials_from_session(
         self,
@@ -417,6 +490,7 @@ class Sub2ApiClient:
             raise ValueError("Cannot update sub2api account without id.")
 
         credentials = self.credentials_from_session(session, access_token)
+        self._add_refresh_token_aliases(account, credentials)
         if not credentials.get("access_token"):
             raise ValueError("Session endpoint did not include a usable access token.")
 
@@ -425,7 +499,8 @@ class Sub2ApiClient:
         if changes:
             await self._update_credentials_patch(account, changes, config)
             self._merge_account_credentials(account, changes)
-        await self._after_account_credentials_update(account_id, config)
+        if changes or self.account_requires_state_recovery(account):
+            await self._after_account_credentials_update(account, account_id, config)
         return sorted(changes)
 
     async def reassert_subscription_state_from_session(
@@ -448,23 +523,27 @@ class Sub2ApiClient:
         return sorted(credentials)
 
     async def refresh_account_usage(self, account: dict[str, Any] | str) -> bool:
+        return await self.refresh_account_usage_data(account) is not None
+
+    async def refresh_account_usage_data(self, account: dict[str, Any] | str) -> dict[str, Any] | None:
         account_id = account if isinstance(account, str) else self.account_id(account)
         if not account_id:
             raise ValueError("Cannot refresh sub2api account usage without id.")
 
         config = await get_runtime_config_service().get_sub2api_config()
         try:
-            await self._request(
+            payload = await self._request(
                 "GET",
                 f"{config.accounts_path}/{account_id}/usage",
                 config=config,
                 params={"source": "active", "force": "true"},
             )
-            return True
         except Sub2ApiRequestError as exc:
             if exc.status_code in {404, 405}:
-                return False
+                return None
             raise
+        usage = self._unwrap(payload)
+        return usage if isinstance(usage, dict) else {}
 
     async def check_openai_account_status(self, account: dict[str, Any] | str) -> dict[str, Any] | None:
         account_id = account if isinstance(account, str) else self.account_id(account)
@@ -507,8 +586,86 @@ class Sub2ApiClient:
         if isinstance(refreshed, dict):
             if isinstance(account, dict):
                 account.update(refreshed)
+                await self._after_account_credentials_update(account, account_id, config)
             return refreshed
         return {}
+
+    async def get_account(self, account: dict[str, Any] | str) -> dict[str, Any] | None:
+        account_id = account if isinstance(account, str) else self.account_id(account)
+        email = None if isinstance(account, str) else self.account_email(account)
+        normalized_email = email.lower() if isinstance(email, str) else None
+        for item in await self.list_accounts():
+            item_id = self.account_id(item)
+            if account_id and item_id == str(account_id):
+                return item
+            item_email = self.account_email(item)
+            if normalized_email and item_email and item_email.lower() == normalized_email:
+                return item
+        return None
+
+    async def create_account(
+        self,
+        *,
+        email: str,
+        access_token: str,
+        session: dict[str, Any] | None = None,
+        refresh_token: str | None = None,
+        id_token: str | None = None,
+        phone_number: str | None = None,
+        phone_sms_url: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_email:
+            raise ValueError("Cannot create sub2api account without email.")
+        token = str(access_token or "").strip()
+        if not token:
+            raise ValueError("Cannot create sub2api account without access_token.")
+
+        session_payload = copy.deepcopy(session) if isinstance(session, dict) else {}
+        tokens = session_payload.get("tokens") if isinstance(session_payload.get("tokens"), dict) else {}
+        if refresh_token:
+            session_payload["refresh_token"] = refresh_token
+            tokens["refresh_token"] = refresh_token
+        if id_token:
+            session_payload["id_token"] = id_token
+            tokens["id_token"] = id_token
+        session_payload["access_token"] = token
+        tokens["access_token"] = token
+        session_payload["tokens"] = tokens
+        session_payload.setdefault("email", normalized_email)
+
+        credentials = self.credentials_from_session(session_payload, token)
+        credentials.update(self.subscription_credentials_from_session(session_payload, token))
+        credentials["email"] = normalized_email
+
+        extra: dict[str, Any] = {"email": normalized_email}
+        mail_console: dict[str, Any] = {}
+        if phone_number:
+            mail_console["phone_verification_phone"] = phone_number
+        if phone_sms_url:
+            mail_console["phone_verification_url"] = phone_sms_url
+        if notes:
+            mail_console["note"] = notes
+        if mail_console:
+            extra["mail_console"] = mail_console
+
+        payload = {
+            "name": normalized_email,
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": credentials,
+            "extra": extra,
+            "concurrency": 2,
+            "priority": 1,
+            "rate_multiplier": 1,
+            "auto_pause_on_expired": True,
+        }
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        created = await self._request("POST", config.accounts_path, config=config, json=payload)
+        unwrapped = self._unwrap(created)
+        return unwrapped if isinstance(unwrapped, dict) else payload
 
     def account_has_refresh_token(self, account: dict[str, Any]) -> bool:
         credentials_status = account.get("credentials_status")
@@ -582,8 +739,10 @@ class Sub2ApiClient:
             data,
             ("refreshToken",),
             ("refresh_token",),
+            ("rt",),
             ("tokens", "refreshToken"),
             ("tokens", "refresh_token"),
+            ("tokens", "rt"),
         )
 
         access_claims = _decode_jwt_payload(access_token)
@@ -662,18 +821,105 @@ class Sub2ApiClient:
             or _default_organization_id(openai_auth),
         )
         _set_if_present(credentials, "plan_type", self.session_plan_type(data, openai_auth))
-        _set_if_present(
-            credentials,
-            "subscription_expires_at",
-            _first_string(
+        subscription_expires_at = _coerce_rfc3339(
+            _first_value(
                 data,
+                ("subscription_expires_at",),
+                ("subscriptionExpiresAt",),
                 ("account", "subscriptionExpiresAt"),
                 ("account", "subscription_expires_at"),
-                ("subscriptionExpiresAt",),
-                ("subscription_expires_at",),
                 ("account", "entitlement", "expires_at"),
                 ("entitlement", "expires_at"),
                 ("entitlement", "expiresAt"),
+            )
+        )
+        subscription_renews_at = _coerce_rfc3339(
+            _first_value(
+                data,
+                ("subscription_renews_at",),
+                ("subscriptionRenewsAt",),
+                ("account", "entitlement", "renews_at"),
+                ("entitlement", "renews_at"),
+                ("entitlement", "renewsAt"),
+            )
+        )
+        subscription_cancels_at = _coerce_rfc3339(
+            _first_value(
+                data,
+                ("subscription_cancels_at",),
+                ("subscriptionCancelsAt",),
+                ("account", "entitlement", "cancels_at"),
+                ("entitlement", "cancels_at"),
+                ("entitlement", "cancelsAt"),
+            )
+        )
+        subscription_billing_period = _first_string(
+            data,
+            ("subscription_billing_period",),
+            ("subscriptionBillingPeriod",),
+            ("account", "entitlement", "billing_period"),
+            ("entitlement", "billing_period"),
+            ("entitlement", "billingPeriod"),
+        )
+        _set_if_present(
+            credentials,
+            "subscription_starts_at",
+            _coerce_rfc3339(
+                _first_value(
+                    data,
+                    ("subscription_starts_at",),
+                    ("subscriptionStartsAt",),
+                    ("subscription_started_at",),
+                    ("subscriptionStartedAt",),
+                    ("account", "entitlement", "starts_at"),
+                    ("entitlement", "starts_at"),
+                    ("entitlement", "startsAt"),
+                )
+            )
+            or _subscription_starts_at(subscription_renews_at or subscription_cancels_at, subscription_billing_period),
+        )
+        _set_if_present(
+            credentials,
+            "subscription_expires_at",
+            subscription_expires_at,
+        )
+        _set_if_present(
+            credentials,
+            "subscription_renews_at",
+            subscription_renews_at,
+        )
+        _set_if_present(
+            credentials,
+            "subscription_cancels_at",
+            subscription_cancels_at,
+        )
+        _set_if_present(
+            credentials,
+            "subscription_billing_period",
+            subscription_billing_period,
+        )
+        _set_if_present(
+            credentials,
+            "subscription_plan",
+            _first_string(
+                data,
+                ("subscription_plan",),
+                ("subscriptionPlan",),
+                ("account", "entitlement", "subscription_plan"),
+                ("entitlement", "subscription_plan"),
+                ("entitlement", "subscriptionPlan"),
+            ),
+        )
+        _set_if_present(
+            credentials,
+            "has_active_subscription",
+            _first_value(
+                data,
+                ("has_active_subscription",),
+                ("hasActiveSubscription",),
+                ("account", "entitlement", "has_active_subscription"),
+                ("entitlement", "has_active_subscription"),
+                ("entitlement", "hasActiveSubscription"),
             ),
         )
         return credentials
@@ -735,6 +981,24 @@ class Sub2ApiClient:
             account["credentials"] = current
         current.update(credentials)
 
+    def _add_refresh_token_aliases(self, account: dict[str, Any], credentials: dict[str, Any]) -> None:
+        refresh_token = credentials.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            return
+        current = account.get("credentials")
+        if not isinstance(current, dict):
+            current = {}
+        credentials_status = account.get("credentials_status")
+        has_rt = isinstance(credentials_status, dict) and credentials_status.get("has_rt") is True
+        has_refresh_token_status = (
+            isinstance(credentials_status, dict)
+            and credentials_status.get("has_refresh_token") is True
+            and "refresh_token" not in current
+            and "refreshToken" not in current
+        )
+        if "rt" in current or has_rt or has_refresh_token_status:
+            credentials["rt"] = refresh_token
+
     async def _update_credentials_patch(
         self,
         account: dict[str, Any],
@@ -768,7 +1032,41 @@ class Sub2ApiClient:
             json={"credentials": merged_credentials},
         )
 
-    async def _after_account_credentials_update(self, account_id: str, config: EffectiveSub2ApiConfig) -> None:
+    async def _after_account_credentials_update(
+        self,
+        account: dict[str, Any],
+        account_id: str,
+        config: EffectiveSub2ApiConfig,
+    ) -> None:
+        should_recover_state = self.account_requires_state_recovery(account)
+        if should_recover_state:
+            await self._recover_account_state(account_id, config)
+
+    async def recover_account_state(self, account: dict[str, Any] | str) -> None:
+        account_id = account if isinstance(account, str) else self.account_id(account)
+        if not account_id:
+            raise ValueError("Cannot recover sub2api account state without id.")
+        config = await get_runtime_config_service().get_sub2api_config()
+        await self._recover_account_state(account_id, config)
+
+    async def clear_rate_limit_state(self, account: dict[str, Any] | str) -> None:
+        account_id = account if isinstance(account, str) else self.account_id(account)
+        if not account_id:
+            raise ValueError("Cannot clear sub2api rate limit state without id.")
+        config = await get_runtime_config_service().get_sub2api_config()
+        await self._request(
+            "PUT",
+            f"{config.accounts_path}/{account_id}",
+            config=config,
+            json={
+                "rate_limited_at": None,
+                "rate_limit_reset_at": None,
+                "temp_unschedulable_until": None,
+                "temp_unschedulable_reason": "",
+            },
+        )
+
+    async def _recover_account_state(self, account_id: str, config: EffectiveSub2ApiConfig) -> None:
         if config.auto_clear_error:
             await self._try_post(f"{config.accounts_path}/{account_id}/clear-error", config)
         if config.auto_recover_state:
@@ -803,6 +1101,71 @@ class Sub2ApiClient:
                 return str(value)
         return None
 
+    def dedupe_accounts_by_email(
+        self,
+        accounts: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        metadata = self.account_duplicate_metadata(accounts)
+        duplicates: list[dict[str, Any]] = []
+        keep_indexes: set[int] = set()
+        for index, account in enumerate(accounts):
+            item = metadata.get(index)
+            if item is None or item["duplicate_primary"]:
+                keep_indexes.add(index)
+            if item is not None and item["is_duplicate"] and not item["duplicate_primary"]:
+                duplicates.append(
+                    {
+                        "email": item["email"],
+                        "kept_account_id": item["duplicate_primary_account_id"],
+                        "ignored_account_id": self.account_id(account),
+                        "ignored_status": self.account_status(account),
+                        "ignored_schedulable": self.account_schedulable(account),
+                        "ignored_error": self.is_error_account(account),
+                        "ignored_deactive": self.is_deactive_account(account),
+                    }
+                )
+
+        deduped = [account for index, account in enumerate(accounts) if index in keep_indexes]
+        return deduped, duplicates
+
+    def account_duplicate_metadata(self, accounts: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for index, account in enumerate(accounts):
+            email = self.account_email(account)
+            if email:
+                grouped.setdefault(email.lower(), []).append((index, account))
+
+        metadata: dict[int, dict[str, Any]] = {}
+        for email, entries in grouped.items():
+            ordered = sorted(entries, key=lambda item: self._dedupe_account_sort_key(item[1], item[0]))
+            primary_index, primary_account = ordered[0]
+            primary_id = self.account_id(primary_account)
+            group_size = len(ordered)
+            for rank, (index, account) in enumerate(ordered):
+                metadata[index] = {
+                    "email": email,
+                    "is_duplicate": group_size > 1,
+                    "duplicate_group_size": group_size,
+                    "duplicate_rank": rank,
+                    "duplicate_primary": index == primary_index,
+                    "duplicate_primary_account_id": primary_id,
+                }
+        return metadata
+
+    def _dedupe_account_sort_key(self, account: dict[str, Any], original_index: int) -> tuple[int, int, int, int, int, int]:
+        status = (self.account_status(account) or "").strip().lower()
+        schedulable = self.account_schedulable(account)
+        schedulable_rank = 0 if schedulable is True else 2 if schedulable is False else 1
+        credential_rank = 0 if self.account_has_refresh_token(account) else 1 if self.account_access_token(account) else 2
+        return (
+            1 if self.is_deactive_account(account) else 0,
+            1 if self.is_error_account(account) else 0,
+            schedulable_rank,
+            0 if status in HEALTHY_ACCOUNT_STATUSES else 1,
+            credential_rank,
+            original_index,
+        )
+
     def account_email(self, account: dict[str, Any]) -> str | None:
         for path in ACCOUNT_EMAIL_PATHS:
             email = extract_email(_path_get(account, path))
@@ -831,11 +1194,101 @@ class Sub2ApiClient:
                 return str(value)
         return None
 
+    def is_oauth_account(self, account: dict[str, Any]) -> bool:
+        account_type = (self.account_type(account) or "").strip().lower()
+        normalized_type = account_type.replace("-", "_").replace(" ", "_")
+        if normalized_type:
+            if "oauth" in normalized_type:
+                return True
+            if "api_key" in normalized_type or "apikey" in normalized_type:
+                return False
+
+        credentials_status = account.get("credentials_status")
+        if isinstance(credentials_status, dict):
+            if any(credentials_status.get(key) is True for key in ("has_refresh_token", "has_refreshToken", "has_rt")):
+                return True
+            if any(credentials_status.get(key) is True for key in ("has_api_key", "hasApiKey")):
+                return False
+
+        credentials = account.get("credentials")
+        if not isinstance(credentials, dict):
+            return False
+        if any(key in credentials for key in ("refresh_token", "refreshToken", "rt", "id_token", "idToken")):
+            return True
+        if any(key in credentials for key in ("api_key", "apiKey", "apikey")):
+            return False
+        return False
+
     def account_schedulable(self, account: dict[str, Any]) -> bool | None:
         value = account.get("schedulable")
         if isinstance(value, bool):
             return value
         return None
+
+    def account_error_message(self, account: dict[str, Any]) -> str | None:
+        for value in (
+            account.get("error_message"),
+            account.get("errorMessage"),
+            _deep_get(account, "error.message"),
+        ):
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return None
+
+    def account_phone_note_text(self, account: dict[str, Any]) -> str:
+        phone_number = _first_string(
+            account,
+            ("extra", "mail_console", "phone_verification_phone"),
+            ("extra", "phone_verification_phone"),
+            ("phone_verification_phone",),
+            ("phone_number",),
+            ("extra", "phone_number"),
+        )
+        phone_url = _first_string(
+            account,
+            ("extra", "mail_console", "phone_verification_url"),
+            ("extra", "phone_verification_url"),
+            ("phone_verification_url",),
+            ("sms_url",),
+            ("extra", "sms_url"),
+        )
+        phone_cdk = _first_string(
+            account,
+            ("extra", "mail_console", "phone_verification_cdk"),
+            ("extra", "phone_verification_cdk"),
+            ("phone_verification_cdk",),
+            ("sms_cdk",),
+            ("extra", "sms_cdk"),
+        )
+        if phone_number and phone_cdk and phone_url:
+            return f"{phone_number}----{phone_cdk}----{phone_url}"
+        if phone_number and phone_cdk:
+            return f"{phone_number}----{phone_cdk}"
+        if phone_number and phone_url:
+            return f"{phone_number}----{phone_url}"
+
+        notes: list[str] = []
+        for value in (
+            account.get("notes"),
+            account.get("note"),
+            account.get("remark"),
+            account.get("remarks"),
+            account.get("description"),
+            _path_get(account, ("extra", "note")),
+            _path_get(account, ("extra", "notes")),
+            _path_get(account, ("extra", "remark")),
+            _path_get(account, ("extra", "remarks")),
+            _path_get(account, ("extra", "mail_console", "note")),
+        ):
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text not in notes:
+                notes.append(text)
+        return "\n".join(notes)
 
     def account_access_token(self, account: dict[str, Any]) -> str | None:
         credentials = account.get("credentials")
@@ -864,15 +1317,42 @@ class Sub2ApiClient:
             return True
         credentials = account.get("credentials")
         return isinstance(credentials, dict) and any(
-            key in credentials for key in ("access_token", "accessToken", "refresh_token", "refreshToken")
+            key in credentials for key in ("access_token", "accessToken", "refresh_token", "refreshToken", "rt")
         )
 
     def is_error_account(self, account: dict[str, Any]) -> bool:
-        status = (self.account_status(account) or "").lower()
+        status = (self.account_status(account) or "").strip().lower()
         if any(marker in status for marker in ("error", "fail", "invalid", "expired", "disabled")):
             return True
         schedulable = self.account_schedulable(account)
-        return schedulable is False and "deactive" not in status
+        if schedulable is not False or "deactive" in status:
+            return False
+        if status in HEALTHY_ACCOUNT_STATUSES and not self.account_error_message(account):
+            return False
+        return True
+
+    def account_looks_healthy(self, account: dict[str, Any]) -> bool:
+        if self.is_error_account(account) or self.is_deactive_account(account):
+            return False
+        status = (self.account_status(account) or "").strip().lower()
+        schedulable = self.account_schedulable(account)
+        return schedulable is True or status in HEALTHY_ACCOUNT_STATUSES
+
+    def account_requires_state_recovery(self, account: dict[str, Any]) -> bool:
+        return not self.account_looks_healthy(account)
+
+    def account_has_stale_rate_limit_state(self, account: dict[str, Any]) -> bool:
+        return any(
+            _first_string(account, path) is not None
+            for path in (
+                ("rate_limited_at",),
+                ("rate_limit_reset_at",),
+                ("temp_unschedulable_until",),
+                ("temp_unschedulable_reason",),
+                ("extra", "rate_limited_at"),
+                ("extra", "rate_limit_reset_at"),
+            )
+        )
 
     def is_deactive_account(self, account: dict[str, Any]) -> bool:
         for key in ("deactive", "deactivated", "account_deactive"):
