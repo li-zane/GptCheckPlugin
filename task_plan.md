@@ -294,7 +294,17 @@ Create a runnable sub2api companion plugin that monitors imported GPT accounts, 
 - [x] Phase 3: Derive non-Team monthly defaults from four times the corresponding weekly range.
 - [x] Phase 4: Add an authenticated, validated single-sample deletion API and a compact manual-delete control on the samples page.
 - [x] Phase 5: Add regression/security coverage and verify backend, frontend, desktop, and mobile behavior.
-- [ ] Phase 6: Commit the complete working tree, deploy safely to x1, remove only confirmed anomalous Plus 7d samples above $200, and verify production health/data.
+- [x] Phase 6: Commit the complete working tree, deploy safely to x1, remove only confirmed anomalous Plus 7d samples above $200, and verify production health/data.
+
+### Final Verification
+
+- Commit: `92af35a feat(accounts): improve identity and quota management`.
+- Local/remote backend: 46 tests passed; compileall passed.
+- Frontend: TypeScript/Vite production build passed; full npm audit reports 0 vulnerabilities.
+- Security: delete API returned 401 unauthenticated, 422 for ID 0, and 404 for an authenticated missing row; changed-line secret scan passed.
+- UI: Playwright verified confirmation/deletion refresh, 4x weekly-to-monthly settings linkage, and 390px document containment for settings and samples.
+- x1: both services active, health API OK, frontend HTTP 200, Plus windows now `none + seven_day` with 10080-minute windows and preserved reset times.
+- Data: integrity-checked pre-change SQLite backup retained; seven Plus 7d samples above $200 deleted transactionally; post-delete count is 0 and remaining maximum is $198.6886.
 
 ### Acceptance Criteria
 
@@ -325,6 +335,14 @@ Create a runnable sub2api companion plugin that monitors imported GPT accounts, 
 - [ ] Phase 5: Add focused backend/frontend tests and verify against the running local sub2api plus representative upstream responses.
 - [ ] Phase 6: Run production builds, Playwright desktop/mobile flows, security checks, and record the final result.
 
+### Backend subtask checklist
+
+- [ ] Extend the persistent model and public Pydantic contracts without exposing stored credentials.
+- [ ] Extend `Sub2ApiClient` with API-key listing, balance/settings/current-rate/update methods.
+- [ ] Implement encrypted upsert/delete, dry-run discovery, confirmed apply, and per-account locks.
+- [ ] Register admin-only routes and add focused regression/security tests.
+- [ ] Run targeted/full backend tests, compile/diff checks, and a changed-line secret scan.
+
 ### Acceptance Criteria
 
 - Administrators can add, edit, test, sync, and remove upstream API-key accounts without exposing full API keys in responses or logs.
@@ -350,3 +368,9 @@ Create a runnable sub2api companion plugin that monitors imported GPT accounts, 
 | First mobile navigation click used a stale desktop ref after viewport resize. | 1 | Captured a fresh mobile snapshot and switched to the current navigation ref before continuing. |
 | Adding `min-width: 0` to the sample panels alone did not contain the 1030px table; document width remained 1005px. | 1 | Inspect the exact overflowing DOM ancestors/computed grid sizes before the second CSS attempt. |
 | Full backend suite found a runtime-settings persistence test still expecting an explicitly supplied non-Team monthly upper bound of `$1000`. | 1 | Updated persistence expectations to prove backend normalization ignores stale monthly input and stores weekly×4 (`$1200-$1600`). |
+| First deployment bundle used only a raw revision range, leaving no advertised ref and producing an empty bundle. | 1 | Recreated it with named `main` plus excluded base `^5151aa7`; `git bundle verify` succeeded with x1's current commit as prerequisite. |
+| First combined x1 preflight/backup command again hit nested zsh quoting around command substitution. | 1 | Moved Git preflight and SQLite backup entirely into the base64 Python script, leaving the SSH shell command quote-free. |
+| First backend-subtask planning patch targeted a heading that exists only in `progress.md`, not `task_plan.md`. | 1 | Located the exact task-plan heading and applied a scoped checklist there. |
+| PowerShell/rg rejected the literal path pattern `backend/test*.py`. | 1 | Use `rg -g 'test*.py' backend` or direct file paths instead of shell wildcard expansion. |
+| Sibling sub2api source had no text match for the new payment-balance recharge setting. | 1 | Implement the required `/admin/settings` client contract with envelope-aware parsing and strict missing-field-only default semantics. |
+| A PowerShell `rg` command used embedded escaped double quotes and failed parsing. | 1 | Use single-quoted PowerShell regex arguments for route/source searches. |

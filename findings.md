@@ -245,8 +245,34 @@
 - Visual review of `plus-samples-mobile-fixed.png` confirms the samples hero, tab matrix, calibration card, and table viewport fit cleanly at 390px; wide columns remain intentionally available through inner horizontal scrolling.
 - Live security checks against the isolated backend returned the expected status matrix: unauthenticated delete `401`, invalid ID `0` returns `422`, and authenticated missing ID returns `404` without mutation.
 - Final code review confirms the earlier account-name/email work is part of the same uncommitted working tree and will be included in this requested commit/deployment; no generated preview database or screenshots are tracked.
+- Production readback after deployment shows both Plus accounts as `five_hour=none`, `seven_day=seven_day`, `window_minutes=10080`, with their upstream 2026-07-20 reset timestamps preserved.
+- Effective x1 ranges now read Plus weekly `$100-$140`, Plus monthly `$400-$560`, and Team monthly unchanged at `$100-$300`.
+- The seven confirmed Plus 7d rows above `$200` were deleted transactionally after backup. Post-delete Plus 7d data has 30 rows, range `$102.8586-$198.6886`, and zero rows above `$200`.
 
 ## 2026-07-13 API Key Upstream Account Management
+
+### Backend subtask notes
+
+- The server-side overlay must list all remote API-key accounts, including unmanaged rows; local persisted state is optional and keyed uniquely by the numeric-looking remote account id.
+- Every new route is admin-only. Credentials are encrypted at rest, omitted from public models, never echoed in errors, and preserved when PUT sends blank values unless the explicit access-token clear flag is set.
+- The upstream client contract is `discover_upstream(...)` / `UpstreamDiscoveryClient.discover(...)` returning `DiscoveryResult` and `GroupOption`, with base URL, type, API key/access token, New API user, and selected group id/name inputs.
+- Discovery remains read-only and applies precedence `auto > manual > default 1`; a default recharge result must have a null discovered value. Apply must re-discover and compare a four-decimal `ROUND_HALF_UP` target against the client-confirmed value before issuing an exact one-account bulk update.
+- Existing encryption helpers derive Fernet from `APP_ENCRYPTION_KEY`; `encrypt_text`/`decrypt_text` and `redact` can be reused. Public response schemas will be constructed explicitly, never from `__dict__`, so encrypted columns cannot leak.
+- Existing route registration uses one module router mounted in `app.api.__init__`; the new router should be mounted at `/api/upstream-accounts`, with `Depends(require_admin)` on every endpoint.
+- `init_db()` already runs `Base.metadata.create_all`; because this feature adds a new table instead of columns to an existing table, no manual SQLite ALTER migration is required.
+- `Sub2ApiClient._request` currently embeds up to 500 response-body characters in raised errors, so the new API layer/service must catch it and persist/return only fixed safe error categories. The low-level client behavior is left compatible for existing callers.
+- Existing pagination uses `/admin/accounts?page=...&page_size=100`; `list_api_key_accounts` can filter `type/account_type/auth_type` after the complete pagination result. Exact remote IDs are available through `account_id`, whose numeric parser already rejects non-positive/non-numeric values.
+- A test search command using `backend/test*.py` failed on Windows wildcard semantics; subsequent searches must use `rg -g 'test*.py'` or direct paths.
+- Local source findings confirm the target's account balance endpoint is `/admin/accounts/:id/balance`, account writes accept `rate_multiplier`, and the established single-account patch transport is `POST /admin/accounts/bulk-update` with numeric `account_ids`.
+- The remote account list intentionally omits its stored API key but includes non-secret credentials such as `base_url`; unmanaged rows can therefore be displayed and balanced through target sub2api while direct group/recharge discovery waits for explicit local key binding.
+- The target bulk update DTO has `AccountIDs []int64` and `RateMultiplier *float64`; the client method must send exactly `{"account_ids":[id],"rate_multiplier":value}` and reject non-positive/non-numeric IDs before transport.
+- A search for `payment_balance_recharge_multiplier` in the sibling checkout returned no match; the feature contract still requires reading that field from `/admin/settings`. Parsing will tolerate common API envelopes but will default to 1 only when the authenticated HTTP call succeeds and the field is absent.
+- The target account DTO explicitly exposes non-secret `rate_multiplier`, `credentials_status`, and redacted credentials metadata; current-rate reads should use the fresh list/get result rather than assuming the bulk-update response contains the updated row.
+- `/api/v1/admin/settings` is a registered authenticated route, so the required local recharge read can share the runtime-configured sub2api authentication and must propagate any auth/HTTP error instead of silently defaulting.
+- Target balance success data is a sanitized object with `status`, `message`, optional `remaining`/`total`/`used`/`unit`, and `checked_at`; plugin persistence can map those fields directly after safe numeric coercion.
+- Target account DTO guarantees `name`, `platform`, `type`, redacted `credentials`, `credentials_status`, `rate_multiplier`, and `status`, which are sufficient for unmanaged account rows and current-rate readback without any secret access.
+- Parent confirmed the shared files are clean at HEAD `92af35a`; production with the default encryption key must reject only attempts to add/replace a secret, while development/test may accept encrypted local secrets for preview/testing.
+
 
 - The current worktree already contains substantial uncommitted changes from an earlier task; they must be preserved and reviewed for overlap before editing shared account/API/UI files.
 - The requested reference task ID is not directly readable through the Codex thread API so far; the recent-task index only returned this current task because the reference ID appears in its prompt.
@@ -278,3 +304,8 @@
 - Chosen source behavior: balance can be refreshed through the target sub2api's server-side `/accounts/:id/balance` even before a key is bound locally; group and recharge discovery use a site adapter only after key binding.
 - Chosen apply behavior: calculate with `Decimal`, reject nonpositive recharge multipliers, quantize half-up to four decimals, and write through sub2api bulk-update only after all required source values are valid.
 - Security review requirements applied: all routes require the existing admin session; no full key/ciphertext in API responses, logs, DOM, or errors; outbound URLs reject unsafe schemes/private targets; redirects and environment proxies are disabled; response sizes and timeouts are bounded.
+- Referenced-session acceptance used an explicit dry-run before writeback and confirmed 24 accounts across 7 upstream sites; source/status enums and default recharge semantics are now part of the API contract rather than frontend-only labels.
+- Live target sub2api `payment_balance_recharge_multiplier` is `10.0`, available from authenticated `GET /api/v1/admin/settings`.
+- Live balance verification: account `2232` (`www.cattoken.cc`) returns `unsupported` with no numeric fields, while account `2250` (`zz1cc.cc.cd`) returns `ok`, unit `USD`, and numeric remaining/total/used values including a negative remaining balance. The UI must not conflate unsupported with zero or clamp valid negative balances.
+- The earlier Plus/sample/identity work was committed as `92af35a`; shared backend/frontend files are now clean, so this feature can make minimal direct integration edits without racing an active worktree change.
+- Existing `redact()` masks every character except the final four and secret encryption derives a Fernet key from `APP_ENCRYPTION_KEY`; the new API should reuse both and offer no reveal endpoint.

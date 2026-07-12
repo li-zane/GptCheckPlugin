@@ -284,6 +284,12 @@
 - First full-suite pass found one obsolete runtime-settings monthly expectation; updated it to verify persisted non-Team values are backend-derived at 4x weekly.
 - Final pre-commit verification passed: 46 backend tests, backend compileall, frontend production build, production dependency audit (0 vulnerabilities), diff check, and changed-line secret-pattern scan.
 - Full frontend dependency audit also reports 0 vulnerabilities; final 15-file source/test/plan diff is clean and contains no generated artifacts.
+- Created commit `92af35a` and a verified incremental deployment bundle that requires x1's current `5151aa7` base.
+- x1 preflight reconfirmed exact base `5151aa7` and no tracked worktree changes. Created integrity-checked 23,027,712-byte online SQLite backup `data/backups/sub2api_at_guardian-before-92af35a-20260712T195931Z.db`, containing the same seven confirmed outlier IDs.
+- Transferred the verified bundle to x1, fetched target `92af35a`, and confirmed the current remote HEAD is its ancestor; ready for the controlled stop/fast-forward window.
+- Fast-forwarded x1 to `92af35a` during a controlled stop, passed all 46 remote tests and the production frontend build, transactionally deleted the exact seven confirmed outlier IDs, and restarted both services.
+- Production verification passed: backend/frontend active, health OK, frontend HTTP 200, `01-login.png` preserved, Plus windows corrected to `none + seven_day`, effective Plus monthly range equals 4x weekly, and no Plus 7d sample above `$200` remains.
+- Completed all six phases of the Plus weekly-window, monthly derivation, sample deletion, data cleanup, commit, and x1 deployment request.
 - Completed Phase 5; only commit, x1 backup/deployment, confirmed seven-row cleanup, and production verification remain.
 - Closed the Playwright session and removed all disposable `preview-manual-delete%` rows from the isolated database; zero remain.
 
@@ -306,3 +312,14 @@
 - Completed read-only analysis of `upstream-ops` v0.0.6 and mapped its New API/Sub2API adapters, API-key CRUD, target-account update flow, and known recharge-rate gap.
 - Used the existing local sub2api admin credential only in memory to inventory non-sensitive runtime data: 43 total accounts, 24 API-key accounts, and 10 groups.
 - Completed the feature boundary and security design: import existing remote accounts, explicitly bind missing upstream keys, preserve old rates on discovery failure, and calculate/write server-side only.
+- Verified the live target recharge multiplier (`10x`) through the authenticated admin settings API.
+- Verified both supported and unsupported live upstream balance responses through sub2api without exposing stored credentials.
+- Confirmed the preceding parallel task committed successfully at `92af35a`; only this task's planning notes remained dirty before implementation agents began.
+- Backend subtask started: loaded the security-review and planning-with-files instructions, confirmed the existing feature boundary, and recorded the implementation/test checklist.
+- Inspected the existing model/database/schema/router/security/crypto patterns; selected a new-table-only migration path and explicit safe DTO construction.
+- Mapped the sub2api account pagination/filtering and error behavior; recorded the need for fixed-category API errors so response bodies/secrets cannot escape.
+- Reconfirmed the exact target balance/rate endpoints and the upstream formula/precedence from shared findings; sent the planned backend DTO fields and request bodies to the frontend subtask for contract alignment.
+- Verified the target bulk-update DTO accepts the required exact one-account `rate_multiplier` payload; recorded the settings-field source mismatch and strict fallback rule.
+- Located the authenticated target settings route and confirmed the account DTO exposes current `rate_multiplier`; readback verification can be implemented without using unsafe response-body text.
+- Confirmed the sanitized balance response shape and the production default-encryption-key rule; shared backend files are now safe to edit from the committed base.
+- Logged a PowerShell quoting failure during sibling-source inspection and switched the remaining searches to single-quoted regex arguments.
