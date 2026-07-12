@@ -81,6 +81,8 @@ export const api = {
   usageEstimate: (refresh = true) =>
     request<UsageEstimate>(`/api/accounts/usage-estimate?refresh=${refresh ? "true" : "false"}`, {}, 180_000),
   usageLimitSamples: () => request<UsageLimitSamples>("/api/accounts/usage-limit-samples"),
+  deleteUsageLimitSample: (id: number) =>
+    request<{ message: string }>(`/api/accounts/usage-limit-samples/${id}`, { method: "DELETE" }),
   refreshUsageWindows: () =>
     request<UsageRefreshResult>("/api/accounts/usage-refresh", { method: "POST" }, 180_000),
   refreshSubscriptions: () =>

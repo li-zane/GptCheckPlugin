@@ -24,6 +24,7 @@ from app.services.usage_estimate import (
     _usage_token_window_observations,
     _window_effective_spent,
     _window_estimate,
+    _estimate_window_values,
     _window_reset_detected,
 )
 
@@ -553,12 +554,13 @@ class UsageEstimateTests(unittest.TestCase):
         self.assertFalse(_usage_limit_sample_allowed("five_hour", "unknown", 20.0))
         self.assertFalse(_usage_limit_sample_allowed("five_hour", "plus", 9.99))
         self.assertFalse(_usage_limit_sample_allowed("seven_day", "team", 99.99))
-        self.assertTrue(_usage_limit_sample_allowed("monthly", "plus", 200.0))
+        self.assertFalse(_usage_limit_sample_allowed("monthly", "plus", 399.99))
+        self.assertTrue(_usage_limit_sample_allowed("monthly", "plus", 400.0))
         self.assertTrue(_usage_limit_sample_allowed("five_hour", "plus", 15.0))
         self.assertTrue(_usage_limit_sample_allowed("seven_day", "team", 100.0))
         self.assertTrue(_usage_limit_sample_allowed("monthly", "team", 100.0))
         self.assertTrue(_usage_limit_sample_allowed("five_hour", "k12", 15.0))
-        self.assertTrue(_usage_limit_sample_allowed("monthly", "enterprise-edu", 100.0))
+        self.assertTrue(_usage_limit_sample_allowed("monthly", "enterprise-edu", 400.0))
 
     def test_custom_k12_default_range_is_used_without_samples(self) -> None:
         ranges = {
@@ -632,6 +634,63 @@ class UsageEstimateTests(unittest.TestCase):
         self.assertEqual(custom_samples[0]["window_key"], "five_hour")
         self.assertAlmostEqual(custom_samples[0]["observed_limit"], 20.0)
         self.assertAlmostEqual(custom_samples[0]["used_percent"], 95.0)
+
+    def test_plus_without_five_hour_keeps_exact_seven_day_window(self) -> None:
+        account = {
+            "id": "2320",
+            "email": "plus@example.com",
+            "credentials": {"plan_type": "plus"},
+            "extra": {"codex_5h_window_minutes": 0, "codex_7d_window_minutes": 10_080},
+        }
+        usage = {
+            "five_hour": {"window_minutes": 0},
+            "seven_day": {
+                "used_percent": 75.0,
+                "window_minutes": 10_080,
+                "resets_at": "2026-07-20T03:05:32+08:00",
+                "remaining_seconds": 603_602,
+                "window_stats": {"cost": 90.0},
+            },
+        }
+
+        _, _, five_hour_kind = _estimate_window_values(account, usage, "five_hour")
+        seven_day_values, _, seven_day_kind = _estimate_window_values(account, usage, "seven_day")
+
+        self.assertEqual(five_hour_kind, "none")
+        self.assertEqual(seven_day_kind, "seven_day")
+        self.assertEqual(seven_day_values["window_minutes"], 10_080)
+        self.assertEqual(seven_day_values["reset_at"], "2026-07-20T03:05:32+08:00")
+        self.assertEqual(seven_day_values["remaining_seconds"], 603_602)
+
+    def test_plus_without_five_hour_collects_weekly_not_monthly_sample(self) -> None:
+        class FakeSub2Api:
+            def account_id(self, account):
+                return account.get("id")
+
+            def account_email(self, account):
+                return account.get("email")
+
+        account = {
+            "id": "2320",
+            "email": "plus@example.com",
+            "credentials": {"plan_type": "plus"},
+            "extra": {"codex_5h_window_minutes": 0, "codex_7d_window_minutes": 10_080},
+        }
+        usage = {
+            "five_hour": {"window_minutes": 0},
+            "seven_day": {
+                "used_percent": 100.0,
+                "window_minutes": 10_080,
+                "reset_at": "2026-07-20T03:05:32+08:00",
+                "window_stats": {"cost": 120.0},
+            },
+        }
+
+        samples = _usage_limit_sample_updates([account], FakeSub2Api(), {"2320": usage})
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["window_key"], "seven_day")
+        self.assertEqual(samples[0]["plan_cohort"], "plus")
 
     def test_calibration_uses_statistics_at_ten_samples(self) -> None:
         ten_samples = _limit_calibration("seven_day", [180.0] * 10, "team")

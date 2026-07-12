@@ -3,7 +3,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -605,6 +605,9 @@ async def list_accounts(
             AccountOut(
                 id=snapshot.id if snapshot else 0,
                 email=normalized,
+                account_name=sub2api.account_name(account)
+                or sub2api.account_name(snapshot.raw if snapshot and isinstance(snapshot.raw, dict) else {})
+                or normalized,
                 sub2api_account_id=account_id,
                 sub2api_imported_at=_sub2api_imported_at(account, snapshot),
                 platform=sub2api.account_platform(account) or (snapshot.platform if snapshot else None),
@@ -668,6 +671,7 @@ async def list_accounts(
             AccountOut(
                 id=snapshot.id,
                 email=normalized,
+                account_name=sub2api.account_name(snapshot.raw if isinstance(snapshot.raw, dict) else {}) or normalized,
                 sub2api_account_id=snapshot.sub2api_account_id,
                 sub2api_imported_at=_sub2api_imported_at(None, snapshot),
                 platform=snapshot.platform,
@@ -794,6 +798,20 @@ async def usage_limit_samples(
         seven_day_threshold_percent=seven_day_threshold,
         windows=windows,
     )
+
+
+@router.delete("/usage-limit-samples/{sample_id}", response_model=MessageResponse)
+async def delete_usage_limit_sample(
+    sample_id: int = Path(ge=1),
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MessageResponse:
+    sample = await db.get(UsageLimitSample, sample_id)
+    if sample is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usage limit sample not found.")
+    await db.delete(sample)
+    await db.commit()
+    return MessageResponse(message=f"已删除额度样本 #{sample_id}")
 
 
 @router.patch("/{account_id}/usage-estimate", response_model=MessageResponse)

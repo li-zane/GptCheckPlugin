@@ -15,6 +15,7 @@ export type Summary = {
 export type Account = {
   id: number;
   email: string;
+  account_name: string;
   sub2api_account_id: string | null;
   sub2api_imported_at: string | null;
   platform: string | null;

@@ -13,15 +13,17 @@ CORE_SUBSCRIPTION_TYPES = ("plus", "team", "pro", "free", "k12")
 MAX_SUBSCRIPTION_TYPES = 100
 MAX_USAGE_LIMIT_VALUE = 1_000_000_000.0
 
+_DEFAULT_WEEKLY_RANGE = {"lower": 100.0, "upper": 140.0}
 _DEFAULT_WINDOW_RANGES = {
     "five_hour": {"lower": 15.0, "upper": 25.0},
-    "seven_day": {"lower": 100.0, "upper": 140.0},
-    "monthly": {"lower": 100.0, "upper": 300.0},
+    "seven_day": copy.deepcopy(_DEFAULT_WEEKLY_RANGE),
+    "monthly": {"lower": _DEFAULT_WEEKLY_RANGE["lower"] * 4, "upper": _DEFAULT_WEEKLY_RANGE["upper"] * 4},
 }
 DEFAULT_USAGE_LIMIT_RANGES = {
     subscription_type: copy.deepcopy(_DEFAULT_WINDOW_RANGES)
     for subscription_type in (*CORE_SUBSCRIPTION_TYPES, SUBSCRIPTION_TYPE_UNKNOWN)
 }
+DEFAULT_USAGE_LIMIT_RANGES["team"]["monthly"] = {"lower": 100.0, "upper": 300.0}
 
 _COMPACT_ALIASES = {
     "chatgptplusplan": "plus",
@@ -112,6 +114,8 @@ def normalize_usage_limit_ranges(value: Any) -> dict[str, dict[str, dict[str, fl
             normalized_range = _normalize_range(raw_windows.get(window_key))
             if normalized_range is not None:
                 plan_ranges[window_key] = normalized_range
+        if subscription_type != "team":
+            plan_ranges["monthly"] = _monthly_range_from_weekly(plan_ranges["seven_day"])
         ranges[subscription_type] = plan_ranges
     return ranges
 
@@ -164,3 +168,10 @@ def _normalize_range(value: Any) -> dict[str, float] | None:
     if lower_value < 0 or upper_value < lower_value or upper_value > MAX_USAGE_LIMIT_VALUE:
         return None
     return {"lower": lower_value, "upper": upper_value}
+
+
+def _monthly_range_from_weekly(weekly_range: dict[str, float]) -> dict[str, float]:
+    return {
+        "lower": min(float(weekly_range["lower"]) * 4, MAX_USAGE_LIMIT_VALUE),
+        "upper": min(float(weekly_range["upper"]) * 4, MAX_USAGE_LIMIT_VALUE),
+    }

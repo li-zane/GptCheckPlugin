@@ -41,6 +41,7 @@ class AccountSnapshotOut(BaseModel):
 class AccountOut(BaseModel):
     id: int
     email: str
+    account_name: str
     sub2api_account_id: str | None
     sub2api_imported_at: str | None = None
     platform: str | None

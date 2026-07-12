@@ -118,7 +118,11 @@ class RuntimeConfigTests(unittest.TestCase):
                 )
 
                 self.assertEqual(settings["usage_limit_default_ranges"]["k12"]["five_hour"]["lower"], 30.0)
-                self.assertEqual(settings["usage_limit_default_ranges"]["enterprise"]["monthly"]["upper"], 1000.0)
+                self.assertEqual(settings["usage_limit_default_ranges"]["k12"]["monthly"], {"lower": 800.0, "upper": 1040.0})
+                self.assertEqual(
+                    settings["usage_limit_default_ranges"]["enterprise"]["monthly"],
+                    {"lower": 1200.0, "upper": 1600.0},
+                )
                 self.assertIn("unknown", settings["usage_limit_default_ranges"])
 
                 async with runtime_config.AsyncSessionLocal() as db:

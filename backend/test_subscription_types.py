@@ -37,9 +37,23 @@ class SubscriptionTypesTests(unittest.TestCase):
         )
 
         self.assertEqual(usage_limit_bounds(ranges, "five_hour", "k12"), (30.0, 45.0))
+        self.assertEqual(usage_limit_bounds(ranges, "monthly", "k12"), (800.0, 1040.0))
         self.assertEqual(usage_limit_bounds(ranges, "seven_day", "enterprise"), (300.0, 400.0))
+        self.assertEqual(usage_limit_bounds(ranges, "monthly", "enterprise"), (1200.0, 1600.0))
         self.assertEqual(usage_limit_bounds(ranges, "five_hour", "enterprise"), (15.0, 25.0))
-        self.assertEqual(usage_limit_bounds(ranges, "monthly", "future-plan"), (100.0, 300.0))
+        self.assertEqual(usage_limit_bounds(ranges, "monthly", "future-plan"), (400.0, 560.0))
+
+    def test_team_monthly_range_remains_independently_configurable(self) -> None:
+        ranges = normalize_usage_limit_ranges(
+            {
+                "team": {
+                    "seven_day": {"lower": 200, "upper": 260},
+                    "monthly": {"lower": 500, "upper": 700},
+                }
+            }
+        )
+
+        self.assertEqual(usage_limit_bounds(ranges, "monthly", "team"), (500.0, 700.0))
 
 
 if __name__ == "__main__":

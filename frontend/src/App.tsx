@@ -77,10 +77,15 @@ const coreSubscriptionTypes = new Set(["plus", "team", "pro", "free", "k12", "un
 const defaultUsageLimitPlanRanges: UsageLimitPlanRanges = {
   five_hour: { lower: 15, upper: 25 },
   seven_day: { lower: 100, upper: 140 },
-  monthly: { lower: 100, upper: 300 },
+  monthly: { lower: 400, upper: 560 },
 };
 const defaultUsageLimitRanges = Object.fromEntries(
-  [...coreSubscriptionTypes].map((subscriptionType) => [subscriptionType, cloneUsageLimitPlanRanges(defaultUsageLimitPlanRanges)]),
+  [...coreSubscriptionTypes].map((subscriptionType) => [
+    subscriptionType,
+    subscriptionType === "team"
+      ? { ...cloneUsageLimitPlanRanges(defaultUsageLimitPlanRanges), monthly: { lower: 100, upper: 300 } }
+      : cloneUsageLimitPlanRanges(defaultUsageLimitPlanRanges),
+  ]),
 ) as UsageLimitDefaultRanges;
 const sub2ApiApiPrefix = "/api/v1";
 const themeStorageKey = "sub2api-at-theme";
@@ -296,7 +301,12 @@ function App() {
   }, [authState, loadAll, loadUsageEstimate, view]);
 
   useEffect(() => {
-    if (authState !== "in" || usageLoading || usageError) return;
+    if (authState !== "in" || usageLoading) return;
+    if (view === "usage-samples" && !usageLimitSamples && !usageLimitSamplesLoading) {
+      loadUsageLimitSamples().catch(() => undefined);
+      return;
+    }
+    if (usageError) return;
     if (view === "overview" || view === "accounts") {
       if (usageEstimate) return;
       loadUsageEstimate(false).catch(() => undefined);
@@ -307,9 +317,6 @@ function App() {
       if (needsEstimate) {
         loadUsageEstimate(true).catch(() => undefined);
       }
-    }
-    if (view === "usage-samples" && !usageLimitSamples && !usageLimitSamplesLoading) {
-      loadUsageLimitSamples().catch(() => undefined);
     }
   }, [authState, loadUsageEstimate, loadUsageLimitSamples, usageError, usageEstimate, usageEstimateRefreshed, usageLimitSamples, usageLimitSamplesLoading, usageLoading, view]);
 
@@ -561,6 +568,13 @@ function App() {
             data={usageLimitSamples}
             error={usageLimitSamplesError}
             loading={usageLimitSamplesLoading}
+            onDelete={(sampleId) =>
+              runAction(async () => {
+                const result = await api.deleteUsageLimitSample(sampleId);
+                await loadUsageLimitSamples();
+                return result;
+              }, "额度样本已删除")
+            }
             onRefresh={loadUsageLimitSamples}
           />
         ) : null}
@@ -982,6 +996,7 @@ function AccountsView({
           (!accountSubscriptionFilter || accountSubscriptionTypeLabel(account) === accountSubscriptionFilter) &&
           textMatchesSearch(
             [
+              account.account_name,
               account.email,
               account.sub2api_account_id,
               account.sub2api_imported_at,
@@ -1260,7 +1275,7 @@ function AccountsView({
             <thead>
               <tr>
                 <th className="accounts-select-header"><span className="sr-only">选择</span></th>
-                <th>邮箱</th>
+                <th>账号</th>
                 <th>sub2api ID</th>
                 <th>时间记录</th>
                 <th>绑定邮箱</th>
@@ -1422,8 +1437,9 @@ function AccountRow({
         </label>
       </td>
       <td>
-        <div className="email-cell">
-          <CopyTextButton className="account-email-copy-button mono" hideIcon title="复制账号邮箱" value={account.email} />
+        <div className="account-identity-cell">
+          <CopyTextButton className="account-identity-copy-button account-name-copy-button" title="复制账号名称" value={account.account_name} />
+          <CopyTextButton className="account-identity-copy-button account-email-copy-button mono" title="复制账号邮箱" value={account.email} />
           <div className="email-cell-meta">
             {account.is_duplicate ? (
               <span className="duplicate-marker">
@@ -2025,11 +2041,13 @@ function UsageLimitSamplesView({
   data,
   loading,
   error,
+  onDelete,
   onRefresh,
 }: {
   data: UsageLimitSamples | null;
   loading: boolean;
   error: string;
+  onDelete: (sampleId: number) => Promise<void> | void;
   onRefresh: () => Promise<unknown>;
 }) {
   const timeZone = useDisplayTimeZone();
@@ -2072,7 +2090,7 @@ function UsageLimitSamplesView({
             触发阈值：5h ≥ {formatPercent(data?.five_hour_threshold_percent ?? data?.full_percent_threshold ?? null)} · 7d/月 ≥{" "}
             {formatPercent(data?.seven_day_threshold_percent ?? data?.full_percent_threshold ?? null)}
           </span>
-          <span>plus / team / 月 team 样本分别统计</span>
+          <span>按订阅类型与真实窗口分别统计</span>
           <span>样本数量 &lt; 10 条时使用默认区间</span>
           <span>样本数量 ≥ 10 条后使用 mean ± 3 sigma</span>
         </div>
@@ -2130,6 +2148,7 @@ function UsageLimitSamplesView({
                       <th>官方百分比</th>
                       <th>重置</th>
                       <th>记录时间</th>
+                      <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2148,6 +2167,22 @@ function UsageLimitSamplesView({
                         <td>{formatPercent(sample.used_percent)}</td>
                         <td>{sample.reset_at ? formatDate(sample.reset_at, timeZone) : "-"}</td>
                         <td>{formatDate(sample.updated_at || sample.created_at, timeZone)}</td>
+                        <td>
+                          <button
+                            aria-label={`删除额度样本 ${sample.id}`}
+                            className="icon-button usage-sample-delete"
+                            disabled={loading}
+                            onClick={() => {
+                              if (window.confirm(`确定删除额度样本 #${sample.id} 吗？此操作不可撤销。`)) {
+                                void onDelete(sample.id);
+                              }
+                            }}
+                            title="删除此样本"
+                            type="button"
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -2985,16 +3020,19 @@ function SettingsView({
     bound: "lower" | "upper",
     value: string,
   ) => {
-    setUsageLimitDefaultRanges((current) => ({
-      ...current,
-      [subscriptionType]: {
+    setUsageLimitDefaultRanges((current) => {
+      const nextPlanRanges = {
         ...current[subscriptionType],
         [windowKey]: {
           ...current[subscriptionType][windowKey],
           [bound]: Number(value),
         },
-      },
-    }));
+      };
+      return {
+        ...current,
+        [subscriptionType]: subscriptionType === "team" ? nextPlanRanges : deriveMonthlyUsageLimitRange(nextPlanRanges),
+      };
+    });
   };
 
   const submit = async (event: FormEvent) => {
@@ -3179,10 +3217,12 @@ function SettingsView({
                           下限
                           <input
                             aria-label={`${subscriptionTypeLabel(subscriptionType)} ${usageLimitWindowLabel(windowKey)} 下限`}
+                            disabled={subscriptionType !== "team" && windowKey === "monthly"}
                             min={0}
                             onChange={(event) => updateUsageLimitRange(subscriptionType, windowKey, "lower", event.target.value)}
                             step="0.01"
                             type="number"
+                            title={subscriptionType !== "team" && windowKey === "monthly" ? "自动使用 7d 下限的 4 倍" : undefined}
                             value={planRanges[windowKey].lower}
                           />
                         </label>
@@ -3190,10 +3230,12 @@ function SettingsView({
                           上限
                           <input
                             aria-label={`${subscriptionTypeLabel(subscriptionType)} ${usageLimitWindowLabel(windowKey)} 上限`}
+                            disabled={subscriptionType !== "team" && windowKey === "monthly"}
                             min={0}
                             onChange={(event) => updateUsageLimitRange(subscriptionType, windowKey, "upper", event.target.value)}
                             step="0.01"
                             type="number"
+                            title={subscriptionType !== "team" && windowKey === "monthly" ? "自动使用 7d 上限的 4 倍" : undefined}
                             value={planRanges[windowKey].upper}
                           />
                         </label>
@@ -4130,21 +4172,32 @@ function cloneUsageLimitPlanRanges(value: UsageLimitPlanRanges): UsageLimitPlanR
   };
 }
 
+function deriveMonthlyUsageLimitRange(value: UsageLimitPlanRanges): UsageLimitPlanRanges {
+  const ranges = cloneUsageLimitPlanRanges(value);
+  ranges.monthly = {
+    lower: Math.min(ranges.seven_day.lower * 4, 1_000_000_000),
+    upper: Math.min(ranges.seven_day.upper * 4, 1_000_000_000),
+  };
+  return ranges;
+}
+
 function mergeUsageLimitDefaultRanges(value: UsageLimitDefaultRanges, detectedTypes: string[]): UsageLimitDefaultRanges {
   const merged = Object.fromEntries(
     Object.entries({ ...defaultUsageLimitRanges, ...(value || {}) }).map(([subscriptionType, ranges]) => [
       normalizeSubscriptionType(subscriptionType),
-      cloneUsageLimitPlanRanges(ranges),
+      normalizeSubscriptionType(subscriptionType) === "team"
+        ? cloneUsageLimitPlanRanges(ranges)
+        : deriveMonthlyUsageLimitRange(ranges),
     ]),
   ) as UsageLimitDefaultRanges;
   const fallback = merged.unknown || cloneUsageLimitPlanRanges(defaultUsageLimitPlanRanges);
   for (const rawType of detectedTypes) {
     const subscriptionType = normalizeSubscriptionType(rawType);
     if (subscriptionType !== "unknown" && !merged[subscriptionType]) {
-      merged[subscriptionType] = cloneUsageLimitPlanRanges(fallback);
+      merged[subscriptionType] = deriveMonthlyUsageLimitRange(fallback);
     }
   }
-  merged.unknown = cloneUsageLimitPlanRanges(fallback);
+  merged.unknown = deriveMonthlyUsageLimitRange(fallback);
   return merged;
 }
 

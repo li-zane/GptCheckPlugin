@@ -207,3 +207,74 @@
 - Live sub2api usage for that account returns monthly-style window data with `utilization=100`, reset in July, and `window_stats.cost=0` for both the reused 5h display path and 7d/month path.
 - The plugin already treats monthly `cost=0` plus nonzero percent as missing cost data by clearing `raw_spent`, but it then filled `estimate_spent` from `estimated_limit * used_percent`, which made the UI show `$200` as used even though sub2api has no `$200` cost record.
 - Correct behavior: keep official percent, estimated total, remaining, and rate-limit status, but leave spent/estimate_spent null when there is no actual cost record. This avoids presenting an inferred monthly total as real usage.
+
+## OAuth Account Identity Display (2026-07-13)
+
+- The accounts API currently exposes only the normalized email, even though sub2api keeps a separate top-level account `name`; the frontend therefore cannot distinguish names from emails.
+- Email must remain the stable identity for OAuth refresh, mailbox lookup, deduplication, and deletion. The account name is display/search metadata only.
+- Name extraction should use an explicit allowlist of name fields and fall back to the normalized email only when constructing the API response.
+
+## Plus Weekly Window and Sample Management (2026-07-13)
+
+- The current `_window_kind()` promotes a `seven_day` window to `monthly` whenever parsed window minutes exceed `MONTHLY_WINDOW_MINUTES_THRESHOLD`; this can misclassify a weekly Plus entitlement when the upstream reset timestamp is farther away than a normal seven-day duration.
+- x1 is currently on commit `5151aa7`; both backend and frontend services are active. Its only visible worktree item is the pre-existing untracked `01-login.png`, which must be preserved during deployment.
+- The first remote inventory found no database under `/root/apps/GptCheckPlugin/data`; the configured production database location needs to be resolved from service/environment configuration without printing secret values.
+- `/root/apps/GptCheckPlugin/data` does exist, but the earlier file probe was invalidated by zsh glob parsing. The systemd unit has the expected working directory and no separately reported `EnvironmentFiles` entry.
+- Production uses SQLite at `/root/apps/GptCheckPlugin/data/sub2api_at_guardian.db`.
+- The x1 sample inventory contains 37 Plus `seven_day` rows ranging from `$102.8586` to `$310.7235`; exactly seven rows exceed `$200` (IDs 1696, 1889, 2659, 2679, 2692, 2702, and 2770). These are the confirmed cleanup set, pending backup and post-delete verification.
+- Team samples are already separated into monthly and seven-day cohorts. The requested non-Team monthly default rule should not relabel actual Plus windows; it only defines the fallback monthly range if a non-Team monthly window is ever observed.
+- x1 currently has two Plus accounts. Both upstream windows report `window_minutes=10080` (exactly seven days) with resets on 2026-07-20, but the estimator returns `five_hour.window_kind=monthly` and `seven_day.window_kind=monthly` for both.
+- The direct cause is the plan-agnostic branch in `_estimate_window_values()`: any seven-day window is promoted to monthly when `_account_has_no_independent_five_hour()` is true. The five-hour fallback repeats the same promotion.
+- Correct classification needs the normalized subscription type: Plus should retain `seven_day`, its missing 5h slot should remain `none`, while Team can retain the legacy monthly-only inference. Explicit upstream monthly aliases remain authoritative for any plan.
+- Current quota defaults use `$100-$140` weekly and `$100-$300` monthly for every plan. To make the non-Team monthly rule stable for future types and setting edits, backend normalization should derive non-Team monthly bounds from `seven_day * 4`; Team keeps an independently configurable monthly range.
+- `_usage_window_data()` already identifies explicit monthly aliases separately. Therefore the safe order is: explicit monthly alias wins for every plan; otherwise only Team may infer monthly from a missing 5h or monthly-sized legacy window; non-Team plans retain the upstream seven-day kind.
+- Existing Team regression tests cover missing-5h monthly inference and explicit `monthly` payloads, so Plus-focused tests can be added without weakening Team behavior.
+- The settings UI currently exposes independent monthly inputs for every plan. It should show non-Team monthly values as derived/read-only and update them immediately when the weekly bounds change; Team retains editable monthly inputs.
+- The samples table already has a dense, horizontally scrollable layout. A final compact action column using the existing icon-button pattern is sufficient; no new card or dialog is needed. Deletion should use the existing confirmation pattern and refresh samples only after the authenticated API succeeds.
+- `runAction()` reloads the general dashboard but not sample data, so sample deletion needs to explicitly call `loadUsageLimitSamples()` in its action.
+- The deletion route is ordered before the generic `/{account_id}` route, uses ORM primary-key lookup, requires `require_admin`, validates `sample_id >= 1`, and returns 404 without mutating when absent.
+- Initial delete-button styling referenced a nonexistent `--danger` token; corrected it to the existing theme-safe `--danger-ink` token before visual testing.
+- Regression coverage now targets the exact x1 Plus shape (`5h=0`, `7d=10080`), asserts the upstream reset fields survive, and ensures new samples remain in the `seven_day` cohort. Separate tests preserve Team monthly overrides and delete-endpoint commit/404 behavior.
+- Playwright exposed an existing coupling: a failed usage-estimate request set `usageError`, and the shared effect returned before loading the independent samples endpoint. The sample load is now evaluated first, so the samples page remains operable even if sub2api usage is temporarily unavailable.
+- The browser console errors in the isolated preview are expected initial 401 probes and unavailable fake-sub2api 502 responses; they are not caused by the new deletion API.
+- End-to-end deletion behavior is correct: confirmation precedes the request, success notice includes the sample ID, and the samples endpoint is reloaded so the tab count and table update immediately.
+- Settings behavior matches the invariant: non-Team monthly fields are read-only and reactively follow weekly edits at exactly 4x; Team's monthly fields remain editable.
+- Visual review of `output/playwright/plus-settings-mobile.png` confirms the existing dense operations-console hierarchy is preserved: plan labels, weekly inputs, and derived monthly inputs remain readable at 390px with no overlap or clipped controls.
+- Mobile samples verification found a real responsive defect: the inner table wrapper is 312px wide with a 1030px scroll area, but the document itself expands to 1005px. The samples panel/grid needs `min-width: 0` containment so horizontal scrolling stays inside `.table-wrap`.
+- Computed ancestry confirmed `.table-wrap` already clips correctly at 312px. The remaining 1005px document width matched the absolutely positioned `.sr-only` span in the far-right action header, which escaped the inner scroll geometry. Replacing it with a visible compact `操作` header keeps semantics and containment.
+- Visual review of `plus-samples-mobile-fixed.png` confirms the samples hero, tab matrix, calibration card, and table viewport fit cleanly at 390px; wide columns remain intentionally available through inner horizontal scrolling.
+- Live security checks against the isolated backend returned the expected status matrix: unauthenticated delete `401`, invalid ID `0` returns `422`, and authenticated missing ID returns `404` without mutation.
+- Final code review confirms the earlier account-name/email work is part of the same uncommitted working tree and will be included in this requested commit/deployment; no generated preview database or screenshots are tracked.
+
+## 2026-07-13 API Key Upstream Account Management
+
+- The current worktree already contains substantial uncommitted changes from an earlier task; they must be preserved and reviewed for overlap before editing shared account/API/UI files.
+- The requested reference task ID is not directly readable through the Codex thread API so far; the recent-task index only returned this current task because the reference ID appears in its prompt.
+- Required external behavior: discover upstream group multipliers and balance, combine the selected upstream multiplier with a recharge multiplier, and synchronize the resulting billing multiplier to a corresponding sub2api account.
+- The plugin backend is healthy at `http://127.0.0.1:8000/api/health` and the frontend is healthy at `http://127.0.0.1:5173`.
+- `127.0.0.1:18080` is currently unreachable even though older project notes used that port; live sub2api discovery must use the persisted runtime settings or a fresh scan.
+- `npx` is installed at `C:\Program Files\nodejs\npx.ps1`, satisfying the Playwright CLI prerequisite.
+- The authenticated plugin settings endpoint reports the live sub2api base URL as `http://127.0.0.1:18082/api/v1`, discovered automatically; `/admin/accounts` returned the expected unauthenticated 401 during discovery.
+- The plugin currently has no persisted sub2api `x-api-key`, so authenticated account reads/writes require locating the already-running local service's management credential without exposing it.
+- The existing `Sub2ApiClient` already lists groups from `/admin/groups/all` with `/admin/groups` fallback and creates accounts with a default `rate_multiplier: 1`; this is the likely write field for the requested billing multiplier.
+- The app uses one encrypted `AppSetting` store for runtime secrets, an authenticated `/api` router, and a single React `View`/navigation shell, so the new feature can fit existing security and UI patterns without a second settings system.
+- Port `18082` is Docker container `sub2api-r2-preview-app`, built from `Wei-Shaw/sub2api`; its source checkout is available at `C:\Users\zanez\Documents\agents_playground\sub2api` and its bound data directory is `sub2api\deploy\data`.
+- The container environment exposes no plaintext admin API-key variable. Existing authentication must be obtained through the product's own login/key-management path or an already configured credential; secrets must not be scraped into logs.
+- `/openapi.json` returns a non-OpenAPI document and the API-prefixed variants return 404, so local source routes are the authoritative contract for this preview build.
+- Local sub2api accepts `rate_multiplier` as a pointer field in `PUT /api/v1/admin/accounts/:id`; values below zero are rejected and omitted fields remain unchanged.
+- Local sub2api exposes `GET /api/v1/admin/accounts/:id/balance`, which fetches the account internally and calls `QueryUpstreamBalance`, keeping stored credentials server-side.
+- The local sub2api worktree already extends balance probing for OpenAI/Anthropic/Gemini/Antigravity/Grok API-key accounts, tries New API-compatible usage/balance endpoints, normalizes quota points at `500000` points per USD, and returns sanitized statuses/messages.
+- Admin sub2api requests support either `x-api-key` or an administrator JWT. Reusing the server-side balance endpoint avoids storing or transmitting an additional copy of each upstream API key in this plugin.
+- The sibling sub2api checkout is dirty with unrelated user work; it is reference/runtime scope only and must not be modified by this task.
+- The referenced Codex task was recovered from `C:\Users\zanez\.codex\sessions\2026\07\03\rollout-2026-07-03T23-38-11-019f28a1-41ae-7332-8f18-f022e15a2d62.jsonl` after thread APIs rejected the ID.
+- Confirmed multiplier formula from that task: `sub2api_account_rate = upstream_group_rate * local_balance_recharge_multiplier / upstream_balance_recharge_multiplier`, rounded to four decimal places.
+- Upstream recharge multiplier precedence is discovered value, then manually saved value, then a `1.0` default. The default must retain an explicit default source/status and must never be persisted or presented as discovered.
+- `upstream-ops` v0.0.6 (`6b90a4f`) confirms the source Sub2API user APIs: `/auth/me` for balance, `/payment/checkout-info` for `balance_recharge_multiplier`, `/groups/available` for base group rates, and `/groups/rates` for user-specific overrides.
+- For New API/One API sources, status/self/groups endpoints use `quota_per_unit`, `price`, user quota, and `{groupName: {ratio, desc}}`; the adapter must skip nonnumeric ratios such as `auto`.
+- Recharge detection failures must keep the last applied sub2api rate unchanged. Falling back to raw group ratio and writing it would silently misbill users.
+- The local target sub2api currently contains 43 accounts, including 24 API-key accounts across OpenAI and Anthropic, with account `rate_multiplier` values already in use. The new page must import/list these without changing them until an explicit successful sync.
+- Existing sub2api account responses omit the stored `api_key` while exposing non-sensitive credential fields such as `base_url`; legacy accounts therefore require an explicit one-time key binding before direct upstream group/recharge discovery.
+- Chosen model boundary: one local managed row per unique `sub2api_account_id`, with encrypted upstream key, normalized upstream URL, selected group, last successful non-secret rate/balance snapshot, source/status/error fields, and timestamps.
+- Chosen source behavior: balance can be refreshed through the target sub2api's server-side `/accounts/:id/balance` even before a key is bound locally; group and recharge discovery use a site adapter only after key binding.
+- Chosen apply behavior: calculate with `Decimal`, reject nonpositive recharge multipliers, quantize half-up to four decimals, and write through sub2api bulk-update only after all required source values are valid.
+- Security review requirements applied: all routes require the existing admin session; no full key/ciphertext in API responses, logs, DOM, or errors; outbound URLs reject unsafe schemes/private targets; redirects and environment proxies are disabled; response sizes and timeouts are bounded.

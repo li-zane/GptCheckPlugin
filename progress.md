@@ -231,3 +231,78 @@
 - Restarted `gptcheckplugin.service`; `systemctl is-active` reports `active` and `/api/health` returns `{"status":"ok"}`.
 - Adjusted frontend quota wording so monthly-only accounts display `未用` instead of `月剩余`, and missing remaining-percent fallback shows `-` instead of `缺少已用百分比`. Frontend build and `git diff --check` passed, then `gptcheckplugin-frontend.service` was restarted and returned HTTP 200.
 - Fixed account-row rate-limit badges for monthly-only accounts: display-only rate-limit windows now collapse duplicated 5h/7d monthly signals into one `月限流` badge, using the existing orange `warn` badge tone. Frontend build and `git diff --check` passed, then `gptcheckplugin-frontend.service` was restarted and returned HTTP 200.
+
+## 2026-07-13 OAuth Account Identity Display
+
+- Added explicit sub2api account-name extraction without changing email-based OAuth identity handling.
+- Added `account_name` to the accounts API/frontend contract, including snapshot and missing-name email fallbacks.
+- Updated the account table to show a copyable name above a separately copyable email, and included names in account search.
+- Verification passed: 41 backend tests, backend compileall, frontend production build, and `git diff --check`.
+- Playwright confirmed independent name/email clipboard values, name-based search, non-overlapping stacked rows, and document widths matching the 1440px desktop and 390px mobile viewports.
+
+## 2026-07-13 Plus Weekly Window and Sample Management
+
+- Started x1 read-only inventory and traced the local window-classification path.
+- Confirmed x1 services are active at `5151aa7` and recorded the pre-existing untracked screenshot for preservation.
+- Logged the failed optional `data` directory assumption; database discovery is the next step.
+- Replaced a second nested-quote failure with a plan to use base64-encoded read-only Python for remote inspection.
+- Resolved the production SQLite path and inventoried samples without exposing account emails or credentials.
+- Confirmed seven anomalous Plus 7d samples above `$200`; no rows have been deleted yet.
+- Queried x1 estimator output without emails/tokens and reproduced the Plus misclassification: exact 7-day windows were shown as monthly because Plus no longer has a 5h window.
+- Completed Phase 1 and selected plan-aware classification plus backend-enforced non-Team monthly derivation.
+- Reviewed the settings and samples UI integration points and selected a compact row action plus read-only derived monthly controls.
+- Implemented plan-aware window classification, backend/frontend non-Team monthly derivation, and the authenticated single-sample deletion flow.
+- Completed the first diff/security pass; corrected the delete action color token before tests.
+- Logged and corrected Windows/no-match test-search command issues before editing regression coverage.
+- Added Plus weekly-window/sample, non-Team monthly-derivation, Team override, and sample-delete regression tests; updated one expected old-bound assertion after the first targeted run.
+- Targeted backend suite passed 42 tests; frontend TypeScript/Vite production build, backend compileall, and diff check passed.
+- Completed Phases 2-4. Browser verification and the full security/regression suite remain before commit/deployment.
+- Restarted the isolated `APP_ENV=test` preview backend on the new code and seeded one disposable Plus 7d sample (ID 1) in `output/codex-preview.db` for real API/UI deletion verification; project `.env` remains absent.
+- Verified `npx` and Playwright CLI availability; documented the Windows/WSL wrapper incompatibility and switched to the wrapper-equivalent direct CLI invocation.
+- Opened the isolated preview in Playwright session `plus-samples` and captured the fresh login snapshot; no production browser/session is being used.
+- Logged into the isolated preview with the test admin key and confirmed the authenticated dashboard rendered before navigating to samples.
+- Opened the samples page; the shell and new explanatory text rendered, but sample tabs were not yet present in the immediate snapshot, so API/console state is being checked before interaction.
+- Diagnosed and fixed sample loading being blocked by an unrelated usage-estimate error in the isolated environment; samples now load independently.
+- Reloaded the authenticated preview after the effect fix; the application shell remains healthy and the session cookie persisted.
+- Reopened samples successfully: the real endpoint now loads independently, reports the disposable row under `7d · Plus` (not monthly), and includes the accessible operation column.
+- Selected `7d · Plus` and confirmed the real row shows its weekly calibration, reset timestamp, and accessible `删除额度样本 1` action.
+- Playwright verified the explicit irreversible confirmation text, accepted it, received `已删除额度样本 #1`, and observed the Plus 7d count/table refresh from 1 to 0 through the real DELETE endpoint.
+- Settings snapshot confirms Plus/Pro/Free/K12/Unknown monthly bounds render as disabled derived `$400-$560`, while Team monthly remains independently editable at `$100-$300`.
+- Editing Plus weekly bounds to `$125-$150` immediately updated the disabled monthly bounds to `$500-$600`, confirming the 4x derivation before save.
+- Captured the full settings page at 390×844; Playwright reports document width exactly 390px with no page-level horizontal overflow.
+- Visually inspected the mobile screenshot; quota rows remain legible and controls do not overlap.
+- Seeded a second disposable row for mobile samples layout verification; refreshed stale Playwright refs after the viewport changed the compact navigation markup.
+- Opened the samples page in the 390px viewport; the compact navigation and horizontally scrollable samples table remain contained within the viewport.
+- Refreshed sample data in the mobile viewport and confirmed the disposable row appears under `7d · Plus` while the monthly Plus tab remains zero.
+- Captured `plus-samples-mobile.png`; Playwright measured unintended page-level width 1005px, so mobile containment requires one CSS correction before acceptance.
+- Added `min-width: 0` to the samples grid panels so the wide table contributes to its own scroll container rather than the page's intrinsic width.
+- First containment attempt was insufficient; Playwright still measured 1005px document width, so computed overflow ancestry is being inspected before another change.
+- Isolated the overflow to the action header's absolutely positioned screen-reader span and replaced it with a visible `操作` label; kept the defensive `min-width: 0` grid containment.
+- Retest passed: mobile document width is now exactly 390px while the 1030px table remains independently scrollable inside its 312px container; captured the fixed screenshot.
+- Visually inspected the fixed mobile samples screenshot and accepted the contained scrolling behavior.
+- Completed the live delete-endpoint authorization/validation matrix (401/422/404) and reviewed the full combined diff before the final regression suite.
+- First full-suite pass found one obsolete runtime-settings monthly expectation; updated it to verify persisted non-Team values are backend-derived at 4x weekly.
+- Final pre-commit verification passed: 46 backend tests, backend compileall, frontend production build, production dependency audit (0 vulnerabilities), diff check, and changed-line secret-pattern scan.
+- Full frontend dependency audit also reports 0 vulnerabilities; final 15-file source/test/plan diff is clean and contains no generated artifacts.
+- Completed Phase 5; only commit, x1 backup/deployment, confirmed seven-row cleanup, and production verification remain.
+- Closed the Playwright session and removed all disposable `preview-manual-delete%` rows from the isolated database; zero remain.
+
+## 2026-07-13 API Key Upstream Account Management
+
+- Started a new scoped change request while preserving the existing unfinished Plus/sample-management work and all current worktree edits.
+- Loaded the planning, frontend-design, and Playwright skill instructions.
+- Ran planning-session catchup and inspected the current branch/worktree state.
+- Attempted to read referenced Codex task `019f28a1-41ae-7332-8f18-f022e15a2d62`; direct task reads were rejected, so local/index recovery is next.
+- Verified the live plugin backend/frontend endpoints and the Playwright CLI prerequisite.
+- Confirmed the historical sub2api port `18080` is not currently reachable; runtime settings discovery is required before live account tests.
+- Authenticated to the local plugin with its current default development admin key and read only non-secret runtime settings.
+- Located the live sub2api at port `18082` and confirmed that no sub2api management key is currently saved in the plugin.
+- Mapped the current encrypted settings, API router, sub2api client, and React view/navigation integration points at a high level.
+- Identified the Docker-backed local sub2api source checkout and non-secret container/runtime metadata.
+- Confirmed the running preview build does not expose a usable unauthenticated OpenAPI contract; source-level route inspection is in progress.
+- Confirmed the exact sub2api account multiplier update and upstream balance endpoints from local source.
+- Reviewed the local sub2api balance-probe extension and selected its credential-isolating endpoint as the preferred balance source for this feature.
+- Recovered the referenced task from local Codex session storage and confirmed the multiplier formula plus upstream-recharge precedence rules.
+- Completed read-only analysis of `upstream-ops` v0.0.6 and mapped its New API/Sub2API adapters, API-key CRUD, target-account update flow, and known recharge-rate gap.
+- Used the existing local sub2api admin credential only in memory to inventory non-sensitive runtime data: 43 total accounts, 24 API-key accounts, and 10 groups.
+- Completed the feature boundary and security design: import existing remote accounts, explicitly bind missing upstream keys, preserve old rates on discovery failure, and calculate/write server-side only.

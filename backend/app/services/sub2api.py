@@ -49,6 +49,14 @@ ACCOUNT_EMAIL_PATHS = (
     ("user",),
     ("login",),
 )
+ACCOUNT_NAME_PATHS = (
+    ("name",),
+    ("account_name",),
+    ("accountName",),
+    ("profile", "name"),
+    ("extra", "name"),
+    ("credentials", "name"),
+)
 
 
 class Sub2ApiRequestError(RuntimeError):
@@ -1171,6 +1179,13 @@ class Sub2ApiClient:
             email = extract_email(_path_get(account, path))
             if email:
                 return email
+        return None
+
+    def account_name(self, account: dict[str, Any]) -> str | None:
+        for path in ACCOUNT_NAME_PATHS:
+            value = _path_get(account, path)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
         return None
 
     def account_status(self, account: dict[str, Any]) -> str | None:

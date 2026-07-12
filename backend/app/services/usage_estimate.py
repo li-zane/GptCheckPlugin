@@ -1452,6 +1452,7 @@ def _window_values(account: dict[str, Any], usage: dict[str, Any], window_key: s
         window_minutes = MONTHLY_WINDOW_MINUTES_THRESHOLD
     return {
         "window_data": window_data,
+        "monthly_alias": monthly_alias,
         "stats": stats,
         "extra": extra,
         "used_percent": used_percent,
@@ -1473,7 +1474,8 @@ def _estimate_window_values(
     values = _window_values(account, usage, window_key)
     account_values = _window_values(account, {}, window_key)
     window_kind = _window_kind(window_key, values, account_values)
-    if window_key == "seven_day" and window_kind == "seven_day" and (
+    can_infer_monthly = _plan_cohort_from_account(account) == "team"
+    if window_key == "seven_day" and window_kind == "seven_day" and can_infer_monthly and (
         _account_has_no_independent_five_hour(account, usage)
         or (_window_looks_monthly_quota(values) and not _account_has_independent_five_hour_quota(account, usage))
     ):
@@ -1487,8 +1489,16 @@ def _estimate_window_values(
     monthly_account_values = _window_values(account, {}, "seven_day")
     if (
         _window_kind("seven_day", monthly_values, monthly_account_values) == "monthly"
-        or (_window_looks_monthly_quota(monthly_values) and not _account_has_independent_five_hour_quota(account, usage))
-        or (_account_has_no_independent_five_hour(account, usage) and _window_has_quota_signal(monthly_values, monthly_account_values))
+        or (
+            can_infer_monthly
+            and (
+                (_window_looks_monthly_quota(monthly_values) and not _account_has_independent_five_hour_quota(account, usage))
+                or (
+                    _account_has_no_independent_five_hour(account, usage)
+                    and _window_has_quota_signal(monthly_values, monthly_account_values)
+                )
+            )
+        )
     ):
         return _monthly_values_with_fallback_spent(account, usage, monthly_values), monthly_account_values, "monthly"
     return values, account_values, window_kind
@@ -1733,6 +1743,10 @@ def _window_kind(window_key: str, values: dict[str, Any], fallback_values: dict[
     minutes = _window_minutes(values, fallback_values)
     if window_key == "five_hour" and minutes == 0:
         return "none"
+    if window_key == "seven_day" and (
+        bool(values.get("monthly_alias")) or bool(fallback_values and fallback_values.get("monthly_alias"))
+    ):
+        return "monthly"
     if window_key == "seven_day" and minutes is not None and minutes >= MONTHLY_WINDOW_MINUTES_THRESHOLD:
         return "monthly"
     return window_key

@@ -1093,6 +1093,7 @@ h2 {
 .usage-sample-window {
   display: grid;
   gap: 14px;
+  min-width: 0;
 }
 
 .usage-samples-note,
@@ -1178,7 +1179,16 @@ h2 {
 }
 
 .usage-sample-table {
-  min-width: 980px;
+  min-width: 1030px;
+}
+
+.usage-sample-delete {
+  color: var(--danger-ink);
+}
+
+.usage-sample-delete:hover,
+.usage-sample-delete:focus-visible {
+  background: var(--danger-bg);
 }
 
 .usage-sample-account {
@@ -1517,10 +1527,15 @@ table {
   background: var(--green-tint) !important;
 }
 
-.email-cell {
+.email-cell,
+.account-identity-cell {
   display: grid;
   gap: 6px;
   min-width: 0;
+}
+
+.account-identity-cell {
+  gap: 2px;
 }
 
 .copy-text-button {
@@ -1564,6 +1579,7 @@ table {
   white-space: nowrap;
 }
 
+.account-identity-copy-button,
 .account-email-copy-button {
   border-radius: 6px;
   margin-left: -4px;
@@ -1571,6 +1587,7 @@ table {
   width: 100%;
 }
 
+.account-identity-copy-button > span:first-child,
 .account-email-copy-button > span:first-child {
   overflow: hidden;
   overflow-wrap: normal;
@@ -1578,6 +1595,17 @@ table {
   white-space: nowrap;
 }
 
+.account-name-copy-button {
+  font-weight: 800;
+}
+
+.account-email-copy-button {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.account-identity-copy-button:hover,
+.account-identity-copy-button:focus-visible,
 .account-email-copy-button:hover,
 .account-email-copy-button:focus-visible {
   background: var(--green-tint);

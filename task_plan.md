@@ -278,3 +278,75 @@ Create a runnable sub2api companion plugin that monitors imported GPT accounts, 
 - [x] Confirm sub2api returns monthly `utilization=100` with `cost=0`, so the plugin only has a percent signal and no actual spent amount.
 - [x] Stop converting percent-only monthly quota signals into `estimate_spent=estimated_limit`.
 - [x] Compile/build-check backend and frontend.
+
+## OAuth Account Name and Email Identity (2026-07-13)
+
+- [x] Trace the sub2api account-name source through the accounts API and frontend table.
+- [x] Keep email as the OAuth identity while exposing a separate display-only account name.
+- [x] Show account name above email and make both values independently copyable.
+- [x] Verify backend tests, frontend build, search behavior, both copy actions, and desktop/mobile layouts.
+
+## Plus Weekly Window and Sample Management (2026-07-13)
+
+- [x] Phase 1: Inspect x1 Plus usage payloads, persisted samples, service state, and current refresh-window classification.
+- [ ] Phase 2: Correct Plus refresh-time/window handling so seven-day limits are not presented as monthly.
+- [x] Phase 2: Correct Plus refresh-time/window handling so seven-day limits are not presented as monthly.
+- [x] Phase 3: Derive non-Team monthly defaults from four times the corresponding weekly range.
+- [x] Phase 4: Add an authenticated, validated single-sample deletion API and a compact manual-delete control on the samples page.
+- [x] Phase 5: Add regression/security coverage and verify backend, frontend, desktop, and mobile behavior.
+- [ ] Phase 6: Commit the complete working tree, deploy safely to x1, remove only confirmed anomalous Plus 7d samples above $200, and verify production health/data.
+
+### Acceptance Criteria
+
+- Plus accounts without a 5h window still expose their upstream 7d reset as a weekly window, never a monthly label solely because the reset is more than seven days away.
+- Team monthly behavior remains unchanged; every non-Team subscription's default monthly lower/upper bounds equal four times its weekly defaults.
+- Administrators can delete one persisted usage-limit sample from the samples page after explicit confirmation.
+- The delete endpoint requires the existing admin session and accepts only a positive integer sample ID; missing rows return 404.
+- x1 Plus seven-day samples with observed limits above $200 are removed after a pre-delete inventory and post-delete verification.
+- The committed revision is deployed to x1 with healthy backend/frontend services and no credential disclosure.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| First x1 inventory stopped after `find data` returned no matches, so the sample query did not run. | 1 | Keep the read-only inventory but remove `&&` dependence on optional directories; discover the configured database path before querying. |
+| Remote zsh rejected a nested double-quoted `lsof`/environment probe. | 1 | Avoid compound shell quoting and use separate simple SSH commands plus a base64-encoded Python read-only probe. |
+| First base64 Python probe could not import `app` from the repository root. | 1 | Reran the same read-only script with `PYTHONPATH=backend`, matching the systemd app-dir layout. |
+| A combined settings/CSS inspection returned exit 1 because the final CSS search pattern had no match. | 1 | Retained the successful file output and reran a focused search using the actual `usage-sample-*` class names. |
+| Two parallel test-search batches failed because PowerShell does not expand `backend\\test*.py` for `rg`, then because one no-match `rg` caused the aggregate call to fail. | 1-2 | Switched to direct file reads and `rg -g 'test*.py'` commands that tolerate no-match results. |
+| First targeted test run retained an obsolete assertion that a `$200` Plus monthly sample meets the old `$100` lower bound. | 1 | Updated the boundary test to the new derived `$400` lower bound (`399.99` rejected, `400` accepted). |
+
+## Change Request: API Key Upstream Account Management (2026-07-13)
+
+- [x] Phase 1: Recover the referenced Codex task context and inspect `bejix/upstream-ops`, the current repository, and the live local sub2api API.
+- [x] Phase 2: Define the persisted upstream API-key account model, balance/group-ratio discovery contract, and recharge-ratio-to-sub2api billing-ratio rule.
+- [ ] Phase 3: Implement authenticated backend CRUD, upstream probing/sync, safe secret handling, and sub2api ratio updates.
+- [ ] Phase 4: Add a dense API-key account management page consistent with the existing admin UI.
+- [ ] Phase 5: Add focused backend/frontend tests and verify against the running local sub2api plus representative upstream responses.
+- [ ] Phase 6: Run production builds, Playwright desktop/mobile flows, security checks, and record the final result.
+
+### Acceptance Criteria
+
+- Administrators can add, edit, test, sync, and remove upstream API-key accounts without exposing full API keys in responses or logs.
+- A sync reads the upstream site's available balance and group multiplier options, persists the selected/current values, and displays them on the management page.
+- The effective sub2api billing multiplier is derived deterministically from the upstream group multiplier and configured recharge multiplier, then written to the matching sub2api account.
+- Upstream failures are isolated per account and surfaced with actionable status without corrupting the last successful values.
+- The feature works with the locally running sub2api and remains responsive on desktop and mobile.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| `read_thread` rejected the referenced task ID, both with and without `hostId=local`. | 1-2 | Locate the task through Codex indexes/local task storage before relying on reconstructed repository history. |
+| Windows PowerShell does not support `Invoke-WebRequest -SkipHttpErrorCheck` in this environment. | 1 | Switched endpoint probing to `curl.exe` with status-only output. |
+| A parallel status probe aborted on the first unreachable URL. | 1 | Re-ran with `Promise.allSettled` so healthy and unavailable services were recorded independently. |
+| PowerShell 5 rejected piping a bare `foreach` expression in the OpenAPI probe. | 1 | Wrapped the loop in an array expression before JSON serialization. |
+| Initial sub2api source search included nonexistent top-level `internal` and `cmd` paths and returned exit 1 after useful matches. | 1 | Restricted subsequent searches to the actual `backend/internal` and `frontend` source roots. |
+| Tried to read nonexistent sub2api route file `backend/internal/server/routes/public.go`. | 1 | Use the actual split route files such as `auth.go` and `admin.go`. |
+| A JavaScript orchestration call referenced `commands` after declaring the array as `calls`. | 1 | Corrected the local variable name and reran the read-only source inspection. |
+| The current sub2api container logs no longer include the one-time generated administrator password. | 1 | Used the existing admin API key from the local database only in process memory; no secret was printed or persisted by the probe. |
+| Second targeted run found the same obsolete `$100` monthly expectation for a future subscription type. | 2 | Updated the future-type assertion to the derived `$400` fallback boundary. |
+| Playwright wrapper failed under Windows because `bash` resolved to WSL, first losing the Windows path and then rejecting the CRLF script. | 1-2 | Used the wrapper's documented underlying `npx --package @playwright/cli playwright-cli` command directly; CLI availability verified. |
+| First mobile navigation click used a stale desktop ref after viewport resize. | 1 | Captured a fresh mobile snapshot and switched to the current navigation ref before continuing. |
+| Adding `min-width: 0` to the sample panels alone did not contain the 1030px table; document width remained 1005px. | 1 | Inspect the exact overflowing DOM ancestors/computed grid sizes before the second CSS attempt. |
+| Full backend suite found a runtime-settings persistence test still expecting an explicitly supplied non-Team monthly upper bound of `$1000`. | 1 | Updated persistence expectations to prove backend normalization ignores stale monthly input and stores weekly×4 (`$1200-$1600`). |
