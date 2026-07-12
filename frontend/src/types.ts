@@ -46,6 +46,8 @@ export type Account = {
   subscription_cancels_at: string | null;
   subscription_billing_period: string | null;
   subscription_plan: string | null;
+  subscription_type: string;
+  subscription_label: string;
   has_active_subscription: boolean | null;
   phone_number: string | null;
   phone_sms_url: string | null;
@@ -242,6 +244,11 @@ export type AccountUsageEstimate = {
   sub2api_account_id: string | null;
   platform: string | null;
   account_type: string | null;
+  subscription_plan: string | null;
+  subscription_type: string;
+  subscription_label: string;
+  subscription_billing_period: string | null;
+  has_active_subscription: boolean | null;
   status: string | null;
   schedulable: boolean | null;
   deactive: boolean;
@@ -295,6 +302,8 @@ export type UsageLimitSample = {
   email: string | null;
   sub2api_account_id: string | null;
   plan_cohort: string;
+  subscription_type: string;
+  subscription_label: string;
   reset_key: string;
   reset_at: string | null;
   observed_limit: number;
@@ -309,6 +318,8 @@ export type UsageLimitWindowSamples = {
   label: string;
   plan_cohort: string;
   plan_label: string;
+  subscription_type: string;
+  subscription_label: string;
   calibration: UsageLimitCalibration;
   samples: UsageLimitSample[];
 };
@@ -317,8 +328,23 @@ export type UsageLimitSamples = {
   updated_at: string;
   target_sample_count: number;
   full_percent_threshold: number;
+  five_hour_threshold_percent: number;
+  seven_day_threshold_percent: number;
   windows: UsageLimitWindowSamples[];
 };
+
+export type UsageLimitRangeSettings = {
+  lower: number;
+  upper: number;
+};
+
+export type UsageLimitPlanRanges = {
+  five_hour: UsageLimitRangeSettings;
+  seven_day: UsageLimitRangeSettings;
+  monthly: UsageLimitRangeSettings;
+};
+
+export type UsageLimitDefaultRanges = Record<string, UsageLimitPlanRanges>;
 
 export type DeactivatedCleanupResult = {
   message: string;
@@ -346,6 +372,10 @@ export type AppSettings = {
   monitor_interval_seconds: number;
   usage_refresh_enabled: boolean;
   usage_refresh_interval_seconds: number;
+  usage_refresh_max_concurrency: number;
+  usage_limit_sample_five_hour_threshold_percent: number;
+  usage_limit_sample_seven_day_threshold_percent: number;
+  usage_limit_default_ranges: UsageLimitDefaultRanges;
   refresh_max_concurrency: number;
   protocol_refresh_max_concurrency: number;
   browser_refresh_max_concurrency: number;
@@ -370,6 +400,10 @@ export type AppSettingsUpdate = {
   monitor_interval_seconds?: number;
   usage_refresh_enabled?: boolean;
   usage_refresh_interval_seconds?: number;
+  usage_refresh_max_concurrency?: number;
+  usage_limit_sample_five_hour_threshold_percent?: number;
+  usage_limit_sample_seven_day_threshold_percent?: number;
+  usage_limit_default_ranges?: UsageLimitDefaultRanges;
   refresh_max_concurrency?: number;
   protocol_refresh_max_concurrency?: number;
   browser_refresh_max_concurrency?: number;

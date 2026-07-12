@@ -57,12 +57,16 @@ class Settings(BaseSettings):
     monitor_page_size: int = 100
     usage_refresh_enabled: bool = False
     usage_refresh_interval_seconds: int = 3600
+    usage_refresh_max_concurrency: int = 5
+    usage_limit_sample_five_hour_threshold_percent: float = 0.0
+    usage_limit_sample_seven_day_threshold_percent: float = 0.0
+    usage_limit_default_ranges_json: str = ""
     refresh_max_concurrency: int = 1
     protocol_refresh_max_concurrency: int | None = None
     browser_refresh_max_concurrency: int = 1
     browser_min_available_memory_mb: int = 500
     subscription_refresh_batch_size: int = 3
-    subscription_refresh_max_concurrency: int = 1
+    subscription_refresh_max_concurrency: int = 3
 
     playwright_headless: bool = True
     playwright_slow_mo_ms: int = 0

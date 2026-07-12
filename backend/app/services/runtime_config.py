@@ -19,6 +19,7 @@ from app.core.config import Settings, get_settings
 from app.core.crypto import decrypt_text, encrypt_text, redact
 from app.core.database import AsyncSessionLocal
 from app.models import AppSetting, utcnow
+from app.core.subscription_types import normalize_usage_limit_ranges
 
 
 KEY_SUB2API_BASE_URL = "sub2api_base_url"
@@ -28,6 +29,10 @@ KEY_SUB2API_AUTO_RECOVER_STATE = "sub2api_auto_recover_state"
 KEY_MONITOR_INTERVAL_SECONDS = "monitor_interval_seconds"
 KEY_USAGE_REFRESH_ENABLED = "usage_refresh_enabled"
 KEY_USAGE_REFRESH_INTERVAL_SECONDS = "usage_refresh_interval_seconds"
+KEY_USAGE_REFRESH_MAX_CONCURRENCY = "usage_refresh_max_concurrency"
+KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
+KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
+KEY_USAGE_LIMIT_DEFAULT_RANGES = "usage_limit_default_ranges"
 KEY_RECOVERY_ENABLED = "recovery_enabled"
 KEY_REFRESH_MAX_CONCURRENCY = "refresh_max_concurrency"
 KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY = "protocol_refresh_max_concurrency"
@@ -117,6 +122,33 @@ class RuntimeConfigService:
             self.settings.usage_refresh_interval_seconds,
         )
 
+    async def get_usage_refresh_max_concurrency(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_USAGE_REFRESH_MAX_CONCURRENCY),
+            self.settings.usage_refresh_max_concurrency,
+            1,
+            20,
+        )
+
+    async def get_usage_limit_sample_thresholds(self) -> dict[str, float]:
+        values = await self._load_values()
+        return {
+            "five_hour": _threshold_or_settings_default(
+                values.get(KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT),
+                self.settings.usage_limit_sample_five_hour_threshold_percent,
+            ),
+            "seven_day": _threshold_or_settings_default(
+                values.get(KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT),
+                self.settings.usage_limit_sample_seven_day_threshold_percent,
+            ),
+        }
+
+    async def get_usage_limit_default_ranges(self) -> dict[str, dict[str, dict[str, float]]]:
+        values = await self._load_values()
+        stored = values.get(KEY_USAGE_LIMIT_DEFAULT_RANGES)
+        return normalize_usage_limit_ranges(stored or self.settings.usage_limit_default_ranges_json)
+
     async def get_refresh_max_concurrency(self) -> int:
         return await self.get_protocol_refresh_max_concurrency()
 
@@ -201,6 +233,23 @@ class RuntimeConfigService:
                 values.get(KEY_USAGE_REFRESH_INTERVAL_SECONDS),
                 self.settings.usage_refresh_interval_seconds,
             ),
+            "usage_refresh_max_concurrency": _bounded_int_or_default(
+                values.get(KEY_USAGE_REFRESH_MAX_CONCURRENCY),
+                self.settings.usage_refresh_max_concurrency,
+                1,
+                20,
+            ),
+            "usage_limit_sample_five_hour_threshold_percent": _threshold_or_settings_default(
+                values.get(KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT),
+                self.settings.usage_limit_sample_five_hour_threshold_percent,
+            ),
+            "usage_limit_sample_seven_day_threshold_percent": _threshold_or_settings_default(
+                values.get(KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT),
+                self.settings.usage_limit_sample_seven_day_threshold_percent,
+            ),
+            "usage_limit_default_ranges": normalize_usage_limit_ranges(
+                values.get(KEY_USAGE_LIMIT_DEFAULT_RANGES) or self.settings.usage_limit_default_ranges_json
+            ),
             "refresh_max_concurrency": _bounded_int_or_default(
                 values.get(KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY) or values.get(KEY_REFRESH_MAX_CONCURRENCY),
                 self._default_protocol_refresh_max_concurrency(),
@@ -276,6 +325,35 @@ class RuntimeConfigService:
                     db,
                     KEY_USAGE_REFRESH_INTERVAL_SECONDS,
                     str(int(payload["usage_refresh_interval_seconds"])),
+                )
+
+            if payload.get("usage_refresh_max_concurrency") is not None:
+                await self._put(
+                    db,
+                    KEY_USAGE_REFRESH_MAX_CONCURRENCY,
+                    str(int(payload["usage_refresh_max_concurrency"])),
+                )
+
+            if payload.get("usage_limit_sample_five_hour_threshold_percent") is not None:
+                await self._put(
+                    db,
+                    KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT,
+                    _format_number(float(payload["usage_limit_sample_five_hour_threshold_percent"])),
+                )
+
+            if payload.get("usage_limit_sample_seven_day_threshold_percent") is not None:
+                await self._put(
+                    db,
+                    KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT,
+                    _format_number(float(payload["usage_limit_sample_seven_day_threshold_percent"])),
+                )
+
+            if payload.get("usage_limit_default_ranges") is not None:
+                normalized_ranges = normalize_usage_limit_ranges(payload["usage_limit_default_ranges"])
+                await self._put(
+                    db,
+                    KEY_USAGE_LIMIT_DEFAULT_RANGES,
+                    json.dumps(normalized_ranges, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
                 )
 
             if payload.get("sub2api_auto_recover_state") is not None:
@@ -477,6 +555,8 @@ class RuntimeConfigService:
         return decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY)) or self._env_x_api_key() or None
 
     def _persist_settings_file(self, settings: dict[str, Any], x_api_key: str | None) -> None:
+        if self.settings.app_env == "test":
+            return
         path = self.settings.project_root / ".env"
         values: dict[str, str | None] = {
             "APP_NAME": str(settings["site_name"]),
@@ -487,6 +567,19 @@ class RuntimeConfigService:
             "MONITOR_INTERVAL_SECONDS": str(int(settings["monitor_interval_seconds"])),
             "USAGE_REFRESH_ENABLED": _env_bool(bool(settings["usage_refresh_enabled"])),
             "USAGE_REFRESH_INTERVAL_SECONDS": str(int(settings["usage_refresh_interval_seconds"])),
+            "USAGE_REFRESH_MAX_CONCURRENCY": str(int(settings["usage_refresh_max_concurrency"])),
+            "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(
+                float(settings["usage_limit_sample_five_hour_threshold_percent"])
+            ),
+            "USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT": _format_number(
+                float(settings["usage_limit_sample_seven_day_threshold_percent"])
+            ),
+            "USAGE_LIMIT_DEFAULT_RANGES_JSON": json.dumps(
+                settings["usage_limit_default_ranges"],
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
             "REFRESH_MAX_CONCURRENCY": str(int(settings["protocol_refresh_max_concurrency"])),
             "PROTOCOL_REFRESH_MAX_CONCURRENCY": str(int(settings["protocol_refresh_max_concurrency"])),
             "BROWSER_REFRESH_MAX_CONCURRENCY": str(int(settings["browser_refresh_max_concurrency"])),
@@ -609,6 +702,32 @@ def _bounded_int_or_default(value: str | None, default: int, minimum: int, maxim
     if result > maximum:
         return maximum
     return result
+
+
+def _float_or_default(value: str | None, default: float) -> float:
+    try:
+        return float(value) if value is not None else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _bounded_float_or_default(value: str | None, default: float, minimum: float, maximum: float) -> float:
+    result = _float_or_default(value, default)
+    if result < minimum:
+        return minimum
+    if result > maximum:
+        return maximum
+    return result
+
+
+def _threshold_or_settings_default(value: str | None, settings_default: float) -> float:
+    if value is None:
+        return _bounded_float_or_default(None, settings_default, 0.0, 100.0)
+    return _bounded_float_or_default(value, 0.0, 0.0, 100.0)
+
+
+def _format_number(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
 
 
 def _bool_or_default(value: str | None, default: bool) -> bool:

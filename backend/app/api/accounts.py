@@ -323,6 +323,14 @@ def _merge_subscription_metadata(primary: dict[str, Any], fallback: dict[str, An
     return {key: primary.get(key) if primary.get(key) is not None else fallback.get(key) for key in _SUBSCRIPTION_KEYS}
 
 
+def _subscription_type_metadata(subscription_metadata: dict[str, Any]) -> dict[str, str]:
+    subscription_type = _normalize_plan_cohort(subscription_metadata.get("subscription_plan"))
+    return {
+        "subscription_type": subscription_type,
+        "subscription_label": _plan_cohort_label(subscription_type),
+    }
+
+
 def _snapshot_subscription_metadata(snapshot: AccountSnapshot | None) -> dict[str, Any]:
     if snapshot is None:
         return {key: None for key in _SUBSCRIPTION_KEYS}
@@ -557,6 +565,7 @@ async def list_accounts(
     metadata = sub2api.account_duplicate_metadata(remote_accounts)
     duplicate_cleanup_ids = _deletable_duplicate_account_ids(remote_accounts, sub2api, metadata)
     delete_unlocked_ids = await _load_delete_unlocked_ids(db)
+    sample_thresholds = await get_runtime_config_service().get_usage_limit_sample_thresholds()
     rows: list[AccountOut] = []
     seen_remote_emails: set[str] = set()
     now = utcnow()
@@ -573,7 +582,7 @@ async def list_accounts(
         duplicate_group_size = int(item.get("duplicate_group_size", 1))
         duplicate_rank = int(item.get("duplicate_rank", 0))
         account_id = sub2api.account_id(account)
-        rate_limited_windows = account_rate_limited_windows(account)
+        rate_limited_windows = account_rate_limited_windows(account, sample_thresholds=sample_thresholds)
         remote_healthy = sub2api.account_looks_healthy(account)
         effective_deactive = _effective_deactive(sub2api, account, snapshot)
         remote_deactive = sub2api.is_deactive_account(account)
@@ -626,6 +635,7 @@ async def list_accounts(
                 phone_sms_url=phone_data.get("phone_sms_url"),
                 phone_sms_cdk=phone_data.get("phone_sms_cdk"),
                 phone_sms_recharge_url=phone_data.get("phone_sms_recharge_url"),
+                **_subscription_type_metadata(subscription_metadata),
                 **subscription_metadata,
             )
         )
@@ -634,7 +644,7 @@ async def list_accounts(
         normalized = snapshot.email.lower()
         if normalized in seen_remote_emails:
             continue
-        rate_limited_windows = account_rate_limited_windows(snapshot.raw or {})
+        rate_limited_windows = account_rate_limited_windows(snapshot.raw or {}, sample_thresholds=sample_thresholds)
         account_id = snapshot.sub2api_account_id
         mailbox_bound = normalized in bound_emails
         phone_data = phone_by_email.get(normalized) or {}
@@ -651,6 +661,9 @@ async def list_accounts(
             is_duplicate=False,
         )
         delete_unlocked = bool(account_id and account_id in delete_unlocked_ids)
+        subscription_metadata = _merge_subscription_metadata(
+            _snapshot_subscription_metadata(snapshot), _subscription_metadata(snapshot.raw)
+        )
         rows.append(
             AccountOut(
                 id=snapshot.id,
@@ -679,7 +692,8 @@ async def list_accounts(
                 phone_sms_url=phone_data.get("phone_sms_url"),
                 phone_sms_cdk=phone_data.get("phone_sms_cdk"),
                 phone_sms_recharge_url=phone_data.get("phone_sms_recharge_url"),
-                **_merge_subscription_metadata(_snapshot_subscription_metadata(snapshot), _subscription_metadata(snapshot.raw)),
+                **_subscription_type_metadata(subscription_metadata),
+                **subscription_metadata,
             )
         )
 
@@ -703,6 +717,11 @@ async def usage_limit_samples(
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> UsageLimitSamplesOut:
+    runtime_config = get_runtime_config_service()
+    sample_thresholds = await runtime_config.get_usage_limit_sample_thresholds()
+    default_ranges = await runtime_config.get_usage_limit_default_ranges()
+    five_hour_threshold = sample_thresholds.get("five_hour") or LIMIT_SAMPLE_FULL_PERCENT
+    seven_day_threshold = sample_thresholds.get("seven_day") or LIMIT_SAMPLE_FULL_PERCENT
     windows: list[UsageLimitWindowSamplesOut] = []
     for window_key, metadata in SAMPLE_WINDOWS.items():
         result = await db.execute(
@@ -713,23 +732,29 @@ async def usage_limit_samples(
         rows = list(result.scalars().all())
         rows_by_cohort: dict[str, list[UsageLimitSample]] = {}
         for row in rows:
-            if not _usage_limit_sample_allowed(row.window_key, row.plan_cohort, row.observed_limit):
+            if not _usage_limit_sample_allowed(
+                row.window_key, row.plan_cohort, row.observed_limit, default_ranges
+            ):
                 continue
             cohort = _normalize_plan_cohort(row.plan_cohort)
             rows_by_cohort.setdefault(cohort, []).append(row)
 
-        cohort_names = set(_default_sample_plan_cohorts(window_key))
+        cohort_names = set(_default_sample_plan_cohorts(window_key, default_ranges))
         cohort_names.update(rows_by_cohort)
         for cohort in sorted(cohort_names, key=_plan_cohort_sort_key):
             cohort_rows = rows_by_cohort.get(cohort, [])
-            calibration = _limit_calibration(window_key, [row.observed_limit for row in cohort_rows], cohort)
-            default_lower, default_upper = _default_limit_bounds(window_key, cohort)
+            calibration = _limit_calibration(
+                window_key, [row.observed_limit for row in cohort_rows], cohort, default_ranges
+            )
+            default_lower, default_upper = _default_limit_bounds(window_key, cohort, default_ranges)
             windows.append(
                 UsageLimitWindowSamplesOut(
                     window_key=window_key,
                     label=metadata["label"],
                     plan_cohort=cohort,
                     plan_label=_plan_cohort_label(cohort),
+                    subscription_type=cohort,
+                    subscription_label=_plan_cohort_label(cohort),
                     calibration=UsageLimitCalibrationOut(
                         source=str(calibration["source"]),
                         sample_count=int(calibration["sample_count"]),
@@ -747,6 +772,8 @@ async def usage_limit_samples(
                             email=row.email,
                             sub2api_account_id=row.sub2api_account_id,
                             plan_cohort=_normalize_plan_cohort(row.plan_cohort),
+                            subscription_type=_normalize_plan_cohort(row.plan_cohort),
+                            subscription_label=_plan_cohort_label(row.plan_cohort),
                             reset_key=row.reset_key,
                             reset_at=row.reset_at,
                             observed_limit=row.observed_limit,
@@ -763,6 +790,8 @@ async def usage_limit_samples(
         updated_at=utcnow(),
         target_sample_count=LIMIT_SAMPLE_TARGET,
         full_percent_threshold=LIMIT_SAMPLE_FULL_PERCENT,
+        five_hour_threshold_percent=five_hour_threshold,
+        seven_day_threshold_percent=seven_day_threshold,
         windows=windows,
     )
 
@@ -791,9 +820,11 @@ async def sync_accounts(
     runtime_config = get_runtime_config_service()
     try:
         result = await get_monitor_service().sync_once(reason="manual")
+        subscription_protocol_limit = await runtime_config.get_subscription_refresh_batch_size()
+        subscription_max_concurrency = await runtime_config.get_subscription_refresh_max_concurrency()
         subscription_result = await refresh_subscriptions(
-            protocol_limit=await runtime_config.get_subscription_refresh_batch_size(),
-            max_concurrency=await runtime_config.get_subscription_refresh_max_concurrency(),
+            protocol_limit=subscription_protocol_limit,
+            max_concurrency=subscription_max_concurrency,
         )
         usage_result = await get_usage_refresh_service().refresh_all(reason="sync")
     except Sub2ApiRequestError as exc:
@@ -816,11 +847,15 @@ async def sync_accounts(
             "subscription_refreshed": subscription_result["refreshed"],
             "subscription_skipped": subscription_result["skipped"],
             "subscription_no_subscription_fields": subscription_result["no_subscription_fields"],
+            "subscription_protocol_attempts": subscription_result.get("protocol_attempts", 0),
+            "subscription_protocol_limit": subscription_protocol_limit,
+            "subscription_max_concurrency": subscription_max_concurrency,
             "subscription_failed": subscription_result["failed"],
             "usage_total": usage_result.total,
             "usage_refreshed": usage_result.refreshed,
             "usage_skipped": usage_result.skipped,
             "usage_failed": usage_result.failed,
+            "usage_max_concurrency": usage_result.max_concurrency,
         },
     )
     return result
@@ -1056,6 +1091,7 @@ async def refresh_usage_windows(
             "usage_refreshed": result.refreshed,
             "usage_skipped": result.skipped,
             "usage_failed": result.failed,
+            "usage_max_concurrency": result.max_concurrency,
         },
     )
     return UsageRefreshResult(

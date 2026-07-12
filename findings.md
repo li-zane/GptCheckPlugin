@@ -154,3 +154,56 @@
 - sub2api admin account payloads are redacted, so a local direct OpenAI RT refresh path is only feasible if the plugin securely caches GPT OAuth tokens from prior successful OAuth/browser refresh outcomes.
 - Minimal port strategy: store encrypted GPT `refresh_token` / `access_token` / `id_token` / `client_id` plus expiry on `account_snapshots`, then try local cached OpenAI RT refresh before falling back to sub2api check-status, plugin-visible AT checks, ChatGPT protocol login, and browser OAuth.
 - For no-mailbox accounts, monitor auto-queue logic must treat local cached GPT tokens as a protocol-capable recovery path; otherwise those accounts would still be skipped before the new RT/AT flow can run.
+## 2026-07-13: x1 Sync and Subscription Extensibility
+
+### Confirmed So Far
+
+- Current repository is clean on `main` at `55f34c7`, matching `origin/main`.
+- The repository is an application/browser-plugin-style project with `backend/` and `frontend/`; it is not a Codex plugin and has no `.codex-plugin/plugin.json`.
+- The user requires explicit K12 OAuth subscription handling plus forward-compatible type recognition, labels, filters, sample persistence, and settings-managed default quota ranges.
+- OAuth credentials and mailbox data are sensitive; implementation and tests must avoid printing access tokens, refresh tokens, authorization headers, cookies, passwords, and OTP codes.
+
+### Open Discovery
+
+- Resolve what host/path/branch the name `x1` maps to in this environment.
+- Determine the exact K12 plan string(s) emitted by sub2api/OpenAI and how existing plan values flow through the backend and frontend.
+- Determine whether x1 already contains compatible improvements that should be synced before extending the design.
+
+### x1 Source State
+
+- `x1` resolves to SSH host `154.12.51.74:54321` as `root`; the project is `/root/apps/GptCheckPlugin`.
+- x1 `main` is at `9270805`, one commit ahead of local `main`/`origin/main` (`55f34c7`).
+- Commit `9270805` adds the missing foundation: OAuth/token refresh paths, phone bindings, exception history, subscription refresh, subscription metadata, calibrated usage estimates/samples, and expanded account UI/settings.
+- x1 also has 17 modified/untracked worktree files. The code changes are concentrated in runtime configuration, usage estimation/samples, account schemas/routes, refresh services, and frontend types/UI/styles; these are likely the source for configurable quota intervals.
+- The x1 worktree is not clean, so fetching x1 Git `main` alone is insufficient. Sync must preserve both the committed commit and selected uncommitted source changes while excluding untracked screenshots, databases, `.env`, and secrets.
+
+### x1 Uncommitted Design Review
+
+- Runtime settings add usage-refresh concurrency and per-window sample trigger percentages; they do not yet expose per-subscription default quota ranges.
+- Usage estimation adds monthly-window handling, derived reset timestamps, threshold-driven sample capture, safer calibration clipping, and broader retained-sample calibration.
+- The committed cohort model remains centered on `plus`, `team`, and `unknown`, with hardcoded default limits. K12 and arbitrary future subscription values still need a generic normalization/configuration layer.
+- x1 tests materially expand estimator coverage and include a new runtime-config test file; these should be synced before local extensibility changes so the local implementation starts from the same tested baseline.
+
+### Extensible Subscription Design
+
+- Root cause: `_normalize_plan_cohort()` recognizes only Plus/Team/Pro/Free and converts every other non-empty plan string to `unknown`; `_usage_limit_sample_allowed()` then rejects `unknown`, so K12/future OAuth plans lose cohort identity and samples.
+- Monthly samples are additionally restricted to Team, which would discard a real monthly K12/future plan even when upstream provides a valid monthly window.
+- Introduce one canonical subscription type normalizer with explicit aliases for K12 and existing plans, plus a sanitized stable slug fallback for new non-sentinel plan strings.
+- API outputs should expose normalized `subscription_type` and `subscription_label` alongside raw `subscription_plan`; frontend labels and dynamic subscription filters should consume these normalized values.
+- Persist quota defaults as a validated runtime-settings map keyed by normalized subscription type, with independent `five_hour`, `seven_day`, and `monthly` lower/upper bounds. Include `unknown` as the configurable fallback and allow custom keys so future types do not require a release.
+- Sample rows continue using the existing indexed `plan_cohort` column for compatibility, but it stores the canonical subscription type; API responses add clearer subscription aliases without a destructive database migration.
+
+### Verification Outcome
+
+- x1 committed code was fast-forwarded to `9270805`; 15 selected x1 worktree files were copied byte-for-byte and hash-verified before local extension work.
+- K12 aliases and future plan strings now normalize centrally; unknown sentinel/missing values retain the explicit `unknown` fallback.
+- Per-type 5h/7d/month default ranges are validated, persisted in app settings, exported through `USAGE_LIMIT_DEFAULT_RANGES_JSON`, and consumed by estimator calibration/sample validation.
+- Playwright verified K12 range editing, custom `Enterprise Edu` creation as `enterprise-edu`, poll-resistant unsaved edits, and non-overlapping desktop/mobile layouts.
+- Security review found no new secret exposure. A compatible audit fix upgraded Vite 6.4.2 to 6.4.3 and patched Babel dependencies; final npm audit is clean.
+
+## 2026-06-08 Monthly Usage Missing Cost Display
+
+- Reported account `niubi963019@edu.aiceo.dev` maps to sub2api account `1056` and is a Team account.
+- Live sub2api usage for that account returns monthly-style window data with `utilization=100`, reset in July, and `window_stats.cost=0` for both the reused 5h display path and 7d/month path.
+- The plugin already treats monthly `cost=0` plus nonzero percent as missing cost data by clearing `raw_spent`, but it then filled `estimate_spent` from `estimated_limit * used_percent`, which made the UI show `$200` as used even though sub2api has no `$200` cost record.
+- Correct behavior: keep official percent, estimated total, remaining, and rate-limit status, but leave spent/estimate_spent null when there is no actual cost record. This avoids presenting an inferred monthly total as real usage.

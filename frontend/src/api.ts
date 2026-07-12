@@ -41,7 +41,7 @@ async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 30_0
   }).finally(() => window.clearTimeout(timeout));
 
   if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`;
+    let message = fallbackHttpErrorMessage(response);
     try {
       const data = await response.json();
       message = data.detail || data.message || message;
@@ -55,6 +55,15 @@ async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 30_0
     return undefined as T;
   }
   return (await response.json()) as T;
+}
+
+function fallbackHttpErrorMessage(response: Response) {
+  const statusText = response.statusText.trim();
+  const status = statusText ? `${response.status} ${statusText}` : `${response.status}`;
+  if (response.status >= 500) {
+    return `后端服务异常 (${status})，请查看后端日志。`;
+  }
+  return `请求失败 (${status})`;
 }
 
 export const api = {

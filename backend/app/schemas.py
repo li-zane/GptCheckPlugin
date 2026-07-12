@@ -1,7 +1,14 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+from app.core.subscription_types import (
+    MAX_SUBSCRIPTION_TYPES,
+    MAX_USAGE_LIMIT_VALUE,
+    SUBSCRIPTION_TYPE_UNKNOWN,
+    normalize_subscription_type,
+)
 
 
 class LoginRequest(BaseModel):
@@ -65,6 +72,8 @@ class AccountOut(BaseModel):
     subscription_cancels_at: str | None = None
     subscription_billing_period: str | None = None
     subscription_plan: str | None = None
+    subscription_type: str = SUBSCRIPTION_TYPE_UNKNOWN
+    subscription_label: str = "Unknown"
     has_active_subscription: bool | None = None
     phone_number: str | None = None
     phone_sms_url: str | None = None
@@ -136,6 +145,11 @@ class AccountUsageEstimateOut(BaseModel):
     sub2api_account_id: str | None
     platform: str | None
     account_type: str | None
+    subscription_plan: str | None = None
+    subscription_type: str = SUBSCRIPTION_TYPE_UNKNOWN
+    subscription_label: str = "Unknown"
+    subscription_billing_period: str | None = None
+    has_active_subscription: bool | None = None
     status: str | None
     schedulable: bool | None
     deactive: bool
@@ -191,6 +205,8 @@ class UsageLimitSampleOut(BaseModel):
     email: str | None
     sub2api_account_id: str | None
     plan_cohort: str
+    subscription_type: str
+    subscription_label: str
     reset_key: str
     reset_at: str | None
     observed_limit: float
@@ -205,6 +221,8 @@ class UsageLimitWindowSamplesOut(BaseModel):
     label: str
     plan_cohort: str
     plan_label: str
+    subscription_type: str
+    subscription_label: str
     calibration: UsageLimitCalibrationOut
     samples: list[UsageLimitSampleOut]
 
@@ -213,7 +231,26 @@ class UsageLimitSamplesOut(BaseModel):
     updated_at: datetime
     target_sample_count: int
     full_percent_threshold: float
+    five_hour_threshold_percent: float
+    seven_day_threshold_percent: float
     windows: list[UsageLimitWindowSamplesOut]
+
+
+class UsageLimitRangeSettings(BaseModel):
+    lower: float = Field(ge=0, le=MAX_USAGE_LIMIT_VALUE)
+    upper: float = Field(ge=0, le=MAX_USAGE_LIMIT_VALUE)
+
+    @model_validator(mode="after")
+    def validate_order(self) -> "UsageLimitRangeSettings":
+        if self.upper < self.lower:
+            raise ValueError("upper must be greater than or equal to lower")
+        return self
+
+
+class UsageLimitPlanRanges(BaseModel):
+    five_hour: UsageLimitRangeSettings
+    seven_day: UsageLimitRangeSettings
+    monthly: UsageLimitRangeSettings
 
 
 class MailboxImportRequest(BaseModel):
@@ -417,6 +454,10 @@ class AppSettingsOut(BaseModel):
     monitor_interval_seconds: int
     usage_refresh_enabled: bool
     usage_refresh_interval_seconds: int
+    usage_refresh_max_concurrency: int
+    usage_limit_sample_five_hour_threshold_percent: float
+    usage_limit_sample_seven_day_threshold_percent: float
+    usage_limit_default_ranges: dict[str, UsageLimitPlanRanges]
     refresh_max_concurrency: int
     protocol_refresh_max_concurrency: int
     browser_refresh_max_concurrency: int
@@ -441,6 +482,10 @@ class AppSettingsUpdate(BaseModel):
     monitor_interval_seconds: int | None = Field(default=None, ge=30, le=86_400)
     usage_refresh_enabled: bool | None = None
     usage_refresh_interval_seconds: int | None = Field(default=None, ge=60, le=86_400)
+    usage_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=20)
+    usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
+    usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
+    usage_limit_default_ranges: dict[str, UsageLimitPlanRanges] | None = None
     refresh_max_concurrency: int | None = Field(default=None, ge=1, le=50)
     protocol_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=50)
     browser_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=50)
@@ -449,6 +494,26 @@ class AppSettingsUpdate(BaseModel):
     subscription_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=20)
     display_timezone: str | None = Field(default=None, min_length=1, max_length=80)
     site_name: str | None = Field(default=None, min_length=1, max_length=80)
+
+    @field_validator("usage_limit_default_ranges")
+    @classmethod
+    def validate_usage_limit_default_range_keys(
+        cls,
+        value: dict[str, UsageLimitPlanRanges] | None,
+    ) -> dict[str, UsageLimitPlanRanges] | None:
+        if value is None:
+            return None
+        if len(value) > MAX_SUBSCRIPTION_TYPES:
+            raise ValueError(f"at most {MAX_SUBSCRIPTION_TYPES} subscription types are allowed")
+        normalized_keys: set[str] = set()
+        for key in value:
+            normalized = normalize_subscription_type(key)
+            if normalized == SUBSCRIPTION_TYPE_UNKNOWN and key.strip().lower() != SUBSCRIPTION_TYPE_UNKNOWN:
+                raise ValueError(f"invalid subscription type: {key}")
+            if normalized in normalized_keys:
+                raise ValueError(f"duplicate normalized subscription type: {normalized}")
+            normalized_keys.add(normalized)
+        return value
 
 
 class Sub2ApiPortScanResult(BaseModel):

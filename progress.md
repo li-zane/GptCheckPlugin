@@ -194,3 +194,40 @@
 - Updated monitor protocol-capability detection so accounts without mailbox credentials are still auto-queueable when the plugin has a local cached GPT RT/AT for that email.
 - Added local-token failure events and summary mapping so final account errors can now mention failed local cached OpenAI RT/AT paths before the existing mailbox/browser message.
 - Verified the backend with `.venv/bin/python -m compileall backend/app`, ran `init_db()` through the project virtualenv, confirmed migrated `account_snapshots` columns through SQLite `PRAGMA table_info`, and ran `git diff --check` successfully.
+## 2026-07-13
+
+- Started the x1 sync and extensible subscription handling request.
+- Read the required planning, existing-plugin update, and authentication security guidance.
+- Confirmed the current Git worktree is clean and synchronized with `origin/main`.
+- Confirmed this repository is not a Codex marketplace plugin, so Codex cachebuster/reinstall steps do not apply.
+- Added a six-phase implementation and verification plan; x1 source discovery is in progress.
+- Logged and corrected a failed all-files append caused by mismatched historical file anchors; no existing content was changed by that failed attempt.
+- Resolved `x1` to SSH host `154.12.51.74:54321` as `root`; the first remote discovery command was rejected by local/remote quote parsing and was replaced with a simpler single-quoted form.
+- Located the remote repository at `/root/apps/GptCheckPlugin`; simplified subsequent remote inspection after a zsh regex parse failure.
+- Fetched x1 `main` into local read-only tracking ref `x1/main` and compared it with local `main`.
+- Confirmed x1 has one large committed feature increment plus an uncommitted quota/settings/UI increment; no runtime data or secrets were fetched.
+- Fast-forwarded local `main` to x1 commit `9270805`; resolved append-only stash conflicts in the three planning files by preserving both histories.
+- Reviewed x1 uncommitted backend/tests: it adds concurrency, sample thresholds, monthly-window handling, reset materialization, and estimator corrections, but not configurable per-subscription quota ranges or K12/general type support.
+- Synced all selected x1 source/config/test files and verified all 15 SHA-256 hashes against x1; excluded planning files, screenshot, `.env`, databases, and output data.
+- Completed subscription-flow tracing and selected a centralized normalization plus structured runtime quota-range design; implementation is in progress.
+- Added centralized subscription normalization/default-range utilities, validated runtime settings persistence, normalized API fields, and estimator/sample integration. Backend compile and the new focused tests passed; one obsolete Team-only monthly assertion was identified for update.
+- Full backend suite (36 tests), compileall, frontend production build, and diff check passed. Playwright then exposed periodic settings-form reset during editing; implemented value-equality guarding for poll updates.
+- Playwright desktop/mobile verification passed after the polling fix and responsive refinement: K12 ranges remained editable, a future `Enterprise Edu` type normalized to `enterprise-edu`, all mobile windows were visible, and mobile document width matched the 390px viewport.
+- Final functional checks passed, while dependency audit found fixable Vite/Babel advisories; started a compatible `npm audit fix` remediation.
+- Applied the compatible dependency fix; final audit reports 0 vulnerabilities, frontend build passes on Vite 6.4.3, backend suite passes all 37 tests, compileall/diff checks pass, and no hardcoded secret patterns were found.
+- Completed all six phases of the x1 sync, K12/general subscription handling, configurable quota ranges, and verification request.
+- Closed the Playwright browser session, kept the isolated dev services healthy for user review, and removed the test-generated root `.env` after verifying it was created during this session.
+- Updated runtime settings persistence so `APP_ENV=test` never writes the project `.env`; development and production behavior remains unchanged, making the live preview fully isolated.
+- API smoke test persisted K12 `30-45` and custom `enterprise-edu` ranges correctly; centralized the test-environment file guard after startup scanning exposed a second `.env` persistence path.
+- Final rerun passed all 38 backend tests, compileall, zero-vulnerability npm audit, conflict/diff checks, and live frontend/backend health checks with no root `.env` present.
+
+## 2026-06-08
+
+- Investigated the monthly quota display problem for `niubi963019@edu.aiceo.dev` without printing secrets. Live sub2api usage reports `utilization=100` and `window_stats.cost=0` for the monthly window.
+- Found the backend estimator cleared `raw_spent` for monthly zero-cost/nonzero-percent windows, but then re-created `estimate_spent` as `estimated_limit * used_percent`, making the frontend display the inferred `$200` total as already used.
+- Patched `usage_estimate.py` so percent-only missing-cost windows keep `used_percent`, `estimated_limit`, `remaining`, and rate-limit state, but leave `estimate_spent` null with basis `percent_only_missing_usage`.
+- Rechecked the reported account through `build_usage_estimate(refresh=False)`: both monthly-backed 5h and 7d/month rows now return `raw_spent=null`, `estimate_spent=null`, `estimated_limit=200.0`, and `remaining=0.0` instead of `estimate_spent=200.0`.
+- Verification passed: `.venv/bin/python -m compileall backend/app`, `npm --prefix frontend run build`, a synthetic monthly missing-cost regression script, `UsageEstimateOut.model_validate`, and `git diff --check`.
+- Restarted `gptcheckplugin.service`; `systemctl is-active` reports `active` and `/api/health` returns `{"status":"ok"}`.
+- Adjusted frontend quota wording so monthly-only accounts display `未用` instead of `月剩余`, and missing remaining-percent fallback shows `-` instead of `缺少已用百分比`. Frontend build and `git diff --check` passed, then `gptcheckplugin-frontend.service` was restarted and returned HTTP 200.
+- Fixed account-row rate-limit badges for monthly-only accounts: display-only rate-limit windows now collapse duplicated 5h/7d monthly signals into one `月限流` badge, using the existing orange `warn` badge tone. Frontend build and `git diff --check` passed, then `gptcheckplugin-frontend.service` was restarted and returned HTTP 200.

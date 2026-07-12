@@ -234,3 +234,47 @@ Create a runnable sub2api companion plugin that monitors imported GPT accounts, 
 - [x] Enable SQLite busy timeout and WAL mode to reduce write-lock contention.
 - [x] Delay scheduled monitor sync briefly after startup so a failed port bind cannot enqueue refresh jobs before uvicorn exits.
 - [x] Terminate the stale backend process, restart `gptcheckplugin.service`, and verify health, port ownership, and refresh-job convergence.
+## Change Request: x1 Sync and Extensible Subscription Handling (2026-07-13)
+
+- [x] Phase 1: Locate the x1 project copy, compare it with this repository, and preserve local/user changes.
+- [x] Phase 2: Trace OAuth subscription detection, labels, filters, usage windows, sample persistence, and settings contracts.
+- [x] Phase 3: Sync the applicable x1 code into this project.
+- [x] Phase 4: Introduce forward-compatible subscription normalization with explicit K12 support and unknown-type fallback.
+- [x] Phase 5: Extend labels, filters, sample records, and settings-configurable default quota ranges for every detected type.
+- [x] Phase 6: Add focused backend/frontend tests, security checks, builds, and runtime UI verification.
+
+### Acceptance Criteria
+
+- K12 OAuth accounts are recognized and processed instead of falling through existing plan-specific logic.
+- Future subscription strings remain visible and usable through normalized type metadata and an `unknown`/derived fallback.
+- Subscription type is consistently represented in API responses, UI labels, filters, and persisted usage samples.
+- Default quota ranges are configurable per subscription type without code changes for newly discovered types.
+- Existing account/token secrets are not logged, exposed, or weakened by the implementation.
+
+### Errors Encountered
+
+- First multi-file append used an anchor that existed only in `progress.md`; `apply_patch` rejected the entire patch without modifying files. Resolved by using each file's actual final line.
+- First x1 discovery command failed before remote execution because nested PowerShell/zsh double quotes were unmatched. Switched to a single-quoted, simplified remote command.
+- Remote file-list filtering used a regex that zsh parsed incorrectly, causing that parallel read batch to fail. Removed remote regex/pipes and switched to simple Git commands plus local tree analysis.
+- Fast-forward to x1 `9270805` succeeded, but restoring the three planning files produced append/append conflicts. Resolved by retaining both x1 history and this task's appended sections.
+- PowerShell misparsed an unquoted `stash@{0}` during cleanup. Retried with a quoted stash reference, then unstaged the resolved planning files.
+- First estimator regression run had one expected failure because the old test required monthly samples to be Team-only. Updated the obsolete expectation and added K12/future-type coverage.
+- Full unittest discovery exposed a circular import because schema validation imported a module under `app.services`, whose package initializer imports monitor/schema code. Moved the pure module to `app.core.subscription_types`.
+- Playwright found that the existing 12-second dashboard poll replaced the settings object and reset unsaved form edits. Changed polling updates to preserve settings object identity when values are unchanged.
+- Final npm audit reported one high-severity Vite development-server issue and one low-severity Babel issue, both with a compatible non-force fix. Applying `npm audit fix` and re-verifying the build/audit.
+- Isolated API smoke testing showed startup port scanning also writes `.env`. Centralized the `APP_ENV=test` guard inside `_persist_settings_file()` so every persistence path is covered.
+
+### Final Verification
+
+- Backend: 38 unit tests passed; `compileall` passed.
+- Frontend: TypeScript/Vite production build passed with Vite 6.4.3.
+- Security: no hardcoded secret patterns found; `npm audit --omit=dev` reports 0 vulnerabilities.
+- UI: Playwright desktop/mobile snapshots passed; mobile document width equals the 390px viewport and all quota windows remain visible.
+- Runtime: isolated backend/frontend are healthy on `127.0.0.1:8000` and `127.0.0.1:5173`.
+
+## Fix: Monthly Usage Missing Cost Display
+
+- [x] Reproduce `niubi963019@edu.aiceo.dev` monthly-window output against live sub2api usage.
+- [x] Confirm sub2api returns monthly `utilization=100` with `cost=0`, so the plugin only has a percent signal and no actual spent amount.
+- [x] Stop converting percent-only monthly quota signals into `estimate_spent=estimated_limit`.
+- [x] Compile/build-check backend and frontend.

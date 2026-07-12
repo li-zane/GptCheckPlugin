@@ -167,11 +167,13 @@ gpt@example.com----mail@example.com----password----client_id----refresh_token---
 
 OAuth 写回会标准保存 `credentials.refresh_token`。如果原账号使用 `rt` 字段，或 sub2api 的隐藏敏感字段状态表明现有 RT 可能不是标准 `refresh_token` 字段，也会同步写入 `credentials.rt` 兼容旧数据。
 
-协议刷新并发和浏览器登录并发可以分开设置：`PROTOCOL_REFRESH_MAX_CONCURRENCY` 控制协议路径，`BROWSER_REFRESH_MAX_CONCURRENCY` 控制 Playwright 回退，旧的 `REFRESH_MAX_CONCURRENCY` 会作为协议并发的兼容默认值。
+用量查询、订阅查询和账号刷新并发可以分开设置：`USAGE_REFRESH_MAX_CONCURRENCY` 控制额度窗口查询并发，默认 `5`；`SUBSCRIPTION_REFRESH_MAX_CONCURRENCY` 控制订阅状态检查并发，默认 `3`；`PROTOCOL_REFRESH_MAX_CONCURRENCY` 控制协议路径，`BROWSER_REFRESH_MAX_CONCURRENCY` 控制 Playwright 回退，旧的 `REFRESH_MAX_CONCURRENCY` 会作为协议并发的兼容默认值。
+
+OAuth 订阅类型会统一规范化后用于账号标注、订阅筛选和额度样本。内置识别 Plus、Team、Pro、Free 与 K12；新的非空订阅类型会保留为稳定类型键，而不会被直接丢到 `unknown`。设置页的“订阅默认额度区间”可分别配置每种类型的 5h、7d 和月窗口上下界，也可新增未来订阅类型；`unknown` 是未返回套餐时的回退区间。对应环境变量为 `USAGE_LIMIT_DEFAULT_RANGES_JSON`，通常直接通过设置页维护即可。
 
 OpenAI OAuth 默认使用 Codex CLI 客户端配置：`OPENAI_OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann`，回调地址为 `http://localhost:1455/auth/callback`。后端会先用 `curl_cffi` 协议流程尝试获取 callback `code`，失败后再回退到浏览器流程；浏览器路径优先使用 Camoufox Firefox 持久化上下文，并复用 `data/browser-profiles/<email>/` 下的账号 profile，在进入 OAuth 页后先等待 Cloudflare challenge 清掉，再继续邮箱验证码与 consent 流程；若 Camoufox 当前不可用，再回退到普通 Playwright Chromium。浏览器路径会直接截获回调 URL 中的 `code`，不需要本机真的监听 `1455` 端口。
 
-管理面板保存运行设置时，会同步写入项目根目录 `.env`。这包括 sub2api 地址、x-api key、账号恢复任务总开关、刷新成功后的 sub2api 状态恢复开关、自动任务开关、并发数、浏览器内存阈值、显示时区和站点名；`.env` 已在 `.gitignore` 中，生产部署时建议把项目根目录或 `.env` 作为持久化配置挂载。
+管理面板保存运行设置时，会同步写入项目根目录 `.env`。这包括 sub2api 地址、x-api key、账号恢复任务总开关、刷新成功后的 sub2api 状态恢复开关、自动任务开关、并发数、用量样本阈值、浏览器内存阈值、显示时区和站点名；`.env` 和 `data/` 已在 `.gitignore` 中，生产部署时建议把项目根目录、`.env` 或 `data/` 作为持久化配置挂载，避免重新部署后运行设置回到默认值。
 
 ## 安全边界
 

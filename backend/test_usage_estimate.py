@@ -13,6 +13,7 @@ from app.services.usage_estimate import (
     account_rate_limited_windows,
     _aggregate_window,
     _limit_calibration,
+    _load_usage_limit_calibrations,
     _normalize_plan_cohort,
     _plan_cohort_from_account,
     _refreshed_window_state_values,
@@ -20,6 +21,7 @@ from app.services.usage_estimate import (
     _save_usage_limit_samples,
     _usage_limit_sample_updates,
     _usage_limit_sample_allowed,
+    _usage_token_window_observations,
     _window_effective_spent,
     _window_estimate,
     _window_reset_detected,
@@ -116,15 +118,15 @@ class UsageEstimateTests(unittest.TestCase):
         self.assertEqual(baseline_spent, 100.0)
         self.assertTrue(uses_delta)
 
-    def test_clipped_limit_reanchors_estimated_spend_to_official_percent(self) -> None:
+    def test_usage_derived_limit_is_clipped_to_calibration(self) -> None:
         window = _window_estimate(
             account={"email": "example@example.com", "status": "active", "schedulable": True},
             usage={
                 "seven_day": {
-                    "used_percent": 68.0,
+                    "used_percent": 70.0,
                     "remaining_seconds": 123,
                     "reset_at": "2026-06-06T03:12:17Z",
-                    "window_stats": {"cost": 181.6509213},
+                    "window_stats": {"cost": 112.0},
                 }
             },
             window_key="seven_day",
@@ -142,13 +144,46 @@ class UsageEstimateTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(window["estimated_limit"], 140.0)
-        self.assertAlmostEqual(window["spent"], 181.6509213)
-        self.assertAlmostEqual(window["estimate_spent"], 95.2)
-        self.assertAlmostEqual(window["remaining"], 44.8)
-        self.assertAlmostEqual(window["remaining_percent"], 32.0)
+        self.assertAlmostEqual(window["spent"], 112.0)
+        self.assertAlmostEqual(window["estimate_spent"], 112.0)
+        self.assertAlmostEqual(window["remaining"], 42.0)
+        self.assertAlmostEqual(window["remaining_percent"], 30.0)
         self.assertEqual(window["estimate_basis"], "official_window_clipped")
 
-    def test_clipped_five_hour_remaining_uses_official_unused_percent(self) -> None:
+    def test_usage_derived_limit_is_not_clipped_below_spent(self) -> None:
+        window = _window_estimate(
+            account={"email": "zacharybell2573@hotmail.com", "status": "active", "schedulable": True},
+            usage={
+                "seven_day": {
+                    "used_percent": 68.0,
+                    "remaining_seconds": 123,
+                    "reset_at": "2026-06-06T03:12:17Z",
+                    "window_stats": {"cost": 154.30},
+                }
+            },
+            window_key="seven_day",
+            account_key="id:zachary",
+            account_id="zachary",
+            email="zacharybell2573@hotmail.com",
+            plan_cohort="team",
+            usage_states={},
+            limit_calibrations={
+                "seven_day": {
+                    "team": {"lower": 100.0, "upper": 140.0, "mean": None, "sigma": None},
+                    "unknown": {"lower": 100.0, "upper": 140.0, "mean": None, "sigma": None},
+                },
+            },
+        )
+
+        expected_limit = 154.30 / 0.68
+        self.assertAlmostEqual(window["estimated_limit"], expected_limit)
+        self.assertAlmostEqual(window["spent"], 154.30)
+        self.assertAlmostEqual(window["estimate_spent"], 154.30)
+        self.assertAlmostEqual(window["remaining"], expected_limit * 0.32)
+        self.assertAlmostEqual(window["remaining_percent"], 32.0)
+        self.assertEqual(window["estimate_basis"], "official_window")
+
+    def test_five_hour_limit_clips_usage_derived_total_to_calibration(self) -> None:
         window = _window_estimate(
             account={"email": "example@example.com", "status": "active", "schedulable": True},
             usage={
@@ -156,7 +191,7 @@ class UsageEstimateTests(unittest.TestCase):
                     "used_percent": 84.0,
                     "remaining_seconds": 6094,
                     "reset_at": "2026-06-05T11:19:21Z",
-                    "window_stats": {"cost": 26.1039835},
+                    "window_stats": {"cost": 22.0},
                 }
             },
             window_key="five_hour",
@@ -174,11 +209,77 @@ class UsageEstimateTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(window["estimated_limit"], 25.0)
-        self.assertAlmostEqual(window["spent"], 26.1039835)
-        self.assertAlmostEqual(window["estimate_spent"], 21.0)
+        self.assertAlmostEqual(window["spent"], 22.0)
+        self.assertAlmostEqual(window["estimate_spent"], 22.0)
         self.assertAlmostEqual(window["remaining"], 4.0)
         self.assertAlmostEqual(window["remaining_percent"], 16.0)
         self.assertEqual(window["estimate_basis"], "official_window_clipped")
+
+    def test_usage_derived_limit_ignores_conflicting_smaller_raw_limit(self) -> None:
+        window = _window_estimate(
+            account={"email": "zacharybell2573@hotmail.com", "status": "active", "schedulable": True},
+            usage={
+                "five_hour": {
+                    "used_percent": 80.0,
+                    "remaining_seconds": 6094,
+                    "reset_at": "2026-06-05T11:19:21Z",
+                    "window_stats": {"cost": 37.52, "limit": 25.0},
+                }
+            },
+            window_key="five_hour",
+            account_key="id:zachary",
+            account_id="zachary",
+            email="zacharybell2573@hotmail.com",
+            plan_cohort="plus",
+            usage_states={},
+            limit_calibrations={
+                "five_hour": {
+                    "plus": {"lower": 10.31, "upper": 30.34, "mean": 20.325, "sigma": 3.3383333333333334},
+                    "unknown": {"lower": 15.0, "upper": 25.0, "mean": None, "sigma": None},
+                },
+            },
+        )
+
+        self.assertAlmostEqual(window["estimated_limit"], 46.9)
+        self.assertAlmostEqual(window["spent"], 37.52)
+        self.assertAlmostEqual(window["estimate_spent"], 37.52)
+        self.assertAlmostEqual(window["remaining"], 9.38)
+        self.assertAlmostEqual(window["remaining_percent"], 20.0)
+        self.assertEqual(window["estimate_basis"], "official_window")
+
+    def test_remaining_seconds_without_reset_at_derives_reset_at(self) -> None:
+        before = usage_estimate.utcnow()
+        usage = usage_estimate.materialize_usage_reset_times(
+            {
+                "five_hour": {
+                    "used_percent": 50.0,
+                    "remaining_seconds": 90,
+                    "window_stats": {"cost": 10.0},
+                }
+            }
+        )
+        window = _window_estimate(
+            account={"email": "example@example.com", "status": "active", "schedulable": True},
+            usage=usage,
+            window_key="five_hour",
+            account_key="id:90",
+            account_id="90",
+            email="example@example.com",
+            plan_cohort="plus",
+            usage_states={},
+            limit_calibrations={
+                "five_hour": {
+                    "plus": _limit_calibration("five_hour", [], "plus"),
+                    "unknown": _limit_calibration("five_hour", [], "unknown"),
+                },
+            },
+        )
+        after = usage_estimate.utcnow()
+
+        reset_at = usage_estimate._parse_datetime(window["reset_at"])
+        self.assertIsNotNone(reset_at)
+        self.assertGreaterEqual(reset_at.timestamp(), before.timestamp() + 89)
+        self.assertLessEqual(reset_at.timestamp(), after.timestamp() + 90)
 
     def test_full_window_limit_uses_official_raw_total_without_clipping(self) -> None:
         window = _window_estimate(
@@ -276,10 +377,156 @@ class UsageEstimateTests(unittest.TestCase):
 
         self.assertEqual(account_rate_limited_windows(account, usage), ["five_hour"])
 
+    def test_custom_threshold_counts_window_as_rate_limited_before_full_percent(self) -> None:
+        account = {
+            "email": "example@example.com",
+            "status": "active",
+            "schedulable": True,
+        }
+        usage = {
+            "five_hour": {
+                "used_percent": 95.0,
+                "reset_at": "2099-06-05T12:59:36Z",
+                "window_stats": {"cost": 19.0},
+            }
+        }
+
+        self.assertEqual(account_rate_limited_windows(account, usage), [])
+        self.assertEqual(account_rate_limited_windows(account, usage, {"five_hour": 95}), ["five_hour"])
+
+        default_window = _window_estimate(
+            account=account,
+            usage=usage,
+            window_key="five_hour",
+            account_key="id:95",
+            account_id="95",
+            email="example@example.com",
+            plan_cohort="plus",
+            usage_states={},
+            limit_calibrations={
+                "five_hour": {
+                    "plus": _limit_calibration("five_hour", [], "plus"),
+                    "unknown": _limit_calibration("five_hour", [], "unknown"),
+                },
+            },
+        )
+        threshold_window = _window_estimate(
+            account=account,
+            usage=usage,
+            window_key="five_hour",
+            account_key="id:95",
+            account_id="95",
+            email="example@example.com",
+            plan_cohort="plus",
+            usage_states={},
+            limit_calibrations={
+                "five_hour": {
+                    "plus": _limit_calibration("five_hour", [], "plus"),
+                    "unknown": _limit_calibration("five_hour", [], "unknown"),
+                },
+            },
+            sample_thresholds={"five_hour": 95},
+        )
+
+        self.assertFalse(default_window["rate_limited"])
+        self.assertTrue(threshold_window["rate_limited"])
+
+    def test_integer_utilization_is_treated_as_percent_not_fraction(self) -> None:
+        account = {
+            "email": "example@example.com",
+            "status": "active",
+            "schedulable": True,
+        }
+        usage = {
+            "seven_day": {
+                "utilization": 1,
+                "reset_at": "2099-07-01T00:00:00Z",
+                "remaining_seconds": 1_000_000,
+                "window_stats": {"cost": 0.0},
+            }
+        }
+
+        window = _window_estimate(
+            account=account,
+            usage=usage,
+            window_key="seven_day",
+            account_key="id:1",
+            account_id="1",
+            email="example@example.com",
+            plan_cohort="team",
+            usage_states={},
+            limit_calibrations={
+                "seven_day": {
+                    "team": _limit_calibration("seven_day", [], "team"),
+                    "unknown": _limit_calibration("seven_day", [], "unknown"),
+                },
+            },
+        )
+
+        self.assertAlmostEqual(window["used_percent"] or 0.0, 1.0)
+        self.assertFalse(window["rate_limited"])
+        self.assertEqual(account_rate_limited_windows(account, usage), [])
+
+    def test_monthly_limit_reports_monthly_window_not_five_hour(self) -> None:
+        account = {
+            "id": "1",
+            "email": "team@example.com",
+            "status": "active",
+            "schedulable": True,
+            "credentials": {"plan_type": "team"},
+            "extra": {"codex_5h_window_minutes": 0},
+        }
+        usage = {
+            "monthly": {
+                "used_percent": 100.0,
+                "remaining_seconds": 1_000_000,
+                "reset_at": "2099-07-01T00:00:00Z",
+                "window_stats": {"cost": 200.0},
+            }
+        }
+
+        self.assertEqual(account_rate_limited_windows(account, usage), ["monthly"])
+
+    def test_monthly_usage_token_history_is_recorded_as_monthly_window(self) -> None:
+        class FakeSub2Api:
+            def account_id(self, account):
+                return account.get("id")
+
+            def account_email(self, account):
+                return account.get("email")
+
+        account = {
+            "id": "1",
+            "email": "team@example.com",
+            "status": "active",
+            "schedulable": True,
+            "credentials": {"plan_type": "team"},
+            "extra": {"codex_5h_window_minutes": 0},
+        }
+        usage = {
+            "monthly": {
+                "used_percent": 50.0,
+                "remaining_seconds": 1_000_000,
+                "reset_at": "2099-07-01T00:00:00Z",
+                "window_stats": {"cost": 120.0, "tokens": 120_000},
+            }
+        }
+
+        observations = _usage_token_window_observations([account], FakeSub2Api(), {"1": usage})
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["window_key"], "monthly")
+        self.assertEqual(observations[0]["window_reset_key"], "reset_date:2099-07-01")
+        self.assertEqual(observations[0]["window_start_at"], "2099-06-01T00:00:00Z")
+        self.assertEqual(observations[0]["tokens"], 120_000)
+        self.assertAlmostEqual(observations[0]["spent"], 120.0)
+
     def test_plan_cohort_normalization(self) -> None:
         self.assertEqual(_normalize_plan_cohort("chatgptplusplan"), "plus")
         self.assertEqual(_normalize_plan_cohort("team"), "team")
         self.assertEqual(_normalize_plan_cohort("ChatGPTTeamPlan"), "team")
+        self.assertEqual(_normalize_plan_cohort("ChatGPTK12Plan"), "k12")
+        self.assertEqual(_normalize_plan_cohort("ChatGPT Enterprise Edu Plan"), "enterprise-edu")
         self.assertEqual(_normalize_plan_cohort(""), "unknown")
         self.assertEqual(_plan_cohort_from_account({"email": "ctf1du13uabx1@gptteam.ikun.edu.rs"}), "team")
 
@@ -306,10 +553,85 @@ class UsageEstimateTests(unittest.TestCase):
         self.assertFalse(_usage_limit_sample_allowed("five_hour", "unknown", 20.0))
         self.assertFalse(_usage_limit_sample_allowed("five_hour", "plus", 9.99))
         self.assertFalse(_usage_limit_sample_allowed("seven_day", "team", 99.99))
-        self.assertFalse(_usage_limit_sample_allowed("monthly", "plus", 200.0))
+        self.assertTrue(_usage_limit_sample_allowed("monthly", "plus", 200.0))
         self.assertTrue(_usage_limit_sample_allowed("five_hour", "plus", 15.0))
         self.assertTrue(_usage_limit_sample_allowed("seven_day", "team", 100.0))
         self.assertTrue(_usage_limit_sample_allowed("monthly", "team", 100.0))
+        self.assertTrue(_usage_limit_sample_allowed("five_hour", "k12", 15.0))
+        self.assertTrue(_usage_limit_sample_allowed("monthly", "enterprise-edu", 100.0))
+
+    def test_custom_k12_default_range_is_used_without_samples(self) -> None:
+        ranges = {
+            "k12": {
+                "five_hour": {"lower": 30.0, "upper": 45.0},
+                "seven_day": {"lower": 200.0, "upper": 260.0},
+                "monthly": {"lower": 500.0, "upper": 700.0},
+            }
+        }
+
+        calibration = _limit_calibration("seven_day", [], "ChatGPTK12Plan", ranges)
+
+        self.assertEqual(calibration["plan_cohort"], "k12")
+        self.assertEqual(calibration["source"], "default")
+        self.assertAlmostEqual(calibration["lower"], 200.0)
+        self.assertAlmostEqual(calibration["upper"], 260.0)
+
+    def test_k12_usage_limit_sample_keeps_subscription_type(self) -> None:
+        class FakeSub2Api:
+            def account_id(self, account):
+                return account.get("id")
+
+            def account_email(self, account):
+                return account.get("email")
+
+        account = {
+            "id": "k12-1",
+            "email": "student@example.edu",
+            "credentials": {"plan_type": "ChatGPTK12Plan"},
+        }
+        usage = {
+            "five_hour": {
+                "used_percent": 100.0,
+                "reset_at": "2099-01-01T05:00:00Z",
+                "window_stats": {"cost": 35.0},
+            }
+        }
+
+        samples = _usage_limit_sample_updates([account], FakeSub2Api(), {"k12-1": usage})
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["plan_cohort"], "k12")
+        self.assertAlmostEqual(samples[0]["observed_limit"], 35.0)
+
+    def test_custom_five_hour_sample_threshold_collects_before_full_percent(self) -> None:
+        class FakeSub2Api:
+            def account_id(self, account):
+                return account.get("id")
+
+            def account_email(self, account):
+                return account.get("email")
+
+        account = {
+            "id": "1",
+            "email": "plus@example.com",
+            "credentials": {"plan_type": "plus"},
+        }
+        usage = {
+            "five_hour": {
+                "used_percent": 95.0,
+                "reset_at": "2099-01-01T05:00:00Z",
+                "window_stats": {"cost": 19.0},
+            }
+        }
+
+        default_samples = _usage_limit_sample_updates([account], FakeSub2Api(), {"1": usage}, {"five_hour": 0})
+        custom_samples = _usage_limit_sample_updates([account], FakeSub2Api(), {"1": usage}, {"five_hour": 95})
+
+        self.assertEqual(default_samples, [])
+        self.assertEqual(len(custom_samples), 1)
+        self.assertEqual(custom_samples[0]["window_key"], "five_hour")
+        self.assertAlmostEqual(custom_samples[0]["observed_limit"], 20.0)
+        self.assertAlmostEqual(custom_samples[0]["used_percent"], 95.0)
 
     def test_calibration_uses_statistics_at_ten_samples(self) -> None:
         ten_samples = _limit_calibration("seven_day", [180.0] * 10, "team")
@@ -327,6 +649,48 @@ class UsageEstimateTests(unittest.TestCase):
 
     def test_usage_limit_samples_keep_distinct_resets_per_account_window(self) -> None:
         asyncio.run(self._assert_usage_limit_samples_keep_distinct_resets_per_account_window())
+
+    def test_usage_limit_calibrations_use_all_retained_samples(self) -> None:
+        asyncio.run(self._assert_usage_limit_calibrations_use_all_retained_samples())
+
+    async def _assert_usage_limit_calibrations_use_all_retained_samples(self) -> None:
+        original_sessionmaker = usage_estimate.AsyncSessionLocal
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "calibrations.db"
+            engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}", future=True)
+            usage_estimate.AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+            try:
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+
+                samples = [
+                    {
+                        "account_key": f"id:old-{index}",
+                        "email": f"old-{index}@example.com",
+                        "sub2api_account_id": f"old-{index}",
+                        "plan_cohort": "team",
+                        "window_key": "seven_day",
+                        "reset_key": f"reset:2099-01-{index + 1:02d}T00:00:00Z",
+                        "reset_at": f"2099-01-{index + 1:02d}T00:00:00Z",
+                        "observed_limit": 180.0,
+                        "raw_spent": 180.0,
+                        "used_percent": 100.0,
+                    }
+                    for index in range(10)
+                ]
+
+                await _save_usage_limit_samples(samples)
+
+                calibrations = await _load_usage_limit_calibrations()
+                team_calibration = calibrations["seven_day"]["team"]
+
+                self.assertEqual(team_calibration["source"], "sigma")
+                self.assertEqual(team_calibration["sample_count"], 10)
+                self.assertAlmostEqual(team_calibration["lower"], 180.0)
+                self.assertAlmostEqual(team_calibration["upper"], 180.0)
+            finally:
+                usage_estimate.AsyncSessionLocal = original_sessionmaker
+                await engine.dispose()
 
     async def _assert_usage_limit_samples_keep_distinct_resets_per_account_window(self) -> None:
         original_sessionmaker = usage_estimate.AsyncSessionLocal
@@ -460,7 +824,7 @@ class UsageEstimateTests(unittest.TestCase):
             self.assertEqual(window["window_kind"], "monthly")
             self.assertIsNone(window["raw_spent"])
             self.assertAlmostEqual(window["estimated_limit"], 200.0)
-            self.assertAlmostEqual(window["estimate_spent"], 40.0)
+            self.assertIsNone(window["estimate_spent"])
             self.assertAlmostEqual(window["remaining"], 160.0)
 
     def test_monthly_only_usage_uses_sub2api_limit_remaining_amounts(self) -> None:

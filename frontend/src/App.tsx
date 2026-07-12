@@ -14,8 +14,10 @@ import {
   LogOut,
   Mail,
   MailOpen,
+  Moon,
   PauseCircle,
   Play,
+  Plus,
   Radar,
   RefreshCcw,
   Save,
@@ -25,6 +27,7 @@ import {
   ShieldCheck,
   Smartphone,
   Sparkles,
+  Sun,
   TimerReset,
   Trash2,
   UserRoundX,
@@ -32,7 +35,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { createContext, FormEvent, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, FormEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "./api";
 import type {
@@ -49,22 +52,41 @@ import type {
   SelectedAccountDeleteItem,
   Summary,
   UsageEstimate,
+  UsageGroupRef,
   UsageLimitSamples,
+  UsageLimitDefaultRanges,
+  UsageLimitPlanRanges,
   UsageTokenHistory,
   UsageWindowAggregate,
   UsageWindowEstimate,
 } from "./types";
 
 type View = "overview" | "accounts" | "usage" | "usage-samples" | "mailboxes" | "phones" | "history" | "settings";
+type Theme = "light" | "dark";
 type AccountCounts = { actual: number; deduped: number; duplicates: number };
-type AccountStatusFilter = "all" | "normal" | "normal-no-rate-limit" | "five-hour-rate-limited" | "seven-day-rate-limited" | "error" | "deactive";
+type AccountStatusFilter = "all" | "normal" | "normal-no-rate-limit" | "five-hour-rate-limited" | "seven-day-rate-limited" | "monthly-rate-limited" | "error" | "deactive";
 type UsageDetailAccountFilter = "normal" | "rate-limited";
 type AccountJumpTarget = { email: string | null; sub2apiAccountId: string | null; requestedAt: number };
+type ProblemUnusedQuotaSummary = { accountCount: number; fiveHour: UsageWindowAggregate; sevenDay: UsageWindowAggregate };
 
 const defaultTimeZone = "Asia/Shanghai";
 const defaultSiteName = "sub2api AT 刷新机";
+const defaultUsageLimitSampleThresholdPercent = 99;
+const usageLimitWindowKeys = ["five_hour", "seven_day", "monthly"] as const;
+const coreSubscriptionTypes = new Set(["plus", "team", "pro", "free", "k12", "unknown"]);
+const defaultUsageLimitPlanRanges: UsageLimitPlanRanges = {
+  five_hour: { lower: 15, upper: 25 },
+  seven_day: { lower: 100, upper: 140 },
+  monthly: { lower: 100, upper: 300 },
+};
+const defaultUsageLimitRanges = Object.fromEntries(
+  [...coreSubscriptionTypes].map((subscriptionType) => [subscriptionType, cloneUsageLimitPlanRanges(defaultUsageLimitPlanRanges)]),
+) as UsageLimitDefaultRanges;
 const sub2ApiApiPrefix = "/api/v1";
+const themeStorageKey = "sub2api-at-theme";
 const TimeZoneContext = createContext(defaultTimeZone);
+const NowContext = createContext(Date.now());
+const refreshClockIntervalMs = 30_000;
 const timeZoneOptions = [
   { value: "Asia/Shanghai", label: "中国标准时间 · Asia/Shanghai" },
   { value: "UTC", label: "UTC" },
@@ -75,12 +97,13 @@ const timeZoneOptions = [
   { value: "America/Los_Angeles", label: "洛杉矶 · America/Los_Angeles" },
 ];
 
-const accountStatusFilterOptions: Array<{ value: AccountStatusFilter; label: string }> = [
+const allAccountStatusFilterOptions: Array<{ value: AccountStatusFilter; label: string }> = [
   { value: "all", label: "全部" },
   { value: "normal", label: "正常" },
   { value: "normal-no-rate-limit", label: "正常(不含限流)" },
   { value: "five-hour-rate-limited", label: "5h限流" },
   { value: "seven-day-rate-limited", label: "7d限流" },
+  { value: "monthly-rate-limited", label: "月限流" },
   { value: "error", label: "错误" },
   { value: "deactive", label: "封禁" },
 ];
@@ -111,12 +134,16 @@ const emptySettings: AppSettings = {
   monitor_interval_seconds: 300,
   usage_refresh_enabled: false,
   usage_refresh_interval_seconds: 3600,
+  usage_refresh_max_concurrency: 5,
+  usage_limit_sample_five_hour_threshold_percent: 0,
+  usage_limit_sample_seven_day_threshold_percent: 0,
+  usage_limit_default_ranges: defaultUsageLimitRanges,
   refresh_max_concurrency: 1,
   protocol_refresh_max_concurrency: 1,
   browser_refresh_max_concurrency: 1,
   browser_min_available_memory_mb: 500,
   subscription_refresh_batch_size: 3,
-  subscription_refresh_max_concurrency: 1,
+  subscription_refresh_max_concurrency: 3,
   last_scan_at: null,
   last_scan_status: null,
   last_scan_message: null,
@@ -125,6 +152,7 @@ const emptySettings: AppSettings = {
 };
 
 function App() {
+  const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [authState, setAuthState] = useState<"checking" | "in" | "out">("checking");
   const [view, setView] = useState<View>("overview");
   const [summary, setSummary] = useState<Summary>(emptySummary);
@@ -146,6 +174,7 @@ function App() {
   const [notice, setNotice] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const siteName = settings.site_name?.trim() || defaultSiteName;
+  const now = useRefreshClock();
   const lastSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
   const lastUsageRefreshEvent = useMemo(
     () => latestEventByKinds(events, ["usage_statistics_refresh", "usage_refresh"]),
@@ -153,6 +182,7 @@ function App() {
   );
   const syncActionTime = lastSyncEvent?.created_at ?? null;
   const usageActionTime = lastUsageRefreshEvent?.created_at ?? null;
+  const toggleTheme = useCallback(() => setTheme((current) => (current === "dark" ? "light" : "dark")), []);
 
   const loadAll = useCallback(async ({ includePhones = true }: { includePhones?: boolean } = {}) => {
     const phonePromise = includePhones ? api.phones().catch(() => null) : Promise.resolve<PhoneNumber[] | null>(null);
@@ -178,7 +208,7 @@ function App() {
     if (nextExceptionRecords) {
       setExceptionRecords(nextExceptionRecords);
     }
-    setSettings(nextSettings);
+    setSettings((current) => (appSettingsEqual(current, nextSettings) ? current : nextSettings));
   }, []);
 
   const usageByEmail = useMemo(() => {
@@ -209,6 +239,7 @@ function App() {
   }, [usageEstimate]);
 
   const accountCounts = useMemo(() => accountDisplayCounts(accounts), [accounts]);
+  const problemUnusedQuota = useMemo(() => (usageEstimate ? usageProblemAccountUnusedQuota(usageEstimate.accounts) : null), [usageEstimate]);
 
   const loadUsageEstimate = useCallback(async (refresh = true) => {
     setUsageLoading(true);
@@ -282,6 +313,15 @@ function App() {
     }
   }, [authState, loadUsageEstimate, loadUsageLimitSamples, usageError, usageEstimate, usageEstimateRefreshed, usageLimitSamples, usageLimitSamplesLoading, usageLoading, view]);
 
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      window.localStorage.setItem(themeStorageKey, theme);
+    } catch {
+      // Ignore storage failures in restricted browser contexts.
+    }
+  }, [theme]);
+
   useEffect(() => {
     document.title = siteName;
   }, [siteName]);
@@ -299,6 +339,23 @@ function App() {
       await loadAll();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "操作失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveSettings = async (payload: AppSettingsUpdate) => {
+    setBusy(true);
+    setNotice("");
+    try {
+      const nextSettings = await api.updateSettings(payload);
+      setSettings(nextSettings);
+      setNotice("设置已保存");
+      await loadAll().catch((error) => {
+        setNotice(error instanceof Error ? `设置已保存；刷新页面数据失败：${error.message}` : "设置已保存；刷新页面数据失败");
+      });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "设置保存失败");
     } finally {
       setBusy(false);
     }
@@ -332,6 +389,8 @@ function App() {
     return (
       <LoginScreen
         siteName={siteName}
+        theme={theme}
+        onToggleTheme={toggleTheme}
         onLogin={async (adminKey) => {
           await api.login(adminKey);
           setAuthState("in");
@@ -358,6 +417,7 @@ function App() {
 
   return (
     <TimeZoneContext.Provider value={settings.display_timezone || defaultTimeZone}>
+      <NowContext.Provider value={now}>
       <main className="shell">
       <aside className="sidebar">
         <div className="brand">
@@ -412,6 +472,7 @@ function App() {
             <h1>{titleFor(view)}</h1>
           </div>
           <div className="topbar-actions">
+            <ThemeToggle theme={theme} onToggleTheme={toggleTheme} />
             {notice ? <span className="notice">{notice}</span> : null}
             <ToolbarTimeButton
               busy={busy}
@@ -437,6 +498,7 @@ function App() {
             accountCounts={accountCounts}
             jobs={jobs}
             events={events}
+            problemUnusedQuota={problemUnusedQuota}
             usageByAccountId={usageByAccountId}
             usageByEmail={usageByEmail}
           />
@@ -548,17 +610,29 @@ function App() {
           <SettingsView
             busy={busy}
             settings={settings}
+            subscriptionTypes={[...new Set(accounts.map((account) => account.subscription_type).filter(Boolean))]}
             onScan={() => runAction(api.scanSub2Api, "扫描完成")}
-            onSave={(payload) => runAction(() => api.updateSettings(payload), "设置已保存")}
+            onSave={saveSettings}
           />
         ) : null}
       </section>
       </main>
+      </NowContext.Provider>
     </TimeZoneContext.Provider>
   );
 }
 
-function LoginScreen({ siteName, onLogin }: { siteName: string; onLogin: (adminKey: string) => Promise<void> }) {
+function LoginScreen({
+  siteName,
+  theme,
+  onToggleTheme,
+  onLogin,
+}: {
+  siteName: string;
+  theme: Theme;
+  onToggleTheme: () => void;
+  onLogin: (adminKey: string) => Promise<void>;
+}) {
   const [adminKey, setAdminKey] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -579,8 +653,11 @@ function LoginScreen({ siteName, onLogin }: { siteName: string; onLogin: (adminK
   return (
     <main className="login-page">
       <section className="login-panel">
-        <div className="login-emblem">
-          <img alt="" src="/logo.png" />
+        <div className="login-panel-head">
+          <div className="login-emblem">
+            <img alt="" src="/logo.png" />
+          </div>
+          <ThemeToggle compact theme={theme} onToggleTheme={onToggleTheme} />
         </div>
         <p className="eyebrow">{siteName}</p>
         <h1>控制台登录</h1>
@@ -622,12 +699,49 @@ function BootScreen() {
   );
 }
 
+function ThemeToggle({ theme, onToggleTheme, compact = false }: { theme: Theme; onToggleTheme: () => void; compact?: boolean }) {
+  const isDark = theme === "dark";
+  const Icon = isDark ? Sun : Moon;
+  const label = isDark ? "浅色" : "暗色";
+  const title = isDark ? "切换到浅色模式" : "切换到暗色模式";
+
+  return (
+    <button
+      aria-label={title}
+      className={compact ? "secondary-button theme-toggle compact" : "secondary-button theme-toggle"}
+      onClick={onToggleTheme}
+      title={title}
+      type="button"
+    >
+      <Icon size={17} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function getInitialTheme(): Theme {
+  if (typeof window === "undefined") return "light";
+
+  try {
+    const storedTheme = window.localStorage.getItem(themeStorageKey);
+    if (storedTheme === "light" || storedTheme === "dark") {
+      return storedTheme;
+    }
+  } catch {
+    // Ignore storage failures in restricted browser contexts.
+  }
+
+  const prefersDark = typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  return prefersDark ? "dark" : "light";
+}
+
 function Overview({
   summary,
   accounts,
   accountCounts,
   jobs,
   events,
+  problemUnusedQuota,
   usageByAccountId,
   usageByEmail,
 }: {
@@ -636,6 +750,7 @@ function Overview({
   accountCounts: AccountCounts;
   jobs: RefreshJob[];
   events: AppEvent[];
+  problemUnusedQuota: ProblemUnusedQuotaSummary | null;
   usageByAccountId: Map<string, AccountUsageEstimate>;
   usageByEmail: Map<string, AccountUsageEstimate>;
 }) {
@@ -647,13 +762,17 @@ function Overview({
   const duplicateAccounts = summary.duplicate_accounts ?? accountCounts.duplicates;
   const fiveHourRateLimitedAccounts = rateLimitedAccountsForWindow(accounts, "five_hour");
   const sevenDayRateLimitedAccounts = rateLimitedAccountsForWindow(accounts, "seven_day");
+  const monthlyRateLimitedAccounts = rateLimitedAccountsForWindow(accounts, "monthly");
   const rateLimitedAccountCount = new Set(
-    [...fiveHourRateLimitedAccounts, ...sevenDayRateLimitedAccounts].map(accountRowKey),
+    [...fiveHourRateLimitedAccounts, ...sevenDayRateLimitedAccounts, ...monthlyRateLimitedAccounts].map(accountRowKey),
   ).size;
   const availableAccountCount = accounts.filter(
     (account) => !account.deactive && !accountHasError(account) && !accountRateLimited(account),
   ).length;
-  const stats = [
+  const problemUnusedQuotaTitle = problemUnusedQuota
+    ? `错误/封停账号 ${problemUnusedQuota.accountCount} 个，可估 ${problemUnusedQuota.sevenDay.estimable_accounts} 个，5h 未用 ${formatAggregateMoney(problemUnusedQuota.fiveHour)}`
+    : "等待额度估算数据";
+  const stats: Array<{ label: string; value: number | string; icon: LucideIcon; tone: string; title?: string }> = [
     { label: "实际账号", value: actualAccounts, icon: UsersRound, tone: "ink" },
     { label: "去重账号", value: dedupedAccounts, icon: ShieldCheck, tone: "ok" },
     { label: "可用", value: availableAccountCount, icon: CheckCircle2, tone: "ok" },
@@ -663,6 +782,7 @@ function Overview({
     { label: "暂停", value: summary.paused_accounts ?? 0, icon: PauseCircle, tone: "ink" },
     { label: "恢复中", value: summary.refreshing_accounts, icon: RefreshCcw, tone: "teal" },
     { label: "封禁", value: summary.deactive_accounts, icon: UserRoundX, tone: "danger" },
+    { label: "无法使用额度", value: formatProblemUnusedQuota(problemUnusedQuota), icon: TimerReset, tone: "danger", title: problemUnusedQuotaTitle },
     { label: "邮箱", value: summary.mailbox_count, icon: Mail, tone: "blue" },
     { label: "24h 成功", value: summary.recent_success, icon: CheckCircle2, tone: "ok" },
   ];
@@ -673,7 +793,7 @@ function Overview({
         {stats.map((stat) => {
           const Icon = stat.icon;
           return (
-            <article className={`stat-card ${stat.tone}`} key={stat.label}>
+            <article className={`stat-card ${stat.tone}`} key={stat.label} title={stat.title}>
               <Icon size={20} />
               <span>{stat.label}</span>
               <strong>{stat.value}</strong>
@@ -686,7 +806,7 @@ function Overview({
         <div className="panel-toolbar">
           <div>
             <PanelTitle title="限流账号" icon={ShieldAlert} />
-            <p className="panel-subtitle">按 sub2api 当前窗口状态分开显示 5h 与 7d 限流账号。</p>
+            <p className="panel-subtitle">按 sub2api 当前窗口状态分开显示 5h、7d 与月限流账号。</p>
           </div>
           <Badge tone={rateLimitedAccountCount ? "warn" : "ok"}>
             {rateLimitedAccountCount ? `${rateLimitedAccountCount} 个账号` : "无限流"}
@@ -704,6 +824,13 @@ function Overview({
             title="7d"
             windowKey="seven_day"
             accounts={sevenDayRateLimitedAccounts}
+            usageByAccountId={usageByAccountId}
+            usageByEmail={usageByEmail}
+          />
+          <RateLimitedAccountColumn
+            title="月"
+            windowKey="monthly"
+            accounts={monthlyRateLimitedAccounts}
             usageByAccountId={usageByAccountId}
             usageByEmail={usageByEmail}
           />
@@ -749,6 +876,7 @@ function RateLimitedAccountColumn({
   usageByEmail: Map<string, AccountUsageEstimate>;
 }) {
   const timeZone = useDisplayTimeZone();
+  const now = useNow();
   return (
     <div className="rate-limit-window">
       <div className="rate-limit-window-head">
@@ -759,7 +887,7 @@ function RateLimitedAccountColumn({
         <div className="rate-limit-account-list">
           {accounts.map((account) => {
             const usage = usageForAccount(account, usageByAccountId, usageByEmail);
-            const detail = accountRateLimitDetails(account, usage, timeZone).find((item) => item.key === windowKey);
+            const detail = accountRateLimitDetails(account, usage, timeZone, now).find((item) => item.key === windowKey);
             return (
               <div className="rate-limit-account-row" key={accountRowKey(account)}>
                 <div className="rate-limit-account-main">
@@ -822,6 +950,7 @@ function AccountsView({
   const orderedAccounts = useMemo(() => [...accounts].sort(accountCompare), [accounts]);
   const [accountSearch, setAccountSearch] = useState("");
   const [accountStatusFilter, setAccountStatusFilter] = useState<AccountStatusFilter>("all");
+  const [accountSubscriptionFilter, setAccountSubscriptionFilter] = useState("");
   const [selectedAccountKeys, setSelectedAccountKeys] = useState<Record<string, boolean>>({});
   const [sessionDeleteUnlocks, setSessionDeleteUnlocks] = useState<Record<string, boolean>>({});
   const [selectedMailbox, setSelectedMailbox] = useState<Mailbox | null>(null);
@@ -839,46 +968,57 @@ function AccountsView({
       .map((mailbox) => [mailbox.gpt_email.toLowerCase(), mailbox] as const);
     return new Map(entries);
   }, [mailboxes]);
+  const accountStatusFilterOptions = useMemo(
+    () => availableAccountStatusFilterOptions(orderedAccounts, usageByAccountId, usageByEmail),
+    [orderedAccounts, usageByAccountId, usageByEmail],
+  );
+  const accountSubscriptionFilterOptions = useMemo(() => availableAccountSubscriptionFilterOptions(orderedAccounts), [orderedAccounts]);
   const filteredAccounts = useMemo(
     () =>
       orderedAccounts.filter((account) => {
         const usage = usageForAccount(account, usageByAccountId, usageByEmail);
-        return accountMatchesStatusFilter(account, usage, accountStatusFilter) && textMatchesSearch(
-          [
-            account.email,
-            account.sub2api_account_id,
-            account.sub2api_imported_at,
-            account.platform,
-            account.account_type,
-            account.status,
-            account.schedulable === null ? "未知 unknown" : account.schedulable ? "可用 schedulable" : "暂停 unschedulable",
-            accountShowsRateLimit(account, usage) ? `限流 rate limited ${accountRateLimitedWindowsLabel(account, usage)}` : "",
-            usage?.seven_day_token_history.total_tokens,
-            usage?.seven_day_token_history.windows.map((window) => `${window.window_reset_key} ${window.tokens}`).join(" "),
-            account.mailbox_bound ? "已绑定 mailbox bound" : "未绑定 mailbox unbound",
-            account.deactive ? "封禁 deactive deactivated banned" : "",
-            account.refreshing ? "刷新中 refreshing" : "",
-            account.remote_error ? "错误 error" : "",
-            account.is_duplicate ? "重复 duplicate" : "",
-            account.subscription_starts_at,
-            account.subscription_expires_at,
-            account.subscription_renews_at,
-            account.subscription_cancels_at,
-            account.subscription_billing_period,
-            account.subscription_plan,
-            account.has_active_subscription === null ? "" : account.has_active_subscription ? "订阅有效 active subscription" : "订阅无效 inactive subscription",
-            account.last_error,
-            mailboxByEmail.get(account.email.toLowerCase())?.mailbox_email,
-            mailboxByEmail.get(account.email.toLowerCase())?.provider,
-            account.phone_number,
-            account.phone_sms_url,
-            account.phone_sms_cdk,
-            account.phone_sms_recharge_url,
-          ],
-          accountSearch,
+        return (
+          accountMatchesStatusFilter(account, usage, accountStatusFilter) &&
+          (!accountSubscriptionFilter || accountSubscriptionTypeLabel(account) === accountSubscriptionFilter) &&
+          textMatchesSearch(
+            [
+              account.email,
+              account.sub2api_account_id,
+              account.sub2api_imported_at,
+              account.last_seen_at,
+              account.updated_at,
+              account.platform,
+              account.account_type,
+              account.status,
+              account.schedulable === null ? "未知 unknown" : account.schedulable ? "可用 schedulable" : "暂停 unschedulable",
+              accountShowsRateLimit(account, usage) ? `限流 rate limited ${accountRateLimitedWindowsLabel(account, usage)}` : "",
+              usage?.seven_day_token_history.total_tokens,
+              usage?.seven_day_token_history.windows.map((window) => `${window.window_reset_key} ${window.tokens}`).join(" "),
+              account.mailbox_bound ? "已绑定 mailbox bound" : "未绑定 mailbox unbound",
+              account.deactive ? "封禁 deactive deactivated banned" : "",
+              account.refreshing ? "刷新中 refreshing" : "",
+              account.remote_error ? "错误 error" : "",
+              account.is_duplicate ? "重复 duplicate" : "",
+              account.subscription_starts_at,
+              account.subscription_expires_at,
+              account.subscription_renews_at,
+              account.subscription_cancels_at,
+              account.subscription_billing_period,
+              account.subscription_plan,
+              account.has_active_subscription === null ? "" : account.has_active_subscription ? "订阅有效 active subscription" : "订阅无效 inactive subscription",
+              account.last_error,
+              mailboxByEmail.get(account.email.toLowerCase())?.mailbox_email,
+              mailboxByEmail.get(account.email.toLowerCase())?.provider,
+              account.phone_number,
+              account.phone_sms_url,
+              account.phone_sms_cdk,
+              account.phone_sms_recharge_url,
+            ],
+            accountSearch,
+          )
         );
       }),
-    [accountSearch, accountStatusFilter, mailboxByEmail, orderedAccounts, usageByAccountId, usageByEmail],
+    [accountSearch, accountStatusFilter, accountSubscriptionFilter, mailboxByEmail, orderedAccounts, usageByAccountId, usageByEmail],
   );
   const selectedAccounts = accounts.filter((account) => selectedAccountKeys[accountRowKey(account)]);
   const selectedAccountCount = selectedAccounts.length;
@@ -903,6 +1043,18 @@ function AccountsView({
   }, [accounts]);
 
   useEffect(() => {
+    if (!accountStatusFilterOptions.some((option) => option.value === accountStatusFilter)) {
+      setAccountStatusFilter("all");
+    }
+  }, [accountStatusFilter, accountStatusFilterOptions]);
+
+  useEffect(() => {
+    if (accountSubscriptionFilter && !accountSubscriptionFilterOptions.some((option) => option.value === accountSubscriptionFilter)) {
+      setAccountSubscriptionFilter("");
+    }
+  }, [accountSubscriptionFilter, accountSubscriptionFilterOptions]);
+
+  useEffect(() => {
     if (!accountJumpTarget || handledJumpRequestRef.current === accountJumpTarget.requestedAt) return;
     if (!orderedAccounts.length) return;
 
@@ -911,6 +1063,7 @@ function AccountsView({
     const searchText = accountJumpSearchText(targetAccount, accountJumpTarget);
 
     setAccountStatusFilter("all");
+    setAccountSubscriptionFilter("");
 
     if (!targetAccount) {
       setAccountSearch(searchText);
@@ -1050,7 +1203,16 @@ function AccountsView({
                 total={accounts.length}
                 value={accountSearch}
               />
-              <AccountStatusFilterMenu onChange={setAccountStatusFilter} value={accountStatusFilter} />
+              <AccountStatusFilterMenu
+                onChange={setAccountStatusFilter}
+                options={accountStatusFilterOptions}
+                value={accountStatusFilter}
+              />
+              <AccountSubscriptionFilterMenu
+                onChange={setAccountSubscriptionFilter}
+                options={accountSubscriptionFilterOptions}
+                value={accountSubscriptionFilter}
+              />
             </div>
           </div>
           <div className="toolbar-actions">
@@ -1083,7 +1245,7 @@ function AccountsView({
               <col className="accounts-col-select" />
               <col className="accounts-col-email" />
               <col className="accounts-col-id" />
-              <col className="accounts-col-imported" />
+              <col className="accounts-col-time-records" />
               <col className="accounts-col-mailbox" />
               <col className="accounts-col-participation" />
               <col className="accounts-col-status" />
@@ -1092,7 +1254,6 @@ function AccountsView({
               <col className="accounts-col-quota" />
               <col className="accounts-col-history" />
               <col className="accounts-col-subscription" />
-              <col className="accounts-col-updated" />
               <col className="accounts-col-error" />
               <col className="accounts-col-actions" />
             </colgroup>
@@ -1101,7 +1262,7 @@ function AccountsView({
                 <th className="accounts-select-header"><span className="sr-only">选择</span></th>
                 <th>邮箱</th>
                 <th>sub2api ID</th>
-                <th>导入 sub2api</th>
+                <th>时间记录</th>
                 <th>绑定邮箱</th>
                 <th>参与额度</th>
                 <th>状态</th>
@@ -1110,7 +1271,6 @@ function AccountsView({
                 <th>7d/月额度</th>
                 <th>7d/月额度历史</th>
                 <th>订阅</th>
-                <th>最近更新</th>
                 <th>错误</th>
                 <th className="sticky-action-column">操作</th>
               </tr>
@@ -1199,11 +1359,16 @@ function AccountRow({
   onToggleUsageEstimate?: (id: number, enabled: boolean) => void;
 }) {
   const timeZone = useDisplayTimeZone();
+  const now = useNow();
   const rateLimited = accountShowsRateLimit(account, usage);
   const manuallyPaused = accountIsManuallyPaused(account, usage);
   const statusTone = accountStatusTone(account, usage);
   const statusText = accountStatusLabel(account, usage);
-  const rateLimitDetails = accountRateLimitDetails(account, usage, timeZone);
+  const rateLimitDetails = accountDisplayRateLimitDetails(account, usage, timeZone, now);
+  const rateLimitStatusLabel = rateLimitDetails.length ? rateLimitDetails.map((detail) => detail.label).join("/") : "";
+  const rateLimitStatusText = `${statusText} | ${rateLimitStatusLabel ? `${rateLimitStatusLabel}限流` : "限流"}`;
+  const rateLimitStatusTone = rateLimitDetails[0]?.tone || "warn";
+  const windowRefreshTags = accountWindowRefreshTags(usage, timeZone, now);
   const errorSummary = accountErrorSummary(account);
   const refreshLocked = accountHasError(account) && account.auto_refresh_locked;
   const ActionIcon = account.deactive ? Radar : account.mailbox_bound ? Play : Radar;
@@ -1269,8 +1434,10 @@ function AccountRow({
           </div>
         </div>
       </td>
-      <td className="mono muted">{account.sub2api_account_id || "-"}</td>
-      <td>{account.sub2api_imported_at ? formatDate(account.sub2api_imported_at, timeZone) : "-"}</td>
+      <td className="account-id-cell mono muted" title={account.sub2api_account_id || undefined}>{account.sub2api_account_id || "-"}</td>
+      <td>
+        <AccountTimeRecordsCell account={account} timeZone={timeZone} />
+      </td>
       <td>
         <Badge tone={account.mailbox_bound ? "ok" : "ink"}>{account.mailbox_bound ? "已绑定" : "未绑定"}</Badge>
       </td>
@@ -1296,21 +1463,16 @@ function AccountRow({
       <td>
         <div className="status-stack">
           <div className="status-badge-row">
-            <Badge className={rateLimited ? "rate-limit-status-badge" : undefined} tone={statusTone}>{statusText}</Badge>
-            {rateLimited
-              ? rateLimitDetails.map((detail) => (
-                  <Badge className="rate-limit-badge" key={`badge-${detail.key}`} tone={detail.tone}>{`${detail.label}限流`}</Badge>
-                ))
-              : null}
-            {!rateLimited && manuallyPaused ? <Badge tone="ink">主动暂停</Badge> : null}
+            <Badge className="status-column-badge" tone={rateLimited ? rateLimitStatusTone : statusTone}>{rateLimited ? rateLimitStatusText : statusText}</Badge>
+            {!rateLimited && manuallyPaused ? <Badge className="status-column-badge" tone="ink">主动暂停</Badge> : null}
           </div>
-          {rateLimited ? (
+          {windowRefreshTags.length ? (
             <div className="rate-limit-details">
-              {rateLimitDetails.map((detail) => (
-                <div className="rate-limit-item" key={detail.key}>
-                  <span className="rate-limit-recovery-tag aligned">
-                    <RefreshCcw size={12} />
-                    <span>{detail.recovery}</span>
+              {windowRefreshTags.map((tag) => (
+                <div className="rate-limit-item" key={tag.key}>
+                  <span className="rate-limit-recovery-tag window-refresh-tag aligned" title={tag.title}>
+                    <span className="window-refresh-tag-label">{tag.label}</span>
+                    <span>{tag.time}</span>
                   </span>
                 </div>
               ))}
@@ -1333,7 +1495,6 @@ function AccountRow({
       <td>
         <AccountSubscriptionCell account={account} timeZone={timeZone} />
       </td>
-      <td>{formatDate(account.updated_at, timeZone)}</td>
       <td className="error-cell">
         {errorSummary ? (
           <button className="error-pill-button" onClick={() => onOpenError?.(account)} title="查看完整错误详情" type="button">
@@ -1381,6 +1542,30 @@ function AccountRow({
   );
 }
 
+function AccountTimeRecordsCell({ account, timeZone }: { account: Account; timeZone: string }) {
+  const records: Array<{ key: string; icon: LucideIcon; label: string; value: string | null | undefined }> = [
+    { key: "imported", icon: Database, label: "导入 sub2api", value: account.sub2api_imported_at },
+    { key: "called", icon: Activity, label: "最近调用", value: account.last_seen_at },
+    { key: "updated", icon: Clock3, label: "最近更新", value: account.updated_at },
+  ];
+
+  return (
+    <div className="account-time-records">
+      {records.map((record) => {
+        const Icon = record.icon;
+        const shortTime = record.value ? formatDate(record.value, timeZone) : "-";
+        const fullTime = record.value ? formatFullDate(record.value, timeZone) : "暂无记录";
+        return (
+          <time className={`account-time-tag ${record.key}`} dateTime={record.value || undefined} key={record.key} title={`${record.label}: ${fullTime}`}>
+            <Icon size={12} />
+            <span>{shortTime}</span>
+          </time>
+        );
+      })}
+    </div>
+  );
+}
+
 function AccountQuotaCell({ window, loading, hideMonthly = false }: { window?: UsageWindowEstimate; loading?: boolean; hideMonthly?: boolean }) {
   if (loading) {
     return <span className="muted">查询中</span>;
@@ -1400,14 +1585,15 @@ function AccountQuotaCell({ window, loading, hideMonthly = false }: { window?: U
   const usedLabel = windowUsedLabel(window);
   const usedPercent = quotaUsedPercent(window);
   const scopeLabel = window.window_kind === "monthly" ? "月" : "";
-  const title = window.rate_limited ? `限流 · ${scopeLabel}已用 ${formatPercent(usedPercent)}` : `${scopeLabel}已用 ${formatPercent(usedPercent)}`;
+  const progressLabel = `${scopeLabel}${usedLabel} ${formatPercent(usedPercent)}`;
+  const title = window.rate_limited ? `限流 · ${progressLabel}` : progressLabel;
   const totalLabel = "总额";
-  const remainingLabel = window.window_kind === "monthly" ? "月剩余" : "未用";
+  const remainingLabel = "未用";
   return (
     <div className={window.rate_limited ? "quota-cell quota-progress-cell limited" : "quota-cell quota-progress-cell"}>
       <div className="quota-progress" title={title}>
         <div style={{ width: `${usedPercent ?? 0}%` }} />
-        <span>{window.rate_limited ? `${scopeLabel}已用 ${formatPercent(usedPercent)} · 限流` : `${scopeLabel}已用 ${formatPercent(usedPercent)}`}</span>
+        <span>{window.rate_limited ? `${progressLabel} · 限流` : progressLabel}</span>
       </div>
       <div className="quota-labels">
         <span>{totalLabel} {formatMoney(window.estimated_limit)}</span>
@@ -1439,20 +1625,21 @@ function QuotaHistoryCell({
   const visibleWindows = compact ? history.windows.slice(0, 3) : history.windows;
   const hiddenCount = Math.max(history.windows.length - visibleWindows.length, 0);
   const title = history.windows
-    .map((window) => `${formatTokenWindowLabel(window, timeZone)}: ${formatMoney(window.estimated_limit)}`)
+    .map((window) => `${formatTokenWindowLabel(window, timeZone)}: ${formatTokenWindowSummary(window)}`)
     .join("\n");
 
   return (
     <div className="token-history-cell" title={title || undefined}>
       <div className="history-metrics">
-        <span className="history-metric-tag strong">{history.window_count ? formatMoney(history.total_estimated_limit) : "-"}</span>
-        <span className="history-metric-tag">{history.window_count ? `共 ${history.window_count} 个 7d 窗口` : "暂无额度历史"}</span>
+        <span className="history-metric-tag strong">{formatTokenHistoryTotalLabel(history)}</span>
+        <span className="history-metric-tag">{formatTokenHistoryCountLabel(history)}</span>
       </div>
       {visibleWindows.length ? (
         <div className="token-window-list">
           {visibleWindows.map((window) => (
             <span key={window.window_reset_key}>
-              {formatTokenWindowLabel(window, timeZone)} · {formatMoney(window.estimated_limit)}
+              <span>{formatTokenWindowLabel(window, timeZone)}</span>
+              <strong>{formatTokenWindowSummary(window)}</strong>
             </span>
           ))}
           {hiddenCount ? <span>另 {hiddenCount} 个窗口</span> : null}
@@ -1467,22 +1654,21 @@ function QuotaHistoryCell({
 function HistoricalQuotaCell({ history }: { history: UsageTokenHistory }) {
   const timeZone = useDisplayTimeZone();
   const title = history.windows
-    .map((window) => `${formatTokenWindowLabel(window, timeZone)}: ${formatMoney(window.estimated_limit)}`)
+    .map((window) => `${formatTokenWindowLabel(window, timeZone)}: ${formatTokenWindowSummary(window)}`)
     .join("\n");
 
   return (
     <div className="history-quota-cell" title={title || undefined}>
-      <strong>{history.window_count ? formatMoney(history.total_estimated_limit) : "-"}</strong>
-      <span>{history.window_count ? `累计 ${history.window_count} 个 7d 总额度` : "暂无历史记录"}</span>
+      <strong>{formatTokenHistoryTotalLabel(history)}</strong>
+      <span>{formatTokenHistoryCountLabel(history)}</span>
     </div>
   );
 }
 
 function AccountSubscriptionCell({ account, timeZone }: { account: Account; timeZone: string }) {
-  const plan = planLabel(account.subscription_plan || account.account_type || account.platform || "-");
   const period = account.subscription_billing_period ? periodLabel(account.subscription_billing_period) : null;
   const activeTone = account.has_active_subscription === false ? "warn" : account.has_active_subscription === true ? "ok" : "ink";
-  const planLabelText = account.has_active_subscription === false ? "订阅无效" : plan === "active" ? "正常" : plan;
+  const planLabelText = accountSubscriptionTypeLabel(account);
   if (!account.subscription_expires_at && !account.subscription_starts_at && !account.subscription_renews_at) {
     return (
       <div className="subscription-cell">
@@ -1515,8 +1701,10 @@ function UsageEstimateView({
   error: string;
 }) {
   const timeZone = useDisplayTimeZone();
+  const now = useNow();
   const [includePausedAccounts, setIncludePausedAccounts] = useState(true);
   const [detailAccountFilter, setDetailAccountFilter] = useState<UsageDetailAccountFilter>("normal");
+  const [subscriptionFilter, setSubscriptionFilter] = useState("");
   const displayedEstimate = useMemo(
     () => (estimate ? buildDisplayedUsageEstimate(estimate, includePausedAccounts) : null),
     [estimate, includePausedAccounts],
@@ -1529,10 +1717,21 @@ function UsageEstimateView({
     () => (displayedEstimate ? usageDetailAccountCounts(displayedEstimate.accounts) : { normal: 0, rateLimited: 0 }),
     [displayedEstimate],
   );
-  const detailAccounts = useMemo(
+  const detailBaseAccounts = useMemo(
     () => displayedEstimate?.accounts.filter((account) => accountMatchesUsageDetailFilter(account, detailAccountFilter)) || [],
     [detailAccountFilter, displayedEstimate],
   );
+  const subscriptionFilterOptions = useMemo(() => usageSubscriptionFilterOptions(detailBaseAccounts), [detailBaseAccounts]);
+  const detailAccounts = useMemo(
+    () => detailBaseAccounts.filter((account) => !subscriptionFilter || usageSubscriptionLabel(account) === subscriptionFilter),
+    [detailBaseAccounts, subscriptionFilter],
+  );
+
+  useEffect(() => {
+    if (subscriptionFilter && !subscriptionFilterOptions.some((option) => option.label === subscriptionFilter)) {
+      setSubscriptionFilter("");
+    }
+  }, [subscriptionFilter, subscriptionFilterOptions]);
 
   return (
     <div className="stack">
@@ -1610,35 +1809,73 @@ function UsageEstimateView({
                 <PanelTitle title="账号额度明细" icon={Activity} />
                 <p className="panel-subtitle">错误和封禁账号不参与估算，已从明细中隐藏。</p>
               </div>
-              <div className="usage-detail-tabs" role="tablist" aria-label="额度明细账号类型">
-                <button
-                  aria-selected={detailAccountFilter === "normal"}
-                  className={detailAccountFilter === "normal" ? "usage-detail-tab active" : "usage-detail-tab"}
-                  onClick={() => setDetailAccountFilter("normal")}
-                  role="tab"
-                  type="button"
-                >
-                  <span>正常账号</span>
-                  <strong>{detailAccountCounts.normal}</strong>
-                </button>
-                <button
-                  aria-selected={detailAccountFilter === "rate-limited"}
-                  className={detailAccountFilter === "rate-limited" ? "usage-detail-tab active" : "usage-detail-tab"}
-                  onClick={() => setDetailAccountFilter("rate-limited")}
-                  role="tab"
-                  type="button"
-                >
-                  <span>限流账号</span>
-                  <strong>{detailAccountCounts.rateLimited}</strong>
-                </button>
+              <div className="usage-detail-toolbar-actions">
+                <div className="usage-detail-tabs" role="tablist" aria-label="额度明细账号类型">
+                  <button
+                    aria-selected={detailAccountFilter === "normal"}
+                    className={detailAccountFilter === "normal" ? "usage-detail-tab active" : "usage-detail-tab"}
+                    onClick={() => setDetailAccountFilter("normal")}
+                    role="tab"
+                    type="button"
+                  >
+                    <span>正常账号</span>
+                    <strong>{detailAccountCounts.normal}</strong>
+                  </button>
+                  <button
+                    aria-selected={detailAccountFilter === "rate-limited"}
+                    className={detailAccountFilter === "rate-limited" ? "usage-detail-tab active" : "usage-detail-tab"}
+                    onClick={() => setDetailAccountFilter("rate-limited")}
+                    role="tab"
+                    type="button"
+                  >
+                    <span>限流账号</span>
+                    <strong>{detailAccountCounts.rateLimited}</strong>
+                  </button>
+                </div>
+                {detailBaseAccounts.length ? (
+                  <div className="usage-subscription-filters" role="toolbar" aria-label="按订阅类型筛选账号">
+                    <button
+                      aria-pressed={!subscriptionFilter}
+                      className={!subscriptionFilter ? "usage-subscription-filter active" : "usage-subscription-filter"}
+                      onClick={() => setSubscriptionFilter("")}
+                      type="button"
+                    >
+                      <span>全部订阅</span>
+                      <strong>{detailBaseAccounts.length}</strong>
+                    </button>
+                    {subscriptionFilterOptions.map((option) => (
+                      <button
+                        aria-pressed={subscriptionFilter === option.label}
+                        className={subscriptionFilter === option.label ? "usage-subscription-filter active" : "usage-subscription-filter"}
+                        key={option.label}
+                        onClick={() => setSubscriptionFilter(option.label)}
+                        type="button"
+                      >
+                        <span>{option.label}</span>
+                        <strong>{option.count}</strong>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             </div>
             <div className="table-wrap">
               <table className="usage-account-table">
+                <colgroup>
+                  <col className="usage-account-col-email" />
+                  <col className="usage-account-col-tags" />
+                  <col className="usage-account-col-subscription" />
+                  <col className="usage-account-col-participation" />
+                  <col className="usage-account-col-quota" />
+                  <col className="usage-account-col-quota" />
+                  <col className="usage-account-col-reset" />
+                  <col className="usage-account-col-history" />
+                </colgroup>
                 <thead>
                   <tr>
                     <th>邮箱</th>
-                    <th>分组</th>
+                    <th>标签</th>
+                    <th>订阅类型</th>
                     <th>参与</th>
                     <th>5h 额度</th>
                     <th>7d/月 额度</th>
@@ -1647,10 +1884,17 @@ function UsageEstimateView({
                   </tr>
                 </thead>
                 <tbody>
-                  {detailAccounts.map((account) => (
-                    <tr key={account.email}>
-                      <td className="mono">{account.email}</td>
-                      <td>{account.groups.map((group) => group.name).join(", ")}</td>
+                  {detailAccounts.map((account, index) => (
+                    <tr key={`${account.email}:${account.sub2api_account_id || index}`}>
+                      <td>
+                        <CopyTextButton className="account-email-copy-button mono" hideIcon title="复制账号邮箱" value={account.email} />
+                      </td>
+                      <td>
+                        <UsageAccountTags groups={account.groups} />
+                      </td>
+                      <td>
+                        <UsageSubscriptionCell account={account} />
+                      </td>
                       <td>
                         <Badge tone={usageEstimateParticipationTone(account, includePausedAccounts)}>
                           {usageEstimateParticipationLabel(account, includePausedAccounts)}
@@ -1663,10 +1907,7 @@ function UsageEstimateView({
                         <AccountQuotaCell window={account.seven_day} />
                       </td>
                       <td>
-                        <div className="quota-cell">
-                          <span>{formatWindowResetLine("5h", account.five_hour, timeZone)}</span>
-                          <span>{formatWindowResetLine("7d", account.seven_day, timeZone)}</span>
-                        </div>
+                        <UsageWindowResetCell fiveHour={account.five_hour} now={now} sevenDay={account.seven_day} />
                       </td>
                       <td>
                         <HistoricalQuotaCell history={account.seven_day_token_history} />
@@ -1675,12 +1916,108 @@ function UsageEstimateView({
                   ))}
                 </tbody>
               </table>
-              {!detailAccounts.length ? <Empty label={detailAccountFilter === "normal" ? "暂无正常账号额度" : "暂无限流账号额度"} /> : null}
+              {!detailAccounts.length ? <Empty label={subscriptionFilter ? `暂无 ${subscriptionFilter} 账号额度` : detailAccountFilter === "normal" ? "暂无正常账号额度" : "暂无限流账号额度"} /> : null}
             </div>
           </section>
         </>
       ) : null}
     </div>
+  );
+}
+
+function UsageAccountTags({ groups }: { groups: UsageGroupRef[] }) {
+  const visibleGroups = groups.length ? groups : [{ id: "ungrouped", name: "未分组" }];
+  return (
+    <div className="usage-account-tags">
+      {visibleGroups.map((group) => (
+        <span className="usage-account-tag" key={`${group.id}:${group.name}`} title={group.name}>
+          {group.name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function UsageSubscriptionCell({ account }: { account: AccountUsageEstimate }) {
+  const period = account.subscription_billing_period ? periodLabel(account.subscription_billing_period) : null;
+  const tone = account.has_active_subscription === false ? "warn" : account.has_active_subscription === true ? "ok" : "ink";
+  const label = usageSubscriptionLabel(account);
+  return (
+    <div className="usage-subscription-cell">
+      <Badge tone={tone}>{label}</Badge>
+      {period ? <span>{period}</span> : null}
+    </div>
+  );
+}
+
+function UsageWindowResetCell({
+  fiveHour,
+  sevenDay,
+  now,
+}: {
+  fiveHour: UsageWindowEstimate;
+  sevenDay: UsageWindowEstimate;
+  now: number;
+}) {
+  const timeZone = useDisplayTimeZone();
+  const rows = [
+    { key: "five-hour", label: "5h", window: fiveHour },
+    { key: "seven-day", label: "7d", window: sevenDay },
+  ];
+
+  return (
+    <div className="usage-reset-cell">
+      {rows.map((row) => (
+        <time
+          className={`account-time-tag usage-reset-tag ${row.key}`}
+          dateTime={row.window.reset_at || undefined}
+          key={row.key}
+          title={formatUsageWindowResetTitle(row.label, row.window, timeZone, now)}
+        >
+          <Clock3 size={12} />
+          <span>{formatWindowResetLine(row.label, row.window, now)}</span>
+        </time>
+      ))}
+    </div>
+  );
+}
+
+function usageSubscriptionLabel(
+  account: Pick<
+    AccountUsageEstimate,
+    "account_type" | "has_active_subscription" | "platform" | "subscription_label" | "subscription_plan" | "subscription_type"
+  >,
+) {
+  const plan = account.subscription_type
+    ? subscriptionTypeLabel(account.subscription_type)
+    : account.subscription_label || planLabel(account.subscription_plan || account.account_type || account.platform || "未知");
+  return account.has_active_subscription === false ? "订阅无效" : plan === "active" ? "正常" : plan;
+}
+
+function usageSubscriptionFilterOptions(accounts: AccountUsageEstimate[]) {
+  const counts = new Map<string, number>();
+  for (const account of accounts) {
+    const label = usageSubscriptionLabel(account);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((left, right) => usageSubscriptionSortRank(left.label) - usageSubscriptionSortRank(right.label) || left.label.localeCompare(right.label));
+}
+
+function usageSubscriptionSortRank(label: string) {
+  const normalized = label.trim().toLowerCase();
+  return (
+    {
+      plus: 10,
+      team: 20,
+      pro: 30,
+      free: 40,
+      k12: 50,
+      正常: 60,
+      订阅无效: 70,
+      未知: 80,
+    }[normalized] || 100
   );
 }
 
@@ -1731,7 +2068,10 @@ function UsageLimitSamplesView({
         </div>
         {error ? <div className="mail-error">{error}</div> : null}
         <div className="usage-samples-note">
-          <span>触发阈值：官方已用 ≥ {formatPercent(data?.full_percent_threshold ?? null)}</span>
+          <span>
+            触发阈值：5h ≥ {formatPercent(data?.five_hour_threshold_percent ?? data?.full_percent_threshold ?? null)} · 7d/月 ≥{" "}
+            {formatPercent(data?.seven_day_threshold_percent ?? data?.full_percent_threshold ?? null)}
+          </span>
           <span>plus / team / 月 team 样本分别统计</span>
           <span>样本数量 &lt; 10 条时使用默认区间</span>
           <span>样本数量 ≥ 10 条后使用 mean ± 3 sigma</span>
@@ -2473,11 +2813,13 @@ function PhoneBindingDialog({
 
 function SettingsView({
   settings,
+  subscriptionTypes,
   busy,
   onSave,
   onScan,
 }: {
   settings: AppSettings;
+  subscriptionTypes: string[];
   busy: boolean;
   onSave: (payload: AppSettingsUpdate) => Promise<void> | void;
   onScan: () => Promise<void> | void;
@@ -2490,6 +2832,20 @@ function SettingsView({
   const [interval, setInterval] = useState(String(settings.monitor_interval_seconds));
   const [usageRefreshEnabled, setUsageRefreshEnabled] = useState(settings.usage_refresh_enabled);
   const [usageRefreshInterval, setUsageRefreshInterval] = useState(String(settings.usage_refresh_interval_seconds));
+  const [usageRefreshMaxConcurrency, setUsageRefreshMaxConcurrency] = useState(
+    String(settings.usage_refresh_max_concurrency || 5),
+  );
+  const [usageLimitSampleFiveHourThreshold, setUsageLimitSampleFiveHourThreshold] = useState(
+    String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0),
+  );
+  const [usageLimitSampleSevenDayThreshold, setUsageLimitSampleSevenDayThreshold] = useState(
+    String(settings.usage_limit_sample_seven_day_threshold_percent ?? 0),
+  );
+  const subscriptionTypesKey = subscriptionTypes.join("\u0000");
+  const [usageLimitDefaultRanges, setUsageLimitDefaultRanges] = useState<UsageLimitDefaultRanges>(() =>
+    mergeUsageLimitDefaultRanges(settings.usage_limit_default_ranges, subscriptionTypes),
+  );
+  const [newSubscriptionType, setNewSubscriptionType] = useState("");
   const [protocolRefreshMaxConcurrency, setProtocolRefreshMaxConcurrency] = useState(
     String(settings.protocol_refresh_max_concurrency || settings.refresh_max_concurrency || 1),
   );
@@ -2503,7 +2859,7 @@ function SettingsView({
     String(settings.subscription_refresh_batch_size || 3),
   );
   const [subscriptionRefreshMaxConcurrency, setSubscriptionRefreshMaxConcurrency] = useState(
-    String(settings.subscription_refresh_max_concurrency || 1),
+    String(settings.subscription_refresh_max_concurrency || 3),
   );
   const [displayTimeZone, setDisplayTimeZone] = useState(settings.display_timezone || defaultTimeZone);
   const [xApiKey, setXApiKey] = useState("");
@@ -2518,13 +2874,18 @@ function SettingsView({
     setInterval(String(settings.monitor_interval_seconds));
     setUsageRefreshEnabled(settings.usage_refresh_enabled);
     setUsageRefreshInterval(String(settings.usage_refresh_interval_seconds));
+    setUsageRefreshMaxConcurrency(String(settings.usage_refresh_max_concurrency || 5));
+    setUsageLimitSampleFiveHourThreshold(String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0));
+    setUsageLimitSampleSevenDayThreshold(String(settings.usage_limit_sample_seven_day_threshold_percent ?? 0));
+    setUsageLimitDefaultRanges(mergeUsageLimitDefaultRanges(settings.usage_limit_default_ranges, subscriptionTypes));
+    setNewSubscriptionType("");
     setProtocolRefreshMaxConcurrency(
       String(settings.protocol_refresh_max_concurrency || settings.refresh_max_concurrency || 1),
     );
     setBrowserRefreshMaxConcurrency(String(settings.browser_refresh_max_concurrency || 1));
     setBrowserMinAvailableMemoryMb(String(settings.browser_min_available_memory_mb ?? 500));
     setSubscriptionRefreshBatchSize(String(settings.subscription_refresh_batch_size || 3));
-    setSubscriptionRefreshMaxConcurrency(String(settings.subscription_refresh_max_concurrency || 1));
+    setSubscriptionRefreshMaxConcurrency(String(settings.subscription_refresh_max_concurrency || 3));
     setDisplayTimeZone(settings.display_timezone || defaultTimeZone);
     setXApiKey("");
     setClearXApiKey(false);
@@ -2546,16 +2907,33 @@ function SettingsView({
     settings.sub2api_x_api_key_set,
     settings.usage_refresh_enabled,
     settings.usage_refresh_interval_seconds,
+    settings.usage_refresh_max_concurrency,
+    settings.usage_limit_sample_five_hour_threshold_percent,
+    settings.usage_limit_sample_seven_day_threshold_percent,
+    settings.usage_limit_default_ranges,
+    subscriptionTypesKey,
   ]);
 
   const intervalNumber = Number(interval);
   const usageRefreshIntervalNumber = Number(usageRefreshInterval);
+  const usageRefreshMaxConcurrencyNumber = Number(usageRefreshMaxConcurrency);
+  const usageLimitSampleFiveHourThresholdNumber = Number(usageLimitSampleFiveHourThreshold);
+  const usageLimitSampleSevenDayThresholdNumber = Number(usageLimitSampleSevenDayThreshold);
   const protocolRefreshMaxConcurrencyNumber = Number(protocolRefreshMaxConcurrency);
   const browserRefreshMaxConcurrencyNumber = Number(browserRefreshMaxConcurrency);
   const browserMinAvailableMemoryMbNumber = Number(browserMinAvailableMemoryMb);
   const subscriptionRefreshBatchSizeNumber = Number(subscriptionRefreshBatchSize);
   const subscriptionRefreshMaxConcurrencyNumber = Number(subscriptionRefreshMaxConcurrency);
   const cleanSiteName = siteName.trim();
+  const usageLimitDefaultRangesInvalid =
+    !usageLimitDefaultRanges.unknown ||
+    Object.keys(usageLimitDefaultRanges).length > 100 ||
+    Object.values(usageLimitDefaultRanges).some((planRanges) =>
+      usageLimitWindowKeys.some((windowKey) => {
+        const range = planRanges[windowKey];
+        return !Number.isFinite(range.lower) || !Number.isFinite(range.upper) || range.lower < 0 || range.upper < range.lower || range.upper > 1_000_000_000;
+      }),
+    );
   const invalid =
     !cleanSiteName ||
     cleanSiteName.length > 80 ||
@@ -2565,6 +2943,15 @@ function SettingsView({
     !Number.isInteger(usageRefreshIntervalNumber) ||
     usageRefreshIntervalNumber < 60 ||
     usageRefreshIntervalNumber > 86_400 ||
+    !Number.isInteger(usageRefreshMaxConcurrencyNumber) ||
+    usageRefreshMaxConcurrencyNumber < 1 ||
+    usageRefreshMaxConcurrencyNumber > 20 ||
+    !Number.isFinite(usageLimitSampleFiveHourThresholdNumber) ||
+    usageLimitSampleFiveHourThresholdNumber < 0 ||
+    usageLimitSampleFiveHourThresholdNumber > 100 ||
+    !Number.isFinite(usageLimitSampleSevenDayThresholdNumber) ||
+    usageLimitSampleSevenDayThresholdNumber < 0 ||
+    usageLimitSampleSevenDayThresholdNumber > 100 ||
     !Number.isInteger(protocolRefreshMaxConcurrencyNumber) ||
     protocolRefreshMaxConcurrencyNumber < 1 ||
     protocolRefreshMaxConcurrencyNumber > 50 ||
@@ -2579,7 +2966,36 @@ function SettingsView({
     subscriptionRefreshBatchSizeNumber > 100 ||
     !Number.isInteger(subscriptionRefreshMaxConcurrencyNumber) ||
     subscriptionRefreshMaxConcurrencyNumber < 1 ||
-    subscriptionRefreshMaxConcurrencyNumber > 20;
+    subscriptionRefreshMaxConcurrencyNumber > 20 ||
+    usageLimitDefaultRangesInvalid;
+
+  const addSubscriptionType = () => {
+    const normalized = normalizeSubscriptionType(newSubscriptionType);
+    if (!normalized || normalized === "unknown") return;
+    setUsageLimitDefaultRanges((current) => ({
+      ...current,
+      [normalized]: cloneUsageLimitPlanRanges(current[normalized] || current.unknown || defaultUsageLimitPlanRanges),
+    }));
+    setNewSubscriptionType("");
+  };
+
+  const updateUsageLimitRange = (
+    subscriptionType: string,
+    windowKey: (typeof usageLimitWindowKeys)[number],
+    bound: "lower" | "upper",
+    value: string,
+  ) => {
+    setUsageLimitDefaultRanges((current) => ({
+      ...current,
+      [subscriptionType]: {
+        ...current[subscriptionType],
+        [windowKey]: {
+          ...current[subscriptionType][windowKey],
+          [bound]: Number(value),
+        },
+      },
+    }));
+  };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -2593,6 +3009,10 @@ function SettingsView({
       monitor_interval_seconds: intervalNumber,
       usage_refresh_enabled: usageRefreshEnabled,
       usage_refresh_interval_seconds: usageRefreshIntervalNumber,
+      usage_refresh_max_concurrency: usageRefreshMaxConcurrencyNumber,
+      usage_limit_sample_five_hour_threshold_percent: usageLimitSampleFiveHourThresholdNumber,
+      usage_limit_sample_seven_day_threshold_percent: usageLimitSampleSevenDayThresholdNumber,
+      usage_limit_default_ranges: usageLimitDefaultRanges,
       protocol_refresh_max_concurrency: protocolRefreshMaxConcurrencyNumber,
       browser_refresh_max_concurrency: browserRefreshMaxConcurrencyNumber,
       browser_min_available_memory_mb: browserMinAvailableMemoryMbNumber,
@@ -2666,6 +3086,40 @@ function SettingsView({
               />
             </label>
             <label>
+              用量查询最大同时数
+              <input
+                max={20}
+                min={1}
+                onChange={(event) => setUsageRefreshMaxConcurrency(event.target.value)}
+                type="number"
+                value={usageRefreshMaxConcurrency}
+              />
+            </label>
+            <label>
+              默认 5h 用量阈值 (%)
+              <input
+                max={100}
+                min={0}
+                onChange={(event) => setUsageLimitSampleFiveHourThreshold(event.target.value)}
+                step="0.1"
+                title={`0 表示使用默认 ${defaultUsageLimitSampleThresholdPercent}%`}
+                type="number"
+                value={usageLimitSampleFiveHourThreshold}
+              />
+            </label>
+            <label>
+              默认 7d 用量阈值 (%)
+              <input
+                max={100}
+                min={0}
+                onChange={(event) => setUsageLimitSampleSevenDayThreshold(event.target.value)}
+                step="0.1"
+                title={`0 表示使用默认 ${defaultUsageLimitSampleThresholdPercent}%`}
+                type="number"
+                value={usageLimitSampleSevenDayThreshold}
+              />
+            </label>
+            <label>
               浏览器最大同时登录数
               <input
                 max={50}
@@ -2706,6 +3160,88 @@ function SettingsView({
               />
             </label>
           </div>
+
+          <fieldset className="quota-range-settings">
+            <legend>订阅默认额度区间</legend>
+            <div className="quota-range-list">
+              {Object.entries(usageLimitDefaultRanges)
+                .sort(([left], [right]) => subscriptionTypeSortRank(left) - subscriptionTypeSortRank(right) || left.localeCompare(right))
+                .map(([subscriptionType, planRanges]) => (
+                  <div className="quota-range-row" key={subscriptionType}>
+                    <div className="quota-range-type">
+                      <strong>{subscriptionTypeLabel(subscriptionType)}</strong>
+                      <span>{subscriptionType}</span>
+                    </div>
+                    {usageLimitWindowKeys.map((windowKey) => (
+                      <div className="quota-range-window" key={windowKey}>
+                        <span>{usageLimitWindowLabel(windowKey)}</span>
+                        <label>
+                          下限
+                          <input
+                            aria-label={`${subscriptionTypeLabel(subscriptionType)} ${usageLimitWindowLabel(windowKey)} 下限`}
+                            min={0}
+                            onChange={(event) => updateUsageLimitRange(subscriptionType, windowKey, "lower", event.target.value)}
+                            step="0.01"
+                            type="number"
+                            value={planRanges[windowKey].lower}
+                          />
+                        </label>
+                        <label>
+                          上限
+                          <input
+                            aria-label={`${subscriptionTypeLabel(subscriptionType)} ${usageLimitWindowLabel(windowKey)} 上限`}
+                            min={0}
+                            onChange={(event) => updateUsageLimitRange(subscriptionType, windowKey, "upper", event.target.value)}
+                            step="0.01"
+                            type="number"
+                            value={planRanges[windowKey].upper}
+                          />
+                        </label>
+                      </div>
+                    ))}
+                    <button
+                      aria-label={`删除 ${subscriptionTypeLabel(subscriptionType)} 额度配置`}
+                      className="icon-button quota-range-delete"
+                      disabled={coreSubscriptionTypes.has(subscriptionType)}
+                      onClick={() =>
+                        setUsageLimitDefaultRanges((current) =>
+                          Object.fromEntries(Object.entries(current).filter(([key]) => key !== subscriptionType)),
+                        )
+                      }
+                      title={coreSubscriptionTypes.has(subscriptionType) ? "内置订阅类型" : "删除订阅类型"}
+                      type="button"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                ))}
+            </div>
+            <div className="quota-range-add">
+              <input
+                maxLength={80}
+                onChange={(event) => setNewSubscriptionType(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    addSubscriptionType();
+                  }
+                }}
+                placeholder="新增订阅类型"
+                value={newSubscriptionType}
+              />
+              <button
+                aria-label="新增订阅类型"
+                className="secondary-button"
+                disabled={!newSubscriptionType.trim() || normalizeSubscriptionType(newSubscriptionType) === "unknown"}
+                onClick={addSubscriptionType}
+                title="新增订阅类型"
+                type="button"
+              >
+                <Plus size={17} />
+                <span>新增</span>
+              </button>
+            </div>
+          </fieldset>
 
           <div className="settings-toggle-list">
             <label className="checkbox-line settings-toggle">
@@ -2806,9 +3342,13 @@ function SettingsView({
             <TimerReset size={16} />
             <span>
               {settings.automation_paused ? "已暂停自动任务 · " : ""}巡检 {settings.monitor_interval_seconds} 秒 · 用量{" "}
-              {settings.usage_refresh_enabled ? `${settings.usage_refresh_interval_seconds} 秒` : "关闭"} · 协议并发{" "}
+              {settings.usage_refresh_enabled ? `${settings.usage_refresh_interval_seconds} 秒` : "关闭"} · 用量并发{" "}
+              {settings.usage_refresh_max_concurrency} · 协议并发{" "}
               {settings.protocol_refresh_max_concurrency || settings.refresh_max_concurrency} · 浏览器并发{" "}
-              {settings.browser_refresh_max_concurrency} · 订阅单次 {settings.subscription_refresh_batch_size} · 订阅并发{" "}
+              {settings.browser_refresh_max_concurrency} · 样本阈值 5h{" "}
+              {sampleThresholdSettingLabel(settings.usage_limit_sample_five_hour_threshold_percent)} / 7d{" "}
+              {sampleThresholdSettingLabel(settings.usage_limit_sample_seven_day_threshold_percent)} · 订阅单次{" "}
+              {settings.subscription_refresh_batch_size} · 订阅并发{" "}
               {settings.subscription_refresh_max_concurrency} · 浏览器内存阈值 {settings.browser_min_available_memory_mb} MB · 恢复任务{" "}
               {settings.recovery_enabled ? "开启" : "关闭"} · 状态恢复 {settings.sub2api_auto_recover_state ? "开启" : "关闭"}
             </span>
@@ -3101,10 +3641,48 @@ function SearchBox({ value, placeholder, count, total, onChange }: { value: stri
   );
 }
 
-function AccountStatusFilterMenu({ value, onChange }: { value: AccountStatusFilter; onChange: (value: AccountStatusFilter) => void }) {
+type QuickFilterOption<T extends string> = { value: T; label: string };
+
+function AccountStatusFilterMenu({
+  value,
+  options,
+  onChange,
+}: {
+  value: AccountStatusFilter;
+  options: Array<QuickFilterOption<AccountStatusFilter>>;
+  onChange: (value: AccountStatusFilter) => void;
+}) {
+  return <QuickFilterMenu ariaLabel="状态筛选选项" label="状态筛选" onChange={onChange} options={options} value={value} />;
+}
+
+function AccountSubscriptionFilterMenu({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: Array<QuickFilterOption<string>>;
+  onChange: (value: string) => void;
+}) {
+  return <QuickFilterMenu ariaLabel="订阅筛选选项" label="订阅筛选" onChange={onChange} options={options} value={value} />;
+}
+
+function QuickFilterMenu<T extends string>({
+  value,
+  options,
+  label,
+  ariaLabel,
+  onChange,
+}: {
+  value: T;
+  options: Array<QuickFilterOption<T>>;
+  label: string;
+  ariaLabel: string;
+  onChange: (value: T) => void;
+}) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const selectedOption = accountStatusFilterOptions.find((option) => option.value === value) || accountStatusFilterOptions[0];
+  const selectedOption = options.find((option) => option.value === value) || options[0] || { value, label: value || "全部" };
 
   useEffect(() => {
     if (!open) return;
@@ -3126,13 +3704,13 @@ function AccountStatusFilterMenu({ value, onChange }: { value: AccountStatusFilt
         onClick={() => setOpen((current) => !current)}
         type="button"
       >
-        <span className="quick-filter-label">状态筛选</span>
+        <span className="quick-filter-label">{label}</span>
         <strong className="quick-filter-value">{selectedOption.label}</strong>
         <ChevronDown size={14} />
       </button>
       {open ? (
-        <div aria-label="状态筛选选项" className="quick-filter-menu" role="menu">
-          {accountStatusFilterOptions.map((option) => (
+        <div aria-label={ariaLabel} className="quick-filter-menu" role="menu">
+          {options.map((option) => (
             <button
               aria-checked={option.value === value}
               className={option.value === value ? "quick-filter-option active" : "quick-filter-option"}
@@ -3206,16 +3784,47 @@ function formatTokenCount(value: number | null | undefined) {
 }
 
 function formatTokenWindowLabel(window: UsageTokenHistory["windows"][number], timeZone: string) {
+  const prefix = tokenWindowKindLabel(window.window_key);
   if (window.window_start_at && window.reset_at) {
-    return `${formatShortDate(window.window_start_at, timeZone)} - ${formatShortDate(window.reset_at, timeZone)}`;
+    return `${prefix} ${formatShortDate(window.window_start_at, timeZone)} - ${formatShortDate(window.reset_at, timeZone)}`;
   }
   if (window.reset_at) {
-    return `重置 ${formatShortDate(window.reset_at, timeZone)}`;
+    return `${prefix} 重置 ${formatShortDate(window.reset_at, timeZone)}`;
   }
   if (window.window_start_at) {
-    return `始于 ${formatShortDate(window.window_start_at, timeZone)}`;
+    return `${prefix} 始于 ${formatShortDate(window.window_start_at, timeZone)}`;
   }
-  return window.window_reset_key.replace(/^reset_date:/, "").replace(/^observed_week:/, "");
+  return `${prefix} ${window.window_reset_key.replace(/^reset_date:/, "").replace(/^observed_week:/, "").replace(/^observed_month:/, "")}`;
+}
+
+function tokenWindowKindLabel(windowKey: string) {
+  return windowKey === "monthly" ? "月" : windowKey === "seven_day" ? "7d" : windowKey;
+}
+
+function formatTokenWindowSummary(window: UsageTokenHistory["windows"][number]) {
+  const limit = formatTokenWindowLimit(window.estimated_limit);
+  const spent = window.spent > 0 ? `已用 ${formatMoney(window.spent)}` : "";
+  const tokens = window.tokens > 0 ? `${formatTokenCount(window.tokens)} tokens` : "";
+  return [limit, spent, tokens].filter(Boolean).join(" · ") || "暂无记录";
+}
+
+function formatTokenWindowLimit(value: number | null | undefined) {
+  return value !== null && value !== undefined && Number.isFinite(value) && value > 0 ? `总额 ${formatMoney(value)}` : "总额待采样";
+}
+
+function formatTokenHistoryTotalLabel(history: UsageTokenHistory) {
+  if (!history.window_count) return "-";
+  if (history.total_estimated_limit > 0) return `总额 ${formatMoney(history.total_estimated_limit)}`;
+  if (history.total_spent > 0) return `已用 ${formatMoney(history.total_spent)}`;
+  if (history.total_tokens > 0) return `${formatTokenCount(history.total_tokens)} tokens`;
+  return "暂无用量";
+}
+
+function formatTokenHistoryCountLabel(history: UsageTokenHistory) {
+  if (!history.window_count) return "暂无额度历史";
+  const windows = new Set(history.windows.map((window) => tokenWindowKindLabel(window.window_key)));
+  const kindLabel = windows.size ? [...windows].join("/") : "7d/月";
+  return `共 ${history.window_count} 个 ${kindLabel} 窗口`;
 }
 
 function windowUsedAmount(window: UsageWindowEstimate) {
@@ -3259,12 +3868,22 @@ function formatAggregateMoney(aggregate: UsageWindowAggregate | null | undefined
   return aggregate?.remaining === null || aggregate?.remaining === undefined ? "-" : formatMoney(aggregate.remaining);
 }
 
+function formatProblemUnusedQuota(summary: ProblemUnusedQuotaSummary | null) {
+  if (!summary) return "-";
+  if (summary.accountCount === 0) return formatMoney(0);
+  return formatAggregateMoney(summary.sevenDay);
+}
+
 function formatPercent(value: number | null | undefined) {
   if (value === null || value === undefined || !Number.isFinite(value)) {
     return "-";
   }
   const normalized = Math.max(0, Math.min(value, 100));
   return `${Number.isInteger(normalized) ? normalized.toFixed(0) : normalized.toFixed(1)}%`;
+}
+
+function sampleThresholdSettingLabel(value: number | null | undefined) {
+  return value && value > 0 ? formatPercent(value) : `默认 ${formatPercent(defaultUsageLimitSampleThresholdPercent)}`;
 }
 
 function formatWindowUsage(window: UsageWindowEstimate) {
@@ -3285,12 +3904,12 @@ function formatWindowRemaining(window: UsageWindowEstimate) {
     return "暂无窗口用量";
   }
   if (!window.used_percent || window.used_percent <= 0) {
-    return "缺少已用百分比";
+    return "-";
   }
   return "无法估算";
 }
 
-function formatWindowResetLine(defaultLabel: string, window: UsageWindowEstimate, timeZone: string) {
+function formatWindowResetLine(defaultLabel: string, window: UsageWindowEstimate, now: number) {
   if (window.window_kind === "none" || window.source === "not_applicable") {
     return `${defaultLabel} 无独立限额`;
   }
@@ -3298,7 +3917,67 @@ function formatWindowResetLine(defaultLabel: string, window: UsageWindowEstimate
     return "5h 无独立限额";
   }
   const label = window.window_kind === "monthly" ? "月" : window.window_label || defaultLabel;
-  return `${label} ${window.reset_at ? formatDate(window.reset_at, timeZone) : "-"}`;
+  const remaining = formatWindowRefreshTime(window, now);
+  return `${label} ${remaining === "待查询" ? "-" : remaining}`;
+}
+
+function formatUsageWindowResetTitle(defaultLabel: string, window: UsageWindowEstimate, timeZone: string, now: number) {
+  if (window.window_kind === "none" || window.source === "not_applicable") {
+    return `${defaultLabel} 无独立限额`;
+  }
+  if (defaultLabel === "5h" && window.window_kind === "monthly") {
+    return "5h 无独立限额";
+  }
+  const label = window.window_kind === "monthly" ? "月" : window.window_label || defaultLabel;
+  return formatWindowRefreshTitle(label, window, timeZone, now);
+}
+
+function accountWindowRefreshTags(usage: AccountUsageEstimate | undefined, timeZone: string, now: number) {
+  if (!usage) return [];
+
+  const monthlyWindow = usage.seven_day.window_kind === "monthly" ? usage.seven_day : usage.five_hour.window_kind === "monthly" ? usage.five_hour : null;
+  const monthlyOnly = Boolean(monthlyWindow && usage.five_hour.window_kind === "monthly" && usage.seven_day.window_kind === "monthly");
+  const windows: Array<{ key: string; label: string; quotaWindow: UsageWindowEstimate }> = [];
+
+  if (monthlyOnly && monthlyWindow) {
+    windows.push({ key: "monthly", label: "月", quotaWindow: monthlyWindow });
+  } else {
+    if (usage.five_hour.window_kind !== "none" && usage.five_hour.window_kind !== "monthly" && usage.five_hour.source !== "not_applicable") {
+      windows.push({ key: "five_hour", label: "5h", quotaWindow: usage.five_hour });
+    }
+    if (usage.seven_day.window_kind !== "none" && usage.seven_day.window_kind !== "monthly" && usage.seven_day.source !== "not_applicable") {
+      windows.push({ key: "seven_day", label: "7d", quotaWindow: usage.seven_day });
+    }
+    if (!windows.length && monthlyWindow) {
+      windows.push({ key: "monthly", label: "月", quotaWindow: monthlyWindow });
+    }
+  }
+
+  return windows.map(({ key, label, quotaWindow }) => ({
+    key,
+    label,
+    time: formatWindowRefreshTime(quotaWindow, now),
+    title: formatWindowRefreshTitle(label, quotaWindow, timeZone, now),
+  }));
+}
+
+function formatWindowRefreshTime(window: UsageWindowEstimate, now: number) {
+  const resetRemainingSeconds = windowResetRemainingSeconds(window, now);
+  if (resetRemainingSeconds !== null) return formatRemainingDuration(resetRemainingSeconds);
+  if (window.remaining_seconds !== null && window.remaining_seconds !== undefined) return formatRemainingDuration(window.remaining_seconds);
+  return "待查询";
+}
+
+function formatWindowRefreshTitle(label: string, window: UsageWindowEstimate, timeZone: string, now: number) {
+  const refreshTime = formatWindowRefreshTime(window, now);
+  if (window.reset_at) {
+    const resetLine = `刷新时间 ${formatFullDate(window.reset_at, timeZone)}`;
+    return refreshTime === "已到刷新" ? `${label} 已到刷新时间，${resetLine}` : `${label} 剩余 ${refreshTime}，${resetLine}`;
+  }
+  if (window.remaining_seconds !== null && window.remaining_seconds !== undefined) {
+    return refreshTime === "已到刷新" ? `${label} 已到刷新时间` : `${label} 约 ${refreshTime} 后刷新`;
+  }
+  return `${label} 刷新时间待查询`;
 }
 
 function titleFor(view: View) {
@@ -3374,17 +4053,103 @@ function periodLabel(period: string) {
 
 function planLabel(plan: string) {
   const normalized = plan.trim().toLowerCase();
+  if (normalized === "active") return "active";
+  const subscriptionType = normalizeSubscriptionType(plan);
+  return subscriptionType === "unknown" ? plan : subscriptionTypeLabel(subscriptionType);
+}
+
+function appSettingsEqual(left: AppSettings, right: AppSettings) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function normalizeSubscriptionType(value: string | null | undefined) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return "unknown";
+  const compact = text.replace(/[^a-z0-9]+/g, "");
+  const aliases: Record<string, string> = {
+    chatgptplusplan: "plus",
+    chatgptplus: "plus",
+    plus: "plus",
+    chatgptteamplan: "team",
+    chatgptteam: "team",
+    chatgptbusinessplan: "team",
+    business: "team",
+    team: "team",
+    chatgptproplan: "pro",
+    chatgptpro: "pro",
+    pro: "pro",
+    chatgptfreeplan: "free",
+    chatgptfree: "free",
+    free: "free",
+    chatgptk12plan: "k12",
+    chatgptk12: "k12",
+    k12plan: "k12",
+    k12: "k12",
+  };
+  if (aliases[compact]) return aliases[compact];
+  if (compact.includes("k12")) return "k12";
+  const candidate = text.replace(/^chatgpt[^a-z0-9]*/, "").replace(/[^a-z0-9]*plan$/, "");
+  const candidateCompact = candidate.replace(/[^a-z0-9]+/g, "");
+  if (aliases[candidateCompact]) return aliases[candidateCompact];
+  const slug = candidate.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+  return !slug || ["active", "inactive", "none", "null", "oauth", "openai", "subscription", "plan", "unknown"].includes(slug)
+    ? "unknown"
+    : slug;
+}
+
+function subscriptionTypeLabel(value: string) {
+  const normalized = normalizeSubscriptionType(value);
+  const known: Record<string, string> = {
+    plus: "Plus",
+    team: "Team",
+    pro: "Pro",
+    free: "Free",
+    k12: "K12",
+    unknown: "未知",
+  };
   return (
-    {
-      chatgptplusplan: "plus",
-      plus: "plus",
-      chatgptteamplan: "team",
-      team: "team",
-      chatgptproplan: "pro",
-      pro: "pro",
-      free: "free",
-    }[normalized] || plan
+    known[normalized] ||
+    normalized
+      .split("-")
+      .map((part) => (/\d/.test(part) ? part.toUpperCase() : `${part.charAt(0).toUpperCase()}${part.slice(1)}`))
+      .join(" ")
   );
+}
+
+function subscriptionTypeSortRank(value: string) {
+  return ({ plus: 10, team: 20, pro: 30, free: 40, k12: 50, unknown: 100 } as Record<string, number>)[
+    normalizeSubscriptionType(value)
+  ] || 80;
+}
+
+function cloneUsageLimitPlanRanges(value: UsageLimitPlanRanges): UsageLimitPlanRanges {
+  return {
+    five_hour: { ...value.five_hour },
+    seven_day: { ...value.seven_day },
+    monthly: { ...value.monthly },
+  };
+}
+
+function mergeUsageLimitDefaultRanges(value: UsageLimitDefaultRanges, detectedTypes: string[]): UsageLimitDefaultRanges {
+  const merged = Object.fromEntries(
+    Object.entries({ ...defaultUsageLimitRanges, ...(value || {}) }).map(([subscriptionType, ranges]) => [
+      normalizeSubscriptionType(subscriptionType),
+      cloneUsageLimitPlanRanges(ranges),
+    ]),
+  ) as UsageLimitDefaultRanges;
+  const fallback = merged.unknown || cloneUsageLimitPlanRanges(defaultUsageLimitPlanRanges);
+  for (const rawType of detectedTypes) {
+    const subscriptionType = normalizeSubscriptionType(rawType);
+    if (subscriptionType !== "unknown" && !merged[subscriptionType]) {
+      merged[subscriptionType] = cloneUsageLimitPlanRanges(fallback);
+    }
+  }
+  merged.unknown = cloneUsageLimitPlanRanges(fallback);
+  return merged;
+}
+
+function usageLimitWindowLabel(windowKey: (typeof usageLimitWindowKeys)[number]) {
+  return windowKey === "five_hour" ? "5h" : windowKey === "seven_day" ? "7d" : "月";
 }
 
 function toSub2ApiInstanceUrl(value: string) {
@@ -3559,6 +4324,8 @@ function accountMatchesStatusFilter(account: Account, usage: AccountUsageEstimat
       return !account.deactive && !accountHasError(account) && accountRateLimitedWindowKeys(account, usage).includes("five_hour");
     case "seven-day-rate-limited":
       return !account.deactive && !accountHasError(account) && accountRateLimitedWindowKeys(account, usage).includes("seven_day");
+    case "monthly-rate-limited":
+      return !account.deactive && !accountHasError(account) && accountRateLimitedWindowKeys(account, usage).includes("monthly");
     case "error":
       return !account.deactive && accountHasError(account);
     case "deactive":
@@ -3566,6 +4333,40 @@ function accountMatchesStatusFilter(account: Account, usage: AccountUsageEstimat
     default:
       return true;
   }
+}
+
+function availableAccountStatusFilterOptions(
+  accounts: Account[],
+  usageByAccountId: Map<string, AccountUsageEstimate>,
+  usageByEmail: Map<string, AccountUsageEstimate>,
+): Array<QuickFilterOption<AccountStatusFilter>> {
+  return allAccountStatusFilterOptions.filter((option) => {
+    if (option.value === "all") return true;
+    return accounts.some((account) => accountMatchesStatusFilter(account, usageForAccount(account, usageByAccountId, usageByEmail), option.value));
+  });
+}
+
+function availableAccountSubscriptionFilterOptions(accounts: Account[]): Array<QuickFilterOption<string>> {
+  const labels = new Set<string>();
+  for (const account of accounts) {
+    labels.add(accountSubscriptionTypeLabel(account));
+  }
+  const options = [...labels]
+    .sort((left, right) => usageSubscriptionSortRank(left) - usageSubscriptionSortRank(right) || left.localeCompare(right))
+    .map((label) => ({ value: label, label }));
+  return [{ value: "", label: "全部订阅" }, ...options];
+}
+
+function accountSubscriptionTypeLabel(
+  account: Pick<
+    Account,
+    "account_type" | "has_active_subscription" | "platform" | "subscription_label" | "subscription_plan" | "subscription_type"
+  >,
+) {
+  const plan = account.subscription_type
+    ? subscriptionTypeLabel(account.subscription_type)
+    : account.subscription_label || planLabel(account.subscription_plan || account.account_type || account.platform || "未知");
+  return account.has_active_subscription === false ? "订阅无效" : plan === "active" ? "正常" : plan;
 }
 
 function accountScheduleTone(account: Account, usage?: AccountUsageEstimate) {
@@ -3745,28 +4546,59 @@ function usageEstimateParticipationTone(
 }
 
 function accountRateLimitedWindowsLabel(account: Account | AccountUsageEstimate, usage?: AccountUsageEstimate) {
-  return accountRateLimitedWindowKeys(account, usage).map((window) => rateLimitedWindowLabel(window, usage)).join("/");
+  return accountDisplayRateLimitedWindowKeys(account, usage).map((window) => rateLimitedWindowLabel(window, usage)).join("/");
 }
 
-function accountRateLimitDetails(account: Account, usage: AccountUsageEstimate | undefined, timeZone: string) {
+function accountRateLimitDetails(account: Account, usage: AccountUsageEstimate | undefined, timeZone: string, now: number) {
   const windows = accountRateLimitedWindowKeys(account, usage);
+  return rateLimitDetailsForWindows(windows, usage, timeZone, now);
+}
+
+function accountDisplayRateLimitDetails(account: Account, usage: AccountUsageEstimate | undefined, timeZone: string, now: number) {
+  const windows = accountDisplayRateLimitedWindowKeys(account, usage);
+  return rateLimitDetailsForWindows(windows, usage, timeZone, now);
+}
+
+function rateLimitDetailsForWindows(windows: string[], usage: AccountUsageEstimate | undefined, timeZone: string, now: number) {
   if (!windows.length) {
     return [];
   }
   return windows.map((window) => ({
     key: window,
     label: rateLimitedWindowLabel(window, usage),
-    recovery: formatRateLimitRecovery(window, usage, timeZone),
-    tone: window === "five_hour" ? "info" : "violet",
+    recovery: formatRateLimitRecovery(window, usage, timeZone, now),
+    tone: rateLimitedWindowTone(window),
   }));
 }
 
+function accountDisplayRateLimitedWindowKeys(account: Account | AccountUsageEstimate, usage?: AccountUsageEstimate) {
+  const windows: string[] = [];
+  for (const window of accountRateLimitedWindowKeys(account, usage)) {
+    const displayWindow = rateLimitedWindowLabel(window, usage) === "月" ? "monthly" : window;
+    if (!windows.includes(displayWindow)) {
+      windows.push(displayWindow);
+    }
+  }
+  return windows;
+}
+
 function accountRateLimitedWindowKeys(account: Account | AccountUsageEstimate, usage?: AccountUsageEstimate) {
-  const windows = new Set(account.rate_limited_windows || []);
-  usage?.rate_limited_windows?.forEach((window) => windows.add(window));
-  if (usage?.five_hour.rate_limited) windows.add("five_hour");
-  if (usage?.seven_day.rate_limited) windows.add("seven_day");
+  const windows = new Set<string>();
+  (account.rate_limited_windows || []).forEach((window) => windows.add(normalizeRateLimitedWindowKey(window, usage)));
+  usage?.rate_limited_windows?.forEach((window) => windows.add(normalizeRateLimitedWindowKey(window, usage)));
+  if (usage?.five_hour.rate_limited) windows.add(normalizeRateLimitedWindowKey("five_hour", usage));
+  if (usage?.seven_day.rate_limited) windows.add(normalizeRateLimitedWindowKey("seven_day", usage));
   return [...windows];
+}
+
+function normalizeRateLimitedWindowKey(window: string, usage?: AccountUsageEstimate) {
+  if (window === "five_hour" && usage?.five_hour.window_kind === "monthly") {
+    return "monthly";
+  }
+  if (window === "seven_day" && usage?.seven_day.window_kind === "monthly") {
+    return "monthly";
+  }
+  return window;
 }
 
 function rateLimitedWindowLabel(window: string, usage?: AccountUsageEstimate) {
@@ -3785,24 +4617,45 @@ function rateLimitedWindowLabel(window: string, usage?: AccountUsageEstimate) {
   );
 }
 
-function formatRateLimitRecovery(window: string, usage: AccountUsageEstimate | undefined, timeZone: string) {
-  const quotaWindow = window === "five_hour" ? usage?.five_hour : window === "seven_day" ? usage?.seven_day : undefined;
+function rateLimitedWindowTone(window: string) {
+  if (window === "monthly") return "warn";
+  return window === "five_hour" ? "info" : "violet";
+}
+
+function formatRateLimitRecovery(window: string, usage: AccountUsageEstimate | undefined, timeZone: string, now: number) {
+  const quotaWindow =
+    window === "five_hour"
+      ? usage?.five_hour
+      : window === "seven_day"
+        ? usage?.seven_day
+        : window === "monthly" && usage?.seven_day.window_kind === "monthly"
+          ? usage.seven_day
+          : window === "monthly" && usage?.five_hour.window_kind === "monthly"
+            ? usage.five_hour
+            : undefined;
   if (!quotaWindow) return "待查询";
-  if (quotaWindow.remaining_seconds !== null && quotaWindow.remaining_seconds !== undefined) {
-    return formatDuration(quotaWindow.remaining_seconds);
-  }
-  if (quotaWindow.reset_at) {
-    const resetAt = parseApiDate(quotaWindow.reset_at);
-    const seconds = Math.ceil((resetAt.getTime() - Date.now()) / 1000);
-    if (Number.isFinite(seconds) && seconds > 0) {
-      return formatDuration(seconds);
-    }
-    return formatDate(quotaWindow.reset_at, timeZone);
+  const resetRemainingSeconds = windowResetRemainingSeconds(quotaWindow, now);
+  if (resetRemainingSeconds !== null) {
+    return formatRemainingDuration(resetRemainingSeconds);
   }
   if (quotaWindow.remaining_seconds !== null && quotaWindow.remaining_seconds !== undefined) {
-    return formatDuration(quotaWindow.remaining_seconds);
+    return formatRemainingDuration(quotaWindow.remaining_seconds);
   }
+  if (quotaWindow.reset_at) return formatDate(quotaWindow.reset_at, timeZone);
   return "待查询";
+}
+
+function windowResetRemainingSeconds(window: UsageWindowEstimate, now: number) {
+  if (!window.reset_at) return null;
+  const resetAt = parseApiDate(window.reset_at);
+  const seconds = Math.ceil((resetAt.getTime() - now) / 1000);
+  return Number.isFinite(seconds) ? Math.max(0, seconds) : null;
+}
+
+function formatRemainingDuration(seconds: number) {
+  if (!Number.isFinite(seconds)) return "待查询";
+  if (seconds <= 0) return "已到刷新";
+  return formatDuration(seconds);
 }
 
 function formatDuration(seconds: number) {
@@ -3850,6 +4703,10 @@ function buildDisplayedUsageEstimate(estimate: UsageEstimate, includePausedAccou
 
 function usageDetailAccountVisible(account: AccountUsageEstimate) {
   return !account.deactive && !account.error && !account.usage_error;
+}
+
+function usageProblemAccount(account: AccountUsageEstimate) {
+  return account.deactive || account.error;
 }
 
 function usageDetailAccountRateLimited(account: AccountUsageEstimate) {
@@ -3940,6 +4797,51 @@ function aggregateUsageAccountsWindow(accounts: AccountUsageEstimate[], windowKe
   };
 }
 
+function usageProblemAccountUnusedQuota(accounts: AccountUsageEstimate[]): ProblemUnusedQuotaSummary {
+  const problemAccounts = accounts.filter(usageProblemAccount);
+  return {
+    accountCount: problemAccounts.length,
+    fiveHour: aggregateProblemUsageAccountsWindow(problemAccounts, "five_hour"),
+    sevenDay: aggregateProblemUsageAccountsWindow(problemAccounts, "seven_day"),
+  };
+}
+
+function aggregateProblemUsageAccountsWindow(accounts: AccountUsageEstimate[], windowKey: "five_hour" | "seven_day"): UsageWindowAggregate {
+  let spent = 0;
+  let limit = 0;
+  let remaining = 0;
+  let estimatedSpent = 0;
+  let windowAccountCount = 0;
+  let estimableAccounts = 0;
+
+  for (const account of accounts) {
+    const window = aggregateSourceWindow(account, windowKey);
+    if (window.window_kind === "none") continue;
+    windowAccountCount += 1;
+    if (window.estimate_spent !== null) {
+      spent += window.estimate_spent;
+    }
+    if (window.estimated_limit === null || window.remaining === null) {
+      continue;
+    }
+    estimableAccounts += 1;
+    estimatedSpent += window.estimate_spent ?? 0;
+    limit += window.estimated_limit;
+    remaining += window.remaining;
+  }
+
+  return {
+    spent,
+    estimated_limit: estimableAccounts ? limit : null,
+    remaining: estimableAccounts ? remaining : null,
+    remaining_percent: estimableAccounts && limit > 0 ? clampPercentValue((remaining / limit) * 100) : null,
+    used_percent: estimableAccounts && limit > 0 ? clampPercentValue((estimatedSpent / limit) * 100) : null,
+    account_count: accounts.length,
+    enabled_account_count: windowAccountCount,
+    estimable_accounts: estimableAccounts,
+  };
+}
+
 function aggregateSourceWindow(account: AccountUsageEstimate, windowKey: "five_hour" | "seven_day") {
   const window = account[windowKey];
   if (windowKey === "five_hour" && window.window_kind === "none" && account.seven_day.window_kind === "monthly") {
@@ -3969,6 +4871,21 @@ function latestEventByKinds(events: AppEvent[], kinds: string[]) {
 
 function useDisplayTimeZone() {
   return useContext(TimeZoneContext);
+}
+
+function useNow() {
+  return useContext(NowContext);
+}
+
+function useRefreshClock() {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), refreshClockIntervalMs);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return now;
 }
 
 function statusLabel(status: string) {

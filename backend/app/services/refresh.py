@@ -32,7 +32,7 @@ from app.services.phone_numbers import (
 )
 from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient, looks_deactive_text, sanitize_payload
-from app.services.usage_estimate import record_usage_limit_samples
+from app.services.usage_estimate import materialize_usage_reset_times, record_usage_limit_samples
 
 
 SENSITIVE_ERROR_RE = re.compile(
@@ -1038,6 +1038,7 @@ class RefreshService:
             return "sub2api usage refresh failed; see events"
 
         if usage is not None:
+            usage = materialize_usage_reset_times(usage)
             await record_usage_limit_samples(self.sub2api, [account], {self.sub2api.account_id(account) or "": usage})
             return "sub2api usage refreshed"
         return "sub2api usage endpoint unavailable"

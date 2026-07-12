@@ -10,7 +10,17 @@ from sqlalchemy import delete, select
 
 from app.core.database import AsyncSessionLocal
 from app.models import AccountSnapshot, UsageLimitSample, UsageTokenWindow, UsageWindowState, utcnow
+from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient, Sub2ApiRequestError
+from app.core.subscription_types import (
+    CORE_SUBSCRIPTION_TYPES,
+    SUBSCRIPTION_TYPE_UNKNOWN,
+    normalize_subscription_type,
+    normalize_usage_limit_ranges,
+    subscription_type_label,
+    subscription_type_sort_key,
+    usage_limit_bounds,
+)
 
 
 WINDOWS = {
@@ -36,27 +46,13 @@ MONTHLY_SAMPLE_WINDOW_KEY = "monthly"
 WINDOW_RESET_SECONDS = {
     "five_hour": 5 * 60 * 60,
     "seven_day": 7 * 24 * 60 * 60,
+    MONTHLY_SAMPLE_WINDOW_KEY: 30 * 24 * 60 * 60,
 }
 RESET_AT_RESET_JUMP_FRACTION = 0.5
 STALE_DELTA_USED_PERCENT_THRESHOLD = 10.0
 STALE_DELTA_SPENT_RATIO_THRESHOLD = 0.1
-PLAN_COHORT_UNKNOWN = "unknown"
-DEFAULT_SAMPLE_PLAN_COHORTS = ("plus", "team")
-MONTHLY_SAMPLE_PLAN_COHORTS = ("team",)
-PLAN_COHORT_LABELS = {
-    "plus": "plus",
-    "team": "team",
-    "pro": "pro",
-    "free": "free",
-    PLAN_COHORT_UNKNOWN: "未识别套餐",
-}
-PLAN_COHORT_ORDER = {
-    "plus": 0,
-    "team": 1,
-    "pro": 2,
-    "free": 3,
-    PLAN_COHORT_UNKNOWN: 4,
-}
+PLAN_COHORT_UNKNOWN = SUBSCRIPTION_TYPE_UNKNOWN
+DEFAULT_SAMPLE_PLAN_COHORTS = CORE_SUBSCRIPTION_TYPES
 PLAN_COHORT_PATHS = (
     ("credentials", "plan_type"),
     ("credentials", "planType"),
@@ -79,11 +75,6 @@ PLAN_COHORT_PATHS = (
     ("last_active_subscription", "plan"),
     ("last_active_subscription", "name"),
 )
-DEFAULT_LIMIT_BOUNDS = {
-    "five_hour": (15.0, 25.0),
-    "seven_day": (100.0, 140.0),
-    MONTHLY_SAMPLE_WINDOW_KEY: (100.0, 300.0),
-}
 SAMPLE_WINDOWS = {
     **WINDOWS,
     MONTHLY_SAMPLE_WINDOW_KEY: {
@@ -105,18 +96,21 @@ MONTHLY_USAGE_KEYS = (
 )
 
 
-def _usage_limit_sample_allowed(window_key: str, plan_cohort: str, observed_limit: float | None) -> bool:
+def _usage_limit_sample_allowed(
+    window_key: str,
+    plan_cohort: str,
+    observed_limit: float | None,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
+) -> bool:
     if window_key not in SAMPLE_WINDOWS:
         return False
     normalized = _normalize_plan_cohort(plan_cohort)
     if normalized == PLAN_COHORT_UNKNOWN:
         return False
-    if window_key == MONTHLY_SAMPLE_WINDOW_KEY and normalized not in MONTHLY_SAMPLE_PLAN_COHORTS:
-        return False
     value = _coerce_float(observed_limit)
     if value is None or value <= 0:
         return False
-    lower_bound, _ = _default_limit_bounds(window_key, normalized)
+    lower_bound, _ = _default_limit_bounds(window_key, normalized, default_ranges)
     return value >= lower_bound
 
 
@@ -144,8 +138,11 @@ async def build_usage_estimate(
         accounts = await _reload_usage_sample_accounts(sub2api, accounts)
         await record_usage_limit_samples(sub2api, accounts, usage_by_account_id)
     allowed_account_ids = {account_id for account in accounts if (account_id := sub2api.account_id(account))}
-    limit_calibrations = await _load_usage_limit_calibrations(allowed_account_ids)
-    token_history = await _load_usage_token_window_history(allowed_account_ids)
+    runtime_config = get_runtime_config_service()
+    default_ranges = await runtime_config.get_usage_limit_default_ranges()
+    limit_calibrations = await _load_usage_limit_calibrations(default_ranges)
+    token_history = await _load_usage_token_window_history(allowed_account_ids, default_ranges)
+    sample_thresholds = await runtime_config.get_usage_limit_sample_thresholds()
 
     account_rows = [
         _account_estimate(
@@ -158,6 +155,8 @@ async def build_usage_estimate(
             usage_states=usage_states,
             limit_calibrations=limit_calibrations,
             token_history=token_history,
+            sample_thresholds=sample_thresholds,
+            default_ranges=default_ranges,
         )
         for account in accounts
     ]
@@ -169,10 +168,10 @@ async def build_usage_estimate(
         "formula": {
             "basis": "当前官方窗口用量 = sub2api 原始窗口用量。",
             "reset_rule": "当前估算直接使用 sub2api 返回的窗口已用额度、重置时间和剩余秒数，不再基于本地状态机修正已用额度。",
-            "account_limit": "单账号总额：优先按 sub2api 原始窗口已用额度 / sub2api 官方已用百分比 反推；官方窗口已满时直接采用 sub2api 当前窗口反推总额；窗口用量为 0 时优先取同套餐样本窗口代表值，样本数量小于 10 条时取默认窗口代表值；未满窗口展示总额会裁剪到限流样本的 3 sigma 区间。",
-            "account_remaining": "单账号剩余：有 sub2api 官方已用百分比时，按 裁剪后总额 × (100 - 官方已用百分比) / 100 估算；缺少官方百分比时回退为 裁剪后总额 - 估算已用额度。",
+            "account_limit": "单账号总额：优先按 sub2api 原始窗口已用额度 / sub2api 官方已用百分比 反推；反推总额存在时优先于 sub2api 原始 limit 字段；官方窗口已满时直接采用当前窗口反推总额；窗口用量为 0 时优先取同套餐样本窗口代表值，样本数量小于 10 条时取默认窗口代表值；未满窗口总额按限流样本区间裁剪，但不会裁到低于当前官方已用额度。",
+            "account_remaining": "单账号剩余：有 sub2api 官方已用百分比时，按 估算总额 × (100 - 官方已用百分比) / 100 估算；缺少官方百分比时回退为 估算总额 - 估算已用额度。",
             "aggregate_remaining": "综合剩余 = 所有参与且未限流账号的剩余额度相加；无独立 5h、只有月总额的账号，5h 聚合复用月总额。",
-            "estimable_rule": "sub2api 官方已用百分比始终保留用于显示；总额度估算优先使用 sub2api 原始窗口已用额度参与反推；官方窗口已满时不做默认/样本裁剪；当前窗口用量为 0 时优先使用同套餐样本，样本数量小于 10 条时使用默认窗口；未满窗口总额做样本区间裁剪后，估算已用/未用按官方百分比重锚定。",
+            "estimable_rule": "sub2api 官方已用百分比始终保留用于显示；有实际窗口用量和官方百分比时，总额度先按两者反推，未满窗口再按样本区间裁剪；已用额度继续使用 sub2api 原始窗口已用金额；若当前已用额度已经超过样本上界，则保留官方用量/百分比反推结果；官方窗口已满时不做默认/样本裁剪；当前窗口用量为 0 时优先使用同套餐样本，样本数量小于 10 条时使用默认窗口；只有百分比、没有用量金额时只估算剩余，不反填已用金额。",
         },
         "overall": {
             "account_count": len(account_rows),
@@ -186,30 +185,7 @@ async def build_usage_estimate(
 
 
 def _normalize_plan_cohort(value: Any) -> str:
-    text = _stringify(value)
-    if not text:
-        return PLAN_COHORT_UNKNOWN
-    normalized = text.strip().lower()
-    direct = {
-        "chatgptplusplan": "plus",
-        "plus": "plus",
-        "chatgptteamplan": "team",
-        "team": "team",
-        "chatgptproplan": "pro",
-        "pro": "pro",
-        "free": "free",
-    }
-    if normalized in direct:
-        return direct[normalized]
-    if "team" in normalized:
-        return "team"
-    if "plus" in normalized:
-        return "plus"
-    if normalized == "free" or "free" in normalized:
-        return "free"
-    if normalized == "pro" or normalized.endswith("proplan"):
-        return "pro"
-    return PLAN_COHORT_UNKNOWN
+    return normalize_subscription_type(value)
 
 
 def _plan_cohort_from_account(account: dict[str, Any]) -> str:
@@ -225,24 +201,31 @@ def _plan_cohort_from_account(account: dict[str, Any]) -> str:
 
 
 def _plan_cohort_label(cohort: str) -> str:
-    normalized = _normalize_plan_cohort(cohort)
-    return PLAN_COHORT_LABELS.get(normalized, normalized)
+    return subscription_type_label(cohort)
 
 
 def _plan_cohort_sort_key(cohort: str) -> tuple[int, str]:
-    normalized = _normalize_plan_cohort(cohort)
-    return PLAN_COHORT_ORDER.get(normalized, len(PLAN_COHORT_ORDER)), normalized
+    return subscription_type_sort_key(cohort)
 
 
-def _default_limit_bounds(window_key: str, plan_cohort: str = PLAN_COHORT_UNKNOWN) -> tuple[float, float]:
-    _ = _normalize_plan_cohort(plan_cohort)
-    return DEFAULT_LIMIT_BOUNDS[window_key]
+def _default_limit_bounds(
+    window_key: str,
+    plan_cohort: str = PLAN_COHORT_UNKNOWN,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
+) -> tuple[float, float]:
+    return usage_limit_bounds(default_ranges, window_key, plan_cohort)
 
 
-def _default_sample_plan_cohorts(window_key: str) -> tuple[str, ...]:
-    if window_key == MONTHLY_SAMPLE_WINDOW_KEY:
-        return MONTHLY_SAMPLE_PLAN_COHORTS
-    return DEFAULT_SAMPLE_PLAN_COHORTS
+def _default_sample_plan_cohorts(
+    window_key: str,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
+) -> tuple[str, ...]:
+    ranges = normalize_usage_limit_ranges(default_ranges)
+    return tuple(
+        subscription_type
+        for subscription_type in sorted(ranges, key=_plan_cohort_sort_key)
+        if subscription_type != PLAN_COHORT_UNKNOWN and window_key in ranges[subscription_type]
+    )
 
 
 async def _load_group_map(sub2api: Sub2ApiClient) -> dict[str, str]:
@@ -325,6 +308,7 @@ async def _save_usage_window_states(states: dict[tuple[str, str], dict[str, Any]
 
 async def _load_usage_token_window_history(
     allowed_account_ids: set[str] | None = None,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     history: dict[str, list[dict[str, Any]]] = defaultdict(list)
     if allowed_account_ids is not None and not allowed_account_ids:
@@ -339,11 +323,13 @@ async def _load_usage_token_window_history(
         if allowed_account_ids is not None:
             sample_query = sample_query.where(UsageLimitSample.sub2api_account_id.in_(allowed_account_ids))
         sample_result = await db.execute(sample_query)
-        limit_samples_by_account: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        limit_samples_by_account: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for row in sample_result.scalars().all():
-            if not _usage_limit_sample_allowed(row.window_key, row.plan_cohort, row.observed_limit):
+            if not _usage_limit_sample_allowed(
+                row.window_key, row.plan_cohort, row.observed_limit, default_ranges
+            ):
                 continue
-            limit_samples_by_account[row.account_key].append(
+            limit_samples_by_account[(row.account_key, row.window_key)].append(
                 {
                     "reset_at": row.reset_at,
                     "observed_limit": float(row.observed_limit or 0),
@@ -351,7 +337,7 @@ async def _load_usage_token_window_history(
             )
         history_query = (
             select(UsageTokenWindow)
-            .where(UsageTokenWindow.window_key == "seven_day")
+            .where(UsageTokenWindow.window_key.in_(["seven_day", MONTHLY_SAMPLE_WINDOW_KEY]))
             .order_by(UsageTokenWindow.account_key, UsageTokenWindow.last_observed_at.desc(), UsageTokenWindow.id.desc())
         )
         if allowed_account_ids is not None:
@@ -368,7 +354,7 @@ async def _load_usage_token_window_history(
                     "reset_at": row.reset_at,
                     "spent": float(row.spent or 0),
                     "tokens": int(row.tokens or 0),
-                    "estimated_limit": _historical_window_limit(limit_samples_by_account.get(row.account_key, []), row.reset_at),
+                    "estimated_limit": _historical_window_limit(limit_samples_by_account.get((row.account_key, row.window_key), []), row.reset_at),
                     "first_observed_at": first_observed_at,
                     "last_observed_at": last_observed_at,
                 }
@@ -429,7 +415,7 @@ async def _fetch_usages(
             return
         async with semaphore:
             try:
-                usage_by_id[account_id] = await sub2api.get_account_usage(account_id, force=True)
+                usage_by_id[account_id] = materialize_usage_reset_times(await sub2api.get_account_usage(account_id, force=True))
             except Sub2ApiRequestError as exc:
                 errors_by_id[account_id] = str(exc)
 
@@ -437,16 +423,34 @@ async def _fetch_usages(
     return usage_by_id, errors_by_id
 
 
+def materialize_usage_reset_times(usage: dict[str, Any], observed_at: datetime | None = None) -> dict[str, Any]:
+    observed_at = _normalize_datetime(observed_at or utcnow())
+    for window_key in WINDOWS:
+        window_data, _ = _usage_window_data(usage, window_key)
+        if not window_data or _usage_window_reset_at(window_data):
+            continue
+        remaining_seconds = _usage_window_remaining_seconds(window_data)
+        if remaining_seconds is not None:
+            window_data["reset_at"] = _format_datetime(observed_at + timedelta(seconds=max(remaining_seconds, 0)))
+    return usage
+
+
 async def record_usage_limit_samples(
     sub2api: Sub2ApiClient,
     accounts: list[dict[str, Any]],
     usage_by_account_id: dict[str, dict[str, Any]],
 ) -> None:
+    for usage in usage_by_account_id.values():
+        if isinstance(usage, dict):
+            materialize_usage_reset_times(usage)
     accounts = await _reload_usage_sample_accounts(sub2api, accounts)
     await _save_refreshed_usage_window_states(accounts, sub2api, usage_by_account_id)
     await _save_usage_token_windows(accounts, sub2api, usage_by_account_id)
-    samples = _usage_limit_samples(accounts, sub2api, usage_by_account_id)
-    await _save_usage_limit_samples(samples)
+    runtime_config = get_runtime_config_service()
+    thresholds = await runtime_config.get_usage_limit_sample_thresholds()
+    default_ranges = await runtime_config.get_usage_limit_default_ranges()
+    samples = _usage_limit_samples(accounts, sub2api, usage_by_account_id, thresholds, default_ranges)
+    await _save_usage_limit_samples(samples, default_ranges)
 
 
 async def _reload_usage_sample_accounts(
@@ -598,7 +602,8 @@ def _usage_token_window_observations(
         if not usage:
             continue
         email = sub2api.account_email(account) or _stringify(account.get("name")) or account_id
-        values = _window_values(account, usage, "seven_day")
+        values, _, window_kind = _estimate_window_values(account, usage, "seven_day")
+        history_window_key = MONTHLY_SAMPLE_WINDOW_KEY if window_kind == "monthly" else "seven_day"
         tokens = _tokens_value(values["stats"], values["window_data"])
         spent = _coerce_float(values.get("raw_spent"))
         if (tokens is None or tokens <= 0) and (spent is None or spent <= 0):
@@ -607,13 +612,15 @@ def _usage_token_window_observations(
             values.get("reset_at"),
             _coerce_int(values.get("remaining_seconds")),
             observed_at,
+            history_window_key,
+            _coerce_int(values.get("window_minutes")),
         )
         observations.append(
             {
                 "account_key": _account_state_key(account_id, email),
                 "email": email,
                 "sub2api_account_id": account_id,
-                "window_key": "seven_day",
+                "window_key": history_window_key,
                 "window_reset_key": reset_key,
                 "window_start_at": window_start_at,
                 "reset_at": reset_at,
@@ -628,6 +635,8 @@ def _token_window_identity(
     reset_at: str | None,
     remaining_seconds: int | None,
     observed_at: datetime,
+    window_key: str = "seven_day",
+    window_minutes: int | None = None,
 ) -> tuple[str, str | None, str | None]:
     reset_dt = _parse_datetime(reset_at)
     effective_reset_at = reset_at
@@ -640,15 +649,33 @@ def _token_window_identity(
         return (
             f"reset_date:{reset_dt.date().isoformat()}",
             effective_reset_at or _format_datetime(reset_dt),
-            _format_datetime(reset_dt - timedelta(days=7)),
+            _format_datetime(reset_dt - timedelta(seconds=_token_window_seconds(window_key, window_minutes))),
         )
+
+    if window_key == MONTHLY_SAMPLE_WINDOW_KEY:
+        month_start = observed_at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return f"observed_month:{observed_at.year}-{observed_at.month:02d}", None, _format_datetime(month_start)
 
     iso_year, iso_week, _ = observed_at.isocalendar()
     week_start = observed_at - timedelta(days=observed_at.weekday())
     return f"observed_week:{iso_year}-W{iso_week:02d}", None, _format_datetime(week_start)
 
 
-def account_rate_limited_windows(account: dict[str, Any], usage: dict[str, Any] | None = None) -> list[str]:
+def _token_window_seconds(window_key: str, window_minutes: int | None = None) -> int:
+    if window_key == MONTHLY_SAMPLE_WINDOW_KEY and (
+        window_minutes is None or window_minutes <= MONTHLY_WINDOW_MINUTES_THRESHOLD
+    ):
+        return WINDOW_RESET_SECONDS[MONTHLY_SAMPLE_WINDOW_KEY]
+    if window_minutes is not None and window_minutes > 0:
+        return window_minutes * 60
+    return WINDOW_RESET_SECONDS.get(window_key, WINDOW_RESET_SECONDS["seven_day"])
+
+
+def account_rate_limited_windows(
+    account: dict[str, Any],
+    usage: dict[str, Any] | None = None,
+    sample_thresholds: dict[str, float] | None = None,
+) -> list[str]:
     usage = usage if isinstance(usage, dict) else {}
     windows: list[str] = []
     for window_key in WINDOWS:
@@ -657,28 +684,44 @@ def account_rate_limited_windows(account: dict[str, Any], usage: dict[str, Any] 
         raw_spent = _coerce_float(values.get("raw_spent"))
         if _account_clears_zero_spend_limit(account_values, used_percent, raw_spent):
             continue
-        if used_percent is not None and used_percent < LIMIT_SAMPLE_FULL_PERCENT:
+        threshold_percent = _limit_sample_threshold(_display_rate_limited_window_key(window_key, window_kind), sample_thresholds)
+        if used_percent is not None and used_percent < threshold_percent:
             continue
         if _window_rate_limited(
             account,
             "seven_day" if window_kind == "monthly" else window_key,
             used_percent=used_percent,
             reset_at=_stringify(values.get("reset_at")),
+            threshold_percent=threshold_percent,
         ):
-            windows.append(window_key)
+            _append_rate_limited_window(windows, _display_rate_limited_window_key(window_key, window_kind))
     return windows
+
+
+def _display_rate_limited_window_key(window_key: str, window_kind: str | None) -> str:
+    if window_kind == "monthly":
+        return MONTHLY_SAMPLE_WINDOW_KEY
+    return window_key
+
+
+def _append_rate_limited_window(windows: list[str], window_key: str) -> None:
+    if window_key not in windows:
+        windows.append(window_key)
 
 
 async def _save_usage_limit_samples(
     samples: list[dict[str, Any]],
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> None:
     valid_samples = [
         sample
         for sample in samples
-        if _usage_limit_sample_allowed(sample["window_key"], sample.get("plan_cohort"), sample.get("observed_limit"))
+        if _usage_limit_sample_allowed(
+            sample["window_key"], sample.get("plan_cohort"), sample.get("observed_limit"), default_ranges
+        )
     ]
     if not valid_samples:
-        await _prune_usage_limit_samples()
+        await _prune_usage_limit_samples(default_ranges)
         return
 
     async with AsyncSessionLocal() as db:
@@ -732,10 +775,12 @@ async def _save_usage_limit_samples(
             row.updated_at = utcnow()
         await db.commit()
 
-    await _prune_usage_limit_samples()
+    await _prune_usage_limit_samples(default_ranges)
 
 
-async def _prune_usage_limit_samples() -> None:
+async def _prune_usage_limit_samples(
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
+) -> None:
     async with AsyncSessionLocal() as db:
         for window_key in SAMPLE_WINDOWS:
             result = await db.execute(
@@ -746,7 +791,9 @@ async def _prune_usage_limit_samples() -> None:
             rows = list(result.scalars().all())
             rows_by_cohort: dict[str, list[UsageLimitSample]] = defaultdict(list)
             for row in rows:
-                if not _usage_limit_sample_allowed(row.window_key, row.plan_cohort, row.observed_limit):
+                if not _usage_limit_sample_allowed(
+                    row.window_key, row.plan_cohort, row.observed_limit, default_ranges
+                ):
                     await db.delete(row)
                     continue
                 rows_by_cohort[_normalize_plan_cohort(row.plan_cohort)].append(row)
@@ -762,40 +809,33 @@ async def _prune_usage_limit_samples() -> None:
 
 
 async def _load_usage_limit_calibrations(
-    allowed_account_ids: set[str] | None = None,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    if allowed_account_ids is not None and not allowed_account_ids:
-        return {
-            window_key: {PLAN_COHORT_UNKNOWN: _limit_calibration(window_key, [], PLAN_COHORT_UNKNOWN)}
-            for window_key in SAMPLE_WINDOWS
-        }
-
     async with AsyncSessionLocal() as db:
         query = select(UsageLimitSample).order_by(
             UsageLimitSample.window_key,
             UsageLimitSample.plan_cohort,
             UsageLimitSample.observed_limit,
         )
-        if allowed_account_ids is not None:
-            query = query.where(UsageLimitSample.sub2api_account_id.in_(allowed_account_ids))
         result = await db.execute(query)
         rows = list(result.scalars().all())
 
     values_by_window: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
         value = _coerce_float(row.observed_limit)
-        if _usage_limit_sample_allowed(row.window_key, row.plan_cohort, value):
+        if _usage_limit_sample_allowed(row.window_key, row.plan_cohort, value, default_ranges):
             values_by_window[row.window_key][_normalize_plan_cohort(row.plan_cohort)].append(value)
 
     calibrations: dict[str, dict[str, dict[str, Any]]] = {}
     for window_key in SAMPLE_WINDOWS:
         cohort_values = values_by_window.get(window_key, {})
         calibrations[window_key] = {
-            cohort: _limit_calibration(window_key, values, cohort)
+            cohort: _limit_calibration(window_key, values, cohort, default_ranges)
             for cohort, values in cohort_values.items()
         }
-        if PLAN_COHORT_UNKNOWN not in calibrations[window_key]:
-            calibrations[window_key][PLAN_COHORT_UNKNOWN] = _limit_calibration(window_key, [], PLAN_COHORT_UNKNOWN)
+        for cohort in (*_default_sample_plan_cohorts(window_key, default_ranges), PLAN_COHORT_UNKNOWN):
+            if cohort not in calibrations[window_key]:
+                calibrations[window_key][cohort] = _limit_calibration(window_key, [], cohort, default_ranges)
     return calibrations
 
 
@@ -803,15 +843,23 @@ def _resolve_limit_calibration(
     window_key: str,
     calibrations: dict[str, dict[str, dict[str, Any]]],
     plan_cohort: str,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> dict[str, Any]:
     normalized = _normalize_plan_cohort(plan_cohort)
     by_window = calibrations.get(window_key) or {}
     if normalized == PLAN_COHORT_UNKNOWN:
-        return by_window.get(PLAN_COHORT_UNKNOWN) or _limit_calibration(window_key, [], PLAN_COHORT_UNKNOWN)
-    return by_window.get(normalized) or _limit_calibration(window_key, [], normalized)
+        return by_window.get(PLAN_COHORT_UNKNOWN) or _limit_calibration(
+            window_key, [], PLAN_COHORT_UNKNOWN, default_ranges
+        )
+    return by_window.get(normalized) or _limit_calibration(window_key, [], normalized, default_ranges)
 
 
-def _limit_calibration(window_key: str, values: list[float], plan_cohort: str = PLAN_COHORT_UNKNOWN) -> dict[str, Any]:
+def _limit_calibration(
+    window_key: str,
+    values: list[float],
+    plan_cohort: str = PLAN_COHORT_UNKNOWN,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
+) -> dict[str, Any]:
     sample_count = len(values)
     if sample_count >= LIMIT_SAMPLE_STATISTICS_MIN_COUNT:
         mean = sum(values) / sample_count
@@ -830,7 +878,7 @@ def _limit_calibration(window_key: str, values: list[float], plan_cohort: str = 
             "plan_label": _plan_cohort_label(plan_cohort),
         }
 
-    lower, upper = _default_limit_bounds(window_key, plan_cohort)
+    lower, upper = _default_limit_bounds(window_key, plan_cohort, default_ranges)
     return {
         "source": "default",
         "sample_count": sample_count,
@@ -843,14 +891,19 @@ def _limit_calibration(window_key: str, values: list[float], plan_cohort: str = 
     }
 
 
-def _monthly_limit_calibration(plan_cohort: str = PLAN_COHORT_UNKNOWN) -> dict[str, Any]:
-    return _limit_calibration(MONTHLY_SAMPLE_WINDOW_KEY, [], plan_cohort)
+def _monthly_limit_calibration(
+    plan_cohort: str = PLAN_COHORT_UNKNOWN,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
+) -> dict[str, Any]:
+    return _limit_calibration(MONTHLY_SAMPLE_WINDOW_KEY, [], plan_cohort, default_ranges)
 
 
 def _usage_limit_sample_updates(
     accounts: list[dict[str, Any]],
     sub2api: Sub2ApiClient,
     usage_by_account_id: dict[str, dict[str, Any]],
+    sample_thresholds: dict[str, float] | None = None,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> list[dict[str, Any]]:
     samples: dict[tuple[str, str, str], dict[str, Any]] = {}
     for account in accounts:
@@ -884,6 +937,8 @@ def _usage_limit_sample_updates(
                         rate_limit_window_key="seven_day",
                         values=usage_window,
                         account_used_percent=account_used_percent,
+                        threshold_percent=_limit_sample_threshold(MONTHLY_SAMPLE_WINDOW_KEY, sample_thresholds),
+                        default_ranges=default_ranges,
                     )
                 continue
             _add_usage_limit_sample(
@@ -897,6 +952,8 @@ def _usage_limit_sample_updates(
                 rate_limit_window_key=window_key,
                 values=usage_window,
                 account_used_percent=account_used_percent,
+                threshold_percent=_limit_sample_threshold(window_key, sample_thresholds),
+                default_ranges=default_ranges,
             )
     return list(samples.values())
 
@@ -913,10 +970,17 @@ def _add_usage_limit_sample(
     rate_limit_window_key: str,
     values: dict[str, Any],
     account_used_percent: float | None,
+    threshold_percent: float,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> None:
-    if not _usage_limit_sample_allowed(sample_window_key, plan_cohort, _default_limit_bounds(sample_window_key, plan_cohort)[0]):
+    if not _usage_limit_sample_allowed(
+        sample_window_key,
+        plan_cohort,
+        _default_limit_bounds(sample_window_key, plan_cohort, default_ranges)[0],
+        default_ranges,
+    ):
         return
-    account_contradicts_limit = not values["window_data"] and account_used_percent is not None and account_used_percent < LIMIT_SAMPLE_FULL_PERCENT
+    account_contradicts_limit = not values["window_data"] and account_used_percent is not None and account_used_percent < threshold_percent
     raw_spent = _coerce_float(values.get("raw_spent"))
     used_percent = _clamp_percent(_coerce_float(values.get("used_percent")))
     if raw_spent is None or used_percent is None:
@@ -929,6 +993,7 @@ def _add_usage_limit_sample(
         raw_spent,
         used_percent,
         reset_at,
+        threshold_percent,
     ):
         return
     if account_contradicts_limit:
@@ -936,7 +1001,7 @@ def _add_usage_limit_sample(
     observed_limit = _limit_from_usage(raw_spent, used_percent)
     if observed_limit is None:
         return
-    if not _usage_limit_sample_allowed(sample_window_key, plan_cohort, observed_limit):
+    if not _usage_limit_sample_allowed(sample_window_key, plan_cohort, observed_limit, default_ranges):
         return
     samples[(account_key, sample_window_key, reset_key)] = {
         "account_key": account_key,
@@ -956,8 +1021,18 @@ def _usage_limit_samples(
     accounts: list[dict[str, Any]],
     sub2api: Sub2ApiClient,
     usage_by_account_id: dict[str, dict[str, Any]],
+    sample_thresholds: dict[str, float] | None = None,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> list[dict[str, Any]]:
-    return _usage_limit_sample_updates(accounts, sub2api, usage_by_account_id)
+    return _usage_limit_sample_updates(accounts, sub2api, usage_by_account_id, sample_thresholds, default_ranges)
+
+
+def _limit_sample_threshold(window_key: str, sample_thresholds: dict[str, float] | None = None) -> float:
+    threshold_key = "seven_day" if window_key == MONTHLY_SAMPLE_WINDOW_KEY else window_key
+    configured = _clamp_percent(_coerce_float((sample_thresholds or {}).get(threshold_key)))
+    if configured is not None and configured > 0:
+        return configured
+    return LIMIT_SAMPLE_FULL_PERCENT
 
 
 def _sample_reset_key(reset_at: str | None) -> str:
@@ -1012,10 +1087,17 @@ def _window_limit_reached(
     raw_spent: float,
     used_percent: float,
     reset_at: str | None,
+    threshold_percent: float = LIMIT_SAMPLE_FULL_PERCENT,
 ) -> bool:
     if raw_spent <= 0 or used_percent <= 0:
         return False
-    return _window_rate_limited(account, window_key, used_percent=used_percent, reset_at=reset_at)
+    if reset_at and not _reset_at_is_future(reset_at):
+        return False
+    normalized_used_percent = _clamp_percent(used_percent)
+    normalized_threshold = _clamp_percent(_coerce_float(threshold_percent))
+    if normalized_threshold is None or normalized_threshold <= 0:
+        normalized_threshold = LIMIT_SAMPLE_FULL_PERCENT
+    return normalized_used_percent is not None and normalized_used_percent >= normalized_threshold
 
 
 def _window_rate_limited(
@@ -1023,13 +1105,17 @@ def _window_rate_limited(
     window_key: str,
     used_percent: float | None = None,
     reset_at: str | None = None,
+    threshold_percent: float = LIMIT_SAMPLE_FULL_PERCENT,
 ) -> bool:
     if reset_at and not _reset_at_is_future(reset_at):
         return False
 
     normalized_used_percent = _clamp_percent(used_percent)
     if normalized_used_percent is not None:
-        return normalized_used_percent >= LIMIT_SAMPLE_FULL_PERCENT
+        normalized_threshold = _clamp_percent(_coerce_float(threshold_percent))
+        if normalized_threshold is None or normalized_threshold <= 0:
+            normalized_threshold = LIMIT_SAMPLE_FULL_PERCENT
+        return normalized_used_percent >= normalized_threshold
 
     account_rate_limited_at = _stringify(
         _first_present(
@@ -1085,6 +1171,8 @@ def _account_estimate(
     usage_states: dict[tuple[str, str], dict[str, Any]],
     limit_calibrations: dict[str, dict[str, Any]],
     token_history: dict[str, list[dict[str, Any]]],
+    sample_thresholds: dict[str, float] | None = None,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> dict[str, Any]:
     account_id = sub2api.account_id(account)
     email = sub2api.account_email(account) or _stringify(account.get("name")) or account_id or "unknown"
@@ -1102,6 +1190,8 @@ def _account_estimate(
         plan_cohort,
         usage_states,
         limit_calibrations,
+        sample_thresholds,
+        default_ranges,
     )
     seven_day = _window_estimate(
         account,
@@ -1113,17 +1203,42 @@ def _account_estimate(
         plan_cohort,
         usage_states,
         limit_calibrations,
+        sample_thresholds,
+        default_ranges,
     )
-    rate_limited_windows = [
-        window_key
-        for window_key, window in (("five_hour", five_hour), ("seven_day", seven_day))
-        if window.get("rate_limited")
-    ]
+    rate_limited_windows: list[str] = []
+    for window_key, window in (("five_hour", five_hour), ("seven_day", seven_day)):
+        if window.get("rate_limited"):
+            _append_rate_limited_window(
+                rate_limited_windows,
+                _display_rate_limited_window_key(window_key, _stringify(window.get("window_kind"))),
+            )
     return {
         "email": email,
         "sub2api_account_id": account_id,
         "platform": sub2api.account_platform(account),
         "account_type": sub2api.account_type(account),
+        "subscription_plan": _account_subscription_plan(account, plan_cohort),
+        "subscription_type": plan_cohort,
+        "subscription_label": _plan_cohort_label(plan_cohort),
+        "subscription_billing_period": _first_string_from_paths(
+            account,
+            ("credentials", "subscription_billing_period"),
+            ("credentials", "subscriptionBillingPeriod"),
+            ("subscription_billing_period",),
+            ("subscriptionBillingPeriod",),
+            ("entitlement", "billing_period"),
+            ("entitlement", "billingPeriod"),
+            ("account", "entitlement", "billing_period"),
+            ("account", "entitlement", "billingPeriod"),
+            ("last_active_subscription", "billing_period"),
+            ("last_active_subscription", "billingPeriod"),
+            ("last_active_subscription", "interval"),
+            ("last_active_subscription", "plan_interval"),
+            ("last_active_subscription", "planInterval"),
+            ("extra", "subscription_billing_period"),
+        ),
+        "has_active_subscription": _account_has_active_subscription(account),
         "status": sub2api.account_status(account),
         "schedulable": sub2api.account_schedulable(account),
         "deactive": sub2api.is_deactive_account(account),
@@ -1138,6 +1253,65 @@ def _account_estimate(
         "seven_day": seven_day,
         "seven_day_token_history": _account_token_history(token_history.get(account_key, [])),
     }
+
+
+def _account_subscription_plan(account: dict[str, Any], plan_cohort: str) -> str | None:
+    plan = _first_string_from_paths(account, *PLAN_COHORT_PATHS)
+    if plan:
+        return plan
+    return None if plan_cohort == PLAN_COHORT_UNKNOWN else plan_cohort
+
+
+def _account_has_active_subscription(account: dict[str, Any]) -> bool | None:
+    for path in (
+        ("credentials", "has_active_subscription"),
+        ("credentials", "hasActiveSubscription"),
+        ("has_active_subscription",),
+        ("hasActiveSubscription",),
+        ("entitlement", "has_active_subscription"),
+        ("entitlement", "hasActiveSubscription"),
+        ("account", "entitlement", "has_active_subscription"),
+        ("account", "entitlement", "hasActiveSubscription"),
+        ("last_active_subscription", "has_active_subscription"),
+        ("last_active_subscription", "hasActiveSubscription"),
+    ):
+        value = _bool_or_none(_path_get(account, path))
+        if value is not None:
+            return value
+    return _subscription_status_is_active(
+        _first_string_from_paths(account, ("last_active_subscription", "status"), ("subscription_status",), ("subscriptionStatus",))
+    )
+
+
+def _first_string_from_paths(data: dict[str, Any], *paths: tuple[str, ...]) -> str | None:
+    for path in paths:
+        text = _stringify(_path_get(data, path))
+        if text is not None:
+            return text
+    return None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "active"}:
+            return True
+        if text in {"0", "false", "no", "inactive"}:
+            return False
+    return None
+
+
+def _subscription_status_is_active(value: str | None) -> bool | None:
+    if not value:
+        return None
+    text = value.strip().lower()
+    if text in {"active", "trialing", "paid", "valid"}:
+        return True
+    if text in {"inactive", "canceled", "cancelled", "expired", "past_due", "unpaid"}:
+        return False
+    return None
 
 
 def _account_state_key(account_id: str | None, email: str | None) -> str:
@@ -1212,6 +1386,27 @@ def _window_data_minutes(window_data: dict[str, Any]) -> int | None:
     )
 
 
+def _usage_window_reset_at(window_data: dict[str, Any]) -> str | None:
+    return _stringify(
+        _first_present(
+            _path_get(window_data, ("resets_at",)),
+            _path_get(window_data, ("reset_at",)),
+            _path_get(window_data, ("resetAt",)),
+        )
+    )
+
+
+def _usage_window_remaining_seconds(window_data: dict[str, Any]) -> int | None:
+    return _coerce_int(
+        _first_present(
+            _path_get(window_data, ("remaining_seconds",)),
+            _path_get(window_data, ("remainingSeconds",)),
+            _path_get(window_data, ("reset_after_seconds",)),
+            _path_get(window_data, ("resetAfterSeconds",)),
+        )
+    )
+
+
 def _window_values(account: dict[str, Any], usage: dict[str, Any], window_key: str) -> dict[str, Any]:
     window_data, monthly_alias = _usage_window_data(usage, window_key)
     stats = _first_dict(window_data, ("window_stats",), ("windowStats",), ("stats",), ("usage",), ("usage_stats",), ("usageStats",))
@@ -1231,19 +1426,14 @@ def _window_values(account: dict[str, Any], usage: dict[str, Any], window_key: s
         spend_source = f"{limit_source or 'limit'}-{remaining_source or 'remaining'}"
     reset_at = _stringify(
         _first_present(
-            _path_get(window_data, ("resets_at",)),
-            _path_get(window_data, ("reset_at",)),
-            _path_get(window_data, ("resetAt",)),
+            _usage_window_reset_at(window_data),
             _path_get(extra, (f"{prefix}_reset_at",)),
             _path_get(account, (f"{prefix}_reset_at",)),
         )
     )
     remaining_seconds = _coerce_int(
         _first_present(
-            _path_get(window_data, ("remaining_seconds",)),
-            _path_get(window_data, ("remainingSeconds",)),
-            _path_get(window_data, ("reset_after_seconds",)),
-            _path_get(window_data, ("resetAfterSeconds",)),
+            _usage_window_remaining_seconds(window_data),
             _path_get(extra, (f"{prefix}_reset_after_seconds",)),
             _path_get(account, (f"{prefix}_reset_after_seconds",)),
         )
@@ -1379,6 +1569,8 @@ def _window_estimate(
     plan_cohort: str,
     usage_states: dict[tuple[str, str], dict[str, Any]],
     limit_calibrations: dict[str, dict[str, dict[str, Any]]],
+    sample_thresholds: dict[str, float] | None = None,
+    default_ranges: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> dict[str, Any]:
     values, account_values, window_kind = _estimate_window_values(account, usage, window_key)
     window_data = values["window_data"]
@@ -1454,32 +1646,47 @@ def _window_estimate(
     estimate_spent = raw_spent
     estimate_basis = "official_window" if raw_spent is not None else None
     calibration_window_key = MONTHLY_SAMPLE_WINDOW_KEY if window_kind == "monthly" else window_key
-    calibration = _resolve_limit_calibration(calibration_window_key, limit_calibrations, plan_cohort)
-    raw_estimated_limit = _coerce_float(raw_limit) or _limit_from_usage(raw_spent, normalized_used_percent)
+    calibration = _resolve_limit_calibration(
+        calibration_window_key, limit_calibrations, plan_cohort, default_ranges
+    )
+    usage_estimated_limit = _limit_from_usage(raw_spent, normalized_used_percent)
+    raw_limit_value = _coerce_float(raw_limit)
+    raw_estimated_limit = usage_estimated_limit or raw_limit_value
     if raw_estimated_limit is None and (estimate_spent is None or estimate_spent <= 0):
         raw_estimated_limit = _zero_usage_limit_estimate(calibration)
-    estimated_limit = _trusted_full_window_limit(raw_estimated_limit, normalized_used_percent) or _calibrated_limit(
-        raw_estimated_limit,
-        calibration,
+    estimated_limit = (
+        _trusted_full_window_limit(raw_estimated_limit, normalized_used_percent)
+        or _calibrated_limit(
+            raw_estimated_limit,
+            calibration,
+            spent_floor=estimate_spent,
+        )
     )
     if estimated_limit is not None and raw_estimated_limit is not None and abs(estimated_limit - raw_estimated_limit) > EPSILON:
         estimate_basis = "official_window_clipped"
     if estimated_limit is not None and estimate_spent is None:
-        estimate_spent = 0.0
-        estimate_basis = "sample_limit_zero_usage"
-    if estimated_limit is not None and normalized_used_percent is not None:
-        estimate_spent = estimated_limit * (normalized_used_percent / 100)
+        if normalized_used_percent is not None and normalized_used_percent > EPSILON:
+            estimate_basis = "percent_only_missing_usage"
+        else:
+            estimate_spent = 0.0
+            estimate_basis = "sample_limit_zero_usage"
     rate_limited = _window_rate_limited(
         account,
         "seven_day" if window_kind == "monthly" else window_key,
         used_percent=normalized_used_percent if normalized_used_percent is not None else account_used_percent,
         reset_at=reset_at or account_reset_at,
+        threshold_percent=_limit_sample_threshold(_display_rate_limited_window_key(window_key, window_kind), sample_thresholds),
     )
     remaining = None
     remaining_percent = None
     if estimated_limit is not None:
         parsed_raw_remaining = _coerce_float(raw_remaining)
-        if parsed_raw_remaining is not None and raw_estimated_limit is not None and abs(estimated_limit - raw_estimated_limit) <= EPSILON:
+        if (
+            usage_estimated_limit is None
+            and parsed_raw_remaining is not None
+            and raw_estimated_limit is not None
+            and abs(estimated_limit - raw_estimated_limit) <= EPSILON
+        ):
             remaining = max(parsed_raw_remaining, 0.0)
             remaining_percent = (remaining / estimated_limit * 100) if estimated_limit > 0 else 0
         elif normalized_used_percent is not None:
@@ -1586,7 +1793,7 @@ def _used_percent_value(
 ) -> float | None:
     utilization = _coerce_float(_path_get(window_data, ("utilization",)))
     if utilization is not None:
-        return utilization * 100 if 0 <= utilization <= 1 else utilization
+        return utilization * 100 if 0 < utilization < 1 else utilization
 
     return _coerce_float(
         _first_present(
@@ -1904,16 +2111,23 @@ def _zero_spend_is_missing(window_kind: str, raw_spent: float | None, used_perce
 def _calibrated_limit(
     raw_limit: float | None,
     calibration: dict[str, Any],
+    spent_floor: float | None = None,
 ) -> float | None:
     if raw_limit is None or raw_limit <= 0:
         return None
+    current_spent = _coerce_float(spent_floor)
+    effective_limit = raw_limit
+    if current_spent is not None and current_spent > effective_limit:
+        effective_limit = current_spent
     lower = _coerce_float(calibration.get("lower"))
     upper = _coerce_float(calibration.get("upper"))
-    if lower is not None and raw_limit < lower:
+    if lower is not None and effective_limit < lower:
         return lower
-    if upper is not None and raw_limit > upper:
+    if upper is not None and effective_limit > upper:
+        if current_spent is not None and current_spent > upper:
+            return effective_limit
         return upper
-    return raw_limit
+    return effective_limit
 
 
 def _trusted_full_window_limit(raw_limit: float | None, used_percent: float | None) -> float | None:

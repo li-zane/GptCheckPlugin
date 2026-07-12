@@ -14,7 +14,7 @@ from app.models import AccountSnapshot
 from app.services.events import record_event
 from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient, looks_deactive_text
-from app.services.usage_estimate import account_rate_limited_windows, record_usage_limit_samples
+from app.services.usage_estimate import account_rate_limited_windows, materialize_usage_reset_times, record_usage_limit_samples
 
 
 SENSITIVE_ERROR_RE = re.compile(
@@ -36,6 +36,7 @@ class UsageRefreshSummary:
     refreshed: int = 0
     skipped: int = 0
     failed: int = 0
+    max_concurrency: int = 1
     failures: list[UsageRefreshFailure] = field(default_factory=list)
 
     @property
@@ -128,6 +129,7 @@ class UsageRefreshService:
                         "refreshed": summary.refreshed,
                         "skipped": summary.skipped,
                         "failed": summary.failed,
+                        "max_concurrency": summary.max_concurrency,
                         "failures": [
                             {
                                 "email": failure.email,
@@ -149,7 +151,9 @@ class UsageRefreshService:
             ]
         )
         summary = UsageRefreshSummary()
-        semaphore = asyncio.Semaphore(2)
+        summary.max_concurrency = await self.runtime_config.get_usage_refresh_max_concurrency()
+        sample_thresholds = await self.runtime_config.get_usage_limit_sample_thresholds()
+        semaphore = asyncio.Semaphore(summary.max_concurrency)
         tasks = []
         usage_by_id: dict[str, dict[str, Any]] = {}
 
@@ -162,7 +166,7 @@ class UsageRefreshService:
                 summary.skipped += 1
                 continue
             summary.total += 1
-            tasks.append(asyncio.create_task(self._refresh_one(account, semaphore)))
+            tasks.append(asyncio.create_task(self._refresh_one(account, semaphore, sample_thresholds)))
 
         for task in asyncio.as_completed(tasks):
             account_id, email, result, error, usage = await task
@@ -185,6 +189,7 @@ class UsageRefreshService:
         self,
         account: dict[str, Any],
         semaphore: asyncio.Semaphore,
+        sample_thresholds: dict[str, float],
     ) -> tuple[str | None, str | None, bool | None, str | None, dict[str, Any] | None]:
         account_id = self.sub2api.account_id(account)
         email = self.sub2api.account_email(account)
@@ -192,8 +197,9 @@ class UsageRefreshService:
             try:
                 usage = await self.sub2api.refresh_account_usage_data(account)
                 if usage is not None:
-                    await self._recover_cleared_rate_limits(account, usage)
-                    await self._mark_deactivated_stale_rate_limit(account, usage)
+                    usage = materialize_usage_reset_times(usage)
+                    await self._recover_cleared_rate_limits(account, usage, sample_thresholds)
+                    await self._mark_deactivated_stale_rate_limit(account, usage, sample_thresholds)
                 return account_id, email, usage is not None, None, usage
             except Exception as exc:
                 error = _redact_error_text(str(exc))
@@ -202,21 +208,31 @@ class UsageRefreshService:
                     error = f"account_deactivated: {error}"
                 return account_id, email, None, error, None
 
-    async def _recover_cleared_rate_limits(self, account: dict[str, Any], usage: dict[str, Any]) -> None:
+    async def _recover_cleared_rate_limits(
+        self,
+        account: dict[str, Any],
+        usage: dict[str, Any],
+        sample_thresholds: dict[str, float],
+    ) -> None:
         if self.sub2api.is_deactive_account(account):
             return
         if not self.sub2api.account_has_stale_rate_limit_state(account):
             return
-        limited_windows_after = account_rate_limited_windows(account, usage)
+        limited_windows_after = account_rate_limited_windows(account, usage, sample_thresholds)
         if limited_windows_after:
             return
         await self.sub2api.recover_account_state(account)
         await self.sub2api.clear_rate_limit_state(account)
 
-    async def _mark_deactivated_stale_rate_limit(self, account: dict[str, Any], usage: dict[str, Any]) -> None:
+    async def _mark_deactivated_stale_rate_limit(
+        self,
+        account: dict[str, Any],
+        usage: dict[str, Any],
+        sample_thresholds: dict[str, float],
+    ) -> None:
         if self.sub2api.is_deactive_account(account):
             return
-        if not account_rate_limited_windows(account, usage):
+        if not account_rate_limited_windows(account, usage, sample_thresholds):
             return
         email = self.sub2api.account_email(account)
         if not email:
