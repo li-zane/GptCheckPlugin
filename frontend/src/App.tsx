@@ -2051,22 +2051,38 @@ function UsageLimitSamplesView({
   onRefresh: () => Promise<unknown>;
 }) {
   const timeZone = useDisplayTimeZone();
-  const sampleWindows = data?.windows || [];
+  const sampleWindowGroups = useMemo(
+    () =>
+      usageLimitWindowKeys
+        .map((windowKey) => {
+          const cohorts = (data?.windows || []).filter(
+            (window) => window.window_key === windowKey && window.samples.length > 0,
+          );
+          return {
+            windowKey,
+            label: cohorts[0]?.label || windowKey,
+            sampleCount: cohorts.reduce((total, window) => total + window.samples.length, 0),
+            cohorts,
+          };
+        })
+        .filter((group) => group.sampleCount > 0),
+    [data?.windows],
+  );
   const [selectedWindowKey, setSelectedWindowKey] = useState<string>("");
   useEffect(() => {
-    if (!sampleWindows.length) {
+    if (!sampleWindowGroups.length) {
       if (selectedWindowKey) {
         setSelectedWindowKey("");
       }
       return;
     }
-    if (!sampleWindows.some((window) => `${window.window_key}:${window.plan_cohort}` === selectedWindowKey)) {
-      setSelectedWindowKey(`${sampleWindows[0].window_key}:${sampleWindows[0].plan_cohort}`);
+    if (!sampleWindowGroups.some((group) => group.windowKey === selectedWindowKey)) {
+      setSelectedWindowKey(sampleWindowGroups[0].windowKey);
     }
-  }, [sampleWindows, selectedWindowKey]);
-  const selectedWindow = useMemo(
-    () => sampleWindows.find((window) => `${window.window_key}:${window.plan_cohort}` === selectedWindowKey) || sampleWindows[0] || null,
-    [sampleWindows, selectedWindowKey],
+  }, [sampleWindowGroups, selectedWindowKey]);
+  const selectedWindowGroup = useMemo(
+    () => sampleWindowGroups.find((group) => group.windowKey === selectedWindowKey) || sampleWindowGroups[0] || null,
+    [sampleWindowGroups, selectedWindowKey],
   );
 
   return (
@@ -2097,47 +2113,45 @@ function UsageLimitSamplesView({
       </section>
 
       {!data && loading ? <Empty label="正在读取额度样本" /> : null}
-      {data ? (
+      {data && sampleWindowGroups.length ? (
         <>
           <div className="usage-sample-tabs" role="tablist" aria-label="额度样本视图切换">
-            {sampleWindows.map((window) => {
-              const windowId = `${window.window_key}:${window.plan_cohort}`;
-              return (
-                <button
-                  key={windowId}
-                  className={selectedWindowKey === windowId ? "usage-sample-tab active" : "usage-sample-tab"}
-                  onClick={() => setSelectedWindowKey(windowId)}
-                  role="tab"
-                  aria-selected={selectedWindowKey === windowId}
-                  type="button"
-                >
-                  <span>{`${window.label} · ${window.plan_label}`}</span>
-                  <strong>{window.samples.length}</strong>
-                </button>
-              );
-            })}
+            {sampleWindowGroups.map((group) => (
+              <button
+                key={group.windowKey}
+                className={selectedWindowKey === group.windowKey ? "usage-sample-tab active" : "usage-sample-tab"}
+                onClick={() => setSelectedWindowKey(group.windowKey)}
+                role="tab"
+                aria-selected={selectedWindowKey === group.windowKey}
+                type="button"
+              >
+                <span>{group.label}</span>
+                <strong>{group.sampleCount}</strong>
+              </button>
+            ))}
           </div>
-          {selectedWindow ? (
-            <section className="panel usage-sample-window" key={`${selectedWindow.window_key}:${selectedWindow.plan_cohort}`}>
-              <div className="usage-sample-window-head">
-                <div>
-                  <PanelTitle title={`${selectedWindow.label} 样本 · ${selectedWindow.plan_label}`} icon={TimerReset} />
-                  <p className="panel-subtitle">
-                    {selectedWindow.calibration.source === "sigma" ? "当前使用统计区间" : "当前使用默认区间"} · {selectedWindow.samples.length}/
-                    {data.target_sample_count} 条 · 更新 {formatDate(data.updated_at, timeZone)}
-                  </p>
+          <div className="usage-samples-grid">
+            {selectedWindowGroup?.cohorts.map((selectedWindow) => (
+              <section className="panel usage-sample-window" key={`${selectedWindow.window_key}:${selectedWindow.plan_cohort}`}>
+                <div className="usage-sample-window-head">
+                  <div>
+                    <PanelTitle title={`${selectedWindow.label} 样本 · ${selectedWindow.plan_label}`} icon={TimerReset} />
+                    <p className="panel-subtitle">
+                      {selectedWindow.calibration.source === "sigma" ? "当前使用统计区间" : "当前使用默认区间"} · {selectedWindow.samples.length}/
+                      {data.target_sample_count} 条 · 更新 {formatDate(data.updated_at, timeZone)}
+                    </p>
+                  </div>
+                  <div className="usage-sample-calibration">
+                    <strong>
+                      {formatMoney(selectedWindow.calibration.lower)} - {formatMoney(selectedWindow.calibration.upper)}
+                    </strong>
+                    <span>
+                      均值 {formatMoney(selectedWindow.calibration.mean)} · sigma {formatMoney(selectedWindow.calibration.sigma)}
+                    </span>
+                  </div>
                 </div>
-                <div className="usage-sample-calibration">
-                  <strong>
-                    {formatMoney(selectedWindow.calibration.lower)} - {formatMoney(selectedWindow.calibration.upper)}
-                  </strong>
-                  <span>
-                    均值 {formatMoney(selectedWindow.calibration.mean)} · sigma {formatMoney(selectedWindow.calibration.sigma)}
-                  </span>
-                </div>
-              </div>
-              <div className="table-wrap">
-                <table className="usage-sample-table">
+                <div className="table-wrap">
+                  <table className="usage-sample-table">
                   <thead>
                     <tr>
                       <th>#</th>
@@ -2186,13 +2200,14 @@ function UsageLimitSamplesView({
                       </tr>
                     ))}
                   </tbody>
-                </table>
-                {!selectedWindow.samples.length ? <Empty label="暂无限流样本" /> : null}
-              </div>
-            </section>
-          ) : null}
+                  </table>
+                </div>
+              </section>
+            ))}
+          </div>
         </>
       ) : null}
+      {data && !sampleWindowGroups.length ? <Empty label="暂无额度样本" /> : null}
     </div>
   );
 }
