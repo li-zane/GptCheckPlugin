@@ -777,6 +777,14 @@ function Overview({
   const fiveHourRateLimitedAccounts = rateLimitedAccountsForWindow(accounts, "five_hour");
   const sevenDayRateLimitedAccounts = rateLimitedAccountsForWindow(accounts, "seven_day");
   const monthlyRateLimitedAccounts = rateLimitedAccountsForWindow(accounts, "monthly");
+  const rateLimitWindowGroups = [
+    { windowKey: "five_hour", title: "5h", accounts: fiveHourRateLimitedAccounts },
+    { windowKey: "seven_day", title: "7d", accounts: sevenDayRateLimitedAccounts },
+    { windowKey: "monthly", title: "月", accounts: monthlyRateLimitedAccounts },
+  ].filter((group) => group.accounts.length > 0);
+  const [selectedRateLimitWindowKey, setSelectedRateLimitWindowKey] = useState("five_hour");
+  const selectedRateLimitWindow =
+    rateLimitWindowGroups.find((group) => group.windowKey === selectedRateLimitWindowKey) || rateLimitWindowGroups[0] || null;
   const rateLimitedAccountCount = new Set(
     [...fiveHourRateLimitedAccounts, ...sevenDayRateLimitedAccounts, ...monthlyRateLimitedAccounts].map(accountRowKey),
   ).size;
@@ -826,29 +834,36 @@ function Overview({
             {rateLimitedAccountCount ? `${rateLimitedAccountCount} 个账号` : "无限流"}
           </Badge>
         </div>
-        <div className="rate-limit-window-grid">
-          <RateLimitedAccountColumn
-            title="5h"
-            windowKey="five_hour"
-            accounts={fiveHourRateLimitedAccounts}
-            usageByAccountId={usageByAccountId}
-            usageByEmail={usageByEmail}
-          />
-          <RateLimitedAccountColumn
-            title="7d"
-            windowKey="seven_day"
-            accounts={sevenDayRateLimitedAccounts}
-            usageByAccountId={usageByAccountId}
-            usageByEmail={usageByEmail}
-          />
-          <RateLimitedAccountColumn
-            title="月"
-            windowKey="monthly"
-            accounts={monthlyRateLimitedAccounts}
-            usageByAccountId={usageByAccountId}
-            usageByEmail={usageByEmail}
-          />
-        </div>
+        {rateLimitWindowGroups.length ? (
+          <div className="rate-limit-filter-tabs" role="tablist" aria-label="限流窗口筛选">
+            {rateLimitWindowGroups.map((group) => (
+              <button
+                className={selectedRateLimitWindow?.windowKey === group.windowKey ? "rate-limit-filter-tab active" : "rate-limit-filter-tab"}
+                key={group.windowKey}
+                onClick={() => setSelectedRateLimitWindowKey(group.windowKey)}
+                role="tab"
+                aria-selected={selectedRateLimitWindow?.windowKey === group.windowKey}
+                type="button"
+              >
+                <span>{group.title}</span>
+                <strong>{group.accounts.length}</strong>
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {selectedRateLimitWindow ? (
+          <div className="rate-limit-window-grid filtered">
+            <RateLimitedAccountColumn
+              title={selectedRateLimitWindow.title}
+              windowKey={selectedRateLimitWindow.windowKey}
+              accounts={selectedRateLimitWindow.accounts}
+              usageByAccountId={usageByAccountId}
+              usageByEmail={usageByEmail}
+            />
+          </div>
+        ) : (
+          <Empty label="暂无限流账号" />
+        )}
       </section>
 
       <section className="split-grid">
@@ -2083,6 +2098,26 @@ function UsageLimitSamplesView({
     () => sampleWindowGroups.find((group) => group.windowKey === selectedWindowKey) || sampleWindowGroups[0] || null,
     [sampleWindowGroups, selectedWindowKey],
   );
+  const [selectedSubscriptionKey, setSelectedSubscriptionKey] = useState<string>("");
+  useEffect(() => {
+    const cohorts = selectedWindowGroup?.cohorts || [];
+    if (!cohorts.length) {
+      if (selectedSubscriptionKey) {
+        setSelectedSubscriptionKey("");
+      }
+      return;
+    }
+    if (!cohorts.some((cohort) => cohort.plan_cohort === selectedSubscriptionKey)) {
+      setSelectedSubscriptionKey(cohorts[0].plan_cohort);
+    }
+  }, [selectedSubscriptionKey, selectedWindowGroup]);
+  const selectedSubscription = useMemo(
+    () =>
+      selectedWindowGroup?.cohorts.find((cohort) => cohort.plan_cohort === selectedSubscriptionKey) ||
+      selectedWindowGroup?.cohorts[0] ||
+      null,
+    [selectedSubscriptionKey, selectedWindowGroup],
+  );
 
   return (
     <div className="stack">
@@ -2119,33 +2154,56 @@ function UsageLimitSamplesView({
               <button
                 key={group.windowKey}
                 className={selectedWindowKey === group.windowKey ? "usage-sample-tab active" : "usage-sample-tab"}
-                onClick={() => setSelectedWindowKey(group.windowKey)}
+                onClick={() => {
+                  setSelectedWindowKey(group.windowKey);
+                  setSelectedSubscriptionKey(group.cohorts[0]?.plan_cohort || "");
+                }}
                 role="tab"
                 aria-selected={selectedWindowKey === group.windowKey}
                 type="button"
               >
-                <span>{group.label}</span>
-                <strong>{group.sampleCount}</strong>
+                <span className="usage-sample-tab-label">{group.label}</span>
+                <span className="usage-sample-tab-metrics">
+                  <small><strong>{group.sampleCount}</strong> 样本</small>
+                  <small><strong>{group.cohorts.length}</strong> 订阅</small>
+                </span>
               </button>
             ))}
           </div>
+          {selectedWindowGroup ? (
+            <div className="usage-sample-subscription-tabs" role="tablist" aria-label={`${selectedWindowGroup.label} 订阅类型切换`}>
+              {selectedWindowGroup.cohorts.map((cohort) => (
+                <button
+                  className={selectedSubscription?.plan_cohort === cohort.plan_cohort ? "usage-sample-subscription-tab active" : "usage-sample-subscription-tab"}
+                  key={`${cohort.window_key}:${cohort.plan_cohort}`}
+                  onClick={() => setSelectedSubscriptionKey(cohort.plan_cohort)}
+                  role="tab"
+                  aria-selected={selectedSubscription?.plan_cohort === cohort.plan_cohort}
+                  type="button"
+                >
+                  <span>{cohort.plan_label}</span>
+                  <strong>{cohort.samples.length}</strong>
+                </button>
+              ))}
+            </div>
+          ) : null}
           <div className="usage-samples-grid">
-            {selectedWindowGroup?.cohorts.map((selectedWindow) => (
-              <section className="panel usage-sample-window" key={`${selectedWindow.window_key}:${selectedWindow.plan_cohort}`}>
+            {selectedSubscription ? (
+              <section className="panel usage-sample-window" key={`${selectedSubscription.window_key}:${selectedSubscription.plan_cohort}`}>
                 <div className="usage-sample-window-head">
                   <div>
-                    <PanelTitle title={`${selectedWindow.label} 样本 · ${selectedWindow.plan_label}`} icon={TimerReset} />
+                    <PanelTitle title={`${selectedSubscription.label} 样本 · ${selectedSubscription.plan_label}`} icon={TimerReset} />
                     <p className="panel-subtitle">
-                      {selectedWindow.calibration.source === "sigma" ? "当前使用统计区间" : "当前使用默认区间"} · {selectedWindow.samples.length}/
+                      {selectedSubscription.calibration.source === "sigma" ? "当前使用统计区间" : "当前使用默认区间"} · {selectedSubscription.samples.length}/
                       {data.target_sample_count} 条 · 更新 {formatDate(data.updated_at, timeZone)}
                     </p>
                   </div>
                   <div className="usage-sample-calibration">
                     <strong>
-                      {formatMoney(selectedWindow.calibration.lower)} - {formatMoney(selectedWindow.calibration.upper)}
+                      {formatMoney(selectedSubscription.calibration.lower)} - {formatMoney(selectedSubscription.calibration.upper)}
                     </strong>
                     <span>
-                      均值 {formatMoney(selectedWindow.calibration.mean)} · sigma {formatMoney(selectedWindow.calibration.sigma)}
+                      均值 {formatMoney(selectedSubscription.calibration.mean)} · sigma {formatMoney(selectedSubscription.calibration.sigma)}
                     </span>
                   </div>
                 </div>
@@ -2165,7 +2223,7 @@ function UsageLimitSamplesView({
                     </tr>
                   </thead>
                   <tbody>
-                    {selectedWindow.samples.map((sample, index) => (
+                    {selectedSubscription.samples.map((sample, index) => (
                       <tr key={sample.id}>
                         <td className="mono muted">{index + 1}</td>
                         <td>{sample.plan_cohort}</td>
@@ -2202,7 +2260,7 @@ function UsageLimitSamplesView({
                   </table>
                 </div>
               </section>
-            ))}
+            ) : null}
           </div>
         </>
       ) : null}
