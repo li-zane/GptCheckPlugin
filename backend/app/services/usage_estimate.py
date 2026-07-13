@@ -1176,6 +1176,7 @@ def _account_estimate(
 ) -> dict[str, Any]:
     account_id = sub2api.account_id(account)
     email = sub2api.account_email(account) or _stringify(account.get("name")) or account_id or "unknown"
+    account_name = sub2api.account_name(account) or email
     account_key = _account_state_key(account_id, email)
     plan_cohort = _plan_cohort_from_account(account)
     groups = _account_groups(account, group_map)
@@ -1215,6 +1216,7 @@ def _account_estimate(
             )
     return {
         "email": email,
+        "account_name": account_name,
         "sub2api_account_id": account_id,
         "platform": sub2api.account_platform(account),
         "account_type": sub2api.account_type(account),

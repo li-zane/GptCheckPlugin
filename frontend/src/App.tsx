@@ -904,10 +904,7 @@ function RateLimitedAccountColumn({
             const detail = accountRateLimitDetails(account, usage, timeZone, now).find((item) => item.key === windowKey);
             return (
               <div className="rate-limit-account-row" key={accountRowKey(account)}>
-                <div className="rate-limit-account-main">
-                  <span className="mono">{account.email}</span>
-                  {account.sub2api_account_id ? <span className="muted mono">{account.sub2api_account_id}</span> : null}
-                </div>
+                <CompactAccountIdentity accountName={account.account_name} className="rate-limit-account-identity" email={account.email} />
                 <div className="rate-limit-account-badges">
                   {account.is_duplicate ? <Badge tone="warn">重复</Badge> : null}
                   <Badge tone={accountStatusTone(account, usage)}>{accountStatusLabel(account, usage)}</Badge>
@@ -1417,9 +1414,11 @@ function AccountRow({
   if (compact) {
     return (
       <div className="compact-row">
-        <span className="mono">{account.email}</span>
-        {account.is_duplicate ? <Badge tone="warn">重复</Badge> : null}
-        <Badge tone={statusTone}>{statusText}</Badge>
+        <CompactAccountIdentity accountName={account.account_name} email={account.email} />
+        <div className="compact-row-badges">
+          {account.is_duplicate ? <Badge tone="warn">重复</Badge> : null}
+          <Badge tone={statusTone}>{statusText}</Badge>
+        </div>
       </div>
     );
   }
@@ -1889,7 +1888,7 @@ function UsageEstimateView({
                 </colgroup>
                 <thead>
                   <tr>
-                    <th>邮箱</th>
+                    <th>账号</th>
                     <th>标签</th>
                     <th>订阅类型</th>
                     <th>参与</th>
@@ -1903,7 +1902,7 @@ function UsageEstimateView({
                   {detailAccounts.map((account, index) => (
                     <tr key={`${account.email}:${account.sub2api_account_id || index}`}>
                       <td>
-                        <CopyTextButton className="account-email-copy-button mono" hideIcon title="复制账号邮箱" value={account.email} />
+                        <StackedAccountIdentity accountName={account.account_name} email={account.email} />
                       </td>
                       <td>
                         <UsageAccountTags groups={account.groups} />
@@ -3674,6 +3673,39 @@ function CopyTextButton({
       <span>{value}</span>
       {copied ? <span className="copy-feedback">{copiedLabel}</span> : hideIcon ? null : <Copy size={13} />}
     </button>
+  );
+}
+
+function CompactAccountIdentity({
+  accountName,
+  email,
+  className = "",
+}: {
+  accountName: string | null | undefined;
+  email: string;
+  className?: string;
+}) {
+  const name = accountName?.trim() || email;
+  const showEmailSeparately = name.toLowerCase() !== email.toLowerCase();
+  return (
+    <div className={["compact-account-identity", className].filter(Boolean).join(" ")}>
+      <CopyTextButton className="compact-identity-copy compact-identity-name" hideIcon title="复制账号名称" value={name} />
+      {showEmailSeparately ? (
+        <>
+          <span aria-hidden="true" className="compact-identity-separator">|</span>
+          <CopyTextButton className="compact-identity-copy compact-identity-email mono" hideIcon title="复制账号邮箱" value={email} />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function StackedAccountIdentity({ accountName, email }: { accountName: string | null | undefined; email: string }) {
+  return (
+    <div className="account-identity-cell">
+      <CopyTextButton className="account-identity-copy-button account-name-copy-button" title="复制账号名称" value={accountName?.trim() || email} />
+      <CopyTextButton className="account-identity-copy-button account-email-copy-button mono" title="复制账号邮箱" value={email} />
+    </div>
   );
 }
 

@@ -143,6 +143,7 @@ class UsageTokenHistoryOut(BaseModel):
 
 class AccountUsageEstimateOut(BaseModel):
     email: str
+    account_name: str
     sub2api_account_id: str | None
     platform: str | None
     account_type: str | None

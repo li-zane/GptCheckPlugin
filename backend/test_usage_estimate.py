@@ -10,6 +10,7 @@ import app.services.usage_estimate as usage_estimate
 from app.core.database import Base
 from app.models import UsageLimitSample
 from app.services.usage_estimate import (
+    _account_estimate,
     account_rate_limited_windows,
     _aggregate_window,
     _limit_calibration,
@@ -27,9 +28,39 @@ from app.services.usage_estimate import (
     _estimate_window_values,
     _window_reset_detected,
 )
+from app.services.sub2api import Sub2ApiClient
 
 
 class UsageEstimateTests(unittest.TestCase):
+    def test_account_estimate_exposes_sub2api_name_separately_from_email(self) -> None:
+        account = {
+            "id": "1",
+            "name": "Campus Plus Account",
+            "credentials": {"email": "student@example.edu", "plan_type": "plus"},
+            "extra": {"codex_5h_window_minutes": 0, "codex_7d_window_minutes": 10_080},
+        }
+        calibrations = {
+            "seven_day": {
+                "plus": _limit_calibration("seven_day", [], "plus"),
+                "unknown": _limit_calibration("seven_day", [], "unknown"),
+            }
+        }
+
+        row = _account_estimate(
+            account=account,
+            group_map={},
+            sub2api=Sub2ApiClient(),
+            usage_estimate_enabled=True,
+            usage={},
+            usage_error=None,
+            usage_states={},
+            limit_calibrations=calibrations,
+            token_history={},
+        )
+
+        self.assertEqual(row["account_name"], "Campus Plus Account")
+        self.assertEqual(row["email"], "student@example.edu")
+
     def test_small_reset_at_drift_does_not_count_as_reset(self) -> None:
         self.assertFalse(
             _window_reset_detected(

@@ -1267,16 +1267,8 @@ h2 {
   border-color: rgba(245, 158, 11, 0.4);
 }
 
-.rate-limit-account-main {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
-.rate-limit-account-main span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.rate-limit-account-identity {
+  flex: 1 1 auto;
 }
 
 .rate-limit-account-badges {
@@ -1306,6 +1298,56 @@ h2 {
 
 .compact-row {
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.compact-row-badges {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.compact-account-identity {
+  align-items: center;
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.compact-identity-copy {
+  border-radius: 5px;
+  flex: 0 1 auto;
+  min-height: 22px;
+  padding: 1px 3px;
+}
+
+.compact-identity-copy > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-identity-copy:hover,
+.compact-identity-copy:focus-visible {
+  background: var(--green-tint);
+}
+
+.compact-identity-name {
+  font-weight: 750;
+}
+
+.compact-identity-email {
+  color: var(--muted);
+  flex: 1 1 auto;
+}
+
+.compact-identity-separator {
+  color: var(--muted);
+  flex: 0 0 auto;
+  padding: 0 5px;
 }
 
 .signal-row {

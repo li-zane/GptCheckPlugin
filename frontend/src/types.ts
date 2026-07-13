@@ -242,6 +242,7 @@ export type UsageTokenHistory = {
 
 export type AccountUsageEstimate = {
   email: string;
+  account_name: string;
   sub2api_account_id: string | null;
   platform: string | null;
   account_type: string | null;
