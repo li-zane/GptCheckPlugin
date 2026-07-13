@@ -2228,9 +2228,9 @@ def _aggregate_window(rows: list[dict[str, Any]], window_key: str) -> dict[str, 
 def _aggregate_source_window(row: dict[str, Any], window_key: str) -> dict[str, Any]:
     window = row.get(window_key) if isinstance(row.get(window_key), dict) else {}
     if window_key == "five_hour" and window.get("window_kind") == "none":
-        monthly_window = row.get("seven_day") if isinstance(row.get("seven_day"), dict) else {}
-        if monthly_window.get("window_kind") == "monthly":
-            return monthly_window
+        longer_window = row.get("seven_day") if isinstance(row.get("seven_day"), dict) else {}
+        if longer_window.get("window_kind") in {"seven_day", "monthly"}:
+            return longer_window
     return window
 
 

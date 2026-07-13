@@ -828,40 +828,42 @@ class UsageEstimateTests(unittest.TestCase):
                 usage_estimate.AsyncSessionLocal = original_sessionmaker
                 await engine.dispose()
 
-    def test_monthly_only_account_counts_in_five_hour_and_seven_day_aggregates(self) -> None:
-        rows = [
-            {
-                "usage_estimate_enabled": True,
-                "deactive": False,
-                "error": False,
-                "usage_error": None,
-                "rate_limited": False,
-                "five_hour": {
-                    "window_kind": "none",
-                    "estimate_spent": None,
-                    "estimated_limit": None,
-                    "remaining": None,
-                },
-                "seven_day": {
-                    "window_kind": "monthly",
-                    "estimate_spent": 20.0,
-                    "estimated_limit": 100.0,
-                    "remaining": 80.0,
-                },
-            }
-        ]
+    def test_long_window_only_account_counts_in_five_hour_and_long_window_aggregates(self) -> None:
+        for window_kind in ("seven_day", "monthly"):
+            with self.subTest(window_kind=window_kind):
+                rows = [
+                    {
+                        "usage_estimate_enabled": True,
+                        "deactive": False,
+                        "error": False,
+                        "usage_error": None,
+                        "rate_limited": False,
+                        "five_hour": {
+                            "window_kind": "none",
+                            "estimate_spent": None,
+                            "estimated_limit": None,
+                            "remaining": None,
+                        },
+                        "seven_day": {
+                            "window_kind": window_kind,
+                            "estimate_spent": 20.0,
+                            "estimated_limit": 100.0,
+                            "remaining": 80.0,
+                        },
+                    }
+                ]
 
-        five_hour = _aggregate_window(rows, "five_hour")
-        seven_day = _aggregate_window(rows, "seven_day")
+                five_hour = _aggregate_window(rows, "five_hour")
+                seven_day = _aggregate_window(rows, "seven_day")
 
-        self.assertEqual(five_hour["enabled_account_count"], 1)
-        self.assertEqual(five_hour["estimable_accounts"], 1)
-        self.assertAlmostEqual(five_hour["spent"], 20.0)
-        self.assertAlmostEqual(five_hour["estimated_limit"], 100.0)
-        self.assertAlmostEqual(five_hour["remaining"], 80.0)
-        self.assertAlmostEqual(five_hour["remaining_percent"], 80.0)
-        self.assertAlmostEqual(five_hour["used_percent"], 20.0)
-        self.assertAlmostEqual(seven_day["estimated_limit"], 100.0)
+                self.assertEqual(five_hour["enabled_account_count"], 1)
+                self.assertEqual(five_hour["estimable_accounts"], 1)
+                self.assertAlmostEqual(five_hour["spent"], 20.0)
+                self.assertAlmostEqual(five_hour["estimated_limit"], 100.0)
+                self.assertAlmostEqual(five_hour["remaining"], 80.0)
+                self.assertAlmostEqual(five_hour["remaining_percent"], 80.0)
+                self.assertAlmostEqual(five_hour["used_percent"], 20.0)
+                self.assertAlmostEqual(seven_day["estimated_limit"], 100.0)
 
     def test_monthly_only_usage_is_reused_for_five_hour_and_seven_day(self) -> None:
         account = {

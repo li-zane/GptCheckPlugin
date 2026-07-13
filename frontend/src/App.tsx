@@ -5054,8 +5054,11 @@ function aggregateProblemUsageAccountsWindow(accounts: AccountUsageEstimate[], w
 
 function aggregateSourceWindow(account: AccountUsageEstimate, windowKey: "five_hour" | "seven_day") {
   const window = account[windowKey];
-  if (windowKey === "five_hour" && window.window_kind === "none" && account.seven_day.window_kind === "monthly") {
-    return account.seven_day;
+  if (windowKey === "five_hour" && window.window_kind === "none") {
+    const longerWindowKind = account.seven_day.window_kind;
+    if (longerWindowKind === "seven_day" || longerWindowKind === "monthly") {
+      return account.seven_day;
+    }
   }
   return window;
 }
