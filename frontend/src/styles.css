@@ -872,6 +872,10 @@ h2 {
   justify-content: flex-end;
 }
 
+.usage-detail-rate-window-filters {
+  margin-top: 10px;
+}
+
 .usage-subscription-filters {
   background: var(--surface);
   border: 1px solid var(--line);

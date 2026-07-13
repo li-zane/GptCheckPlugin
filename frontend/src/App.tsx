@@ -1734,6 +1734,7 @@ function UsageEstimateView({
   const now = useNow();
   const [includePausedAccounts, setIncludePausedAccounts] = useState(true);
   const [detailAccountFilter, setDetailAccountFilter] = useState<UsageDetailAccountFilter>("normal");
+  const [requestedDetailRateLimitWindowKey, setRequestedDetailRateLimitWindowKey] = useState("");
   const [subscriptionFilter, setSubscriptionFilter] = useState("");
   const displayedEstimate = useMemo(
     () => (estimate ? buildDisplayedUsageEstimate(estimate, includePausedAccounts) : null),
@@ -1747,9 +1748,34 @@ function UsageEstimateView({
     () => (displayedEstimate ? usageDetailAccountCounts(displayedEstimate.accounts) : { normal: 0, rateLimited: 0 }),
     [displayedEstimate],
   );
+  const detailRateLimitedAccounts = useMemo(
+    () => displayedEstimate?.accounts.filter((account) => usageDetailAccountVisible(account) && usageDetailAccountRateLimited(account)) || [],
+    [displayedEstimate],
+  );
+  const detailRateLimitWindowOptions = useMemo(
+    () =>
+      usageLimitWindowKeys
+        .map((windowKey) => ({
+          windowKey,
+          label: rateLimitedWindowLabel(windowKey),
+          count: detailRateLimitedAccounts.filter((account) => accountRateLimitedWindowKeys(account, account).includes(windowKey)).length,
+        }))
+        .filter((option) => option.count > 0),
+    [detailRateLimitedAccounts],
+  );
+  const selectedDetailRateLimitWindow =
+    detailAccountFilter === "rate-limited"
+      ? detailRateLimitWindowOptions.find((option) => option.windowKey === requestedDetailRateLimitWindowKey) || detailRateLimitWindowOptions[0] || null
+      : null;
+  const selectedDetailRateLimitWindowKey = selectedDetailRateLimitWindow?.windowKey || "";
   const detailBaseAccounts = useMemo(
-    () => displayedEstimate?.accounts.filter((account) => accountMatchesUsageDetailFilter(account, detailAccountFilter)) || [],
-    [detailAccountFilter, displayedEstimate],
+    () =>
+      displayedEstimate?.accounts.filter(
+        (account) =>
+          accountMatchesUsageDetailFilter(account, detailAccountFilter) &&
+          (!selectedDetailRateLimitWindowKey || accountRateLimitedWindowKeys(account, account).includes(selectedDetailRateLimitWindowKey)),
+      ) || [],
+    [detailAccountFilter, displayedEstimate, selectedDetailRateLimitWindowKey],
   );
   const subscriptionFilterOptions = useMemo(() => usageSubscriptionFilterOptions(detailBaseAccounts), [detailBaseAccounts]);
   const detailAccounts = useMemo(
@@ -1838,13 +1864,36 @@ function UsageEstimateView({
               <div>
                 <PanelTitle title="账号额度明细" icon={Activity} />
                 <p className="panel-subtitle">错误和封禁账号不参与估算，已从明细中隐藏。</p>
+                {detailAccountFilter === "rate-limited" && detailRateLimitWindowOptions.length ? (
+                  <div className="rate-limit-filter-tabs usage-detail-rate-window-filters" role="tablist" aria-label="限流账号窗口筛选">
+                    {detailRateLimitWindowOptions.map((option) => (
+                      <button
+                        aria-selected={selectedDetailRateLimitWindowKey === option.windowKey}
+                        className={selectedDetailRateLimitWindowKey === option.windowKey ? "rate-limit-filter-tab active" : "rate-limit-filter-tab"}
+                        key={option.windowKey}
+                        onClick={() => {
+                          setRequestedDetailRateLimitWindowKey(option.windowKey);
+                          setSubscriptionFilter("");
+                        }}
+                        role="tab"
+                        type="button"
+                      >
+                        <span>{option.label}</span>
+                        <strong>{option.count}</strong>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
               <div className="usage-detail-toolbar-actions">
                 <div className="usage-detail-tabs" role="tablist" aria-label="额度明细账号类型">
                   <button
                     aria-selected={detailAccountFilter === "normal"}
                     className={detailAccountFilter === "normal" ? "usage-detail-tab active" : "usage-detail-tab"}
-                    onClick={() => setDetailAccountFilter("normal")}
+                    onClick={() => {
+                      setDetailAccountFilter("normal");
+                      setSubscriptionFilter("");
+                    }}
                     role="tab"
                     type="button"
                   >
@@ -1854,7 +1903,10 @@ function UsageEstimateView({
                   <button
                     aria-selected={detailAccountFilter === "rate-limited"}
                     className={detailAccountFilter === "rate-limited" ? "usage-detail-tab active" : "usage-detail-tab"}
-                    onClick={() => setDetailAccountFilter("rate-limited")}
+                    onClick={() => {
+                      setDetailAccountFilter("rate-limited");
+                      setSubscriptionFilter("");
+                    }}
                     role="tab"
                     type="button"
                   >
