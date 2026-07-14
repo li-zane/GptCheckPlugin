@@ -1,14 +1,17 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import api_router
 from app.core.config import get_settings
 from app.core.database import init_db
+from app.core.validation import sanitized_request_validation_handler
 from app.services.monitor import get_monitor_service
 from app.services.refresh import get_refresh_service
 from app.services.runtime_config import get_runtime_config_service
+from app.services.upstream_rate_sync import get_upstream_rate_sync_service
 from app.services.usage_refresh import get_usage_refresh_service
 
 
@@ -18,17 +21,21 @@ async def lifespan(app: FastAPI):
     await get_refresh_service().cleanup_stale_jobs()
     await get_runtime_config_service().auto_detect_sub2api()
     monitor = get_monitor_service()
+    upstream_rate_sync = get_upstream_rate_sync_service()
     usage_refresh = get_usage_refresh_service()
     monitor.start()
+    upstream_rate_sync.start()
     usage_refresh.start()
     yield
     await monitor.stop()
+    await upstream_rate_sync.stop()
     await usage_refresh.stop()
 
 
 settings = get_settings()
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+app.add_exception_handler(RequestValidationError, sanitized_request_validation_handler)
 
 app.add_middleware(
     CORSMiddleware,

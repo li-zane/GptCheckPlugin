@@ -9,6 +9,11 @@ from app.core.subscription_types import (
     SUBSCRIPTION_TYPE_UNKNOWN,
     normalize_subscription_type,
 )
+from app.core.sub2api_urls import normalize_sub2api_base_url
+from app.core.upstream_urls import canonicalize_upstream_url
+
+
+JS_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 
 
 class LoginRequest(BaseModel):
@@ -457,6 +462,8 @@ class AppSettingsOut(BaseModel):
     usage_refresh_enabled: bool
     usage_refresh_interval_seconds: int
     usage_refresh_max_concurrency: int
+    upstream_rate_sync_enabled: bool
+    upstream_rate_log_retention_days: int
     usage_limit_sample_five_hour_threshold_percent: float
     usage_limit_sample_seven_day_threshold_percent: float
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges]
@@ -485,6 +492,8 @@ class AppSettingsUpdate(BaseModel):
     usage_refresh_enabled: bool | None = None
     usage_refresh_interval_seconds: int | None = Field(default=None, ge=60, le=86_400)
     usage_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=20)
+    upstream_rate_sync_enabled: bool | None = None
+    upstream_rate_log_retention_days: int | None = Field(default=None, ge=1, le=3650)
     usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges] | None = None
@@ -496,6 +505,13 @@ class AppSettingsUpdate(BaseModel):
     subscription_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=20)
     display_timezone: str | None = Field(default=None, min_length=1, max_length=80)
     site_name: str | None = Field(default=None, min_length=1, max_length=80)
+
+    @field_validator("sub2api_base_url")
+    @classmethod
+    def validate_sub2api_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_sub2api_base_url(value)
 
     @field_validator("usage_limit_default_ranges")
     @classmethod
@@ -526,3 +542,232 @@ class Sub2ApiPortScanResult(BaseModel):
     message: str
     checked_ports: list[int]
     applied: bool
+
+
+class UpstreamGroupOptionOut(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=200)
+    multiplier: float = Field(gt=0, le=1000, allow_inf_nan=False)
+
+
+class UpstreamAccountUpdate(BaseModel):
+    channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    remote_name: str | None = Field(default=None, max_length=200)
+    base_url: str | None = Field(default=None, max_length=500)
+    upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
+    upstream_user_id: str | None = Field(default=None, max_length=128)
+    selected_group_id: str | None = Field(default=None, max_length=128)
+    selected_group_name: str | None = Field(default=None, max_length=200)
+    api_key: str | None = None
+    access_token: str | None = None
+    clear_access_token: bool = False
+    confirm_credential_rebind: bool = False
+    manual_group_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
+    manual_recharge_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
+
+    @field_validator(
+        "remote_name",
+        "base_url",
+        "upstream_user_id",
+        "selected_group_id",
+        "selected_group_name",
+        "api_key",
+        "access_token",
+        mode="before",
+    )
+    @classmethod
+    def strip_optional_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return canonicalize_upstream_url(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class UpstreamChannelUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=200)
+    base_url: str | None = Field(default=None, max_length=500)
+    management_base_url: str | None = Field(default=None, max_length=500)
+    upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
+    upstream_user_id: str | None = Field(default=None, max_length=128)
+    access_token: str | None = None
+    clear_access_token: bool = False
+    refresh_token: str | None = None
+    clear_refresh_token: bool = False
+    confirm_credential_rebind: bool = False
+    manual_recharge_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
+
+    @field_validator(
+        "display_name",
+        "base_url",
+        "management_base_url",
+        "upstream_user_id",
+        "access_token",
+        "refresh_token",
+        mode="before",
+    )
+    @classmethod
+    def strip_optional_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("base_url", "management_base_url")
+    @classmethod
+    def validate_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return canonicalize_upstream_url(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+class UpstreamApplyRequest(BaseModel):
+    confirmed_target_rate: float = Field(gt=0, le=1000, allow_inf_nan=False)
+
+
+class UpstreamAccountEnabledUpdate(BaseModel):
+    enabled: bool
+
+
+class UpstreamRemoteDeleteRequest(BaseModel):
+    confirmed_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+
+
+class UpstreamRateChangeLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    account_name: str | None = None
+    channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_name: str | None = None
+    group_id: str | None = None
+    group_name: str | None = None
+    old_group_multiplier: float | None = None
+    new_group_multiplier: float | None = None
+    old_upstream_multiplier: float | None = None
+    new_upstream_multiplier: float | None = None
+    old_upstream_recharge_multiplier: float | None = None
+    new_upstream_recharge_multiplier: float | None = None
+    upstream_recharge_multiplier: float | None = None
+    local_recharge_multiplier: float | None = None
+    old_target_rate: float | None = None
+    new_target_rate: float | None = None
+    old_current_rate: float | None = None
+    new_current_rate: float | None = None
+    reason: str
+    status: str
+    safe_error: str | None = None
+    created_at: datetime
+
+
+class UpstreamAccountOut(BaseModel):
+    sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_name: str | None = None
+    remote_name: str
+    remote_platform: str | None = None
+    remote_account_type: str | None = None
+    remote_status: str | None = None
+    remote_schedulable: bool | None = None
+    managed: bool
+    base_url: str | None = None
+    upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
+    resolved_upstream_type: Literal["newapi", "sub2api"] | None = None
+    upstream_user_id: str | None = None
+    selected_group_id: str | None = None
+    selected_group_name: str | None = None
+    api_key_set: bool = False
+    api_key_hint: str | None = None
+    access_token_set: bool = False
+    manual_group_multiplier: float | None = None
+    manual_recharge_multiplier: float | None = None
+    group_options: list[UpstreamGroupOptionOut] = Field(default_factory=list)
+    discovered_group_multiplier: float | None = None
+    effective_group_multiplier: float | None = None
+    group_multiplier_source: str | None = None
+    group_multiplier_status: str | None = None
+    discovered_recharge_multiplier: float | None = None
+    effective_recharge_multiplier: float | None = None
+    recharge_multiplier_source: str | None = None
+    recharge_multiplier_status: str | None = None
+    local_recharge_multiplier: float | None = None
+    local_recharge_source: str | None = None
+    local_recharge_status: str | None = None
+    current_rate: float | None = None
+    target_rate: float | None = None
+    would_change: bool | None = None
+    balance_remaining: float | None = None
+    balance_total: float | None = None
+    balance_used: float | None = None
+    balance_unit: str | None = None
+    balance_status: str | None = None
+    balance_message: str | None = None
+    balance_checked_at: datetime | None = None
+    last_error: str | None = None
+    last_discovered_at: datetime | None = None
+    last_applied_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class UpstreamChannelOut(BaseModel):
+    id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    display_name: str
+    canonical_base_url: str
+    base_url: str
+    management_base_url: str | None = None
+    upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
+    resolved_upstream_type: Literal["newapi", "sub2api"] | None = None
+    access_token_set: bool = False
+    refresh_token_set: bool = False
+    upstream_user_id: str | None = None
+    manual_recharge_multiplier: float | None = None
+    discovered_recharge_multiplier: float | None = None
+    effective_recharge_multiplier: float | None = None
+    recharge_multiplier_source: str | None = None
+    recharge_multiplier_status: str | None = None
+    group_options: list[UpstreamGroupOptionOut] = Field(default_factory=list)
+    balance_remaining: float | None = None
+    balance_total: float | None = None
+    balance_used: float | None = None
+    balance_unit: str | None = None
+    balance_status: str | None = None
+    balance_message: str | None = None
+    balance_checked_at: datetime | None = None
+    last_error: str | None = None
+    last_discovered_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    accounts: list["UpstreamAccountOut"] = Field(default_factory=list)
+
+
+class UpstreamOverviewOut(BaseModel):
+    channels: list[UpstreamChannelOut] = Field(default_factory=list)
+    unassigned_accounts: list[UpstreamAccountOut] = Field(default_factory=list)
+    local_recharge_multiplier: float | None = None
+    local_recharge_source: str | None = None
+    local_recharge_status: str | None = None
+
+
+class UpstreamChannelDiscoverAllOut(BaseModel):
+    total: int = Field(ge=0)
+    succeeded: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    channels: list[UpstreamChannelOut] = Field(default_factory=list)
+
+
+class UpstreamDiscoverAllOut(BaseModel):
+    total: int = Field(ge=0)
+    succeeded: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    accounts: list[UpstreamAccountOut] = Field(default_factory=list)

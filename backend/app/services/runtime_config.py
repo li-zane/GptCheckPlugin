@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import select
@@ -20,6 +20,12 @@ from app.core.crypto import decrypt_text, encrypt_text, redact
 from app.core.database import AsyncSessionLocal
 from app.models import AppSetting, utcnow
 from app.core.subscription_types import normalize_usage_limit_ranges
+from app.core.sub2api_urls import (
+    is_loopback_sub2api_url,
+    normalize_sub2api_base_url,
+    replace_sub2api_port,
+)
+from app.services.upstream_rate_logs import delete_expired_upstream_rate_change_logs
 
 
 KEY_SUB2API_BASE_URL = "sub2api_base_url"
@@ -30,6 +36,8 @@ KEY_MONITOR_INTERVAL_SECONDS = "monitor_interval_seconds"
 KEY_USAGE_REFRESH_ENABLED = "usage_refresh_enabled"
 KEY_USAGE_REFRESH_INTERVAL_SECONDS = "usage_refresh_interval_seconds"
 KEY_USAGE_REFRESH_MAX_CONCURRENCY = "usage_refresh_max_concurrency"
+KEY_UPSTREAM_RATE_SYNC_ENABLED = "upstream_rate_sync_enabled"
+KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS = "upstream_rate_log_retention_days"
 KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
 KEY_USAGE_LIMIT_DEFAULT_RANGES = "usage_limit_default_ranges"
@@ -46,7 +54,6 @@ KEY_LAST_SCAN_MESSAGE = "sub2api_last_scan_message"
 KEY_DISPLAY_TIMEZONE = "display_timezone"
 KEY_SITE_NAME = "site_name"
 KEY_AUTOMATION_PAUSED = "automation_paused"
-SUB2API_API_PREFIX = "/api/v1"
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,22 @@ class RuntimeConfigService:
             self.settings.usage_refresh_max_concurrency,
             1,
             20,
+        )
+
+    async def get_upstream_rate_sync_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_UPSTREAM_RATE_SYNC_ENABLED),
+            self.settings.upstream_rate_sync_enabled,
+        )
+
+    async def get_upstream_rate_log_retention_days(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS),
+            self.settings.upstream_rate_log_retention_days,
+            1,
+            3650,
         )
 
     async def get_usage_limit_sample_thresholds(self) -> dict[str, float]:
@@ -239,6 +262,16 @@ class RuntimeConfigService:
                 1,
                 20,
             ),
+            "upstream_rate_sync_enabled": _bool_or_default(
+                values.get(KEY_UPSTREAM_RATE_SYNC_ENABLED),
+                self.settings.upstream_rate_sync_enabled,
+            ),
+            "upstream_rate_log_retention_days": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS),
+                self.settings.upstream_rate_log_retention_days,
+                1,
+                3650,
+            ),
             "usage_limit_sample_five_hour_threshold_percent": _threshold_or_settings_default(
                 values.get(KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT),
                 self.settings.usage_limit_sample_five_hour_threshold_percent,
@@ -299,6 +332,10 @@ class RuntimeConfigService:
             current_values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url
         )
         x_api_key_for_file = self._x_api_key_for_file(payload, current_values)
+        explicit_runtime_key_change = bool(payload.get("clear_sub2api_x_api_key")) or bool(
+            isinstance(payload.get("sub2api_x_api_key"), str)
+            and payload["sub2api_x_api_key"].strip()
+        )
 
         async with AsyncSessionLocal() as db:
             if payload.get("sub2api_base_url") is not None or payload.get("sub2api_port") is not None:
@@ -332,6 +369,25 @@ class RuntimeConfigService:
                     db,
                     KEY_USAGE_REFRESH_MAX_CONCURRENCY,
                     str(int(payload["usage_refresh_max_concurrency"])),
+                )
+
+            if payload.get("upstream_rate_sync_enabled") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_RATE_SYNC_ENABLED,
+                    "true" if payload["upstream_rate_sync_enabled"] else "false",
+                )
+
+            if payload.get("upstream_rate_log_retention_days") is not None:
+                retention_days = int(payload["upstream_rate_log_retention_days"])
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS,
+                    str(retention_days),
+                )
+                await delete_expired_upstream_rate_change_logs(
+                    db,
+                    retention_days=retention_days,
                 )
 
             if payload.get("usage_limit_sample_five_hour_threshold_percent") is not None:
@@ -415,7 +471,11 @@ class RuntimeConfigService:
             await db.commit()
 
         settings = await self.get_public_settings()
-        self._persist_settings_file(settings, x_api_key_for_file)
+        self._persist_settings_file(
+            settings,
+            x_api_key_for_file,
+            remove_legacy_x_api_key=explicit_runtime_key_change and bool(self._env_x_api_key()),
+        )
         return settings
 
     async def scan_sub2api_ports(self, apply: bool = False) -> dict:
@@ -483,11 +543,12 @@ class RuntimeConfigService:
         ports: list[int],
         config: EffectiveSub2ApiConfig,
     ) -> ProbeHit | None:
-        headers = _headers_for_probe(config)
         timeout = httpx.Timeout(self.settings.sub2api_scan_timeout_seconds)
         async with httpx.AsyncClient(
             timeout=timeout,
-            headers=headers,
+            # Discovery must not broadcast the administrator token to every
+            # process that happens to listen on loopback.
+            headers={"Accept": "application/json"},
             follow_redirects=False,
             trust_env=False,
         ) as client:
@@ -554,7 +615,13 @@ class RuntimeConfigService:
             return raw_key.strip()
         return decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY)) or self._env_x_api_key() or None
 
-    def _persist_settings_file(self, settings: dict[str, Any], x_api_key: str | None) -> None:
+    def _persist_settings_file(
+        self,
+        settings: dict[str, Any],
+        x_api_key: str | None,
+        *,
+        remove_legacy_x_api_key: bool = False,
+    ) -> None:
         if self.settings.app_env == "test":
             return
         path = self.settings.project_root / ".env"
@@ -568,6 +635,8 @@ class RuntimeConfigService:
             "USAGE_REFRESH_ENABLED": _env_bool(bool(settings["usage_refresh_enabled"])),
             "USAGE_REFRESH_INTERVAL_SECONDS": str(int(settings["usage_refresh_interval_seconds"])),
             "USAGE_REFRESH_MAX_CONCURRENCY": str(int(settings["usage_refresh_max_concurrency"])),
+            "UPSTREAM_RATE_SYNC_ENABLED": _env_bool(bool(settings["upstream_rate_sync_enabled"])),
+            "UPSTREAM_RATE_LOG_RETENTION_DAYS": str(int(settings["upstream_rate_log_retention_days"])),
             "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(
                 float(settings["usage_limit_sample_five_hour_threshold_percent"])
             ),
@@ -588,20 +657,12 @@ class RuntimeConfigService:
             "SUBSCRIPTION_REFRESH_MAX_CONCURRENCY": str(int(settings["subscription_refresh_max_concurrency"])),
             "DISPLAY_TIMEZONE": str(settings["display_timezone"]),
         }
-        if x_api_key == "":
+        if remove_legacy_x_api_key or x_api_key == "":
             values.update(
                 {
                     "SUB2API_AUTH_TOKEN": None,
                     "SUB2API_AUTH_HEADER": None,
                     "SUB2API_AUTH_SCHEME": None,
-                }
-            )
-        elif x_api_key is not None:
-            values.update(
-                {
-                    "SUB2API_AUTH_TOKEN": x_api_key,
-                    "SUB2API_AUTH_HEADER": "x-api-key",
-                    "SUB2API_AUTH_SCHEME": "",
                 }
             )
         _write_env_file(path, values)
@@ -639,39 +700,11 @@ def _headers_for_probe(config: EffectiveSub2ApiConfig) -> dict[str, str]:
 
 
 def _normalize_base_url(value: str) -> str:
-    return f"{_normalize_instance_url(value)}{SUB2API_API_PREFIX}"
-
-
-def _normalize_instance_url(value: str) -> str:
-    text = value.strip().rstrip("/")
-    if not text:
-        text = "http://localhost:8080"
-    if "://" not in text:
-        text = f"http://{text}"
-    parsed = urlparse(text)
-    path = _strip_api_prefix(parsed.path)
-    return urlunparse((parsed.scheme or "http", parsed.netloc, path, "", "", "")).rstrip("/")
-
-
-def _strip_api_prefix(path: str) -> str:
-    clean_path = (path or "").strip().rstrip("/")
-    if not clean_path or clean_path == "/":
-        return ""
-    if clean_path.lower() == SUB2API_API_PREFIX:
-        return ""
-    if clean_path.lower().endswith(SUB2API_API_PREFIX):
-        return clean_path[: -len(SUB2API_API_PREFIX)].rstrip("/")
-    return clean_path
+    return normalize_sub2api_base_url(value)
 
 
 def _replace_port(base_url: str, port: int) -> str:
-    parsed = urlparse(_normalize_instance_url(base_url))
-    host = parsed.hostname or "localhost"
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    netloc = f"{host}:{port}"
-    instance_url = urlunparse((parsed.scheme or "http", netloc, parsed.path.rstrip("/"), "", "", "")).rstrip("/")
-    return f"{instance_url}{SUB2API_API_PREFIX}"
+    return replace_sub2api_port(base_url, port)
 
 
 def _port_from_url(value: str) -> int | None:
@@ -814,8 +847,7 @@ def _datetime_or_none(value: str | None) -> datetime | None:
 
 
 def _is_local_url(value: str) -> bool:
-    host = (urlparse(value).hostname or "").lower()
-    return host in {"localhost", "127.0.0.1", "::1"}
+    return is_loopback_sub2api_url(value)
 
 
 def _looks_like_sub2api(text: str) -> bool:

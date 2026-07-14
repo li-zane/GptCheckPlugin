@@ -315,6 +315,10 @@
 - Verified the live target recharge multiplier (`10x`) through the authenticated admin settings API.
 - Verified both supported and unsupported live upstream balance responses through sub2api without exposing stored credentials.
 - Confirmed the preceding parallel task committed successfully at `92af35a`; only this task's planning notes remained dirty before implementation agents began.
+- Began parallel implementation of the upstream discovery adapter, backend management/sync API, and standalone React view; shared signatures were coordinated before service integration.
+- The upstream adapter and standalone React view are now on disk; the backend orchestration service is being connected to the finalized discovery dataclasses and method signature.
+- Upstream adapter verification passed 56 backend tests, including 10 new discovery/security cases.
+- Started independent backend/frontend review and sent fixes for negative balances, exact multiplier sources, stale balance presentation, and secret-safe validation errors.
 - Backend subtask started: loaded the security-review and planning-with-files instructions, confirmed the existing feature boundary, and recorded the implementation/test checklist.
 - Inspected the existing model/database/schema/router/security/crypto patterns; selected a new-table-only migration path and explicit safe DTO construction.
 - Mapped the sub2api account pagination/filtering and error behavior; recorded the need for fixed-category API errors so response bodies/secrets cannot escape.
@@ -322,4 +326,196 @@
 - Verified the target bulk-update DTO accepts the required exact one-account `rate_multiplier` payload; recorded the settings-field source mismatch and strict fallback rule.
 - Located the authenticated target settings route and confirmed the account DTO exposes current `rate_multiplier`; readback verification can be implemented without using unsafe response-body text.
 - Confirmed the sanitized balance response shape and the production default-encryption-key rule; shared backend files are now safe to edit from the committed base.
+- Added the new one-row-per-sub2api-account persistence model, bounded public/input schemas, and explicit Sub2ApiClient methods for API-key lists, target balance/settings reads, exact bulk rate updates, and current-rate readback (verification pending).
+- Implemented the managed-account service and admin-only routes: remote overlay listing, encrypted upsert/idempotent local delete, per-account locking, read-only discovery, safe failure persistence, bulk discover, stale-confirmation rejection, exact write/readback verification, and router registration.
+- Read the complete upstream-client implementation and aligned discovery parsing with its exact `groups`, `matched_group`, `discovered_*`, `status`, and selected-group contract; failed discovery results no longer erase last successful options.
+- First compileall and `git diff --check` passed; tightened finite-number validation, exact positive account-ID coercion, malformed-port rejection, and a separate high balance ceiling before the focused test phase.
+- First focused test run passed 14/15; the only failure was a contradictory mock-call assertion, not product behavior. Corrected the test to require the in-memory adapter credential while retaining response/ciphertext leakage assertions.
+- Incorporated live negative-balance and precise-source requirements, added regression coverage, and completed the focused backend suite: 16/16 tests pass.
+- Full backend regression passed 72/72 tests; forced compileall and `git diff --check` also passed.
+- Tightened the final contract after review: managed rows now show a truly cleared base URL instead of silently overlaying the remote URL, conflicting access-token set/clear actions are rejected, remote display fields are length-bounded, and discover-all lists sub2api accounts once per batch instead of once per managed row.
+- Focused tests remained 16/16 after those changes; completed a changed-line secret/error scan and verified the parallel frontend field names match the backend contract.
+- Moved secret length/action validation out of Pydantic to prevent 422 input echo, added service and real route-response non-disclosure tests, widened source columns, and reran the focused suite successfully: 18/18.
+- Added no-echo coverage for unrelated schema validation failures. The first combined final-verification command stopped on an expected no-match `rg` status; changed route mapping to use an explicit `public_message` field and will rerun tests/scans with no-match handled as success.
+- Final full backend suite passed 77/77. Forced compile and diff checks completed, but the first security grep produced a false positive on the intended `exc.public_message` mapping; refining and rerunning that scan.
+- Refined security scan passed with no unsafe logging/direct exception mappings and no literal secret-like values in changed production files; `git diff --check` remains clean. Backend subtask is complete.
 - Logged a PowerShell quoting failure during sibling-source inspection and switched the remaining searches to single-quoted regex arguments.
+- Added and wired the API Key account-management page, including desktop tables, mobile cards, search/filtering, configuration, single/batch discovery, confirmed apply, and local configuration removal.
+- Independent backend/integration review found and closed failed-discovery default writes, DNS rebinding, validation/response secret reflection, invalid balance snapshots, extreme Decimal handling, NewAPI recharge semantics, stale previews, and the initial unmanaged-balance workflow gap.
+- Final NewAPI behavior follows `upstream-ops`: explicit payment multipliers take priority and `/api/status.price` is only a `1 / price` fallback. DNS connections are pinned to validated public IPs with bounded multi-address fallback while preserving Host and TLS SNI.
+- Playwright verified 24 local API-key accounts, the `0.25 × 10 ÷ 2 = 1.25` preview, the real `-40.9041 USD` balance, 1440px/390px containment, dialog focus trapping/restoration, and the new no-key balance opt-in path. No final apply was performed; disposable managed rows were removed.
+- Final verification passed: 102 backend tests, backend compileall, frontend production build, production dependency audit with 0 vulnerabilities, secret-pattern scan, and `git diff --check`.
+- User clarified that every recharge figure must mean CNY paid per USD credit. Normalized the target sub2api setting from USD/CNY by taking its reciprocal, changed account billing to `group multiplier × upstream CNY/USD cost`, and labeled the UI as `¥/$1`.
+- Regression verification passed with the exact `1 CNY = 10 USD` case producing local cost `0.1`, upstream cost `0.1`, and target account multiplier `0.1`; full backend tests passed 103/103 and the frontend production build passed.
+- Refreshed the isolated preview at `127.0.0.1:5174`: 24 accounts loaded, the first rows displayed `本地 ¥0.1 / $1`, and no multiplier was applied to sub2api.
+
+## 2026-07-13 Upstream Channel Cards and Balance Repair
+
+- Loaded the planning, frontend-design, security-review, in-app-browser, and Chrome control instructions.
+- Added a six-phase channel-model/card-layout/NewAPI-balance plan while preserving all existing dirty worktree changes.
+- Started parallel read-only reviews for `upstream-ops` UI/protocol behavior, NewAPI balance semantics, and the current channel migration boundary.
+- Located the authorized Chrome candidates for live verification: `zz1cc.cc.cd/wallet` (章鱼哥/NewAPI) and `api.biuapi.com/login` (哈基米/Sub2API).
+- First attempt to claim the existing ZZ tab and immediately read a full DOM snapshot timed out and reset the browser-control session; no page content or credential was read.
+- Completed the reference UI/protocol review and the normalized channel migration design.
+- Added the `UpstreamChannel` persistence model, shared canonical URL parser, account `channel_id`, compatibility DTOs, and idempotent SQLite migration; old account balances are not promoted.
+- Added the channel overview/update/discover API and service, including one direct upstream probe per channel and per-account target derivation as `selected group multiplier * upstream CNY/USD recharge cost`.
+- Added direct NewAPI and Sub2API balance parsing with endpoint-specific credentials; focused client, migration, URL, channel, and legacy account tests pass.
+- Restarted the isolated preview backend on `127.0.0.1:8001`; migration produced seven channels and bound all 24 API-key accounts, with the local recharge cost verified as `0.1 CNY/USD`.
+- Reconnected to Chrome and confirmed the existing ZZ/哈基米 candidate tabs are still present. A minimal claim of the ZZ tab again timed out and reset the browser connection; no visible page or secret was read.
+- Recovered Chrome through its supported connection flow and opened a fresh ZZ tab; its automatic site check completed and the logged-in wallet page became reachable.
+- Read the visible ZZ wallet balance as `$502.19` and navigated to its visible profile entry to look for the supported system-token UI.
+- Confirmed the ZZ profile has a supported visible Access Token management dialog entry; no token or storage state has been read yet.
+- Opened the visible ZZ Access Token dialog. Its built-in generation entered progress automatically; no token value was printed, logged, or copied outside browser memory.
+- Regenerated the ZZ system Access Token for this isolated test and retained only its length/status plus an in-memory value for the upcoming local-channel form.
+- Tried the supported read-only route of opening the known ZZ `/api/user/self` URL visibly to obtain the user ID; the browser blocked that navigation, so no response data was read.
+- Completed a final ZZ token regeneration and kept the current value only in browser-session memory for local form entry; continued searching visible profile surfaces for the required numeric user ID.
+- Closed the token dialog and confirmed the account-binding profile view still exposes no numeric ID; the remaining visible `设置与偏好` tab is being checked next.
+- Checked the visible ZZ preferences tab; it contains notification/preferences fields but no `New-Api-User` ID.
+- Checked the visible ZZ avatar/account-menu control; it revealed no accessible numeric ID, so the supported UI search for `New-Api-User` is exhausted.
+- Verified the ZZ public contract live after fake-IP-safe DNS fallback: direct recharge cost is `0.0621 CNY/USD`; balance remains blocked only by the missing visible numeric user ID.
+- Opened a fresh 哈基米 Chrome tab using the existing profile state; the root SPA is loading before login-state inspection.
+- Confirmed the 哈基米 profile session is currently logged out (`/home` shows only login actions), so visible Access Token acquisition cannot proceed without the user signing in.
+- Restored the reference-compatible NewAPI balance requirement (`Access Token` plus positive numeric `New-Api-User`), restarted the isolated backend, and opened the updated local preview in a controlled Chrome tab for end-to-end configuration.
+- Logged into the isolated local preview and reached the authenticated dashboard; the next UI action is opening the new API Key channel-card view.
+- Opened the new local API Key view and confirmed the channel-oriented shell renders; waiting for its seven-channel dataset before configuring ZZ.
+- Completed the responsive channel-card UI: seven canonical channels own URL/protocol/token/balance/recharge state, while 24 API-key accounts remain compact separated rows with explicit rate-apply actions.
+- Added actionable NewAPI/Sub2API credential guidance, non-reflecting password inputs, channel URL conflict handling, shared-config invalidation, and response/error secret-leak regressions.
+- Corrected NewAPI balance parsing to `quota / quota_per_unit`, kept Sub2API balance as `/api/v1/auth/me.data.balance`, and verified authentication headers remain protocol-specific.
+- Verified the live ZZ public recharge cost as `0.0621 CNY/USD`; its visible wallet reports `$502.19`, but the authenticated API balance remains intentionally unrequested until the required numeric `New-Api-User` is supplied.
+- Rotated the temporary ZZ system token after a browser-inspection snapshot exposed the superseded value, stored only the replacement in the encrypted isolated preview database, and cleared every in-memory reference.
+- Full backend verification passed `127/127`; frontend production build, backend compileall, zero-vulnerability npm audit, diff check, and production-source secret scan passed.
+- Restarted the final isolated preview on `127.0.0.1:8001` with the original isolated database; `127.0.0.1:5174` remains available for review and no account multiplier was applied.
+- Captured ZZ's numeric `New-Api-User` from the visible token dialog's own `/api/user/token` request header, synchronized the current system token, and verified the direct NewAPI balance as `$502.1853` (matching the visible `$502.19` wallet), recharge cost `0.0621 CNY/USD`, and 13 groups.
+- Used Chrome's saved-credential autofill to complete the existing Hakimi login without reading a password, captured its JWT from a visible dashboard refresh request to `/api/v1/auth/me`, and verified the direct Sub2API balance as `$46.226`, recharge cost `1 CNY/USD`, and 11 groups.
+- Updated the Sub2API credential guide to describe the actual login JWT contract instead of a nonexistent account/security token page; model API keys remain explicitly unsupported for channel balance.
+- Both real credentials are stored only in the encrypted isolated preview database. Browser storage was not inspected, temporary authorization event objects were cleared, and no multiplier was applied.
+## 2026-07-13 Sample Page Window Grouping
+
+- Started from the existing dirty worktree and preserved all prior changes.
+- Read the frontend-design and planning-with-files skill instructions.
+- Located the usage-limit sample API/types and recorded the requested grouping and visibility rules.
+- Confirmed the backend collector already separates true monthly windows and rejects the known Plus 7d misclassification case.
+- Chosen implementation: three window-level tabs, with subscription-specific calibration sections retained inside each selected window and all zero-sample entries omitted.
+- Updated the samples view to aggregate tabs by quota window, total only visible samples, retain per-subscription calibration tables, and show one empty state when all groups are empty.
+- Initial backend test invocation used the wrong working directory; no application assertion ran, then the corrected invocation passed.
+- Frontend build passed; the corrected backend run passed all 34 focused tests; `git diff --check` passed.
+- Playwright desktop/mobile verification passed for grouping order, aggregate counts, true-monthly filtering, empty cohort/window hiding, and 390px width containment.
+- Removed the temporary Playwright route fixture after verification; retained ignored desktop/mobile screenshots under `output/playwright/`.
+
+## 2026-07-13 Account Identity Across Dashboard and Usage Views
+
+- Started from the current dirty shared worktree and recorded preservation of the separate upstream-management and sample-grouping changes.
+- Traced the three render paths and confirmed only usage-estimate rows need a backend contract extension; overview surfaces already receive full account names.
+- Selected a shared compact identity line for overview rows and the existing stacked copy-button treatment for the usage-detail table.
+- Located `_account_estimate()` and confirmed the name field can be added as display metadata with email fallback and no database migration.
+- Confirmed the new estimator field will not break existing fake-client tests because none invoke `_account_estimate()` directly.
+- Added `account_name` to usage-estimate output/schema/types, compact copyable `名称 | 邮箱` identity rows for recent/rate-limit accounts, and stacked copyable name/email identity in usage details.
+- Focused backend tests passed 36/36, frontend production build passed, and `git diff --check` passed on the combined dirty worktree.
+- Started Playwright session `identity-views`, confirmed the current frontend loads, and captured a fresh login snapshot before installing脱敏 API fixtures.
+- Installed脱敏 account/usage/settings fixtures. The first reload remained on login because the broad fallback route took precedence over specific handlers; route ordering will be corrected before layout checks.
+## 2026-07-13 Commit and Deploy Sample Grouping to x1
+
+- Read the required git-commit and planning-with-files instructions.
+- Confirmed local `main` at `504a977` with no staged changes and a dirty worktree containing unrelated work that must be preserved.
+- Started isolated commit and x1 deployment workflow for the sample grouping change only.
+- Completed x1 read-only preflight and local frontend build; remote base/health are suitable for a fast-forward deployment.
+- Confirmed `git diff -G` is not hunk-scoped and switched to Git-native hunk staging plus staged-diff verification.
+- Staged only the three sample grouping hunks in `frontend/src/App.tsx`; staged diff check passes and no other file is staged.
+- A pre-commit temporary patch replay failed on hunk offsets and cleaned itself without changing the real worktree/index; clean-tree build will run from the committed tree instead.
+- Created conventional commit `885e603 feat(samples): group quota samples by window`.
+- Verified the commit in a clean detached worktree: dependency install/audit and frontend production build passed; temporary worktree was removed.
+- Created and verified the incremental deployment bundle, reconfirmed x1's exact clean tracked base, transferred/fetched the target commit, and completed a successful remote clean-worktree frontend build.
+- Fast-forwarded x1 to `885e603`, rebuilt production `dist`, restarted the frontend service, and verified frontend/backend health plus the expected built asset.
+- Authenticated production sample API verification passed with visible counts 157/39/14 for 5h/7d/month. Cleaned temporary deployment artifacts and confirmed local unrelated work remains unstaged.
+
+## 2026-07-13 Commit and Deploy Account Identity Views to x1
+
+- Loaded the required git-commit and planning-with-files instructions and ran planning-session catchup.
+- Confirmed the index is clean, local `main` is at `885e603`, and unrelated upstream-channel work remains unstaged in shared files.
+- Started a scoped identity-only commit and x1 deployment workflow.
+- Classified the changed files: two backend files are identity-only, while schemas/types/App/styles require hunk-scoped staging to exclude upstream-channel work.
+- Rebuilt the exact six-file identity patch in a clean detached worktree at `885e603`; `git diff --check` passed and Phase 1 is complete.
+- Clean-tree verification passed: 47 backend tests, zero-vulnerability `npm ci`, and the frontend production build.
+- The first pre-stage guard falsely reported a dirty index because PowerShell treated empty stdout as false. Direct cached-diff inspection confirmed the index is clean; no staged content was changed.
+- The first patch pipeline was rejected because PowerShell altered patch line endings; Git applied no hunks. Switching to a byte-preserving native pipeline after rechecking the empty index.
+- The first native-pipeline quoting attempt passed a literal pipe to Git and changed nothing; corrected the shell boundary before retrying.
+- Staged exactly the verified six-file identity patch through a byte-preserving native pipe. Cached diff check, file list, stable patch-ID comparison, and unrelated-feature exclusion scan all passed.
+- Created commit `c8f1fbe feat(accounts): show account names across dashboard views`; the index is clean and all unrelated upstream-channel work remains unstaged.
+- The first encoded x1 preflight command failed at the local/remote quote boundary before running the script; no remote state changed. Rebuilding the remote command as one SSH argument.
+- The second inline-command attempt was also re-tokenized by OpenSSH/zsh and did not execute the script. Switching to SSH standard input eliminates the quoting boundary entirely.
+- SSH standard-input preflight succeeded: x1 is at clean tracked base `885e603`, preserves only `01-login.png`, has 4.7 GB free, and serves healthy backend/frontend endpoints.
+- Identified both active production units and completed deployment preflight; Phase 4 is in progress.
+- Transferred and hash-verified the incremental bundle, created a rollback ref, fetched exact target `c8f1fbe`, and confirmed the remote six-file change list.
+- The first remote clean-tree backend run stopped because the production virtualenv lacks `pytest`; the temporary worktree was removed automatically and production remained untouched.
+- Installed only pytest into an isolated `/tmp` target, then passed all 47 backend tests plus remote frontend install/audit/build at `c8f1fbe`; all temporary verification paths were removed.
+- Fast-forwarded x1 production to `c8f1fbe`, rebuilt frontend assets, restarted both services, and passed HTTP 200 health/frontend/authenticated usage checks.
+- Verified all 60 production usage rows expose separate name/email fields (58 currently differ) while preserving the remote `01-login.png`.
+- The first final asset/cleanup script failed to parse because redirected stdin encoded literal Chinese labels non-UTF-8; it executed nothing. Retrying with ASCII-only Unicode escapes.
+- Final remote asset checks and cleanup passed; the local cleanup guard then stopped on a Windows path-format mismatch before deleting anything.
+- Normalized Git's worktree path format, removed only the identity verification worktree and bundle, and confirmed the local index/diff checks remain clean for the committed scope.
+- Completed all four phases of the identity-only commit and x1 deployment request; the rollback ref remains available and unrelated local work is intact.
+- Final x1 readback: HEAD `c8f1fbe`, identity commit present, both services active, backend health and frontend HTTP 200. Local `main` later advanced to descendant `166ed56` through a separate isolated task.
+## 2026-07-13 Sample Subscription Secondary Navigation
+
+- Read the frontend-design and planning-with-files instructions and preserved the existing dirty worktree.
+- Confirmed the change can remain frontend-only using the grouped sample response already in memory.
+- Added the sample-page two-level navigation implementation; build/UI verification remains.
+- Scoped the follow-up rate-limit filter to the existing overview panel and its three already-derived account arrays.
+- Implemented both navigation changes and passed TypeScript/Vite production build plus `git diff --check`.
+- Prepared an isolated Playwright fixture plan covering absent rate-limit filters, two-level sample counts, secondary selection, and responsive containment.
+- Completed Playwright desktop interaction and 390px responsive verification for both navigation changes; no database data was modified.
+- Removed the temporary browser fixture after verification; retained the ignored mobile screenshot under `output/playwright/`.
+## 2026-07-13 Commit and Deploy Secondary Navigation to x1
+
+- Read the git-commit and planning-with-files instructions.
+- Confirmed local/x1 exact base `c8f1fbe`, clean staging area, healthy remote services, and unrelated dirty work that must remain intact.
+- Selected a clean worktree commit strategy to prevent mixed CSS/App hunks from entering the deployment commit.
+- Recreated only the verified navigation changes on temporary branch `codex/secondary-navigation-deploy`; clean diff inspection and frontend build passed.
+- Created isolated conventional commit `166ed56` with only the two intended frontend files.
+- Safely advanced local `main` to `166ed56` via ref/index synchronization; unrelated dirty files remained unstaged and the temporary branch/worktree were removed.
+- Created, verified, transferred, and remotely prebuilt the incremental deployment bundle on x1.
+- Fast-forwarded x1 to `166ed56`, rebuilt production assets, restarted the frontend, and verified both services plus authenticated sample/account APIs.
+- Cleaned all task-created deployment artifacts and confirmed unrelated local work remains unstaged.
+## 2026-07-13 Usage Detail Rate-Limit Window Filters
+
+- Read frontend-design and planning-with-files instructions and preserved the dirty worktree.
+- Located the exact account quota detail state/rendering and selected a frontend-only normalized-window filter design.
+- Added left-side, non-empty 5h/7d/month tabs for rate-limited detail accounts and applied the selected window before subscription filtering.
+- Playwright verified hidden tabs for normal accounts, omitted empty 7d, correct 5h/month rows and counts, subscription reset, monthly normalization, and 390px containment.
+- Production build, diff check, and browser console checks passed; temporary route fixtures were removed.
+
+## 2026-07-13 Commit and Deploy Usage Detail Filters to x1
+
+- Read the git-commit and planning-with-files instructions and started a clean-patch commit/deployment workflow.
+- Confirmed local `main` is `166ed56`, the index is clean, and unrelated API Key/backend/planning changes must remain unstaged.
+- Preflight confirmed x1 is at exact base `166ed56` with no tracked changes, only `01-login.png` untracked, healthy services/endpoints, and sufficient disk space.
+- Recreated the two-file filter patch in a detached clean worktree; diff check, zero-vulnerability audit, and production frontend build passed with stable patch ID `e600d9a8fb6f1e9264aec2a1eb45223c2bb7b442`.
+- The first cached-apply attempt failed because PowerShell rewrote the patch stream's line endings; Git staged no hunks, so switching to a byte-preserving native pipeline.
+- The native byte-preserving pipeline staged exactly the verified patch; cached diff checks, sensitive-path exclusion, and patch-ID comparison passed.
+- Created `f8c48df feat(quota): filter rate-limited usage details by window`; the index is clean and unrelated local changes remain unstaged.
+- Created and verified the 1,556-byte incremental bundle, transferred it to x1, fetched exact target `f8c48df`, and created the timestamped rollback ref.
+- Remote clean-worktree `npm ci`, zero-vulnerability audit, and production frontend build passed; temporary verification worktree was removed automatically.
+- x1 fast-forwarded to `f8c48df`, rebuilt production assets, and restarted the frontend; both services, backend health, and frontend HTTP 200 checks passed.
+- The final exact Chinese-label asset grep did not match the minified JS and returned a nonzero script status after deployment; rechecking with a stable ASCII selector before cleanup.
+- Final source/compiled-selector readback passed; x1 remains healthy at `f8c48df` and preserves only `01-login.png` as untracked.
+- Removed the temporary local/remote bundles, deployment ref, and clean verification worktrees while retaining the x1 rollback ref.
+
+## 2026-07-13 Sub2API Refresh Token Persistence
+
+- Verified the local Sub2API contract: `POST /api/v1/auth/refresh` accepts a JSON Refresh Token and returns a rotated AT/RT pair in the standard `data` envelope; the old RT becomes invalid immediately.
+- Added encrypted channel-level RT storage, an idempotent existing-SQLite migration, non-echoing update/output schemas, and validation-error redaction.
+- Added `/api/v1/auth/me`-specific 401 detection, hardened pinned-host refresh transport, immediate encrypted AT/RT persistence, and one discovery retry under the existing per-channel lock.
+- Added a Sub2API-only RT password field with leave-blank/explicit-clear behavior, channel credential status, and automatic-rotation guidance.
+- Captured Hakimi's current AT/RT through its visible login response without reading browser storage, saved both to the isolated encrypted preview DB, and cleared the in-memory token copies.
+- Verified a real forced-401 rotation restored Hakimi balance/group discovery, then restarted the preview backend and confirmed the rotated pair remained usable with both public token fields absent.
+- Final verification passed `139/139` backend tests, frontend production build, zero-vulnerability npm audit, compileall, diff check, preview-log token scan, desktop UI inspection, and 390px overflow checks.
+- The isolated preview remains available at `http://127.0.0.1:5174/`; Hakimi shows `$45.0821`, 11 groups, and configured AT/RT status. No account billing multiplier was applied.
+
+## 2026-07-13 Upstream API Key Group Synchronization
+
+- Added a protected, one-request local sub2api credential export path that maps requested account IDs only when the complete ordered response is valid; exported API Keys stay in memory and are not cached or persisted.
+- Added channel-level batch group matching for NewAPI and Sub2API. NewAPI supports bounded-concurrency reveal and a strict bidirectionally unique anchored-mask fallback; Sub2API preserves list group fields when revealing a masked key.
+- Removed API Key suffix hints from account responses/UI, marked matched groups as `上游 Key 同步`, and renamed NewAPI usage to `上游累计已用`.
+- Persisted live group selections for Octopus `6/6` and Hakimi `5/5`. Two retired Octopus groups expose names but no current multiplier, so they remain unapplied and explicitly unavailable.
+- Passed `143/143` backend tests, the frontend production build, diff validation, desktop inspection, 390px containment, and a clean-reload console check.
+- Restarted the isolated preview backend on `127.0.0.1:8001`; `http://127.0.0.1:5174/` serves the verified API Key page. No target billing rate was applied to sub2api.

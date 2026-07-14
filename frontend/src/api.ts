@@ -19,7 +19,25 @@ import type {
   UsageEstimate,
   UsageLimitSamples,
   UsageRefreshResult,
+  UpstreamAccount,
+  UpstreamAccountUpdate,
+  UpstreamChannel,
+  UpstreamChannelsResponse,
+  UpstreamChannelUpdate,
+  UpstreamRateChangeLog,
 } from "./types";
+
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export const AUTH_EXPIRED_EVENT = "sub2api-at-auth-expired";
 
 async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 30_000): Promise<T> {
   const controller = new AbortController();
@@ -48,13 +66,29 @@ async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 30_0
     } catch {
       // Keep the HTTP status message.
     }
-    throw new Error(message);
+    if (response.status === 401 && !path.startsWith("/api/auth/")) {
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    }
+    throw new ApiError(message, response.status);
   }
 
   if (response.status === 204) {
     return undefined as T;
   }
   return (await response.json()) as T;
+}
+
+export function upstreamRateChangeLogsPath(
+  limit = 50,
+  beforeId?: number | null,
+  filters?: { startDate?: string; endDate?: string; timeZone?: string },
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (beforeId) params.set("before_id", String(beforeId));
+  if (filters?.startDate) params.set("start_date", filters.startDate);
+  if (filters?.endDate) params.set("end_date", filters.endDate);
+  if (filters?.timeZone) params.set("time_zone", filters.timeZone);
+  return `/api/upstream-accounts/rate-change-logs?${params.toString()}`;
 }
 
 function fallbackHttpErrorMessage(response: Response) {
@@ -155,4 +189,56 @@ export const api = {
       body: JSON.stringify({ account_emails: accountEmails }),
     }),
   deletePhone: (id: number) => request<{ message: string }>(`/api/phones/${id}`, { method: "DELETE" }),
+  upstreamAccounts: () => request<UpstreamAccount[]>("/api/upstream-accounts"),
+  updateUpstreamAccount: (accountId: number | string, payload: UpstreamAccountUpdate) =>
+    request<UpstreamAccount>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  setUpstreamAccountEnabled: (accountId: number | string, enabled: boolean) =>
+    request<UpstreamAccount>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}/enabled`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
+  deleteRemoteUpstreamAccount: (accountId: number | string) =>
+    request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}/remote`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirmed_account_id: accountId }),
+    }),
+  upstreamRateChangeLogs: (
+    limit = 50,
+    beforeId?: number | null,
+    filters?: { startDate?: string; endDate?: string; timeZone?: string },
+  ) => request<UpstreamRateChangeLog[]>(upstreamRateChangeLogsPath(limit, beforeId, filters)),
+  deleteUpstreamAccount: (accountId: number | string) =>
+    request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}`, { method: "DELETE" }),
+  discoverUpstreamAccount: (accountId: number | string) =>
+    request<UpstreamAccount>(
+      `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/discover`,
+      { method: "POST" },
+      90_000,
+    ),
+  applyUpstreamAccountRate: (accountId: number | string, confirmedTargetRate: number) =>
+    request<UpstreamAccount>(
+      `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/apply`,
+      {
+        method: "POST",
+        body: JSON.stringify({ confirmed_target_rate: confirmedTargetRate }),
+      },
+      90_000,
+    ),
+  upstreamChannels: () => request<UpstreamChannelsResponse>("/api/upstream-channels"),
+  updateUpstreamChannel: (channelId: number | string, payload: UpstreamChannelUpdate) =>
+    request<UpstreamChannel>(`/api/upstream-channels/${encodeURIComponent(String(channelId))}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  discoverUpstreamChannel: (channelId: number | string) =>
+    request<UpstreamChannel>(
+      `/api/upstream-channels/${encodeURIComponent(String(channelId))}/discover`,
+      { method: "POST" },
+      90_000,
+    ),
+  discoverAllUpstreamChannels: () =>
+    request<unknown>("/api/upstream-channels/discover-all", { method: "POST" }, 180_000),
 };

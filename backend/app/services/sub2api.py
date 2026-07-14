@@ -2,6 +2,7 @@ import base64
 import calendar
 import copy
 import json
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -57,12 +58,35 @@ ACCOUNT_NAME_PATHS = (
     ("extra", "name"),
     ("credentials", "name"),
 )
+MAX_SUB2API_RESPONSE_BYTES = 1024 * 1024
+MAX_SUB2API_ERROR_PREVIEW_BYTES = 500
+MAX_SUB2API_ACCOUNT_PAGES = 100
+MAX_SUB2API_ACCOUNTS = 10_000
 
 
 class Sub2ApiRequestError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+async def _read_bounded_response(
+    response: httpx.Response,
+    *,
+    limit: int,
+) -> tuple[bytes, bool]:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        remaining = limit - size
+        if remaining <= 0:
+            return b"".join(chunks), True
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining])
+            return b"".join(chunks), True
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks), False
 
 
 def _deep_get(data: Any, path: str) -> Any:
@@ -121,11 +145,41 @@ def extract_email(value: Any) -> str | None:
 
 
 def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _find_nested_field(value: Any, field: str) -> tuple[bool, Any]:
+    if not isinstance(value, dict):
+        return False, None
+    if field in value:
+        return True, value[field]
+    for key in ("data", "settings", "payment", "payment_settings", "config"):
+        child = value.get(key)
+        if isinstance(child, dict):
+            found, result = _find_nested_field(child, field)
+            if found:
+                return True, result
+    return False, None
+
+
+def _bounded_number(value: Any, *, minimum: float = 0, maximum: float = 1000) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
+        return None
+    return parsed
 
 
 def looks_deactive_text(value: Any) -> bool:
@@ -352,8 +406,14 @@ def _default_organization_id(openai_auth: dict[str, Any]) -> str | None:
 
 
 class Sub2ApiClient:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
+        self.transport = transport
 
     def _headers(self, config: EffectiveSub2ApiConfig) -> dict[str, str]:
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -375,24 +435,39 @@ class Sub2ApiClient:
         **kwargs: Any,
     ) -> Any:
         active_config = config or await get_runtime_config_service().get_sub2api_config()
-        async with httpx.AsyncClient(timeout=30.0, headers=self._headers(active_config), trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            headers=self._headers(active_config),
+            trust_env=False,
+            transport=self.transport,
+        ) as client:
             url = self._url(active_config, path)
-            response = await client.request(method, url, **kwargs)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail = exc.response.text[:500] if exc.response is not None else ""
-                status_code = exc.response.status_code if exc.response is not None else None
+            async with client.stream(method, url, **kwargs) as response:
+                status_code = response.status_code
+                if status_code < 200 or status_code >= 300:
+                    body, _truncated = await _read_bounded_response(
+                        response,
+                        limit=MAX_SUB2API_ERROR_PREVIEW_BYTES,
+                    )
+                    detail = body.decode("utf-8", errors="replace")
+                    raise Sub2ApiRequestError(
+                        f"sub2api request failed: HTTP {status_code} for {method} {url}. {detail}",
+                        status_code=status_code,
+                    )
+                body, truncated = await _read_bounded_response(
+                    response,
+                    limit=MAX_SUB2API_RESPONSE_BYTES,
+                )
+            if truncated:
                 raise Sub2ApiRequestError(
-                    f"sub2api request failed: HTTP {status_code} for {method} {url}. {detail}",
-                    status_code=status_code,
-                ) from exc
-            if not response.content:
+                    f"sub2api response exceeded {MAX_SUB2API_RESPONSE_BYTES} bytes for {method} {url}."
+                )
+            if not body:
                 return None
             try:
-                return response.json()
-            except json.JSONDecodeError as exc:
-                preview = response.text[:500]
+                return json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                preview = body[:MAX_SUB2API_ERROR_PREVIEW_BYTES].decode("utf-8", errors="replace")
                 raise Sub2ApiRequestError(f"sub2api returned non-JSON response for {method} {url}: {preview}") from exc
 
     def _unwrap(self, payload: Any) -> Any:
@@ -418,8 +493,12 @@ class Sub2ApiClient:
             return []
 
         result = [item for item in accounts if isinstance(item, dict)]
+        if len(result) > MAX_SUB2API_ACCOUNTS:
+            raise Sub2ApiRequestError("sub2api returned too many accounts.")
         data = payload.get("data") if isinstance(payload, dict) else None
         pages = _positive_int(data.get("pages") if isinstance(data, dict) else None)
+        if pages is not None and pages > MAX_SUB2API_ACCOUNT_PAGES:
+            raise Sub2ApiRequestError("sub2api account pagination exceeds the safety limit.")
         if pages is not None and pages > 1:
             for page in range(2, pages + 1):
                 page_payload = await self._request(
@@ -431,7 +510,176 @@ class Sub2ApiClient:
                 page_accounts = self._unwrap(page_payload)
                 if isinstance(page_accounts, list):
                     result.extend(item for item in page_accounts if isinstance(item, dict))
+                    if len(result) > MAX_SUB2API_ACCOUNTS:
+                        raise Sub2ApiRequestError("sub2api returned too many accounts.")
         return result
+
+    async def list_api_key_accounts(self) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for account in await self.list_accounts():
+            account_type = (self.account_type(account) or "").strip().lower()
+            normalized = account_type.replace("-", "_").replace(" ", "_")
+            if normalized in {"apikey", "api_key"}:
+                result.append(account)
+        return result
+
+    async def export_api_key_secrets(self, account_ids: list[int]) -> dict[int, str]:
+        """Read API keys from the protected local admin export without caching them."""
+
+        normalized_ids: list[int] = []
+        for raw_id in account_ids:
+            account_id = _positive_int(raw_id)
+            if account_id is None or account_id in normalized_ids:
+                continue
+            normalized_ids.append(account_id)
+        if not normalized_ids or len(normalized_ids) > 200:
+            return {}
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        try:
+            payload = await self._request(
+                "GET",
+                f"{config.accounts_path}/data",
+                config=config,
+                params={
+                    "ids": ",".join(str(account_id) for account_id in normalized_ids),
+                    "include_proxies": "false",
+                },
+            )
+        except Sub2ApiRequestError:
+            return {}
+        exported = self._unwrap(payload)
+        if not isinstance(exported, list):
+            return {}
+
+        requested = set(normalized_ids)
+
+        def exported_key(item: Any) -> str | None:
+            if not isinstance(item, dict):
+                return None
+            credentials = item.get("credentials")
+            if not isinstance(credentials, dict):
+                return None
+            raw_key = _first_value(
+                credentials,
+                ("api_key",),
+                ("apiKey",),
+                ("apikey",),
+            )
+            if not isinstance(raw_key, str):
+                return None
+            api_key = raw_key.strip()
+            if (
+                not api_key
+                or len(api_key) > 8192
+                or _looks_redacted(api_key)
+                or any(ord(char) < 32 or ord(char) == 127 for char in api_key)
+            ):
+                return None
+            return api_key
+
+        response_ids = [
+            _positive_int(
+                _first_value(
+                    item,
+                    ("id",),
+                    ("account_id",),
+                    ("accountId",),
+                )
+            )
+            if isinstance(item, dict)
+            else None
+            for item in exported
+        ]
+        result: dict[int, str] = {}
+        if any(account_id is not None for account_id in response_ids):
+            duplicate_ids: set[int] = set()
+            for account_id, item in zip(response_ids, exported, strict=True):
+                if account_id is None or account_id not in requested:
+                    continue
+                if account_id in result:
+                    duplicate_ids.add(account_id)
+                    continue
+                api_key = exported_key(item)
+                if api_key:
+                    result[account_id] = api_key
+            for account_id in duplicate_ids:
+                result.pop(account_id, None)
+            return result
+
+        # A credential must never be associated by response position. Older
+        # exports that omit stable account ids are intentionally unsupported.
+        return {}
+
+    async def get_account_balance(self, account: dict[str, Any] | str | int) -> dict[str, Any]:
+        raw_account_id = account if isinstance(account, (str, int)) else self.account_id(account)
+        account_id = _positive_int(raw_account_id)
+        if account_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        config = await get_runtime_config_service().get_sub2api_config()
+        payload = await self._request(
+            "GET",
+            f"{config.accounts_path}/{account_id}/balance",
+            config=config,
+        )
+        balance = self._unwrap(payload)
+        return balance if isinstance(balance, dict) else {}
+
+    async def get_payment_balance_recharge_multiplier_info(self) -> tuple[float, bool]:
+        config = await get_runtime_config_service().get_sub2api_config()
+        payload = await self._request("GET", "/admin/settings", config=config)
+        found, raw_value = _find_nested_field(payload, "payment_balance_recharge_multiplier")
+        if not found:
+            return 1.0, False
+        value = _bounded_number(raw_value, minimum=0.000000001, maximum=1000)
+        if value is None:
+            raise Sub2ApiRequestError("sub2api returned an invalid payment balance recharge multiplier.")
+        return value, True
+
+    async def get_payment_balance_recharge_multiplier(self) -> float:
+        value, _field_present = await self.get_payment_balance_recharge_multiplier_info()
+        return value
+
+    async def get_account_current_rate_multiplier(self, account_id: str | int) -> float:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        account = await self.get_account(str(numeric_id))
+        if account is None:
+            raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
+        value = _bounded_number(account.get("rate_multiplier"), minimum=0, maximum=1000)
+        if value is None:
+            raise Sub2ApiRequestError("sub2api account returned an invalid rate multiplier.")
+        return value
+
+    async def update_account_rate_multiplier(self, account_id: str | int, rate_multiplier: float) -> None:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        parsed_rate = _bounded_number(rate_multiplier, minimum=0, maximum=1000)
+        if parsed_rate is None:
+            raise ValueError("rate_multiplier must be between 0 and 1000.")
+        config = await get_runtime_config_service().get_sub2api_config()
+        await self._request(
+            "POST",
+            f"{config.accounts_path}/bulk-update",
+            config=config,
+            json={"account_ids": [numeric_id], "rate_multiplier": parsed_rate},
+        )
+
+    async def set_account_schedulable(self, account_id: str | int, schedulable: bool) -> None:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        if not isinstance(schedulable, bool):
+            raise ValueError("schedulable must be a boolean.")
+        config = await get_runtime_config_service().get_sub2api_config()
+        await self._request(
+            "POST",
+            f"{config.accounts_path}/{numeric_id}/schedulable",
+            config=config,
+            json={"schedulable": schedulable},
+        )
 
     async def list_groups(self) -> list[dict[str, Any]]:
         config = await get_runtime_config_service().get_sub2api_config()
@@ -1208,6 +1456,20 @@ class Sub2ApiClient:
             if value is not None:
                 return str(value)
         return None
+
+    def account_has_api_key(self, account: dict[str, Any]) -> bool:
+        credentials_status = account.get("credentials_status")
+        if isinstance(credentials_status, dict) and any(
+            credentials_status.get(key) is True for key in ("has_api_key", "hasApiKey")
+        ):
+            return True
+        credentials = account.get("credentials")
+        if not isinstance(credentials, dict):
+            return False
+        return any(
+            isinstance(credentials.get(key), str) and bool(credentials[key].strip())
+            for key in ("api_key", "apiKey", "apikey")
+        )
 
     def is_oauth_account(self, account: dict[str, Any]) -> bool:
         account_type = (self.account_type(account) or "").strip().lower()

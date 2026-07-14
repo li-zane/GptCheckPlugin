@@ -49,6 +49,24 @@ SUB2API_AUTH_SCHEME=Bearer
 SUB2API_AUTH_TOKEN=your-sub2api-admin-token
 ```
 
+### API Key 账号托管
+
+`API Key` 页面会自动列出 sub2api 中已有的 `apikey` 账号，并按上游 URL 聚合为渠道卡片。URL 末尾的 `/v1` 或 `/api/v1` 会被忽略，因此同一站点的多个 API Key 账号只配置一次协议、Access Token、充值成本并共享一份站点余额。每个账号以小卡片展示；账号使用的分组由上游 Key 列表自动识别，只有无法取得权威分组倍率时才允许填写手动倍率。
+
+NewAPI 应在上游个人设置中生成“系统访问令牌”，不要使用模型调用 API Key；用户余额接口还需要数字 `New-Api-User` ID。Sub2API 应同时填写登录响应签发的 Access Token 和 Refresh Token，不能使用模型 API Key；当 `/api/v1/auth/me` 明确返回 401 时，后端会调用 `/api/v1/auth/refresh`，先加密保存轮换后的 AT/RT，再重试一次探测。凭据使用 `APP_ENCRYPTION_KEY` 加密存入本地 SQLite，渠道接口和浏览器只返回“是否已配置”，不回显 Token 或密文。
+
+页面中的充值成本统一使用“每获得 1 USD 额度需要支付多少 CNY”的口径。sub2api 原始设置 `payment_balance_recharge_multiplier` 表示“每支付 1 CNY 获得多少 USD”，因此页面会取其倒数；例如原始值 `10` 会显示为 `0.1 CNY/USD`。目标倍率由后端统一计算：
+
+```text
+rate_multiplier = round4(上游分组倍率 * 上游充值成本 / 本地充值成本)
+```
+
+这保证 `上游分组倍率 * 上游充值成本 = sub2api 账号计费倍率 * 本地充值成本`。例如上游分组倍率为 `1`、充值 `1 CNY` 得 `10 USD`，上游充值成本就是 `0.1 CNY/USD`；若本地也是 `0.1 CNY/USD`，账号计费倍率应为 `1`。
+
+倍率变化日志中的“上游倍率”统一折算到 `1 CNY : 1 USD` 充值口径，即 `上游分组倍率 * 上游充值成本`。日志保存变更前后的折算值，并用“上涨”或“下降”标签标记方向和差值；本地充值成本单独变化只会重算账号计费倍率，不会被误记为上游涨跌。
+
+上游充值成本按“自动发现 > 手动配置 > 默认 1x”选择；只有上游探测成功且确认字段缺失时才允许默认 `1x`，探测失败或字段无效时不会生成目标倍率。NewAPI 的 `/api/status.price` 已是 CNY/USD 成本，直接使用；Sub2API 的 `balance_recharge_multiplier` 表示 USD/CNY，需要取倒数。使用默认值时会明确标记为默认，`discovered_recharge_multiplier` 仍为空。启用“自动同步上游分组与账号计费倍率”后，手动同步、保存账号配置和后台定时巡检都会在发现分组、充值成本或倍率漂移时自动写回 sub2api，并记录倍率变化；关闭后只更新探测结果，不自动写回。渠道余额由登录 Access Token 读取：NewAPI 使用 `quota / quota_per_unit`，Sub2API 使用 `/api/v1/auth/me` 的 `balance`。余额读取失败不会伪造为 0，也不会覆盖最后一次成功余额。保存凭据后只允许向 HTTPS 上游发送；外连会固定到已验证的公共 IP，同时保留原 Host 和 TLS SNI。
+
 ## 邮箱导入格式
 
 面板支持批量导入，一行一个；空行和 `#` 开头的行会被忽略。每行支持 `----`、`|`、`,` 三种分隔符。默认会按取件邮箱后缀自动识别 `outlook` / `hotmail` / `gmail`。推荐格式：

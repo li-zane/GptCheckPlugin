@@ -1,12 +1,15 @@
 from collections.abc import AsyncIterator
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import get_settings
+from app.core.crypto import decrypt_text
+from app.core.upstream_urls import canonicalize_upstream_url
 
 
 class Base(DeclarativeBase):
@@ -45,6 +48,358 @@ if is_sqlite:
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
+def _migration_consensus(
+    rows: list[dict],
+    field: str,
+    *,
+    ignored_values: set[str] | None = None,
+) -> tuple[object | None, bool]:
+    values: list[object] = []
+    ignored = ignored_values or set()
+    for row in rows:
+        value = row.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value or value.casefold() in ignored:
+                continue
+        if not any(value == existing for existing in values):
+            values.append(value)
+    return (values[0] if len(values) == 1 else None, len(values) > 1)
+
+
+def _migration_encrypted_consensus(
+    rows: list[dict],
+    field: str,
+) -> tuple[str | None, bool]:
+    """Compare encrypted legacy values by plaintext without re-encrypting them."""
+
+    values: dict[str, str] = {}
+    invalid_ciphertext = False
+    for row in rows:
+        raw_value = row.get(field)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        ciphertext = raw_value.strip()
+        plaintext = decrypt_text(ciphertext)
+        if plaintext is None:
+            invalid_ciphertext = True
+            continue
+        values.setdefault(plaintext, ciphertext)
+    conflict = invalid_ciphertext or len(values) > 1
+    if conflict or len(values) != 1:
+        return None, conflict
+    return next(iter(values.values())), False
+
+
+async def _ensure_upstream_channel_reference_guards(conn: AsyncConnection) -> None:
+    """Emulate the channel FK for SQLite databases upgraded via ADD COLUMN."""
+
+    result = await conn.execute(text("PRAGMA foreign_key_list(upstream_account_configs)"))
+    has_channel_foreign_key = any(
+        str(row[2]) == "upstream_channels" and str(row[3]) == "channel_id"
+        for row in result.fetchall()
+    )
+    if has_channel_foreign_key:
+        return
+
+    await conn.execute(
+        text(
+            "UPDATE upstream_account_configs SET channel_id = NULL "
+            "WHERE channel_id IS NOT NULL AND channel_id NOT IN (SELECT id FROM upstream_channels)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_account_channel_insert "
+            "BEFORE INSERT ON upstream_account_configs "
+            "WHEN NEW.channel_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM upstream_channels WHERE id = NEW.channel_id) "
+            "BEGIN SELECT RAISE(ABORT, 'invalid upstream channel reference'); END"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_account_channel_update "
+            "BEFORE UPDATE OF channel_id ON upstream_account_configs "
+            "WHEN NEW.channel_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM upstream_channels WHERE id = NEW.channel_id) "
+            "BEGIN SELECT RAISE(ABORT, 'invalid upstream channel reference'); END"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_channel_delete "
+            "AFTER DELETE ON upstream_channels "
+            "BEGIN UPDATE upstream_account_configs SET channel_id = NULL "
+            "WHERE channel_id = OLD.id; END"
+        )
+    )
+
+
+async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
+    result = await conn.execute(text("PRAGMA table_info(upstream_channels)"))
+    channel_columns = {str(row[1]) for row in result.fetchall()}
+    if channel_columns and "management_base_url" not in channel_columns:
+        await conn.execute(
+            text("ALTER TABLE upstream_channels ADD COLUMN management_base_url VARCHAR(500)")
+        )
+    if channel_columns and "encrypted_refresh_token" not in channel_columns:
+        await conn.execute(
+            text("ALTER TABLE upstream_channels ADD COLUMN encrypted_refresh_token TEXT")
+        )
+
+    result = await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
+    columns = {str(row[1]) for row in result.fetchall()}
+    if not columns:
+        return
+    if "resolved_upstream_type" not in columns:
+        await conn.execute(
+            text("ALTER TABLE upstream_account_configs ADD COLUMN resolved_upstream_type VARCHAR(32)")
+        )
+        columns.add("resolved_upstream_type")
+    if "channel_id" not in columns:
+        await conn.execute(text("ALTER TABLE upstream_account_configs ADD COLUMN channel_id INTEGER"))
+        columns.add("channel_id")
+    optional_account_columns = {
+        "channel_auto_assign_disabled": "BOOLEAN NOT NULL DEFAULT 0",
+        "remote_name": "VARCHAR(200)",
+        "remote_platform": "VARCHAR(64)",
+        "remote_account_type": "VARCHAR(32)",
+        "base_url": "VARCHAR(500)",
+        "encrypted_api_key": "TEXT",
+        "encrypted_access_token": "TEXT",
+        "upstream_user_id": "VARCHAR(128)",
+        "selected_group_id": "VARCHAR(128)",
+        "selected_group_name": "VARCHAR(200)",
+        "manual_group_multiplier": "FLOAT",
+        "manual_recharge_multiplier": "FLOAT",
+        "group_options": "JSON",
+        "discovered_group_multiplier": "FLOAT",
+        "effective_group_multiplier": "FLOAT",
+        "group_multiplier_source": "VARCHAR(128)",
+        "group_multiplier_status": "VARCHAR(32)",
+        "discovered_recharge_multiplier": "FLOAT",
+        "effective_recharge_multiplier": "FLOAT",
+        "recharge_multiplier_source": "VARCHAR(128)",
+        "recharge_multiplier_status": "VARCHAR(32)",
+        "local_recharge_multiplier": "FLOAT",
+        "local_recharge_source": "VARCHAR(32)",
+        "local_recharge_status": "VARCHAR(32)",
+        "target_rate": "FLOAT",
+        "current_rate": "FLOAT",
+        "balance_remaining": "FLOAT",
+        "balance_total": "FLOAT",
+        "balance_used": "FLOAT",
+        "balance_unit": "VARCHAR(32)",
+        "balance_status": "VARCHAR(32)",
+        "balance_message": "TEXT",
+        "balance_checked_at": "DATETIME",
+        "last_error": "TEXT",
+        "last_discovered_at": "DATETIME",
+        "last_applied_at": "DATETIME",
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+    }
+    for column, column_type in optional_account_columns.items():
+        if column not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE upstream_account_configs ADD COLUMN {column} {column_type}")
+            )
+            columns.add(column)
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_upstream_account_configs_channel_id "
+            "ON upstream_account_configs (channel_id)"
+        )
+    )
+    await _ensure_upstream_channel_reference_guards(conn)
+
+    migration_fields = (
+        "id",
+        "base_url",
+        "upstream_type",
+        "resolved_upstream_type",
+        "encrypted_access_token",
+        "upstream_user_id",
+        "manual_recharge_multiplier",
+        "discovered_recharge_multiplier",
+        "effective_recharge_multiplier",
+        "recharge_multiplier_source",
+        "recharge_multiplier_status",
+        "group_options",
+        "last_discovered_at",
+    )
+    select_fields = [field if field in columns else f"NULL AS {field}" for field in migration_fields]
+    result = await conn.execute(
+        text(
+            f"SELECT {', '.join(select_fields)} FROM upstream_account_configs "
+            "WHERE channel_id IS NULL "
+            "AND COALESCE(channel_auto_assign_disabled, 0) = 0 "
+            "AND TRIM(COALESCE(base_url, '')) <> ''"
+        )
+    )
+    grouped_rows: dict[str, list[dict]] = {}
+    for raw_row in result.mappings().all():
+        row = dict(raw_row)
+        try:
+            canonical_url = canonicalize_upstream_url(str(row.get("base_url") or ""))
+        except (TypeError, ValueError):
+            continue
+        grouped_rows.setdefault(canonical_url, []).append(row)
+
+    for canonical_url, rows in grouped_rows.items():
+        result = await conn.execute(
+            text("SELECT id FROM upstream_channels WHERE canonical_base_url = :canonical_base_url"),
+            {"canonical_base_url": canonical_url},
+        )
+        channel_id = result.scalar_one_or_none()
+        if channel_id is None:
+            conflicts: list[str] = []
+
+            upstream_type, upstream_type_conflict = _migration_consensus(
+                rows,
+                "upstream_type",
+                ignored_values={"auto"},
+            )
+            if upstream_type_conflict:
+                conflicts.append("upstream type")
+            if upstream_type not in {"newapi", "sub2api"}:
+                upstream_type = "auto"
+
+            resolved_type, resolved_type_conflict = _migration_consensus(
+                rows,
+                "resolved_upstream_type",
+            )
+            if resolved_type_conflict:
+                conflicts.append("resolved upstream type")
+            if resolved_type not in {"newapi", "sub2api"}:
+                resolved_type = None
+
+            access_token_cipher, access_token_conflict = _migration_encrypted_consensus(
+                rows,
+                "encrypted_access_token",
+            )
+            if access_token_conflict:
+                conflicts.append("access token")
+
+            upstream_user_id, upstream_user_id_conflict = _migration_consensus(
+                rows,
+                "upstream_user_id",
+            )
+            if upstream_user_id_conflict:
+                conflicts.append("upstream user id")
+
+            manual_recharge, manual_recharge_conflict = _migration_consensus(
+                rows,
+                "manual_recharge_multiplier",
+            )
+            if manual_recharge_conflict:
+                conflicts.append("manual recharge multiplier")
+
+            recharge_fields = (
+                "discovered_recharge_multiplier",
+                "effective_recharge_multiplier",
+                "recharge_multiplier_source",
+                "recharge_multiplier_status",
+            )
+            recharge_values: dict[str, object | None] = {}
+            recharge_conflict = False
+            for field in recharge_fields:
+                value, conflict = _migration_consensus(rows, field)
+                recharge_values[field] = value
+                recharge_conflict = recharge_conflict or conflict
+            if recharge_conflict:
+                conflicts.append("recharge discovery")
+                recharge_values = {field: None for field in recharge_fields}
+
+            group_options, group_options_conflict = _migration_consensus(rows, "group_options")
+            if group_options_conflict:
+                conflicts.append("group options")
+
+            discovered_dates = [
+                str(row["last_discovered_at"])
+                for row in rows
+                if row.get("last_discovered_at") is not None
+            ]
+            last_discovered_at = max(discovered_dates) if discovered_dates else None
+            parsed_url = urlsplit(canonical_url)
+            display_name = f"{parsed_url.netloc}{parsed_url.path}" or canonical_url
+            last_error = None
+            if conflicts:
+                last_error = (
+                    "Legacy channel migration left conflicting fields unset: "
+                    + ", ".join(conflicts)
+                    + "."
+                )
+
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_channels ("
+                    "display_name, canonical_base_url, upstream_type, resolved_upstream_type, "
+                    "encrypted_access_token, upstream_user_id, manual_recharge_multiplier, "
+                    "discovered_recharge_multiplier, effective_recharge_multiplier, "
+                    "recharge_multiplier_source, recharge_multiplier_status, group_options, "
+                    "balance_status, last_error, last_discovered_at, created_at, updated_at"
+                    ") VALUES ("
+                    ":display_name, :canonical_base_url, :upstream_type, :resolved_upstream_type, "
+                    ":encrypted_access_token, :upstream_user_id, :manual_recharge_multiplier, "
+                    ":discovered_recharge_multiplier, :effective_recharge_multiplier, "
+                    ":recharge_multiplier_source, :recharge_multiplier_status, :group_options, "
+                    "'not_checked', :last_error, :last_discovered_at, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+                    ") ON CONFLICT(canonical_base_url) DO NOTHING"
+                ),
+                {
+                    "display_name": display_name,
+                    "canonical_base_url": canonical_url,
+                    "upstream_type": upstream_type,
+                    "resolved_upstream_type": resolved_type,
+                    "encrypted_access_token": access_token_cipher,
+                    "upstream_user_id": upstream_user_id,
+                    "manual_recharge_multiplier": manual_recharge,
+                    "discovered_recharge_multiplier": recharge_values["discovered_recharge_multiplier"],
+                    "effective_recharge_multiplier": recharge_values["effective_recharge_multiplier"],
+                    "recharge_multiplier_source": recharge_values["recharge_multiplier_source"],
+                    "recharge_multiplier_status": recharge_values["recharge_multiplier_status"] or "not_discovered",
+                    "group_options": group_options,
+                    "last_error": last_error,
+                    "last_discovered_at": last_discovered_at,
+                },
+            )
+            result = await conn.execute(
+                text("SELECT id FROM upstream_channels WHERE canonical_base_url = :canonical_base_url"),
+                {"canonical_base_url": canonical_url},
+            )
+            channel_id = result.scalar_one()
+
+        for row in rows:
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET channel_id = :channel_id "
+                    "WHERE id = :account_config_id AND channel_id IS NULL"
+                ),
+                {"channel_id": channel_id, "account_config_id": row["id"]},
+            )
+
+
+async def _migrate_upstream_rate_change_logs(conn: AsyncConnection) -> None:
+    result = await conn.execute(text("PRAGMA table_info(upstream_rate_change_logs)"))
+    columns = {str(row[1]) for row in result.fetchall()}
+    if not columns:
+        return
+    for column in (
+        "old_upstream_multiplier",
+        "new_upstream_multiplier",
+        "old_upstream_recharge_multiplier",
+        "new_upstream_recharge_multiplier",
+    ):
+        if column not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE upstream_rate_change_logs ADD COLUMN {column} FLOAT")
+            )
+
+
 async def init_db() -> None:
     from app import models  # noqa: F401
 
@@ -53,6 +408,8 @@ async def init_db() -> None:
             await conn.execute(text("PRAGMA journal_mode=WAL"))
         await conn.run_sync(Base.metadata.create_all)
         if is_sqlite:
+            await _migrate_upstream_channels(conn)
+            await _migrate_upstream_rate_change_logs(conn)
             result = await conn.execute(text("PRAGMA table_info(mailbox_credentials)"))
             columns = {str(row[1]) for row in result.fetchall()}
             if "encrypted_access_token" not in columns:

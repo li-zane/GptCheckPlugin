@@ -2,11 +2,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.sub2api_urls import normalize_sub2api_base_url
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+MIN_PRODUCTION_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -58,6 +61,8 @@ class Settings(BaseSettings):
     usage_refresh_enabled: bool = False
     usage_refresh_interval_seconds: int = 3600
     usage_refresh_max_concurrency: int = 5
+    upstream_rate_sync_enabled: bool = False
+    upstream_rate_log_retention_days: int = Field(default=90, ge=1, le=3650)
     usage_limit_sample_five_hour_threshold_percent: float = 0.0
     usage_limit_sample_seven_day_threshold_percent: float = 0.0
     usage_limit_default_ranges_json: str = ""
@@ -110,7 +115,7 @@ class Settings(BaseSettings):
     @field_validator("sub2api_base_url")
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
-        return value.rstrip("/")
+        return normalize_sub2api_base_url(value)
 
     @field_validator("sub2api_accounts_path")
     @classmethod
@@ -118,6 +123,29 @@ class Settings(BaseSettings):
         if not value.startswith("/"):
             return f"/{value}"
         return value
+
+    @model_validator(mode="after")
+    def validate_production_security(self) -> "Settings":
+        if self.app_env != "production":
+            return self
+
+        secret_fields = {
+            "APP_ADMIN_KEY": self.app_admin_key,
+            "APP_SESSION_SECRET": self.app_session_secret,
+            "APP_ENCRYPTION_KEY": self.app_encryption_key,
+        }
+        for env_name, value in secret_fields.items():
+            if (
+                _is_placeholder_secret(value)
+                or len(value.strip()) < MIN_PRODUCTION_SECRET_LENGTH
+            ):
+                raise ValueError(
+                    f"{env_name} must be a non-default secret of at least "
+                    f"{MIN_PRODUCTION_SECRET_LENGTH} characters in production"
+                )
+        if not self.cookie_secure:
+            raise ValueError("COOKIE_SECURE must be true in production")
+        return self
 
     @property
     def project_root(self) -> Path:
@@ -131,3 +159,15 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def _is_placeholder_secret(value: str) -> bool:
+    normalized = value.strip().casefold()
+    return not normalized or normalized in {
+        "change-me-now",
+        "change-me-session-secret",
+        "change-me-encryption-key",
+        "replace-with-a-long-random-admin-key",
+        "replace-with-a-long-random-session-secret",
+        "replace-with-a-long-random-encryption-key",
+    }

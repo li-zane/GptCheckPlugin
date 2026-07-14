@@ -37,7 +37,15 @@ import {
 } from "lucide-react";
 import { createContext, FormEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-import { api } from "./api";
+import { api, AUTH_EXPIRED_EVENT } from "./api";
+import { ApiKeyAccountsView } from "./ApiKeyAccountsView";
+import {
+  clearUpstreamOverviewCache,
+  getUpstreamOverviewSessionStorage,
+  readUpstreamOverviewCache,
+  upstreamOverviewCacheScope,
+  writeUpstreamOverviewCache,
+} from "./upstreamOverviewCache";
 import type {
   Account,
   AccountExceptionRecord,
@@ -59,9 +67,10 @@ import type {
   UsageTokenHistory,
   UsageWindowAggregate,
   UsageWindowEstimate,
+  UpstreamChannelsResponse,
 } from "./types";
 
-type View = "overview" | "accounts" | "usage" | "usage-samples" | "mailboxes" | "phones" | "history" | "settings";
+type View = "overview" | "accounts" | "api-keys" | "usage" | "usage-samples" | "mailboxes" | "phones" | "history" | "settings";
 type Theme = "light" | "dark";
 type AccountCounts = { actual: number; deduped: number; duplicates: number };
 type AccountStatusFilter = "all" | "normal" | "normal-no-rate-limit" | "five-hour-rate-limited" | "seven-day-rate-limited" | "monthly-rate-limited" | "error" | "deactive";
@@ -140,6 +149,8 @@ const emptySettings: AppSettings = {
   usage_refresh_enabled: false,
   usage_refresh_interval_seconds: 3600,
   usage_refresh_max_concurrency: 5,
+  upstream_rate_sync_enabled: false,
+  upstream_rate_log_retention_days: 90,
   usage_limit_sample_five_hour_threshold_percent: 0,
   usage_limit_sample_seven_day_threshold_percent: 0,
   usage_limit_default_ranges: defaultUsageLimitRanges,
@@ -169,6 +180,8 @@ function App() {
   const [exceptionRecords, setExceptionRecords] = useState<AccountExceptionRecord[]>([]);
   const [accountJumpTarget, setAccountJumpTarget] = useState<AccountJumpTarget | null>(null);
   const [settings, setSettings] = useState<AppSettings>(emptySettings);
+  const [apiKeyAccountsCache, setApiKeyAccountsCache] = useState<UpstreamChannelsResponse | null>(null);
+  const apiKeyAccountsCacheBaseUrlRef = useRef<string | null>(null);
   const [usageEstimate, setUsageEstimate] = useState<UsageEstimate | null>(null);
   const [usageLimitSamples, setUsageLimitSamples] = useState<UsageLimitSamples | null>(null);
   const [usageLimitSamplesLoading, setUsageLimitSamplesLoading] = useState(false);
@@ -181,13 +194,15 @@ function App() {
   const siteName = settings.site_name?.trim() || defaultSiteName;
   const now = useRefreshClock();
   const lastSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
-  const lastUsageRefreshEvent = useMemo(
-    () => latestEventByKinds(events, ["usage_statistics_refresh", "usage_refresh"]),
-    [events],
-  );
   const syncActionTime = lastSyncEvent?.created_at ?? null;
-  const usageActionTime = lastUsageRefreshEvent?.created_at ?? null;
   const toggleTheme = useCallback(() => setTheme((current) => (current === "dark" ? "light" : "dark")), []);
+
+  const cacheApiKeyAccounts = useCallback((response: UpstreamChannelsResponse, responseBaseUrl: string) => {
+    const activeBaseUrl = apiKeyAccountsCacheBaseUrlRef.current;
+    if (!activeBaseUrl || upstreamOverviewCacheScope(activeBaseUrl) !== upstreamOverviewCacheScope(responseBaseUrl)) return;
+    const safeResponse = writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), responseBaseUrl, response);
+    if (safeResponse) setApiKeyAccountsCache(safeResponse);
+  }, []);
 
   const loadAll = useCallback(async ({ includePhones = true }: { includePhones?: boolean } = {}) => {
     const phonePromise = includePhones ? api.phones().catch(() => null) : Promise.resolve<PhoneNumber[] | null>(null);
@@ -212,6 +227,17 @@ function App() {
     setEvents(nextEvents);
     if (nextExceptionRecords) {
       setExceptionRecords(nextExceptionRecords);
+    }
+    const previousBaseUrl = apiKeyAccountsCacheBaseUrlRef.current;
+    if (!previousBaseUrl) {
+      apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+      setApiKeyAccountsCache(readUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url));
+    } else if (upstreamOverviewCacheScope(previousBaseUrl) !== upstreamOverviewCacheScope(nextSettings.sub2api_base_url)) {
+      clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+      apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+      setApiKeyAccountsCache(null);
+    } else {
+      apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
     }
     setSettings((current) => (appSettingsEqual(current, nextSettings) ? current : nextSettings));
   }, []);
@@ -276,6 +302,19 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const handleAuthExpired = () => {
+      clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+      apiKeyAccountsCacheBaseUrlRef.current = null;
+      setApiKeyAccountsCache(null);
+      setUsageEstimate(null);
+      setUsageLimitSamples(null);
+      setAuthState("out");
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+  }, []);
+
+  useEffect(() => {
     api
       .me()
       .then(async () => {
@@ -286,7 +325,12 @@ function App() {
           setNotice(error instanceof Error ? error.message : "数据读取失败");
         }
       })
-      .catch(() => setAuthState("out"));
+      .catch(() => {
+        clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+        apiKeyAccountsCacheBaseUrlRef.current = null;
+        setApiKeyAccountsCache(null);
+        setAuthState("out");
+      });
   }, [loadAll]);
 
   useEffect(() => {
@@ -355,8 +399,14 @@ function App() {
     setBusy(true);
     setNotice("");
     try {
+      const previousSub2ApiBaseUrl = settings.sub2api_base_url;
       const nextSettings = await api.updateSettings(payload);
       setSettings(nextSettings);
+      if (nextSettings.sub2api_base_url !== previousSub2ApiBaseUrl) {
+        clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+        apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+        setApiKeyAccountsCache(null);
+      }
       setNotice("设置已保存");
       await loadAll().catch((error) => {
         setNotice(error instanceof Error ? `设置已保存；刷新页面数据失败：${error.message}` : "设置已保存；刷新页面数据失败");
@@ -371,22 +421,10 @@ function App() {
   const runSync = () =>
     runAction(async () => {
       const result = await api.sync();
-      await loadUsageEstimate(false).catch(() => undefined);
+      const estimate = await loadUsageEstimate(false).catch(() => null);
+      if (estimate) setUsageEstimateRefreshed(true);
       return result;
-    }, "同步完成");
-
-  const runUsageStatistics = () =>
-    runAction(async () => {
-      setUsageLoading(true);
-      try {
-        const result = await api.refreshUsageWindows();
-        await loadUsageEstimate(false);
-        setUsageEstimateRefreshed(true);
-        return result;
-      } finally {
-        setUsageLoading(false);
-      }
-    }, "额度统计已刷新");
+    }, "账号与额度同步完成");
 
   if (authState === "checking") {
     return <BootScreen />;
@@ -414,6 +452,7 @@ function App() {
   const navItems: Array<{ id: View; label: string; icon: LucideIcon }> = [
     { id: "overview", label: "概览", icon: Activity },
     { id: "accounts", label: "账号", icon: UsersRound },
+    { id: "api-keys", label: "API Key", icon: KeyRound },
     { id: "usage", label: "额度", icon: TimerReset },
     { id: "usage-samples", label: "样本", icon: Radar },
     { id: "mailboxes", label: "邮箱", icon: Mail },
@@ -442,9 +481,11 @@ function App() {
             const Icon = item.icon;
             return (
               <button
+                aria-label={item.label}
                 className={view === item.id ? "nav-item active" : "nav-item"}
                 key={item.id}
                 onClick={() => setView(item.id)}
+                title={item.label}
                 type="button"
               >
                 <Icon size={18} />
@@ -455,14 +496,19 @@ function App() {
         </nav>
 
         <button
+          aria-label="退出"
           className="ghost-button"
           type="button"
+          title="退出"
           onClick={async () => {
             setBusy(true);
             try {
               await api.logout();
             } finally {
               setBusy(false);
+              clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+              apiKeyAccountsCacheBaseUrlRef.current = null;
+              setApiKeyAccountsCache(null);
               setAuthState("out");
             }
           }}
@@ -484,16 +530,9 @@ function App() {
             <ToolbarTimeButton
               busy={busy}
               icon={RefreshCcw}
-              label="同步"
+              label="同步账号与额度"
               onClick={runSync}
               time={syncActionTime}
-            />
-            <ToolbarTimeButton
-              busy={busy || usageLoading}
-              icon={Database}
-              label={usageLoading ? "统计中" : "额度统计"}
-              onClick={runUsageStatistics}
-              time={usageActionTime}
             />
           </div>
         </header>
@@ -554,6 +593,16 @@ function App() {
                 unlocked ? "已解锁自动刷新" : "已恢复自动刷新锁定",
               )
             }
+          />
+        ) : null}
+        {view === "api-keys" ? (
+          <ApiKeyAccountsView
+            cacheBaseUrl={settings.sub2api_base_url}
+            cachedData={apiKeyAccountsCache}
+            displayTimeZone={settings.display_timezone || defaultTimeZone}
+            key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
+            onCacheChange={cacheApiKeyAccounts}
+            rateWritesEnabled={settings.upstream_rate_sync_enabled && !settings.automation_paused}
           />
         ) : null}
         {view === "usage" ? (
@@ -2994,6 +3043,10 @@ function SettingsView({
   const [usageRefreshMaxConcurrency, setUsageRefreshMaxConcurrency] = useState(
     String(settings.usage_refresh_max_concurrency || 5),
   );
+  const [upstreamRateSyncEnabled, setUpstreamRateSyncEnabled] = useState(settings.upstream_rate_sync_enabled ?? false);
+  const [upstreamRateLogRetentionDays, setUpstreamRateLogRetentionDays] = useState(
+    String(settings.upstream_rate_log_retention_days || 90),
+  );
   const [usageLimitSampleFiveHourThreshold, setUsageLimitSampleFiveHourThreshold] = useState(
     String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0),
   );
@@ -3034,6 +3087,8 @@ function SettingsView({
     setUsageRefreshEnabled(settings.usage_refresh_enabled);
     setUsageRefreshInterval(String(settings.usage_refresh_interval_seconds));
     setUsageRefreshMaxConcurrency(String(settings.usage_refresh_max_concurrency || 5));
+    setUpstreamRateSyncEnabled(settings.upstream_rate_sync_enabled ?? false);
+    setUpstreamRateLogRetentionDays(String(settings.upstream_rate_log_retention_days || 90));
     setUsageLimitSampleFiveHourThreshold(String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0));
     setUsageLimitSampleSevenDayThreshold(String(settings.usage_limit_sample_seven_day_threshold_percent ?? 0));
     setUsageLimitDefaultRanges(mergeUsageLimitDefaultRanges(settings.usage_limit_default_ranges, subscriptionTypes));
@@ -3067,6 +3122,8 @@ function SettingsView({
     settings.usage_refresh_enabled,
     settings.usage_refresh_interval_seconds,
     settings.usage_refresh_max_concurrency,
+    settings.upstream_rate_log_retention_days,
+    settings.upstream_rate_sync_enabled,
     settings.usage_limit_sample_five_hour_threshold_percent,
     settings.usage_limit_sample_seven_day_threshold_percent,
     settings.usage_limit_default_ranges,
@@ -3076,6 +3133,7 @@ function SettingsView({
   const intervalNumber = Number(interval);
   const usageRefreshIntervalNumber = Number(usageRefreshInterval);
   const usageRefreshMaxConcurrencyNumber = Number(usageRefreshMaxConcurrency);
+  const upstreamRateLogRetentionDaysNumber = Number(upstreamRateLogRetentionDays);
   const usageLimitSampleFiveHourThresholdNumber = Number(usageLimitSampleFiveHourThreshold);
   const usageLimitSampleSevenDayThresholdNumber = Number(usageLimitSampleSevenDayThreshold);
   const protocolRefreshMaxConcurrencyNumber = Number(protocolRefreshMaxConcurrency);
@@ -3105,6 +3163,9 @@ function SettingsView({
     !Number.isInteger(usageRefreshMaxConcurrencyNumber) ||
     usageRefreshMaxConcurrencyNumber < 1 ||
     usageRefreshMaxConcurrencyNumber > 20 ||
+    !Number.isInteger(upstreamRateLogRetentionDaysNumber) ||
+    upstreamRateLogRetentionDaysNumber < 1 ||
+    upstreamRateLogRetentionDaysNumber > 3650 ||
     !Number.isFinite(usageLimitSampleFiveHourThresholdNumber) ||
     usageLimitSampleFiveHourThresholdNumber < 0 ||
     usageLimitSampleFiveHourThresholdNumber > 100 ||
@@ -3172,6 +3233,8 @@ function SettingsView({
       usage_refresh_enabled: usageRefreshEnabled,
       usage_refresh_interval_seconds: usageRefreshIntervalNumber,
       usage_refresh_max_concurrency: usageRefreshMaxConcurrencyNumber,
+      upstream_rate_sync_enabled: upstreamRateSyncEnabled,
+      upstream_rate_log_retention_days: upstreamRateLogRetentionDaysNumber,
       usage_limit_sample_five_hour_threshold_percent: usageLimitSampleFiveHourThresholdNumber,
       usage_limit_sample_seven_day_threshold_percent: usageLimitSampleSevenDayThresholdNumber,
       usage_limit_default_ranges: usageLimitDefaultRanges,
@@ -3196,7 +3259,7 @@ function SettingsView({
       <section className="panel">
         <PanelTitle title="sub2api 连接" icon={Link2} />
         <form className="settings-form" onSubmit={submit}>
-          <div className="settings-grid settings-main-grid">
+          <div className="settings-grid settings-main-grid settings-connection-grid">
             <label className="site-name-label">
               站点名
               <input
@@ -3218,6 +3281,20 @@ function SettingsView({
                 <span className="url-suffix">{sub2ApiApiPrefix}</span>
               </div>
             </label>
+          </div>
+
+          <label className="checkbox-line settings-toggle settings-global-toggle">
+            <input
+              checked={automationPaused}
+              onChange={(event) => setAutomationPaused(event.target.checked)}
+              type="checkbox"
+            />
+            <span>暂停自动巡检与自动用量查询</span>
+          </label>
+
+          <fieldset className="settings-section">
+            <legend>OAuth 账号巡检</legend>
+            <div className="settings-grid settings-section-grid">
             <label>
               巡检间隔（秒）
               <input
@@ -3225,16 +3302,6 @@ function SettingsView({
                 onChange={(event) => setInterval(event.target.value)}
                 type="number"
                 value={interval}
-              />
-            </label>
-            <label>
-              用量查询间隔（秒）
-              <input
-                max={86400}
-                min={60}
-                onChange={(event) => setUsageRefreshInterval(event.target.value)}
-                type="number"
-                value={usageRefreshInterval}
               />
             </label>
             <label>
@@ -3248,7 +3315,71 @@ function SettingsView({
               />
             </label>
             <label>
-              用量查询最大同时数
+              浏览器最大同时登录数
+              <input
+                max={50}
+                min={1}
+                onChange={(event) => setBrowserRefreshMaxConcurrency(event.target.value)}
+                type="number"
+                value={browserRefreshMaxConcurrency}
+              />
+            </label>
+            <label>
+              浏览器最低可用内存（MB）
+              <input
+                max={1048576}
+                min={0}
+                onChange={(event) => setBrowserMinAvailableMemoryMb(event.target.value)}
+                type="number"
+                value={browserMinAvailableMemoryMb}
+              />
+            </label>
+            </div>
+            <div className="settings-toggle-list settings-toggle-list--compact">
+              <label className="checkbox-line settings-toggle">
+                <input
+                  checked={recoveryEnabled}
+                  onChange={(event) => setRecoveryEnabled(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>开启账号恢复任务</span>
+              </label>
+              <label className="checkbox-line settings-toggle">
+                <input
+                  checked={autoRecoverState}
+                  onChange={(event) => setAutoRecoverState(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>刷新成功后自动恢复 sub2api 调度状态</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset className="settings-section">
+            <legend>OAuth 用量窗口查询</legend>
+            <div className="settings-toggle-list settings-toggle-list--compact">
+              <label className="checkbox-line settings-toggle">
+                <input
+                  checked={usageRefreshEnabled}
+                  onChange={(event) => setUsageRefreshEnabled(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>自动查询账号用量窗口</span>
+              </label>
+            </div>
+            <div className="settings-grid settings-section-grid">
+            <label>
+              查询周期（秒）
+              <input
+                max={86400}
+                min={60}
+                onChange={(event) => setUsageRefreshInterval(event.target.value)}
+                type="number"
+                value={usageRefreshInterval}
+              />
+            </label>
+            <label>
+              查询最大同时数
               <input
                 max={20}
                 min={1}
@@ -3282,26 +3413,6 @@ function SettingsView({
               />
             </label>
             <label>
-              浏览器最大同时登录数
-              <input
-                max={50}
-                min={1}
-                onChange={(event) => setBrowserRefreshMaxConcurrency(event.target.value)}
-                type="number"
-                value={browserRefreshMaxConcurrency}
-              />
-            </label>
-            <label>
-              浏览器最低可用内存（MB）
-              <input
-                max={1048576}
-                min={0}
-                onChange={(event) => setBrowserMinAvailableMemoryMb(event.target.value)}
-                type="number"
-                value={browserMinAvailableMemoryMb}
-              />
-            </label>
-            <label>
               单次订阅查询数量
               <input
                 max={100}
@@ -3322,6 +3433,7 @@ function SettingsView({
               />
             </label>
           </div>
+          </fieldset>
 
           <fieldset className="quota-range-settings">
             <legend>订阅默认额度区间</legend>
@@ -3409,40 +3521,31 @@ function SettingsView({
             </div>
           </fieldset>
 
-          <div className="settings-toggle-list">
-            <label className="checkbox-line settings-toggle">
-              <input
-                checked={recoveryEnabled}
-                onChange={(event) => setRecoveryEnabled(event.target.checked)}
-                type="checkbox"
-              />
-              <span>开启账号恢复任务</span>
-            </label>
-            <label className="checkbox-line settings-toggle">
-              <input
-                checked={autoRecoverState}
-                onChange={(event) => setAutoRecoverState(event.target.checked)}
-                type="checkbox"
-              />
-              <span>刷新成功后自动恢复 sub2api 调度状态</span>
-            </label>
-            <label className="checkbox-line settings-toggle">
-              <input
-                checked={automationPaused}
-                onChange={(event) => setAutomationPaused(event.target.checked)}
-                type="checkbox"
-              />
-              <span>暂停自动巡检与自动用量查询</span>
-            </label>
-            <label className="checkbox-line settings-toggle">
-              <input
-                checked={usageRefreshEnabled}
-                onChange={(event) => setUsageRefreshEnabled(event.target.checked)}
-                type="checkbox"
-              />
-              <span>自动查询账号用量窗口</span>
-            </label>
-          </div>
+          <fieldset className="settings-section settings-section--api-key">
+            <legend>API Key 上游倍率同步</legend>
+            <div className="settings-toggle-list settings-toggle-list--compact">
+              <label className="checkbox-line settings-toggle">
+                <input
+                  checked={upstreamRateSyncEnabled}
+                  onChange={(event) => setUpstreamRateSyncEnabled(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>自动同步上游分组与账号计费倍率</span>
+              </label>
+            </div>
+            <div className="settings-grid settings-section-grid">
+              <label>
+                倍率日志保留天数
+                <input
+                  max={3650}
+                  min={1}
+                  onChange={(event) => setUpstreamRateLogRetentionDays(event.target.value)}
+                  type="number"
+                  value={upstreamRateLogRetentionDays}
+                />
+              </label>
+            </div>
+          </fieldset>
 
           <div className="settings-grid time-zone-grid">
             <label>
@@ -3516,7 +3619,8 @@ function SettingsView({
               {sampleThresholdSettingLabel(settings.usage_limit_sample_seven_day_threshold_percent)} · 订阅单次{" "}
               {settings.subscription_refresh_batch_size} · 订阅并发{" "}
               {settings.subscription_refresh_max_concurrency} · 浏览器内存阈值 {settings.browser_min_available_memory_mb} MB · 恢复任务{" "}
-              {settings.recovery_enabled ? "开启" : "关闭"} · 状态恢复 {settings.sub2api_auto_recover_state ? "开启" : "关闭"}
+              {settings.recovery_enabled ? "开启" : "关闭"} · 状态恢复 {settings.sub2api_auto_recover_state ? "开启" : "关闭"} · API Key 倍率同步{" "}
+              {settings.upstream_rate_sync_enabled ? "开启" : "关闭"} · 倍率日志 {settings.upstream_rate_log_retention_days} 天
             </span>
           </div>
           <button className="secondary-button" disabled={busy} onClick={onScan} type="button">
@@ -4183,6 +4287,7 @@ function titleFor(view: View) {
   return {
     overview: "调度恢复概览",
     accounts: "GPT 账号状态",
+    "api-keys": "API Key 账号管理",
     usage: "额度估算",
     "usage-samples": "额度样本",
     mailboxes: "验证码邮箱",

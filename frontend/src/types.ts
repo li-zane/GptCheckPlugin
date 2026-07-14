@@ -375,6 +375,8 @@ export type AppSettings = {
   usage_refresh_enabled: boolean;
   usage_refresh_interval_seconds: number;
   usage_refresh_max_concurrency: number;
+  upstream_rate_sync_enabled: boolean;
+  upstream_rate_log_retention_days: number;
   usage_limit_sample_five_hour_threshold_percent: number;
   usage_limit_sample_seven_day_threshold_percent: number;
   usage_limit_default_ranges: UsageLimitDefaultRanges;
@@ -403,6 +405,8 @@ export type AppSettingsUpdate = {
   usage_refresh_enabled?: boolean;
   usage_refresh_interval_seconds?: number;
   usage_refresh_max_concurrency?: number;
+  upstream_rate_sync_enabled?: boolean;
+  upstream_rate_log_retention_days?: number;
   usage_limit_sample_five_hour_threshold_percent?: number;
   usage_limit_sample_seven_day_threshold_percent?: number;
   usage_limit_default_ranges?: UsageLimitDefaultRanges;
@@ -424,4 +428,169 @@ export type Sub2ApiPortScanResult = {
   message: string;
   checked_ports: number[];
   applied: boolean;
+};
+
+export type UpstreamType = "auto" | "newapi" | "sub2api";
+
+export type UpstreamGroupOption = {
+  id: string;
+  name: string;
+  multiplier: number;
+};
+
+/**
+ * A remote sub2api API-key account enriched with its optional local upstream
+ * management state. Most enrichment fields are optional so an unmanaged or
+ * not-yet-discovered account remains renderable.
+ */
+export type UpstreamAccount = {
+  sub2api_account_id: number | string;
+  channel_id?: number | string | null;
+  remote_name?: string | null;
+  remote_platform?: string | null;
+  remote_account_type?: string | null;
+  remote_status?: string | null;
+  remote_schedulable?: boolean | null;
+  managed?: boolean;
+  base_url?: string | null;
+  upstream_type?: UpstreamType | null;
+  /** Protocol resolved by the backend while configured mode remains `auto`. */
+  resolved_upstream_type?: Exclude<UpstreamType, "auto"> | null;
+  /** Compatibility alias used by earlier preview builds. */
+  detected_upstream_type?: Exclude<UpstreamType, "auto"> | null;
+  upstream_user_id?: string | null;
+  selected_group_id?: string | null;
+  selected_group_name?: string | null;
+  api_key_set?: boolean;
+  api_key_hint?: string | null;
+  access_token_set?: boolean;
+  manual_group_multiplier?: number | null;
+  manual_recharge_multiplier?: number | null;
+  group_options?: UpstreamGroupOption[] | null;
+  discovered_group_multiplier?: number | null;
+  effective_group_multiplier?: number | null;
+  group_multiplier_source?: string | null;
+  group_multiplier_status?: string | null;
+  discovered_recharge_multiplier?: number | null;
+  effective_recharge_multiplier?: number | null;
+  recharge_multiplier_source?: string | null;
+  recharge_multiplier_status?: string | null;
+  local_recharge_multiplier?: number | null;
+  local_recharge_source?: string | null;
+  local_recharge_status?: string | null;
+  current_rate?: number | null;
+  target_rate?: number | null;
+  would_change?: boolean;
+  balance_remaining?: number | null;
+  balance_total?: number | null;
+  balance_used?: number | null;
+  balance_unit?: string | null;
+  balance_status?: string | null;
+  balance_message?: string | null;
+  balance_checked_at?: string | null;
+  last_error?: string | null;
+  last_discovered_at?: string | null;
+  last_applied_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type UpstreamAccountUpdate = {
+  channel_id?: number | string | null;
+  remote_name?: string | null;
+  base_url?: string | null;
+  upstream_type?: UpstreamType;
+  upstream_user_id?: string | null;
+  selected_group_id?: string | null;
+  selected_group_name?: string | null;
+  api_key?: string;
+  access_token?: string;
+  clear_access_token?: boolean;
+  confirm_credential_rebind?: boolean;
+  manual_group_multiplier?: number | null;
+  manual_recharge_multiplier?: number | null;
+};
+
+export type UpstreamChannel = {
+  id: number | string;
+  display_name?: string | null;
+  base_url?: string | null;
+  canonical_base_url?: string | null;
+  management_base_url?: string | null;
+  upstream_type?: UpstreamType | null;
+  resolved_upstream_type?: Exclude<UpstreamType, "auto"> | null;
+  upstream_user_id?: string | null;
+  access_token_set?: boolean;
+  refresh_token_set?: boolean;
+  manual_recharge_multiplier?: number | null;
+  discovered_recharge_multiplier?: number | null;
+  effective_recharge_multiplier?: number | null;
+  recharge_multiplier_source?: string | null;
+  recharge_multiplier_status?: string | null;
+  group_options?: UpstreamGroupOption[] | null;
+  balance_remaining?: number | null;
+  balance_total?: number | null;
+  balance_used?: number | null;
+  balance_unit?: string | null;
+  balance_status?: string | null;
+  balance_message?: string | null;
+  balance_checked_at?: string | null;
+  status?: string | null;
+  message?: string | null;
+  checked_at?: string | null;
+  last_error?: string | null;
+  last_discovered_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  accounts?: UpstreamAccount[] | null;
+};
+
+export type UpstreamChannelsResponse = {
+  local_recharge_multiplier?: number | null;
+  local_recharge_source?: string | null;
+  local_recharge_status?: string | null;
+  channels: UpstreamChannel[];
+  unassigned_accounts: UpstreamAccount[];
+};
+
+export type UpstreamChannelUpdate = {
+  display_name?: string | null;
+  base_url?: string | null;
+  management_base_url?: string | null;
+  upstream_type?: UpstreamType;
+  access_token?: string;
+  clear_access_token?: boolean;
+  refresh_token?: string;
+  clear_refresh_token?: boolean;
+  confirm_credential_rebind?: boolean;
+  upstream_user_id?: string | null;
+  manual_recharge_multiplier?: number | null;
+};
+
+export type UpstreamRateChangeLog = {
+  id: number;
+  sub2api_account_id: number | string;
+  account_name?: string | null;
+  channel_id?: number | string | null;
+  channel_name?: string | null;
+  group_id?: string | null;
+  group_name?: string | null;
+  old_group_multiplier?: number | null;
+  new_group_multiplier?: number | null;
+  /** Group multiplier normalized to the cost of one upstream USD at a 1:1 recharge ratio. */
+  old_upstream_multiplier?: number | null;
+  /** Group multiplier normalized to the cost of one upstream USD at a 1:1 recharge ratio. */
+  new_upstream_multiplier?: number | null;
+  old_upstream_recharge_multiplier?: number | null;
+  new_upstream_recharge_multiplier?: number | null;
+  upstream_recharge_multiplier?: number | null;
+  local_recharge_multiplier?: number | null;
+  old_target_rate?: number | null;
+  new_target_rate?: number | null;
+  old_current_rate?: number | null;
+  new_current_rate?: number | null;
+  reason?: string | null;
+  status: string;
+  safe_error?: string | null;
+  created_at: string;
 };

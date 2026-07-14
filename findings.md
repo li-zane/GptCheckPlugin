@@ -272,6 +272,14 @@
 - Target balance success data is a sanitized object with `status`, `message`, optional `remaining`/`total`/`used`/`unit`, and `checked_at`; plugin persistence can map those fields directly after safe numeric coercion.
 - Target account DTO guarantees `name`, `platform`, `type`, redacted `credentials`, `credentials_status`, `rate_multiplier`, and `status`, which are sufficient for unmanaged account rows and current-rate readback without any secret access.
 - Parent confirmed the shared files are clean at HEAD `92af35a`; production with the default encryption key must reject only attempts to add/replace a secret, while development/test may accept encrypted local secrets for preview/testing.
+- Public account output now includes separate group/upstream-recharge/target-local-recharge source and status fields; local recharge source/status are persisted so a successful `/admin/settings` response with a missing field remains visibly distinguishable from an explicit value of 1 on later GETs.
+- First compile/diff check passed. A pre-test boundary review caught two type-domain issues: balances may legitimately exceed the 1000 multiplier cap, while account IDs must reject booleans/non-integral floats rather than coercing them; both were corrected before test coverage was added.
+- Live target data includes a valid negative remaining balance (`-40.904106`), so balance validation now accepts finite signed values within an absolute safety ceiling. Failed/unsupported balance attempts preserve both prior numeric fields and the prior successful `balance_checked_at`.
+- Auto-discovered multiplier sources now persist the adapter's precise source strings (for example `groups.available`, `groups.rates`, or `status.price`); only manual/default fallbacks use generic source labels.
+- Changed-line secret/error review found no logging or exception-string persistence in the new service; credentials appear only at encryption/decryption boundaries and the in-memory upstream adapter call. All route-visible service errors are fixed public messages.
+- The parallel frontend contract includes `remote_status`, concrete source strings, and `confirmed_target_rate`; it remains compatible with the finalized backend response names.
+- Secret length constraints cannot safely live in FastAPI/Pydantic fields because default 422 details include the rejected `input`. API-key/access-token length and conflicting set/clear validation now run in the service and raise fixed safe 422 messages; a real route-response regression test proves the oversized secret is absent.
+- Multiplier source columns use 128 characters so full adapter labels such as `payment.checkout-info.balance_recharge_multiplier` are not truncated on databases that enforce VARCHAR lengths.
 
 
 - The current worktree already contains substantial uncommitted changes from an earlier task; they must be preserved and reviewed for overlap before editing shared account/API/UI files.
@@ -293,7 +301,7 @@
 - Admin sub2api requests support either `x-api-key` or an administrator JWT. Reusing the server-side balance endpoint avoids storing or transmitting an additional copy of each upstream API key in this plugin.
 - The sibling sub2api checkout is dirty with unrelated user work; it is reference/runtime scope only and must not be modified by this task.
 - The referenced Codex task was recovered from `C:\Users\zanez\.codex\sessions\2026\07\03\rollout-2026-07-03T23-38-11-019f28a1-41ae-7332-8f18-f022e15a2d62.jsonl` after thread APIs rejected the ID.
-- Confirmed multiplier formula from that task: `sub2api_account_rate = upstream_group_rate * local_balance_recharge_multiplier / upstream_balance_recharge_multiplier`, rounded to four decimal places.
+- The referenced task originally used `upstream_group_rate * local_balance_recharge_multiplier / upstream_balance_recharge_multiplier`, but the user later clarified the canonical unit is CNY paid per USD credit. The implemented account cost is therefore `upstream_group_rate * upstream_cost_per_usd`, rounded to four decimal places; the inverse sub2api setting is normalized only for local cost comparison.
 - Upstream recharge multiplier precedence is discovered value, then manually saved value, then a `1.0` default. The default must retain an explicit default source/status and must never be persisted or presented as discovered.
 - `upstream-ops` v0.0.6 (`6b90a4f`) confirms the source Sub2API user APIs: `/auth/me` for balance, `/payment/checkout-info` for `balance_recharge_multiplier`, `/groups/available` for base group rates, and `/groups/rates` for user-specific overrides.
 - For New API/One API sources, status/self/groups endpoints use `quota_per_unit`, `price`, user quota, and `{groupName: {ratio, desc}}`; the adapter must skip nonnumeric ratios such as `auto`.
@@ -309,3 +317,166 @@
 - Live balance verification: account `2232` (`www.cattoken.cc`) returns `unsupported` with no numeric fields, while account `2250` (`zz1cc.cc.cd`) returns `ok`, unit `USD`, and numeric remaining/total/used values including a negative remaining balance. The UI must not conflate unsupported with zero or clamp valid negative balances.
 - The earlier Plus/sample/identity work was committed as `92af35a`; shared backend/frontend files are now clean, so this feature can make minimal direct integration edits without racing an active worktree change.
 - Existing `redact()` masks every character except the final four and secret encryption derives a Fernet key from `APP_ENCRYPTION_KEY`; the new API should reuse both and offer no reveal endpoint.
+- Backend review caught that balance parsing must accept finite negative values and only update `balance_checked_at` after a successful balance response; the implementation and regression tests were adjusted accordingly.
+- Pydantic/FastAPI validation errors include the rejected `input` value even with `hide_input_in_errors=True`; API-key/token length validation must therefore occur in the service with a generic error rather than a secret-bearing schema max-length failure.
+- Frontend review identified that a failed/unsupported latest balance probe should still show the last successful numeric balance as stale, rather than hiding it; status and error text remain visible beside the retained amount.
+- Final recharge semantics are endpoint- and field-aware: NewAPI payment config/checkout explicit multipliers win; only a missing explicit value may fall back to `1 / status.price`; failed or invalid discovery never becomes the default `1x`.
+- Existing sub2api API-key accounts can opt into balance monitoring without copying their upstream key into this plugin. A user-triggered probe creates a no-key local row and uses sub2api's server-side balance endpoint; direct group/recharge discovery remains unavailable until credentials are explicitly bound.
+- Direct credentialed discovery requires HTTPS. The client validates every resolved address as public, pins the TCP connection to a validated IP, preserves the logical Host/TLS SNI, disables redirects and environment proxies, and tries each address from one DNS result at most once.
+- All upstream-derived strings are scrubbed against stored credentials before persistence and response construction. Route validation also redacts malformed `api_key`, `access_token`, and credential-bearing `base_url` inputs from FastAPI 422 details.
+- Configuration identity changes clear old automatically selected groups and invalidate all derived previews. Applying a rate always re-discovers, compares the four-decimal confirmation, performs an exact one-account update, and verifies the readback.
+## 2026-07-13 Sample Page Window Grouping
+
+- The sample API exposes a flat `windows` collection whose rows already carry `window_key`, subscription metadata, calibration, and samples.
+- The frontend currently creates one top-level tab per `window_key + plan_cohort`, so quota windows are fragmented by subscription type instead of grouped under 5h, 7d, and monthly views.
+
+## 2026-07-13 Upstream Channel Cards and Balance Repair
+
+- The old balance path is definitively account-scoped: it calls local sub2api `/admin/accounts/{id}/balance`, so those snapshots cannot represent a shared upstream wallet.
+- Correct NewAPI site balance is `/api/user/self.data.quota / /api/status.data.quota_per_unit`; `used_quota` is cumulative usage, and recharge cost must not be applied to either number.
+- Correct Sub2API site balance is `/api/v1/auth/me.data.balance` in USD.
+- Both direct balance contracts require the channel login Access Token; a model API key must never substitute for it. NewAPI additionally requires a positive numeric `New-Api-User` value.
+- The additive SQLite migration groups the 24 preview configs into seven canonical URLs, retains legacy NOT NULL columns, and deliberately initializes every channel balance as `not_checked`.
+- URL canonicalization removes one exact trailing `/v1` or `/api/v1`, normalizes scheme/IDNA host/default port, and preserves all other path prefixes.
+- Chrome still lists the logged-in `ZZ API Console` wallet tab and the 哈基米 login tab, but claiming the existing ZZ tab timed out a second time even when only URL/title were requested; no page content or credential was read.
+- A fresh controlled Chrome tab inherited the existing ZZ login state. Cloudflare's automatic check completed without interaction and the tab reached `https://zz1cc.cc.cd/wallet` with title `ZZ API Console`.
+- The visible ZZ wallet page reports a current balance of `$502.19` and exposes a `/profile` navigation entry. No browser storage or token was inspected.
+- ZZ profile exposes a visible `访问令牌` button described as generating/managing API access tokens. The visible profile does not yet show a numeric New-Api-User ID.
+- Opening the supported ZZ Access Token dialog started its built-in token generation flow. The token field was not read or emitted; the dialog still did not expose a numeric user ID.
+- ZZ generated a 32-character system Access Token through the visible dialog. It was immediately regenerated for the test session and retained only in browser-session memory; no token value is persisted in planning files or terminal commands.
+- A focused visible navigation to ZZ's known `/api/user/self` endpoint was blocked by the browser client, so it could not be used to obtain the numeric user ID. No storage or cookie fallback was attempted.
+- The final ZZ test token was regenerated again after verification and retained only in browser memory; only its non-secret populated/length metadata was observed. Numeric user ID remains unresolved through visible UI.
+- Closing the token dialog returned to the same profile view; the only profile tabs are `账户绑定` and `设置与偏好`, with no numeric user ID visible in the selected account-binding view.
+- ZZ `设置与偏好` exposes notification and account-behavior settings only; it also contains no numeric user ID.
+- The visible ZZ avatar/account-menu control did not expose any additional menu content or numeric ID in the accessible page state.
+- Live ZZ discovery now reaches the public NewAPI endpoints through the narrow fake-IP DoH fallback. Its `status.price` is `0.0621`, which is already the normalized CNY/USD cost; the authenticated self endpoint still rejects the token without `New-Api-User`.
+- Observing the visible ZZ token dialog's `/api/user/token` request exposed the required numeric `New-Api-User` header without reading browser storage. With the current system token, `/api/user/self` returns `$502.1853`, matching the wallet's rounded `$502.19`.
+- Hakimi is Sub2API and exposes no user-facing long-lived token generator. Its supported credential is the login JWT used as `Authorization: Bearer ...`; a visible dashboard refresh supplied it without reading browser storage, and `/api/v1/auth/me` returned `$46.226`.
+- Hakimi's `/api/v1/payment/checkout-info` reports `balance_recharge_multiplier=1`, normalized to `1 CNY/USD`, and its group endpoints returned 11 groups.
+- A fresh Chrome tab reached the 哈基米 root page with title `哈基米biu - AI API Gateway`; its initial SPA snapshot was still empty.
+- After the 哈基米 SPA loaded it redirected to `/home` and exposed only `登录` / `立即开始`; the Chrome profile is not currently authenticated to this site.
+- The updated local preview is reachable at `http://127.0.0.1:5174/` after the backend restart; the Chrome test tab initially entered the app loading state.
+- Local preview login succeeds with the isolated preview key and the `API Key` navigation entry is available from the authenticated dashboard.
+- The rewritten API Key view renders its channel-level summary, URL-grouping explanation, channel actions, search/filter controls, and loading state without the old table tree.
+
+- The in-app browser contains only duplicate local preview tabs; the relevant existing login state is in Chrome.
+- Chrome has an existing `https://zz1cc.cc.cd/wallet` tab titled `ZZ API Console`, matching the 章鱼哥/`zz1cc.cc.cd` NewAPI candidate from the local account inventory.
+- Chrome has an existing `https://api.biuapi.com/login` tab titled `登录 - 哈基米biu`, matching the requested 哈基米 Sub2API channel, though login state still needs verification.
+- Browser policy prohibits reading cookies, Local Storage, session stores, profiles, or passwords. Credential acquisition must use visible site UI or a supported authenticated page action without extracting browser storage.
+- Current persistence puts `base_url`, protocol, encrypted API key/access token, recharge discovery, and balance fields directly on every `UpstreamAccountConfig`; grouping requires a real channel owner rather than a frontend-only visual regroup.
+- Current discovery always starts an account-level sub2api balance call and stores that result on the account, while direct upstream discovery returns only group/recharge metadata. Channel-level balance needs a direct authenticated upstream balance result in the discovery adapter.
+- Current public API is a flat `list[UpstreamAccountOut]` plus account-scoped PUT/discover/apply/delete routes. A compatibility-preserving response can add channel DTOs/routes while retaining account apply endpoints.
+- SQLite migrations are handled imperatively in `init_db` alongside `create_all`; a new channel table plus nullable account `channel_id` can be created safely, then existing rows can be backfilled by normalized URL.
+- The current React page is a desktop table with separate mobile cards and an account-scoped configuration dialog. The requested design should replace both with one responsive channel-card grid containing compact account cards, avoiding duplicated desktop/mobile render trees.
+- `UpstreamClient._normalize_base_url` already removes trailing `/v1` and `/api/v1` before direct requests, but the account-service normalization used for persisted/grouped URLs does not. Channel identity should reuse one canonical normalizer across persistence, migration, and API input.
+- The discovery adapter currently has no balance fields or direct balance parser at all. The visible balance comes only from sub2api's account-scoped `/accounts/:id/balance`, which explains why multiple same-site accounts duplicate balance and why NewAPI site balance can be wrong for channel semantics.
+- The `upstream-ops` Git worktree is intentionally missing files but commit `6b90a4f` remains readable through `git show`; do not restore or alter this reference directory.
+- `upstream-ops` channel cards use a responsive 1/2/3-column grid, a compact status header, balance/cost stat tiles, two-line collapsible group-rate chips, and an icon action row. This visual language should be adapted to channel cards with nested compact account cards.
+- NewAPI direct balance contract: public `GET /api/status` supplies `quota_per_unit` (default 500000) and `price`; authenticated `GET /api/user/self` supplies `quota` and `used_quota`; after unwrapping `{success,data}`, USD balance is `quota / quota_per_unit`.
+- NewAPI token auth requires both a system access token in a raw `Authorization` header and `New-Api-User`; the reference deliberately does not add `Bearer`. Cookie mode exists in the reference but browser policy prevents harvesting cookies, so this implementation should guide users to generate the visible system access token instead.
+- Sub2API direct channel balance uses authenticated `GET /api/v1/auth/me` and its `balance`; group/rate/recharge endpoints are `/groups/available`, `/groups/rates`, and `/payment/checkout-info` under `/api/v1`.
+- Channel balance must remain USD credit. Recharge cost (`CNY/USD`) is separate metadata and must not be applied to the displayed balance; optionally a monetary cost equivalent can be derived separately.
+- Access-token guidance should distinguish NewAPI's personal-settings system token + User ID from Sub2API's Access Token (and optional Refresh Token). Current scope can store only the access token unless refresh support is added deliberately.
+- The API deliberately emits default calibration entries for every configured subscription/window combination, including entries with `samples=[]`; these are the source of visible empty tabs.
+- Sample collection writes `monthly` only when `_window_kind()` resolves an upstream window as truly monthly. Existing coverage proves a Plus account with a real 10,080-minute 7d window stays in `seven_day`, while explicit monthly-only usage is stored under `monthly`.
+- Preserve per-subscription calibration semantics inside each quota-window view, but derive the three top-level groups only from entries with samples. This makes the monthly count include only persisted true-monthly samples and hides every empty quota-window group.
+- Playwright fixture coverage showed `5h 2`, `7d 1`, and `月 1` in fixed order; the monthly view rendered only its Team true-monthly sample despite an empty Plus monthly calibration entry. With the 7d fixture emptied, the live tab list became only `5h 2` and `月 1`.
+- At a 390x844 viewport, the document and body scroll widths both remained 390px. Browser console errors were exclusively expected 401 responses from unrelated protected endpoints left unmocked; no component/runtime exception was present.
+
+## Account Identity Across Dashboard and Usage Views (2026-07-13)
+
+- The requested extension covers three existing surfaces: overview recent accounts, overview rate-limit account rows, and the usage account-detail table.
+- The shared worktree already contains unrelated uncommitted upstream-management/sample-grouping changes, including edits to `App.tsx`, `styles.css`, schemas, services, and types. New changes must be additive and narrowly scoped.
+- `Overview` renders recent accounts through `AccountRow compact`; that branch currently shows only `account.email`.
+- `RateLimitedAccountColumn` receives full `Account` rows but currently renders email on the first line and sub2api ID below it, so it can use `account.account_name` without an API change.
+- `AccountUsageEstimateOut` and the frontend `AccountUsageEstimate` type currently expose email but not account name. The usage estimator must add a display-only `account_name` field derived from the same sub2api helper with email fallback.
+- The compact recent-account branch has a two-column grid for identity plus status badges, so a single ellipsized identity wrapper can render `名称 | 邮箱` without changing the status layout.
+- Rate-limit rows already reserve the right side for status/recovery badges. Replacing the left email/sub2api-ID stack with one compact identity line saves vertical space as requested; the account ID can remain available in the row tooltip if needed.
+- The usage-detail table's first column is already 230px wide and currently holds one copyable email. It can reuse the existing stacked account identity styles/buttons used by the main accounts table after the API adds `account_name`.
+- `_account_estimate()` already receives `Sub2ApiClient` and the raw account. It can add `account_name=sub2api.account_name(account) or email` directly beside the existing email field, with no persistence or OAuth identity changes.
+- Existing backend tests exercise estimator dictionaries rather than constructing `AccountUsageEstimateOut` directly, so one focused assertion on the returned account row is sufficient to guard the new contract.
+- No test directly calls `_account_estimate()` or `build_usage_estimate()`. Existing `Sub2ApiClient.account_name()` coverage already verifies name extraction/fallback boundaries; focused schema/estimator output coverage can be added without modifying unrelated FakeSub2Api fixtures.
+- The CLI route shorthand stripped quotes from the first Playwright JSON fixtures; structured `route.fulfill({ json })` fixtures restored authenticated rendering without changing product code.
+- Overview recent-account and rate-limit rows expose two independent copy targets while preserving the requested compact single-line `name | email` layout.
+- Desktop measurements found no overlap between identity and status/recovery badges, even with `K12 Campus Account - East District | student.oauth@example.edu`.
+- Usage details expose the account name above the email for both normal Plus and rate-limited K12 tabs, and both values copy independently.
+- At 390px, `documentElement.scrollWidth`, body width, and viewport width all remained 390px. The usage table uses its existing internal horizontal scroller rather than widening the page.
+- For the deployment commit, `backend/app/services/usage_estimate.py` and `backend/test_usage_estimate.py` contain only identity-related changes and can be staged whole.
+- `backend/app/schemas.py`, `frontend/src/types.ts`, `frontend/src/App.tsx`, and `frontend/src/styles.css` also contain unrelated upstream-channel work; only their identity-specific hunks/lines may enter the commit.
+- The identity-only `App.tsx` hunks are the rate-limit compact identity, recent-account compact identity/badge wrapper, usage table header/cell, and the two shared identity renderers. API-key navigation/import/view/title hunks are unrelated.
+- Reconstructed the identity change from clean base `885e603` in a detached verification worktree. Its complete diff is six files, 128 insertions, and 19 deletions, with no upstream-channel imports, routes, models, types, or styles.
+- The staged patch has the same stable patch ID (`c2c03f831fcd60b8bdab44d04991568becad2b7f`) as the clean verification worktree and passes an explicit upstream/API-key exclusion scan.
+- x1 is exactly at the commit parent `885e603`, its tracked worktree/index are clean, and the only worktree item remains the pre-existing `01-login.png`.
+- x1 services are `gptcheckplugin.service` (backend, port 8000) and `gptcheckplugin-frontend.service` (Vite preview, port 5173); both are active/running and both HTTP probes pass.
+- The root filesystem has 4.7 GB free. The deployment is code/schema-output only, with no database migration or data mutation, so a Git rollback ref plus the exact parent commit is sufficient rollback coverage.
+- The verified incremental bundle SHA-256 is `02517ad43850e1f0dc8198e81632f0b5fe36e4e3edadfefb7b253837f2f14143`; x1 fetched exact target `c8f1fbe` and created rollback ref `refs/backups/pre-identity-c8f1fbe-20260713T061217Z` before clean-tree verification.
+- Neither x1's system Python nor production virtualenv includes `pytest`; remote regression tests must use an isolated temporary test virtualenv so production dependencies remain unchanged.
+- Remote clean-tree verification at `c8f1fbe` passed 47 backend tests, `npm ci`, zero-vulnerability production audit, and the Vite production build; both temporary worktree and isolated pytest target were removed.
+- Production x1 fast-forwarded to `c8f1fbe`; both systemd units are active and backend health, frontend, authenticated login, and usage-estimate endpoints all return HTTP 200.
+- The production usage-estimate response contains 60/60 rows with both `account_name` and `email`; 58 currently have distinct values. No identity values or credentials were printed during verification.
+- Production frontend assets are the clean-build hashes `index-BDqbCuNY.css` and `index-BO-O-0fL.js`, and the only remaining x1 worktree item is the preserved `01-login.png`.
+- A separate secondary-navigation workflow advanced local `main` to descendant `166ed56` after this commit; x1's final readback remains exactly `c8f1fbe`, and Git confirms the identity commit is present.
+## 2026-07-13 Commit and Deploy Sample Grouping to x1
+
+- Local `main` starts at `504a977`; the worktree is dirty with unrelated API-key, identity, backend, test, and planning changes.
+- `frontend/src/App.tsx` contains both unrelated changes and the sample grouping implementation, so whole-file staging is unsafe. The commit must use hunk-scoped cached staging and staged-diff verification.
+- Known x1 target: SSH `root@154.12.51.74:54321`, repository `/root/apps/GptCheckPlugin`.
+- x1 preflight is exactly at local base `504a977`; its only worktree item is the pre-existing untracked `01-login.png`. Both services are active, backend health returns OK, and frontend returns HTTP 200.
+- Local frontend production build passes on the complete working tree. No staged changes existed before hunk isolation.
+- Commit `885e603` contains only three `UsageLimitSamplesView` hunks in `frontend/src/App.tsx` (65 insertions, 50 deletions). No unrelated file or hunk entered the commit.
+- A clean detached worktree at `885e603` passed `npm ci`, full dependency audit with zero vulnerabilities, TypeScript compilation, and the Vite production build.
+- The verified incremental bundle is 1,352 bytes, advertises `main=885e603`, and requires x1's exact `504a977` base. It was transferred to `/tmp` and fetched into `refs/remotes/deploy/sample-grouping-885e603`.
+- x1 clean temporary worktree at `885e603` passed `npm ci`, zero-vulnerability audit, TypeScript compilation, and Vite build. Node 18 emitted an engine warning for `@vitejs/plugin-react@5.2.0`, but the unchanged dependency set built successfully.
+- Production fast-forward/build completed at `885e603`; `dist` serves the expected `index-eNTarn2Z.js` bundle, both services are active, and the backend remains healthy.
+- A secret-safe authenticated production probe returned login/sample API status 200 and aggregate counts `five_hour=157`, `seven_day=39`, `monthly=14`, confirming all three top-level groups have real samples on x1.
+## 2026-07-13 Sample Subscription Secondary Navigation
+
+- `sampleWindowGroups` already contains only non-empty subscription cohorts, so `group.cohorts.length` is the exact visible subscription-type count and `group.sampleCount` remains the aggregate sample count.
+- Add a second selected key for `plan_cohort`; synchronize it against the selected primary group's cohorts and render one selected cohort panel instead of mapping every cohort panel vertically.
+- The existing rate-limited accounts panel precomputes separate 5h, 7d, and monthly account arrays but always renders all three columns. A filtered array plus selected-key fallback can hide empty window buttons without backend changes or effect-based synchronization.
+- Both implementations compile successfully. Playwright verification should use accounts with 5h/month rate-limit keys and no 7d key, plus samples spanning multiple subscriptions, to prove absent filters and secondary selection behavior.
+- The browser fixture can authenticate locally and fulfill the initial dashboard/settings/account requests without database writes. Planned assertions: rate-limit buttons `5h 2` and `月 2` with no 7d; sample primary tabs with both sample/subscription counts; secondary Plus/Team switching changes the single rendered panel.
+- Playwright confirmed the rate-limit panel renders only `5h 2` and `月 2`, omits empty 7d, and swaps the account list on selection.
+- Sample navigation confirmed primary metrics `5h 3 samples / 2 subscriptions`, `7d 1 / 1`, `monthly 2 / 2`; secondary navigation switched Plus to Team and changed the only rendered panel, while primary monthly selection reset to valid Team/K12 options.
+- At 390px, primary/secondary tabs wrap cleanly and both document/body scroll widths equal the viewport width.
+## 2026-07-13 Commit and Deploy Secondary Navigation to x1
+
+- Local `main` and x1 independently advanced to the same `c8f1fbe` identity-display commit before this deployment request; use that as the new exact base rather than the earlier `885e603` assumption.
+- The dirty working CSS combines this task with unrelated API-key styles, so use a clean temporary worktree/branch to recreate and commit only the intended App/CSS changes.
+- Preserve the existing detached identity verification worktree at `C:/Users/zanez/Documents/agents_playground/GptCheckPlugin-identity-verify-885e603` because it was not created by this deployment workflow.
+- Clean-worktree diff contains only `frontend/src/App.tsx` (navigation state/rendering) and `frontend/src/styles.css` (110 lines of matching styles). `npm ci`, zero-vulnerability audit, TypeScript, and Vite build passed.
+- Isolated commit `166ed56 feat(quota): add secondary window filters` contains exactly those two frontend files (198 insertions, 38 deletions).
+- Verified 2,589-byte incremental bundle advertises `main=166ed56` and requires exact base `c8f1fbe`. x1 fetched it into a temporary deploy ref and passed clean-worktree `npm ci`, zero-vulnerability audit, and production build.
+- Production `main` is now `166ed56`; authenticated sample/account probes confirm the new navigation has real counts and the non-empty rate-limit rule hides monthly because its current raw count is zero.
+## 2026-07-13 Usage Detail Rate-Limit Window Filters
+
+- The requested location is `UsageEstimateView` → `账号额度明细`, not the overview `限流账号` panel.
+- Detail rows use `AccountUsageEstimate`, which carries `rate_limited_windows` plus `five_hour/seven_day.rate_limited` and `window_kind`. Reusing `accountRateLimitedWindowKeys(account, account)` provides the existing monthly normalization semantics.
+- Place the dynamic window tabs inside the left title block below its subtitle, then filter `detailBaseAccounts` by the selected non-empty window before deriving subscription options.
+- Deriving tab counts from visible rate-limited detail accounts ensures a button is absent when no matching rows can be shown.
+- Clearing the subscription selection on account-type and window changes prevents a valid new window from appearing empty because of a stale subscription filter.
+
+## 2026-07-13 Sub2API Refresh Token Contract
+
+- `POST /api/v1/auth/refresh` is unauthenticated apart from the JSON `refresh_token`; success returns `data.access_token`, `data.refresh_token`, `data.expires_in`, and `data.token_type`.
+- Sub2API deletes the old RT before generating the new pair, so the plugin must persist both returned tokens before retrying any balance or group endpoint.
+- Only a 401 from `/api/v1/auth/me` is a reliable expired-login-token signal. A 401 from another group/key endpoint must not consume the single-use RT, and NewAPI must never enter this flow.
+- Refresh requests reuse the discovery client's normalized HTTPS URL, public-IP validation, DNS pinning, disabled redirects, bounded response reader, and secret-safe error handling.
+- Hakimi live verification exercised the complete path: invalid local AT -> real `/auth/me` 401 -> RT rotation -> encrypted pair commit -> successful retry with 11 groups and a current positive USD balance.
+
+## 2026-07-13 Upstream API Key Group Matching
+
+- The local sub2api list intentionally redacts API Keys, but authenticated `GET /admin/accounts/data?ids=...&include_proxies=false` returns ordered credential exports. A count mismatch must reject the entire batch to prevent account/Key misassociation.
+- NewAPI token lists can return the same masked records from both list and search endpoints; deduplicate by positive token ID before testing uniqueness.
+- NewAPI `POST /api/token/{id}/key` returns an internal raw Key that can omit the standard `sk-` prefix and, for custom keys, may differ from the displayed/callable Key. Prefer canonical exact matching, then allow only a fully anchored mask with at least four visible characters on each side (or the known `sk` mask form) and a one-to-one mapping in both directions.
+- Sub2API `GET /api/v1/keys/{id}` may return the full Key without the list record's `group_id`; merge detail fields over the listed record before resolving the group.
+- Octopus `used_quota=5,057,755,384` and `quota_per_unit=500,000` produce `$10,115.510768`, displayed as `$10,115.5108`. This is cumulative upstream user-account usage, not plugin-generated usage and not `$10`.
+
+## 2026-07-13 Commit and Deploy Usage Detail Filters to x1
+
+- Local `main` and x1 both start at exact commit `166ed56`; the local index and x1 tracked worktree/index are clean.
+- x1 preserves only the pre-existing untracked `01-login.png`, has about 4.6 GB free, and both systemd services are active.
+- The backend health response is OK and the frontend returns HTTP 200 before deployment, so a fast-forward plus Git rollback ref is sufficient for this frontend-only change.
+- Incremental bundle SHA-256 is `410c85cb2898fa3cac412cabf02ed94e3b6984832eb977a33e4a89acce694110`; it advertises target `f8c48df` and requires exact base `166ed56`.
+- x1 fetched the exact target, created rollback ref `refs/backups/pre-usage-detail-f8c48df-20260713T075905Z`, and passed a clean-worktree zero-vulnerability audit and production build.
+- x1 Node 18 emits the existing `@vitejs/plugin-react@5.2.0` engine warning, but the unchanged dependency set compiles successfully.

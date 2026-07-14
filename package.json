@@ -6,6 +6,6 @@
     "frontend:dev": "npm --prefix frontend run dev",
     "frontend:build": "npm --prefix frontend run build",
     "backend:dev": "python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000",
-    "backend:prod": "python -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000"
+    "backend:prod": "python backend/run_production.py"
   }
 }

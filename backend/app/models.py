@@ -202,3 +202,117 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UpstreamChannel(Base):
+    __tablename__ = "upstream_channels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    canonical_base_url: Mapped[str] = mapped_column(String(500), unique=True, index=True, nullable=False)
+    management_base_url: Mapped[str | None] = mapped_column(String(500))
+    upstream_type: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
+    resolved_upstream_type: Mapped[str | None] = mapped_column(String(32))
+    encrypted_access_token: Mapped[str | None] = mapped_column(Text)
+    encrypted_refresh_token: Mapped[str | None] = mapped_column(Text)
+    upstream_user_id: Mapped[str | None] = mapped_column(String(128))
+    manual_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    discovered_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    effective_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    recharge_multiplier_source: Mapped[str | None] = mapped_column(String(128))
+    recharge_multiplier_status: Mapped[str | None] = mapped_column(String(32))
+    group_options: Mapped[list[dict] | None] = mapped_column(JSON)
+    balance_remaining: Mapped[float | None] = mapped_column(Float)
+    balance_total: Mapped[float | None] = mapped_column(Float)
+    balance_used: Mapped[float | None] = mapped_column(Float)
+    balance_unit: Mapped[str | None] = mapped_column(String(32))
+    balance_status: Mapped[str | None] = mapped_column(String(32))
+    balance_message: Mapped[str | None] = mapped_column(Text)
+    balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UpstreamAccountConfig(Base):
+    __tablename__ = "upstream_account_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sub2api_account_id: Mapped[int] = mapped_column(Integer, unique=True, index=True, nullable=False)
+    channel_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstream_channels.id", ondelete="SET NULL"),
+        index=True,
+    )
+    channel_auto_assign_disabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+    remote_name: Mapped[str | None] = mapped_column(String(200))
+    remote_platform: Mapped[str | None] = mapped_column(String(64))
+    remote_account_type: Mapped[str | None] = mapped_column(String(32))
+    base_url: Mapped[str | None] = mapped_column(String(500))
+    encrypted_api_key: Mapped[str | None] = mapped_column(Text)
+    encrypted_access_token: Mapped[str | None] = mapped_column(Text)
+    upstream_type: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
+    resolved_upstream_type: Mapped[str | None] = mapped_column(String(32))
+    upstream_user_id: Mapped[str | None] = mapped_column(String(128))
+    selected_group_id: Mapped[str | None] = mapped_column(String(128))
+    selected_group_name: Mapped[str | None] = mapped_column(String(200))
+    manual_group_multiplier: Mapped[float | None] = mapped_column(Float)
+    manual_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    group_options: Mapped[list[dict] | None] = mapped_column(JSON)
+    discovered_group_multiplier: Mapped[float | None] = mapped_column(Float)
+    effective_group_multiplier: Mapped[float | None] = mapped_column(Float)
+    group_multiplier_source: Mapped[str | None] = mapped_column(String(128))
+    group_multiplier_status: Mapped[str | None] = mapped_column(String(32))
+    discovered_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    effective_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    recharge_multiplier_source: Mapped[str | None] = mapped_column(String(128))
+    recharge_multiplier_status: Mapped[str | None] = mapped_column(String(32))
+    local_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    local_recharge_source: Mapped[str | None] = mapped_column(String(32))
+    local_recharge_status: Mapped[str | None] = mapped_column(String(32))
+    target_rate: Mapped[float | None] = mapped_column(Float)
+    current_rate: Mapped[float | None] = mapped_column(Float)
+    balance_remaining: Mapped[float | None] = mapped_column(Float)
+    balance_total: Mapped[float | None] = mapped_column(Float)
+    balance_used: Mapped[float | None] = mapped_column(Float)
+    balance_unit: Mapped[str | None] = mapped_column(String(32))
+    balance_status: Mapped[str | None] = mapped_column(String(32))
+    balance_message: Mapped[str | None] = mapped_column(Text)
+    balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UpstreamRateChangeLog(Base):
+    __tablename__ = "upstream_rate_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sub2api_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    account_name: Mapped[str | None] = mapped_column(String(200))
+    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    channel_name: Mapped[str | None] = mapped_column(String(200))
+    group_id: Mapped[str | None] = mapped_column(String(128))
+    group_name: Mapped[str | None] = mapped_column(String(200))
+    old_group_multiplier: Mapped[float | None] = mapped_column(Float)
+    new_group_multiplier: Mapped[float | None] = mapped_column(Float)
+    old_upstream_multiplier: Mapped[float | None] = mapped_column(Float)
+    new_upstream_multiplier: Mapped[float | None] = mapped_column(Float)
+    old_upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    new_upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    local_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    old_target_rate: Mapped[float | None] = mapped_column(Float)
+    new_target_rate: Mapped[float | None] = mapped_column(Float)
+    old_current_rate: Mapped[float | None] = mapped_column(Float)
+    new_current_rate: Mapped[float | None] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    safe_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
