@@ -894,6 +894,29 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exceeded", str(context.exception))
         self.assertNotIn(secret, str(context.exception))
 
+    async def test_sub2api_accepts_multi_megabyte_account_pages_below_limit(self) -> None:
+        body = (
+            b'{"data":{"items":[{"id":7,"padding":"'
+            + b"x" * (2 * 1024 * 1024)
+            + b'"}]}}'
+        )
+
+        client = Sub2ApiClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, content=body)
+            )
+        )
+        config = SimpleNamespace(
+            base_url="https://sub2api.example/api/v1",
+            auth_token="",
+            auth_scheme="",
+            auth_header="x-api-key",
+        )
+
+        payload = await client._request("GET", "/admin/accounts", config=config)
+
+        self.assertEqual(payload["data"]["items"][0]["id"], 7)
+
     async def test_schedulable_update_uses_account_specific_endpoint(self) -> None:
         client = Sub2ApiClient()
         client._request = AsyncMock(return_value={})  # type: ignore[method-assign]

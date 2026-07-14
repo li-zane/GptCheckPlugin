@@ -58,7 +58,8 @@ ACCOUNT_NAME_PATHS = (
     ("extra", "name"),
     ("credentials", "name"),
 )
-MAX_SUB2API_RESPONSE_BYTES = 1024 * 1024
+# A 100-account page can exceed 1 MiB because sub2api includes OAuth metadata.
+MAX_SUB2API_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SUB2API_ERROR_PREVIEW_BYTES = 500
 MAX_SUB2API_ACCOUNT_PAGES = 100
 MAX_SUB2API_ACCOUNTS = 10_000
