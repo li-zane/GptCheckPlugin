@@ -247,7 +247,15 @@ class UpstreamChannelService:
         for account_id in sorted(remote_by_id):
             remote = remote_by_id[account_id]
             config = configs.get(account_id)
-            raw_url = (config.base_url if config and config.base_url else None) or _remote_base_url(remote)
+            remote_url = _remote_base_url(remote)
+            configured_url: str | None = None
+            if config is not None and config.base_url:
+                try:
+                    configured_url = canonicalize_upstream_url(config.base_url)
+                except ValueError:
+                    configured_url = None
+            auto_assign_allowed = config is None or not config.channel_auto_assign_disabled
+            raw_url = remote_url if auto_assign_allowed and remote_url else configured_url or remote_url
             canonical_url: str | None = None
             if raw_url:
                 try:
@@ -258,9 +266,14 @@ class UpstreamChannelService:
             channel: UpstreamChannel | None = None
             if config is not None and config.channel_id is not None:
                 channel = next((item for item in channels if item.id == config.channel_id), None)
-            auto_assign_allowed = (
-                config is None or not config.channel_auto_assign_disabled
+            endpoint_changed = bool(
+                config is not None
+                and auto_assign_allowed
+                and remote_url
+                and remote_url != configured_url
             )
+            if endpoint_changed:
+                channel = None
             if channel is None and canonical_url is not None and auto_assign_allowed:
                 channel = channels_by_url.get(canonical_url)
                 if channel is None:
@@ -286,7 +299,24 @@ class UpstreamChannelService:
                 configs[account_id] = config
                 changed = True
             else:
-                if (
+                if endpoint_changed and channel is not None:
+                    config.channel_id = channel.id
+                    config.base_url = canonical_url
+                    config.upstream_type = channel.upstream_type
+                    config.resolved_upstream_type = channel.resolved_upstream_type
+                    config.upstream_user_id = channel.upstream_user_id
+                    config.encrypted_access_token = channel.encrypted_access_token
+                    config.encrypted_api_key = None
+                    config.selected_group_id = None
+                    config.selected_group_name = None
+                    config.manual_group_multiplier = None
+                    config.manual_recharge_multiplier = channel.manual_recharge_multiplier
+                    config.group_options = channel.group_options
+                    config.last_applied_at = None
+                    self._invalidate_account(config)
+                    config.last_error = "The upstream endpoint changed; rediscovery is required."
+                    changed = True
+                elif (
                     config.channel_id is None
                     and channel is not None
                     and not config.channel_auto_assign_disabled
@@ -485,6 +515,7 @@ class UpstreamChannelService:
                 channel.management_base_url or channel.canonical_base_url
             )
             identity_changed = False
+            base_url_changed = False
 
             if "base_url" in fields:
                 if payload.base_url is None:
@@ -502,7 +533,8 @@ class UpstreamChannelService:
                     raise UpstreamAccountServiceError(
                         "Another upstream channel already uses this URL.", status_code=409
                     )
-                identity_changed = canonical_url != channel.canonical_base_url
+                base_url_changed = canonical_url != channel.canonical_base_url
+                identity_changed = base_url_changed
                 channel.canonical_base_url = canonical_url
             if "management_base_url" in fields:
                 management_base_url = payload.management_base_url
@@ -563,6 +595,8 @@ class UpstreamChannelService:
                     target_rate=None,
                     last_discovered_at=None,
                 )
+            if base_url_changed:
+                account_values["channel_auto_assign_disabled"] = True
             await db.execute(
                 update(UpstreamAccountConfig)
                 .where(UpstreamAccountConfig.channel_id == channel_id)

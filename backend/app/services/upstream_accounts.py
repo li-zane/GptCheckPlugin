@@ -526,8 +526,10 @@ class UpstreamAccountService:
                 limit=32,
             )
             if "channel_id" in fields:
+                channel_changed = payload.channel_id != config.channel_id
                 config.channel_id = payload.channel_id
-                config.channel_auto_assign_disabled = payload.channel_id is None
+                if channel_changed:
+                    config.channel_auto_assign_disabled = True
                 if selected_channel is not None:
                     config.base_url = selected_channel.canonical_base_url
                     config.upstream_type = selected_channel.upstream_type

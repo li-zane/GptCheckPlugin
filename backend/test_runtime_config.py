@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from pydantic import ValidationError
@@ -16,7 +16,7 @@ from app.core.config import Settings
 from app.core.database import Base
 from app.models import AppSetting, UpstreamRateChangeLog, utcnow
 from app.schemas import AppSettingsUpdate
-from app.services.runtime_config import RuntimeConfigService
+from app.services.runtime_config import ProbeHit, RuntimeConfigService
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -109,6 +109,74 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(captured_headers)
         self.assertTrue(all("x-api-key" not in headers for headers in captured_headers))
         self.assertTrue(all("authorization" not in headers for headers in captured_headers))
+
+    def test_configured_sub2api_url_is_verified_with_its_credential(self) -> None:
+        asyncio.run(self._assert_configured_sub2api_url_is_verified_with_its_credential())
+
+    async def _assert_configured_sub2api_url_is_verified_with_its_credential(self) -> None:
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json={"data": {"items": []}})
+
+        real_async_client = httpx.AsyncClient
+
+        def configured_client(**kwargs: object) -> httpx.AsyncClient:
+            return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = RuntimeConfigService(_FakeSettings(Path(tmpdir)))
+            config = SimpleNamespace(
+                base_url="https://configured.example/api/v1",
+                accounts_path="/admin/accounts",
+                auth_token="configured-administrator-secret",
+                auth_header="x-api-key",
+                auth_scheme="",
+            )
+            with patch(
+                "app.services.runtime_config.httpx.AsyncClient",
+                side_effect=configured_client,
+            ):
+                hit = await service._probe_configured_sub2api(config)
+
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertEqual(hit.base_url, config.base_url)
+        self.assertEqual(hit.port, 443)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].url.path, "/api/v1/admin/accounts")
+        self.assertEqual(captured[0].headers.get("x-api-key"), config.auth_token)
+
+    def test_scan_prefers_the_current_configured_sub2api_url(self) -> None:
+        asyncio.run(self._assert_scan_prefers_the_current_configured_sub2api_url())
+
+    async def _assert_scan_prefers_the_current_configured_sub2api_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = RuntimeConfigService(_FakeSettings(Path(tmpdir)))
+            config = SimpleNamespace(base_url="https://configured.example/api/v1")
+            hit = ProbeHit(
+                base_url=config.base_url,
+                port=443,
+                status="200",
+                message="configured endpoint verified",
+            )
+            db = AsyncMock()
+            service.get_sub2api_config = AsyncMock(return_value=config)  # type: ignore[method-assign]
+            service._candidate_ports = Mock(return_value=[443, 18080])  # type: ignore[method-assign]
+            service._probe_configured_sub2api = AsyncMock(return_value=hit)  # type: ignore[method-assign]
+            service._find_sub2api = AsyncMock(  # type: ignore[method-assign]
+                side_effect=AssertionError("port scan must not run after configured URL succeeds")
+            )
+            service._put = AsyncMock()  # type: ignore[method-assign]
+            with patch.object(runtime_config, "AsyncSessionLocal", return_value=_SessionContext(db)):
+                result = await service.scan_sub2api_ports(apply=False)
+
+        self.assertTrue(result["found"])
+        self.assertEqual(result["base_url"], config.base_url)
+        self.assertEqual(result["port"], 443)
+        self.assertEqual(result["checked_ports"], [443, 18080])
+        service._find_sub2api.assert_not_awaited()  # type: ignore[attr-defined]
 
     def test_usage_limit_default_ranges_reject_reversed_bounds(self) -> None:
         with self.assertRaises(ValidationError):
@@ -387,6 +455,17 @@ class _FakeSettings:
         self.subscription_refresh_batch_size = 3
         self.subscription_refresh_max_concurrency = 3
         self.display_timezone = "Asia/Shanghai"
+
+
+class _SessionContext:
+    def __init__(self, db: object) -> None:
+        self.db = db
+
+    async def __aenter__(self) -> object:
+        return self.db
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
 
 
 def _public_settings_fixture() -> dict:

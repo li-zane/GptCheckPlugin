@@ -481,7 +481,8 @@ class RuntimeConfigService:
     async def scan_sub2api_ports(self, apply: bool = False) -> dict:
         config = await self.get_sub2api_config()
         checked_ports = self._candidate_ports(config.base_url)
-        hit = await self._find_sub2api(checked_ports, config)
+        configured_hit = await self._probe_configured_sub2api(config)
+        hit = configured_hit or await self._find_sub2api(checked_ports, config)
 
         if hit:
             status = "found"
@@ -497,7 +498,8 @@ class RuntimeConfigService:
         async with AsyncSessionLocal() as db:
             if hit and apply:
                 await self._put(db, KEY_SUB2API_BASE_URL, hit.base_url)
-                await self._put(db, KEY_SUB2API_BASE_URL_SOURCE, "auto")
+                if configured_hit is None:
+                    await self._put(db, KEY_SUB2API_BASE_URL_SOURCE, "auto")
             await self._put(db, KEY_LAST_SCAN_AT, utcnow().isoformat())
             await self._put(db, KEY_LAST_SCAN_STATUS, status)
             await self._put(db, KEY_LAST_SCAN_MESSAGE, message)
@@ -519,6 +521,42 @@ class RuntimeConfigService:
                 self._x_api_key_for_file({}, current_values),
             )
         return result
+
+    async def _probe_configured_sub2api(
+        self,
+        config: EffectiveSub2ApiConfig,
+    ) -> ProbeHit | None:
+        timeout = httpx.Timeout(max(2.0, self.settings.sub2api_scan_timeout_seconds))
+        accounts_url = f"{config.base_url.rstrip('/')}{config.accounts_path}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers=_headers_for_probe(config),
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                response = await client.get(accounts_url, params={"page": 1, "page_size": 1})
+        except httpx.HTTPError:
+            return None
+
+        port = _port_from_url(config.base_url)
+        if port is None:
+            return None
+        if response.status_code == 200 and _looks_like_sub2api_accounts_response(response):
+            return ProbeHit(
+                base_url=config.base_url,
+                port=port,
+                status="200",
+                message=f"已验证当前 sub2api 地址 {config.base_url}。",
+            )
+        if response.status_code in {401, 403} and _looks_like_sub2api_auth_response(response):
+            return ProbeHit(
+                base_url=config.base_url,
+                port=port,
+                status=str(response.status_code),
+                message=f"已识别当前 sub2api 地址 {config.base_url}，但凭据未通过验证。",
+            )
+        return None
 
     async def auto_detect_sub2api(self) -> None:
         values = await self._load_values()

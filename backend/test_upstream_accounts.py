@@ -196,8 +196,15 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         rebound = await channel_service.overview(self.db)
         stored = await self._config()
-        self.assertFalse(stored.channel_auto_assign_disabled)
+        self.assertTrue(stored.channel_auto_assign_disabled)
         self.assertEqual([item.sub2api_account_id for item in rebound.channels[0].accounts], [7])
+
+        self.sub2api.accounts[0]["credentials"]["base_url"] = "https://changed.example/v1"
+        pinned = await channel_service.overview(self.db)
+        stored = await self._config()
+        self.assertEqual(stored.channel_id, channel_id)
+        self.assertEqual(stored.base_url, "https://upstream.example.com")
+        self.assertEqual(pinned.channels[0].canonical_base_url, "https://upstream.example.com")
 
     async def test_discover_unmanaged_account_opts_in_and_reads_balance_without_key(self) -> None:
         account = await self.service.discover_account(self.db, 7)

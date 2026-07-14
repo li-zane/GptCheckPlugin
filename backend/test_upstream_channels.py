@@ -170,6 +170,60 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         channels = await self.db.execute(select(UpstreamChannel))
         self.assertEqual(len(channels.scalars().all()), 1)
 
+    async def test_auto_assigned_account_follows_remote_endpoint_change(self) -> None:
+        overview = await self.service.overview(self.db)
+        original_channel = overview.channels[0]
+        stored = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == 7
+                )
+            )
+        ).scalar_one()
+        original_channel_row = await self.db.get(UpstreamChannel, original_channel.id)
+        assert original_channel_row is not None
+        original_channel_row.encrypted_access_token = encrypt_text("old-channel-token")
+        stored.encrypted_access_token = original_channel_row.encrypted_access_token
+        stored.encrypted_api_key = encrypt_text("old-endpoint-api-key")
+        stored.selected_group_id = "legacy"
+        stored.selected_group_name = "Legacy"
+        stored.manual_group_multiplier = 2.0
+        stored.effective_group_multiplier = 2.0
+        stored.target_rate = 2.0
+        await self.db.commit()
+
+        self.sub2api.accounts[0]["credentials"]["base_url"] = (
+            "https://replacement.example/api/v1"
+        )
+        updated = await self.service.overview(self.db)
+
+        by_url = {channel.canonical_base_url: channel for channel in updated.channels}
+        self.assertEqual(
+            [account.sub2api_account_id for account in by_url["https://upstream.example"].accounts],
+            [8],
+        )
+        replacement = by_url["https://replacement.example"]
+        self.assertEqual(
+            [account.sub2api_account_id for account in replacement.accounts],
+            [7],
+        )
+        self.assertFalse(replacement.accounts[0].api_key_set)
+        self.assertFalse(replacement.access_token_set)
+
+        await self.db.refresh(stored)
+        self.assertEqual(stored.channel_id, replacement.id)
+        self.assertEqual(stored.base_url, "https://replacement.example")
+        self.assertIsNone(stored.encrypted_api_key)
+        self.assertIsNone(stored.encrypted_access_token)
+        self.assertIsNone(stored.selected_group_id)
+        self.assertIsNone(stored.selected_group_name)
+        self.assertIsNone(stored.manual_group_multiplier)
+        self.assertIsNone(stored.target_rate)
+        self.assertEqual(
+            stored.last_error,
+            "The upstream endpoint changed; rediscovery is required.",
+        )
+
     async def test_channel_token_is_encrypted_and_never_returned(self) -> None:
         channel = (await self.service.overview(self.db)).channels[0]
         secret = "channel-access-token-private"
