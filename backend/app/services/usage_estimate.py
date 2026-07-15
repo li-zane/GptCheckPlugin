@@ -170,7 +170,7 @@ async def build_usage_estimate(
             "reset_rule": "当前估算直接使用 sub2api 返回的窗口已用额度、重置时间和剩余秒数，不再基于本地状态机修正已用额度。",
             "account_limit": "单账号总额：优先按 sub2api 原始窗口已用额度 / sub2api 官方已用百分比 反推；反推总额存在时优先于 sub2api 原始 limit 字段；官方窗口已满时直接采用当前窗口反推总额；窗口用量为 0 时优先取同套餐样本窗口代表值，样本数量小于 10 条时取默认窗口代表值；未满窗口总额按限流样本区间裁剪，但不会裁到低于当前官方已用额度。",
             "account_remaining": "单账号剩余：有 sub2api 官方已用百分比时，按 估算总额 × (100 - 官方已用百分比) / 100 估算；缺少官方百分比时回退为 估算总额 - 估算已用额度。",
-            "aggregate_remaining": "综合剩余 = 所有参与且未限流账号的剩余额度相加；无独立 5h、只有月总额的账号，5h 聚合复用月总额。",
+            "aggregate_remaining": "综合 5h 剩余只统计当前可用账号：有独立 5h 窗口时使用 5h 额度，只有 7d/月窗口时复用该长窗口额度；综合 7d/月剩余统计尚未达到 7d/月限额账号的长窗口额度，不因 5h 窗口限流而排除。",
             "estimable_rule": "sub2api 官方已用百分比始终保留用于显示；有实际窗口用量和官方百分比时，总额度先按两者反推，未满窗口再按样本区间裁剪；已用额度继续使用 sub2api 原始窗口已用金额；若当前已用额度已经超过样本上界，则保留官方用量/百分比反推结果；官方窗口已满时不做默认/样本裁剪；当前窗口用量为 0 时优先使用同套餐样本，样本数量小于 10 条时使用默认窗口；只有百分比、没有用量金额时只估算剩余，不反填已用金额。",
         },
         "overall": {
@@ -2198,7 +2198,7 @@ def _aggregate_window(rows: list[dict[str, Any]], window_key: str) -> dict[str, 
         if not row.get("usage_estimate_enabled", True):
             continue
         window = _aggregate_source_window(row, window_key)
-        if _exclude_from_aggregate(row, window):
+        if _exclude_from_aggregate(row, window, window_key):
             continue
         enabled_account_count += 1
         estimate_spent = window.get("estimate_spent")
@@ -2216,7 +2216,7 @@ def _aggregate_window(rows: list[dict[str, Any]], window_key: str) -> dict[str, 
     return {
         "spent": spent,
         "estimated_limit": limit if estimable_accounts else None,
-        "remaining": remaining if estimable_accounts else None,
+        "remaining": remaining if estimable_accounts else (0.0 if enabled_account_count == 0 else None),
         "remaining_percent": _clamp_percent(remaining_percent),
         "used_percent": _clamp_percent(used_percent),
         "account_count": len(rows),
@@ -2234,11 +2234,12 @@ def _aggregate_source_window(row: dict[str, Any], window_key: str) -> dict[str, 
     return window
 
 
-def _exclude_from_aggregate(row: dict[str, Any], window: dict[str, Any]) -> bool:
+def _exclude_from_aggregate(row: dict[str, Any], window: dict[str, Any], window_key: str) -> bool:
     return bool(
         row.get("deactive")
         or row.get("error")
         or row.get("usage_error")
+        or (window_key == "five_hour" and row.get("rate_limited"))
         or window.get("rate_limited")
         or window.get("window_kind") == "none"
     )

@@ -865,7 +865,7 @@ class UsageEstimateTests(unittest.TestCase):
                 self.assertAlmostEqual(five_hour["used_percent"], 20.0)
                 self.assertAlmostEqual(seven_day["estimated_limit"], 100.0)
 
-    def test_aggregate_excludes_only_the_rate_limited_target_window(self) -> None:
+    def test_aggregate_uses_account_availability_for_five_hour_but_long_window_for_seven_day(self) -> None:
         rows = [
             {
                 "usage_estimate_enabled": True,
@@ -914,11 +914,11 @@ class UsageEstimateTests(unittest.TestCase):
         five_hour = _aggregate_window(rows, "five_hour")
         seven_day = _aggregate_window(rows, "seven_day")
 
-        self.assertEqual(five_hour["enabled_account_count"], 1)
-        self.assertEqual(five_hour["estimable_accounts"], 1)
-        self.assertAlmostEqual(five_hour["spent"], 5.0)
-        self.assertAlmostEqual(five_hour["estimated_limit"], 25.0)
-        self.assertAlmostEqual(five_hour["remaining"], 20.0)
+        self.assertEqual(five_hour["enabled_account_count"], 0)
+        self.assertEqual(five_hour["estimable_accounts"], 0)
+        self.assertAlmostEqual(five_hour["spent"], 0.0)
+        self.assertIsNone(five_hour["estimated_limit"])
+        self.assertAlmostEqual(five_hour["remaining"], 0.0)
         self.assertEqual(seven_day["enabled_account_count"], 1)
         self.assertEqual(seven_day["estimable_accounts"], 1)
         self.assertAlmostEqual(seven_day["spent"], 20.0)

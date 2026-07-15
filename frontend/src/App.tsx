@@ -5647,6 +5647,7 @@ function aggregateUsageAccountsWindow(accounts: AccountUsageEstimate[], windowKe
   for (const account of accounts) {
     if (!usageDetailAccountVisible(account)) continue;
     if (!account.usage_estimate_enabled) continue;
+    if (windowKey === "five_hour" && usageDetailAccountRateLimited(account)) continue;
     const window = aggregateSourceWindow(account, windowKey);
     if (window.rate_limited) continue;
     if (window.window_kind === "none") continue;
@@ -5666,7 +5667,7 @@ function aggregateUsageAccountsWindow(accounts: AccountUsageEstimate[], windowKe
   return {
     spent,
     estimated_limit: estimableAccounts ? limit : null,
-    remaining: estimableAccounts ? remaining : null,
+    remaining: estimableAccounts ? remaining : enabledAccountCount === 0 ? 0 : null,
     remaining_percent: estimableAccounts && limit > 0 ? clampPercentValue((remaining / limit) * 100) : null,
     used_percent: estimableAccounts && limit > 0 ? clampPercentValue((estimatedSpent / limit) * 100) : null,
     account_count: accounts.length,
