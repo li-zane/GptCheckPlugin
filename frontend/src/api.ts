@@ -22,6 +22,7 @@ import type {
   UpstreamAccount,
   UpstreamAccountUpdate,
   UpstreamChannel,
+  UpstreamChannelDiscoverAllResult,
   UpstreamChannelsResponse,
   UpstreamChannelUpdate,
   UpstreamRateChangeLog,
@@ -240,5 +241,5 @@ export const api = {
       90_000,
     ),
   discoverAllUpstreamChannels: () =>
-    request<unknown>("/api/upstream-channels/discover-all", { method: "POST" }, 180_000),
+    request<UpstreamChannelDiscoverAllResult>("/api/upstream-channels/discover-all", { method: "POST" }, 180_000),
 };

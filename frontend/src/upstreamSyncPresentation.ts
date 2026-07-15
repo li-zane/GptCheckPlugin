@@ -41,6 +41,18 @@ export function channelDiscoveryErrorMessage(rateWritesEnabled: boolean, channel
   return `${channelName} ${rateWritesEnabled ? "探测并应用" : "探测"}失败`;
 }
 
+export function apiAccountSyncMessage(
+  result: { total: number; succeeded: number; failed: number },
+  rateWritesEnabled: boolean,
+) {
+  const action = rateWritesEnabled ? "探测并应用" : "探测";
+  if (result.total === 0) return "未在 sub2api 中发现可同步的 API Key 渠道。";
+  if (result.failed > 0) {
+    return `API 账号同步完成：${result.succeeded}/${result.total} 个渠道${action}成功，${result.failed} 个失败。`;
+  }
+  return `API 账号同步完成：${result.succeeded} 个渠道${action}成功。`;
+}
+
 export function accountRateStatusLabel(
   targetRate: unknown,
   wouldChange: boolean | null | undefined,

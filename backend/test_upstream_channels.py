@@ -17,7 +17,11 @@ from app.core.database import Base, get_db
 from app.core.security import require_admin
 from app.core.validation import sanitized_request_validation_handler
 from app.models import UpstreamAccountConfig, UpstreamChannel, UpstreamRateChangeLog
-from app.schemas import UpstreamAccountUpdate, UpstreamChannelUpdate
+from app.schemas import (
+    UpstreamAccountUpdate,
+    UpstreamChannelDiscoverAllOut,
+    UpstreamChannelUpdate,
+)
 from app.services.sub2api import Sub2ApiClient
 from app.services.upstream_accounts import UpstreamAccountServiceError
 from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
@@ -162,6 +166,10 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(overview.channels), 1)
         self.assertEqual(overview.channels[0].canonical_base_url, "https://upstream.example")
         self.assertEqual([item.sub2api_account_id for item in overview.channels[0].accounts], [7, 8])
+        self.assertEqual(
+            [item.remote_platform for item in overview.channels[0].accounts],
+            ["openai", "anthropic"],
+        )
         self.assertEqual(overview.local_recharge_multiplier, 0.1)
         self.assertEqual(overview.unassigned_accounts, [])
 
@@ -453,6 +461,27 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sub2api.export_calls, [])
         serialized = str(channel.model_dump())
         for secret in (alpha_key, beta_key, by_id[7].encrypted_api_key or ""):
+            self.assertNotIn(secret, serialized)
+
+    async def test_discover_all_syncs_multi_platform_inventory_and_probes_each_channel(self) -> None:
+        self.sub2api.exported_api_keys = {
+            7: "sk-openai-private-A1B2",
+            8: "sk-anthropic-private-C3D4",
+        }
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=self._discovery_result()),
+        ) as discover:
+            result = await self.service.discover_all(self.db)
+
+        self.assertEqual((result.total, result.succeeded, result.failed), (1, 1, 0))
+        discover.assert_awaited_once()
+        self.assertEqual(
+            [account.remote_platform for account in result.channels[0].accounts],
+            ["openai", "anthropic"],
+        )
+        serialized = str(result.model_dump())
+        for secret in self.sub2api.exported_api_keys.values():
             self.assertNotIn(secret, serialized)
 
     async def test_missing_recharge_field_clears_stale_discovered_value(self) -> None:
@@ -1212,6 +1241,70 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpstreamChannelAuthenticationTests(unittest.TestCase):
+    def test_discover_all_records_only_summary_counts(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-channels")
+        db = AsyncMock()
+        result = UpstreamChannelDiscoverAllOut(
+            total=2,
+            succeeded=1,
+            failed=1,
+            channels=[],
+        )
+        service = SimpleNamespace(discover_all=AsyncMock(return_value=result))
+
+        async def fake_db():
+            yield db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = fake_db
+        app.dependency_overrides[get_upstream_channel_service] = lambda: service
+        with (
+            patch("app.api.upstream_channels.record_event", new=AsyncMock()) as record,
+            TestClient(app) as client,
+        ):
+            response = client.post("/api/upstream-channels/discover-all")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["failed"], 1)
+        record.assert_awaited_once_with(
+            db,
+            "manual_upstream_sync",
+            "Synchronized 2 API key channel(s); 1 succeeded and 1 failed.",
+            details={"total": 2, "succeeded": 1, "failed": 1},
+        )
+
+    def test_discover_all_returns_success_when_summary_event_cannot_be_saved(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-channels")
+        db = AsyncMock()
+        result = UpstreamChannelDiscoverAllOut(
+            total=1,
+            succeeded=1,
+            failed=0,
+            channels=[],
+        )
+        service = SimpleNamespace(discover_all=AsyncMock(return_value=result))
+
+        async def fake_db():
+            yield db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = fake_db
+        app.dependency_overrides[get_upstream_channel_service] = lambda: service
+        with (
+            patch(
+                "app.api.upstream_channels.record_event",
+                new=AsyncMock(side_effect=RuntimeError("synthetic audit failure")),
+            ),
+            TestClient(app) as client,
+        ):
+            response = client.post("/api/upstream-channels/discover-all")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["succeeded"], 1)
+        db.rollback.assert_awaited_once()
+
     def test_every_route_requires_admin_session(self) -> None:
         app = FastAPI()
         app.include_router(router, prefix="/api/upstream-channels")

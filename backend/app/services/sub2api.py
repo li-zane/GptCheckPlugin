@@ -1445,10 +1445,14 @@ class Sub2ApiClient:
         return None
 
     def account_platform(self, account: dict[str, Any]) -> str | None:
-        for key in ("platform", "provider", "service"):
-            value = account.get(key)
-            if value is not None:
-                return str(value)
+        credentials = account.get("credentials")
+        for source in (account, credentials):
+            if not isinstance(source, dict):
+                continue
+            for key in ("platform", "provider", "service"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
         return None
 
     def account_type(self, account: dict[str, Any]) -> str | None:

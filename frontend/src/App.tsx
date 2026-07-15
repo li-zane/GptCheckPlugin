@@ -39,6 +39,7 @@ import { createContext, FormEvent, useCallback, useContext, useEffect, useLayout
 
 import { api, AUTH_EXPIRED_EVENT } from "./api";
 import { ApiKeyAccountsView } from "./ApiKeyAccountsView";
+import { apiAccountSyncMessage } from "./upstreamSyncPresentation";
 import {
   clearUpstreamOverviewCache,
   getUpstreamOverviewSessionStorage,
@@ -181,6 +182,8 @@ function App() {
   const [accountJumpTarget, setAccountJumpTarget] = useState<AccountJumpTarget | null>(null);
   const [settings, setSettings] = useState<AppSettings>(emptySettings);
   const [apiKeyAccountsCache, setApiKeyAccountsCache] = useState<UpstreamChannelsResponse | null>(null);
+  const [apiKeyRefreshVersion, setApiKeyRefreshVersion] = useState(0);
+  const [apiKeyViewBusy, setApiKeyViewBusy] = useState(false);
   const apiKeyAccountsCacheBaseUrlRef = useRef<string | null>(null);
   const [usageEstimate, setUsageEstimate] = useState<UsageEstimate | null>(null);
   const [usageLimitSamples, setUsageLimitSamples] = useState<UsageLimitSamples | null>(null);
@@ -193,8 +196,11 @@ function App() {
   const [busy, setBusy] = useState(false);
   const siteName = settings.site_name?.trim() || defaultSiteName;
   const now = useRefreshClock();
-  const lastSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
-  const syncActionTime = lastSyncEvent?.created_at ?? null;
+  const lastOAuthSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
+  const lastApiKeySyncEvent = useMemo(() => latestEventByKinds(events, ["manual_upstream_sync"]), [events]);
+  const oauthSyncActionTime = lastOAuthSyncEvent?.created_at ?? null;
+  const apiKeySyncActionTime = lastApiKeySyncEvent?.created_at ?? null;
+  const syncBusy = busy || apiKeyViewBusy;
   const toggleTheme = useCallback(() => setTheme((current) => (current === "dark" ? "light" : "dark")), []);
 
   const cacheApiKeyAccounts = useCallback((response: UpstreamChannelsResponse, responseBaseUrl: string) => {
@@ -418,13 +424,30 @@ function App() {
     }
   };
 
-  const runSync = () =>
+  const runOAuthSync = () =>
     runAction(async () => {
       const result = await api.sync();
       const estimate = await loadUsageEstimate(false).catch(() => null);
       if (estimate) setUsageEstimateRefreshed(true);
       return result;
-    }, "账号与额度同步完成");
+    }, "OAuth 账号同步完成");
+
+  const runApiKeySync = () =>
+    runAction(async () => {
+      try {
+        const result = await api.discoverAllUpstreamChannels();
+        return {
+          message: apiAccountSyncMessage(
+            result,
+            settings.upstream_rate_sync_enabled && !settings.automation_paused,
+          ),
+        };
+      } finally {
+        clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+        setApiKeyAccountsCache(null);
+        setApiKeyRefreshVersion((current) => current + 1);
+      }
+    }, "API 账号同步完成");
 
   if (authState === "checking") {
     return <BootScreen />;
@@ -528,11 +551,18 @@ function App() {
             <ThemeToggle theme={theme} onToggleTheme={toggleTheme} />
             {notice ? <span className="notice">{notice}</span> : null}
             <ToolbarTimeButton
-              busy={busy}
+              busy={syncBusy}
               icon={RefreshCcw}
-              label="同步账号与额度"
-              onClick={runSync}
-              time={syncActionTime}
+              label="同步 OAuth 账号"
+              onClick={runOAuthSync}
+              time={oauthSyncActionTime}
+            />
+            <ToolbarTimeButton
+              busy={syncBusy}
+              icon={KeyRound}
+              label="同步 API 账号"
+              onClick={runApiKeySync}
+              time={apiKeySyncActionTime}
             />
           </div>
         </header>
@@ -600,9 +630,12 @@ function App() {
             cacheBaseUrl={settings.sub2api_base_url}
             cachedData={apiKeyAccountsCache}
             displayTimeZone={settings.display_timezone || defaultTimeZone}
+            globallyBusy={busy}
             key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
             onCacheChange={cacheApiKeyAccounts}
+            onBusyChange={setApiKeyViewBusy}
             rateWritesEnabled={settings.upstream_rate_sync_enabled && !settings.automation_paused}
+            refreshVersion={apiKeyRefreshVersion}
           />
         ) : null}
         {view === "usage" ? (
@@ -5368,6 +5401,7 @@ function eventKindLabel(kind: string) {
       refresh_succeeded: "刷新成功",
       refresh_deactive: "刷新封禁",
       refresh_skipped_missing_mailbox: "缺少邮箱",
+      manual_upstream_sync: "API 账号同步",
     }[kind] || kind
   );
 }

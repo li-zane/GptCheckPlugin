@@ -89,14 +89,23 @@ class MonitorService:
 
     async def sync_once(self, reason: str = "manual") -> Sub2ApiSyncResult:
         raw_accounts = await self.sub2api.list_accounts()
+        present_remote_emails = {
+            email.lower()
+            for account in raw_accounts
+            if (email := self.sub2api.account_email(account))
+        }
         accounts, duplicate_accounts = self.sub2api.dedupe_accounts_by_email(
-            [account for account in raw_accounts if self.sub2api.is_gpt_account(account)]
+            [
+                account
+                for account in raw_accounts
+                if self.sub2api.is_gpt_account(account)
+                and self.sub2api.is_oauth_account(account)
+            ]
         )
         recovery_enabled = await self.runtime_config.get_recovery_enabled()
         total_seen = 0
         error_seen = 0
         queued = 0
-        seen_emails: set[str] = set()
 
         for account in accounts:
             email = self.sub2api.account_email(account)
@@ -104,7 +113,6 @@ class MonitorService:
                 continue
             total_seen += 1
             normalized = email.lower()
-            seen_emails.add(normalized)
             is_error = self.sub2api.is_error_account(account)
             is_deactive = self.sub2api.is_deactive_account(account)
             is_deactive, auto_refresh_locked = await self._upsert_snapshot(normalized, account, is_error, is_deactive)
@@ -136,14 +144,16 @@ class MonitorService:
                     if job_id is not None:
                         queued += 1
 
-        deleted_accounts, deleted_mailboxes = await self._delete_missing_remote_accounts(seen_emails)
+        deleted_accounts, deleted_mailboxes = await self._delete_missing_remote_accounts(
+            present_remote_emails
+        )
 
         async with AsyncSessionLocal() as db:
             await record_event(
                 db,
                 "monitor_sync",
                 (
-                    f"Synced {total_seen} GPT accounts; {error_seen} are in error state; queued {queued}; "
+                    f"Synced {total_seen} OAuth GPT accounts; {error_seen} are in error state; queued {queued}; "
                     f"ignored {len(duplicate_accounts)} duplicate sub2api account(s); "
                     f"deleted {deleted_accounts} stale local account(s) and {deleted_mailboxes} mailbox credential(s)."
                 ),
@@ -160,7 +170,7 @@ class MonitorService:
             )
         return Sub2ApiSyncResult(
             message=(
-                f"Synced {total_seen} GPT accounts; {error_seen} are in error state; queued {queued}; "
+                f"Synced {total_seen} OAuth GPT accounts; {error_seen} are in error state; queued {queued}; "
                 f"ignored {len(duplicate_accounts)} duplicate sub2api account(s); "
                 f"deleted {deleted_accounts} stale local account(s) and {deleted_mailboxes} mailbox credential(s)."
             ),
@@ -259,10 +269,17 @@ class MonitorService:
             return False
         return self.sub2api.account_looks_healthy(account)
 
-    async def _delete_missing_remote_accounts(self, seen_emails: set[str]) -> tuple[int, int]:
+    async def _delete_missing_remote_accounts(
+        self,
+        present_remote_emails: set[str],
+    ) -> tuple[int, int]:
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(AccountSnapshot))
-            stale = [snapshot for snapshot in result.scalars().all() if snapshot.email.lower() not in seen_emails]
+            stale = [
+                snapshot
+                for snapshot in result.scalars().all()
+                if snapshot.email.lower() not in present_remote_emails
+            ]
             if not stale:
                 return 0, 0
 

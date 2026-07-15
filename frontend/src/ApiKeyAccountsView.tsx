@@ -39,6 +39,7 @@ import {
   upstreamRechargeRateChange,
 } from "./upstreamRatePresentation";
 import {
+  apiAccountSyncMessage,
   accountRateStatusLabel,
   channelDiscoveryErrorMessage,
   channelDiscoverySuccessMessage,
@@ -105,14 +106,20 @@ export function ApiKeyAccountsView({
   cacheBaseUrl,
   cachedData,
   displayTimeZone,
+  globallyBusy,
   onCacheChange,
+  onBusyChange,
   rateWritesEnabled,
+  refreshVersion,
 }: {
   cacheBaseUrl: string;
   cachedData: UpstreamChannelsResponse | null;
   displayTimeZone: string;
+  globallyBusy: boolean;
   onCacheChange: (data: UpstreamChannelsResponse, baseUrl: string) => void;
+  onBusyChange: (busy: boolean) => void;
   rateWritesEnabled: boolean;
+  refreshVersion: number;
 }) {
   const [data, setData] = useState<UpstreamChannelsResponse>(cachedData || emptyData);
   const [loading, setLoading] = useState(!cachedData);
@@ -141,8 +148,12 @@ export function ApiKeyAccountsView({
   const [liveDataValidated, setLiveDataValidated] = useState(false);
   const requestSequence = useRef(0);
   const hasDataRef = useRef(Boolean(cachedData));
+  const refreshVersionRef = useRef(refreshVersion);
   const dialogRef = useRef<HTMLElement | null>(null);
   const lastFocusedElementRef = useRef<HTMLElement | null>(null);
+  const localMutationBusy = bulkDiscovering
+    || Object.keys(busyChannels).length > 0
+    || Object.keys(busyAccounts).length > 0;
 
   const loadData = useCallback(async (preserveFeedback = false) => {
     const sequence = ++requestSequence.current;
@@ -188,6 +199,18 @@ export function ApiKeyAccountsView({
   useEffect(() => {
     void loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    if (refreshVersionRef.current === refreshVersion) return;
+    refreshVersionRef.current = refreshVersion;
+    void loadData(true);
+  }, [loadData, refreshVersion]);
+
+  useEffect(() => {
+    onBusyChange(localMutationBusy);
+  }, [localMutationBusy, onBusyChange]);
+
+  useEffect(() => () => onBusyChange(false), [onBusyChange]);
 
   const loadRateLogs = useCallback(async (append = false) => {
     setRateLogsLoading(true);
@@ -493,10 +516,10 @@ export function ApiKeyAccountsView({
     setError("");
     setNotice("");
     try {
-      await api.discoverAllUpstreamChannels();
+      const result = await api.discoverAllUpstreamChannels();
       await loadData(true);
       setRateLogsLoaded(false);
-      setNotice(upstreamDiscoveryCopy(rateWritesEnabled).allSuccess);
+      setNotice(apiAccountSyncMessage(result, rateWritesEnabled));
     } catch (reason) {
       setError(errorMessage(reason, upstreamDiscoveryCopy(rateWritesEnabled).allError));
     } finally {
@@ -547,8 +570,7 @@ export function ApiKeyAccountsView({
       ? editingChannel?.resolved_upstream_type || "auto"
       : channelForm.upstreamType;
   const showChannelRefreshToken = editingChannelType === "sub2api";
-  const anyBusy =
-    bulkDiscovering || Object.keys(busyChannels).length > 0 || Object.keys(busyAccounts).length > 0;
+  const anyBusy = globallyBusy || localMutationBusy;
   const discoveryCopy = upstreamDiscoveryCopy(rateWritesEnabled);
   const mutationControlsDisabled = upstreamMutationControlsDisabled({
     liveDataValidated,
@@ -671,7 +693,7 @@ export function ApiKeyAccountsView({
                 busyAction={busyChannels[channelKey(channel)]}
                 channel={channel}
                 displayTimeZone={displayTimeZone}
-                globallyDisabled={mutationControlsDisabled || bulkDiscovering}
+                globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
                 key={channelKey(channel)}
                 onConfigureAccount={(account) => openAccountConfig(account, channel)}
                 onConfigureChannel={() => openChannelConfig(channel)}
@@ -686,7 +708,7 @@ export function ApiKeyAccountsView({
               <UnassignedCard
                 accounts={filteredUnassigned}
                 busyAccounts={busyAccounts}
-                globallyDisabled={mutationControlsDisabled || bulkDiscovering}
+                globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
                 onConfigure={openAccountConfig}
                 onDelete={deleteRemoteAccount}
                 onToggle={toggleAccountEnabled}
@@ -992,12 +1014,11 @@ function ChannelCard({
           <div className="api-key-channel-urls">
             {isHttpUrl(url) ? (
               <a href={url} rel="noreferrer" target="_blank" title={url}>
-                <b>推理</b>
                 <span>{displayCanonicalUrl(url)}</span>
                 <ExternalLink size={13} />
               </a>
             ) : (
-              <span className="api-key-channel-url"><b>推理</b>{displayCanonicalUrl(url)}</span>
+              <span className="api-key-channel-url">{displayCanonicalUrl(url)}</span>
             )}
             {hasSeparateManagementUrl ? (
               isHttpUrl(managementUrl) ? (
@@ -1223,14 +1244,15 @@ function AccountCard({
         + "；1:1 折算 " + formatMultiplier(normalizedMultiplier)
         + "（分组倍率 × 上游充值成本）";
   const enabled = account.remote_schedulable !== false;
+  const effectiveStatus = enabled ? account.remote_status || "enabled" : "disabled";
   return (
     <article className={"api-key-account-card" + (enabled ? "" : " api-key-account-card--disabled")}>
       <header className="api-key-account-card-head">
         <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
         <span className="api-key-mono">#{account.sub2api_account_id}</span>
         <div className="api-key-inline-chips">
-          {account.remote_status ? <StatusChip status={account.remote_status} /> : null}
-          {!enabled ? <StatusChip status="disabled" /> : null}
+          <StatusChip status={effectiveStatus} />
+          {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
         </div>
       </header>
       <div className="api-key-account-card-facts">
@@ -1605,6 +1627,11 @@ function TokenGuide({ upstreamType }: { upstreamType: UpstreamType }) {
 function StatusChip({ status }: { status?: string | null }) {
   const value = String(status || "unknown").trim().toLowerCase();
   return <span className={"api-key-chip api-key-chip--" + statusTone(value)}>{statusLabel(value)}</span>;
+}
+
+function PlatformChip({ platform }: { platform: string }) {
+  const value = platform.trim().toLowerCase();
+  return <span className="api-key-chip api-key-chip--info">{statusLabel(value)}</span>;
 }
 
 function channelKey(channel: UpstreamChannel) {

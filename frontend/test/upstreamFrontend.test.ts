@@ -21,6 +21,7 @@ import {
   upstreamRechargeRateChange,
 } from "../src/upstreamRatePresentation.ts";
 import {
+  apiAccountSyncMessage,
   accountRateStatusLabel,
   channelDiscoveryErrorMessage,
   channelDiscoverySuccessMessage,
@@ -105,6 +106,7 @@ test("session cache strips credentials and credential hints", () => {
       accounts: [{
         sub2api_account_id: 10,
         remote_name: "账号",
+        remote_platform: "anthropic",
         api_key: "secret-key",
         encrypted_api_key: "secret-ciphertext",
         api_key_hint: "key-tail",
@@ -118,6 +120,7 @@ test("session cache strips credentials and credential hints", () => {
   assert.equal(safe.channels[0].access_token_set, true);
   assert.equal(safe.channels[0].accounts?.[0].api_key_set, true);
   assert.equal(safe.channels[0].accounts?.[0].api_key_hint, undefined);
+  assert.equal(safe.channels[0].accounts?.[0].remote_platform, "anthropic");
 
   const serialized = JSON.stringify(safe);
   assert.doesNotMatch(serialized, /secret-access|secret-refresh|secret-key|secret-ciphertext|key-tail/);
@@ -177,6 +180,21 @@ test("discovery copy distinguishes read-only probing from rate application", () 
   assert.equal(channelDiscoveryErrorMessage(true, "渠道甲"), "渠道甲 探测并应用失败");
 });
 
+test("API account sync summaries report empty, complete, and partial results", () => {
+  assert.equal(
+    apiAccountSyncMessage({ total: 0, succeeded: 0, failed: 0 }, false),
+    "未在 sub2api 中发现可同步的 API Key 渠道。",
+  );
+  assert.match(
+    apiAccountSyncMessage({ total: 3, succeeded: 3, failed: 0 }, false),
+    /3 个渠道探测成功/,
+  );
+  assert.match(
+    apiAccountSyncMessage({ total: 3, succeeded: 2, failed: 1 }, true),
+    /2\/3 个渠道探测并应用成功，1 个失败/,
+  );
+});
+
 test("account rate labels reflect current comparison and automatic write mode", () => {
   assert.equal(accountRateStatusLabel(null, undefined, false), "待计算");
   assert.equal(accountRateStatusLabel(2, undefined, true), "待确认当前倍率");
@@ -213,6 +231,10 @@ test("rate change reasons and statuses use user-facing Chinese labels", () => {
   assert.equal(upstreamStatusLabel("applied"), "已应用");
   assert.equal(upstreamStatusLabel("apply_failed"), "应用失败");
   assert.equal(upstreamStatusLabel("skipped"), "已跳过");
+  assert.equal(upstreamStatusLabel("openai"), "OpenAI");
+  assert.equal(upstreamStatusLabel("anthropic"), "Anthropic");
+  assert.equal(upstreamStatusLabel("gemini"), "Gemini");
+  assert.equal(upstreamStatusLabel("xai"), "xAI");
 });
 
 test("rate log presentation prefers persisted 1:1 upstream multipliers", () => {

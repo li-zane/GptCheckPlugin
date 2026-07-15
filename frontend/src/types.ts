@@ -553,6 +553,13 @@ export type UpstreamChannelsResponse = {
   unassigned_accounts: UpstreamAccount[];
 };
 
+export type UpstreamChannelDiscoverAllResult = {
+  total: number;
+  succeeded: number;
+  failed: number;
+  channels: UpstreamChannel[];
+};
+
 export type UpstreamChannelUpdate = {
   display_name?: string | null;
   base_url?: string | null;

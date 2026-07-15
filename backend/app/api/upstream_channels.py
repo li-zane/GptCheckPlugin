@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path
@@ -13,9 +14,11 @@ from app.schemas import (
 )
 from app.services.upstream_accounts import UpstreamAccountServiceError
 from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
+from app.services.events import record_event
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 ChannelId = Annotated[int, Path(ge=1, le=9_007_199_254_740_991)]
 
 
@@ -42,9 +45,27 @@ async def discover_all_upstream_channels(
     service: UpstreamChannelService = Depends(get_upstream_channel_service),
 ) -> UpstreamChannelDiscoverAllOut:
     try:
-        return await service.discover_all(db)
+        result = await service.discover_all(db)
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
+    try:
+        await record_event(
+            db,
+            "manual_upstream_sync",
+            (
+                f"Synchronized {result.total} API key channel(s); "
+                f"{result.succeeded} succeeded and {result.failed} failed."
+            ),
+            details={
+                "total": result.total,
+                "succeeded": result.succeeded,
+                "failed": result.failed,
+            },
+        )
+    except Exception:
+        await db.rollback()
+        logger.warning("Could not persist the manual upstream sync event.", exc_info=True)
+    return result
 
 
 @router.put("/{channel_id}", response_model=UpstreamChannelOut)

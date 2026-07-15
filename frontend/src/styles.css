@@ -394,13 +394,13 @@ h2 {
   align-items: center;
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 8px;
   justify-content: flex-end;
 }
 
 .toolbar-time-button {
-  gap: 10px;
-  padding-right: 10px;
+  gap: 7px;
+  padding-inline: 11px 8px;
 }
 
 .theme-toggle {
@@ -422,7 +422,7 @@ h2 {
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
-  padding: 3px 8px;
+  padding: 3px 6px;
 }
 
 .notice {
@@ -4753,22 +4753,37 @@ fieldset.api-key-field {
 }
 
 .api-key-channel-urls {
-  align-items: stretch !important;
-  display: grid !important;
-  gap: 3px !important;
+  align-items: center !important;
+  display: flex !important;
+  flex-wrap: wrap;
+  gap: 4px !important;
 }
 
 .api-key-channel-urls a,
 .api-key-channel-urls .api-key-channel-url {
-  display: grid !important;
-  grid-template-columns: 32px minmax(0, 1fr) auto;
+  background: var(--info-bg);
+  border: 1px solid color-mix(in srgb, var(--info-ink) 18%, transparent);
+  border-radius: 5px;
+  color: var(--info-ink) !important;
+  display: inline-flex !important;
+  gap: 5px;
+  max-width: 100%;
+  min-height: 22px;
+  padding: 3px 7px;
+  width: max-content;
 }
 
 .api-key-channel-urls b {
-  color: var(--muted);
+  color: inherit;
   font-family: inherit;
   font-size: 9px;
   font-weight: 750;
+}
+
+.api-key-channel-urls a:hover,
+.api-key-channel-urls a:focus-visible {
+  background: color-mix(in srgb, var(--info-bg) 72%, var(--surface));
+  border-color: color-mix(in srgb, var(--info-ink) 36%, transparent);
 }
 
 .api-key-channel-section-tools {
@@ -5237,10 +5252,10 @@ button.api-key-group-chip--more {
 .api-key-channel-grid {
   align-items: start;
   display: grid;
-  gap: 12px;
+  gap: 10px;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr));
   min-width: 0;
-  padding-top: 13px;
+  padding-top: 10px;
 }
 
 .api-key-channel-card {
@@ -5272,10 +5287,10 @@ button.api-key-group-chip--more {
 .api-key-channel-head {
   align-items: flex-start;
   display: grid;
-  gap: 10px;
+  gap: 8px;
   grid-template-columns: auto minmax(0, 1fr) auto;
   min-width: 0;
-  padding: 15px 15px 12px;
+  padding: 12px 13px 10px;
 }
 
 .api-key-channel-mark {
@@ -5285,9 +5300,9 @@ button.api-key-group-chip--more {
   border-radius: 7px;
   color: var(--info-ink);
   display: inline-flex;
-  height: 34px;
+  height: 30px;
   justify-content: center;
-  width: 34px;
+  width: 30px;
 }
 
 .api-key-channel-card--attention .api-key-channel-mark,
@@ -5299,7 +5314,7 @@ button.api-key-group-chip--more {
 
 .api-key-channel-title {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
 }
 
@@ -5369,10 +5384,10 @@ button.api-key-group-chip--more {
 
 .api-key-channel-stat {
   display: grid;
-  gap: 7px;
-  min-height: 84px;
+  gap: 5px;
+  min-height: 76px;
   min-width: 0;
-  padding: 11px 12px;
+  padding: 9px 11px;
 }
 
 .api-key-channel-stat + .api-key-channel-stat {
@@ -5426,7 +5441,7 @@ button.api-key-group-chip--more {
   flex-wrap: wrap;
   gap: 6px 10px;
   min-width: 0;
-  padding: 8px 14px;
+  padding: 7px 12px;
 }
 
 .api-key-channel-credential-line > span {
@@ -5464,7 +5479,7 @@ button.api-key-group-chip--more {
   display: grid;
   gap: 8px;
   min-width: 0;
-  padding: 11px 14px;
+  padding: 9px 12px;
 }
 
 .api-key-channel-section-label {

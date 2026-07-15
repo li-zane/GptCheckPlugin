@@ -62,6 +62,11 @@ export function upstreamStatusLabel(status: string) {
     sub2api: "Sub2API",
     openai: "OpenAI",
     anthropic: "Anthropic",
+    gemini: "Gemini",
+    google: "Google",
+    xai: "xAI",
+    grok: "Grok",
+    deepseek: "DeepSeek",
     api_key: "API Key",
     unknown: "待确认",
   } as Record<string, string>)[normalizedStatus(status)] || status;
