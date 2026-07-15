@@ -623,7 +623,7 @@ class UpstreamAccountUpdate(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
-    remote_name: str | None = Field(default=None, max_length=200)
+    remote_name: str | None = Field(default=None, max_length=100)
     base_url: str | None = Field(default=None, max_length=500)
     upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
     upstream_user_id: str | None = Field(default=None, max_length=128)
@@ -637,8 +637,16 @@ class UpstreamAccountUpdate(BaseModel):
     manual_group_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
     manual_recharge_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
 
+    @field_validator("remote_name", mode="before")
+    @classmethod
+    def strip_remote_name(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("remote_name must not be blank")
+        return value
+
     @field_validator(
-        "remote_name",
         "base_url",
         "upstream_user_id",
         "selected_group_id",

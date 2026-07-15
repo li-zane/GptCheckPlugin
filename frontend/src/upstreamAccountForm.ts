@@ -28,11 +28,13 @@ export function buildUpstreamAccountUpdatePayload({
   apiKey,
   channelId,
   manualGroupMultiplier,
+  remoteName,
 }: {
   account: UpstreamAccount;
   apiKey: string;
   channelId: number | string | null;
   manualGroupMultiplier: string;
+  remoteName?: string;
 }): UpstreamAccountUpdate {
   const payload: UpstreamAccountUpdate = {
     channel_id: channelId,
@@ -40,6 +42,15 @@ export function buildUpstreamAccountUpdatePayload({
   };
   if (canSetManualMultiplier(account)) {
     payload.manual_group_multiplier = optionalPositiveNumber(manualGroupMultiplier, "手动分组倍率");
+  }
+  if (remoteName !== undefined) {
+    const normalizedName = remoteName.trim();
+    const currentName = String(account.remote_name || "").trim();
+    if (normalizedName !== currentName) {
+      if (!normalizedName) throw new Error("账号名称不能为空");
+      if (normalizedName.length > 100) throw new Error("账号名称不能超过 100 个字符");
+      payload.remote_name = normalizedName;
+    }
   }
   if (apiKey.trim()) payload.api_key = apiKey.trim();
   return payload;

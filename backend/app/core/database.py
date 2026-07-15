@@ -402,6 +402,97 @@ async def _migrate_upstream_rate_change_logs(conn: AsyncConnection) -> None:
             )
 
 
+def _redact_migration_secrets(value: object, secrets: set[str], *, limit: int = 200) -> str | None:
+    if value is None:
+        return None
+    redacted = str(value)
+    for secret in sorted(secrets, key=len, reverse=True):
+        redacted = redacted.replace(secret, "[redacted]")
+    return redacted[:limit]
+
+
+def _migration_secret_variants(*values: object) -> set[str]:
+    secrets: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        secret = str(value).strip()
+        if not secret:
+            continue
+        secrets.add(secret)
+        if secret.lower().startswith("bearer ") and secret[7:].strip():
+            secrets.add(secret[7:].strip())
+    return secrets
+
+
+async def _scrub_upstream_plaintext_secret_copies(conn: AsyncConnection) -> None:
+    rows = (
+        await conn.execute(
+            text(
+                "SELECT a.sub2api_account_id, a.remote_name, a.encrypted_api_key, "
+                "a.encrypted_access_token AS account_access_token, "
+                "c.encrypted_access_token AS channel_access_token, "
+                "c.encrypted_refresh_token AS channel_refresh_token "
+                "FROM upstream_account_configs a "
+                "LEFT JOIN upstream_channels c ON c.id = a.channel_id"
+            )
+        )
+    ).mappings().all()
+    secrets_by_account: dict[int, set[str]] = {}
+    for row in rows:
+        secrets = _migration_secret_variants(
+            *(
+                plaintext
+                for field in (
+                    "encrypted_api_key",
+                    "account_access_token",
+                    "channel_access_token",
+                    "channel_refresh_token",
+                )
+                if (plaintext := decrypt_text(row[field]))
+            )
+        )
+        if not secrets:
+            continue
+        account_id = int(row["sub2api_account_id"])
+        secrets_by_account[account_id] = secrets
+        remote_name = _redact_migration_secrets(row["remote_name"], secrets)
+        if remote_name != row["remote_name"]:
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET remote_name = :remote_name "
+                    "WHERE sub2api_account_id = :account_id"
+                ),
+                {
+                    "remote_name": remote_name,
+                    "account_id": account_id,
+                },
+            )
+    if not secrets_by_account:
+        return
+    logs = (
+        await conn.execute(
+            text(
+                "SELECT id, sub2api_account_id, account_name "
+                "FROM upstream_rate_change_logs"
+            )
+        )
+    ).mappings().all()
+    for log in logs:
+        secrets = secrets_by_account.get(int(log["sub2api_account_id"]))
+        if not secrets:
+            continue
+        account_name = _redact_migration_secrets(log["account_name"], secrets)
+        if account_name != log["account_name"]:
+            await conn.execute(
+                text(
+                    "UPDATE upstream_rate_change_logs SET account_name = :account_name "
+                    "WHERE id = :log_id"
+                ),
+                {"account_name": account_name, "log_id": log["id"]},
+            )
+
+
 async def init_db() -> None:
     from app import models  # noqa: F401
 
@@ -412,6 +503,7 @@ async def init_db() -> None:
         if is_sqlite:
             await _migrate_upstream_channels(conn)
             await _migrate_upstream_rate_change_logs(conn)
+            await _scrub_upstream_plaintext_secret_copies(conn)
             result = await conn.execute(text("PRAGMA table_info(mailbox_credentials)"))
             columns = {str(row[1]) for row in result.fetchall()}
             if "encrypted_access_token" not in columns:

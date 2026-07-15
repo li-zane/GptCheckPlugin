@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import re
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -70,6 +71,9 @@ SUB2API_TEST_TOTAL_TIMEOUT_SECONDS = 70.0
 MAX_REMOTE_ACCOUNT_ERROR_CHARS = 500
 MAX_SUB2API_ACCOUNT_PAGES = 100
 MAX_SUB2API_ACCOUNTS = 10_000
+SUB2API_MUTATION_READBACK_ATTEMPTS = 3
+SUB2API_MUTATION_READBACK_DELAY_SECONDS = 0.1
+SUB2API_MUTATION_READBACK_TIMEOUT_SECONDS = 10.0
 SENSITIVE_ERROR_FIELD_PATTERN = (
     r"(?:access[-_]?token|refresh[-_]?token|id[-_]?token|token|rt|"
     r"api[-_]?key|apikey|x[-_]?api[-_]?key|password|client[-_]?secret|secret|"
@@ -675,6 +679,33 @@ class Sub2ApiClient:
                 result.append(account)
         return result
 
+    async def get_account_by_id(
+        self,
+        account_id: str | int,
+        *,
+        config: EffectiveSub2ApiConfig | None = None,
+    ) -> dict[str, Any] | None:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        config = config or await get_runtime_config_service().get_sub2api_config()
+        try:
+            payload = await self._request(
+                "GET",
+                f"{config.accounts_path}/{numeric_id}",
+                config=config,
+            )
+        except Sub2ApiRequestError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        account = self._unwrap(payload)
+        if not isinstance(account, dict):
+            raise Sub2ApiRequestError("sub2api returned an invalid account response.")
+        if self.account_id(account) != str(numeric_id):
+            raise Sub2ApiRequestError("sub2api returned a mismatched account response.")
+        return account
+
     def _api_key_export_identity(
         self,
         account: dict[str, Any],
@@ -937,6 +968,74 @@ class Sub2ApiClient:
             config=config,
             json={"account_ids": [numeric_id], "rate_multiplier": parsed_rate},
         )
+
+    async def update_account_name(
+        self,
+        account_id: str | int,
+        name: str,
+        *,
+        validate_current: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        normalized_name = str(name or "").strip()
+        if not normalized_name or len(normalized_name) > 100:
+            raise ValueError("name must contain between 1 and 100 characters.")
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        current = await self.get_account_by_id(numeric_id, config=config)
+        if current is None:
+            raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
+        if validate_current is not None:
+            validate_current(current)
+
+        mutation_error: Exception | None = None
+        try:
+            await self._request(
+                "PUT",
+                f"{config.accounts_path}/{numeric_id}",
+                config=config,
+                json={"name": normalized_name},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A lost response does not prove that the remote mutation failed.
+            # Resolve the outcome with bounded GETs and never repeat the PUT.
+            mutation_error = exc
+
+        account_was_seen = False
+        readback_completed = False
+        try:
+            async with asyncio.timeout(SUB2API_MUTATION_READBACK_TIMEOUT_SECONDS):
+                for attempt in range(SUB2API_MUTATION_READBACK_ATTEMPTS):
+                    try:
+                        updated = await self.get_account_by_id(numeric_id, config=config)
+                        readback_completed = True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        updated = None
+                    if updated is not None:
+                        account_was_seen = True
+                        if self.account_name(updated) == normalized_name:
+                            return updated
+                    if attempt + 1 < SUB2API_MUTATION_READBACK_ATTEMPTS:
+                        await asyncio.sleep(SUB2API_MUTATION_READBACK_DELAY_SECONDS)
+        except TimeoutError:
+            pass
+
+        if mutation_error is not None:
+            raise mutation_error
+        if readback_completed and not account_was_seen:
+            raise Sub2ApiRequestError(
+                "sub2api account was not found after updating its name.",
+                status_code=404,
+            )
+        if not readback_completed:
+            raise Sub2ApiRequestError("sub2api account readback did not complete after updating its name.")
+        raise Sub2ApiRequestError("sub2api did not confirm the updated account name.")
 
     async def set_account_schedulable(self, account_id: str | int, schedulable: bool) -> None:
         numeric_id = _positive_int(account_id)

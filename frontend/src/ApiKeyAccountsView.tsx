@@ -26,7 +26,7 @@ import {
   WalletCards,
   X,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { api } from "./api";
 import {
@@ -81,6 +81,7 @@ type AccountForm = {
   channelId: string;
   apiKey: string;
   manualGroupMultiplier: string;
+  remoteName: string;
 };
 
 const emptyData: UpstreamChannelsResponse = {
@@ -105,6 +106,7 @@ const emptyAccountForm: AccountForm = {
   channelId: "",
   apiKey: "",
   manualGroupMultiplier: "",
+  remoteName: "",
 };
 
 export function ApiKeyAccountsView({
@@ -431,6 +433,7 @@ export function ApiKeyAccountsView({
       channelId: String(account.channel_id ?? fallbackChannel?.id ?? ""),
       apiKey: "",
       manualGroupMultiplier: numberInputValue(account.manual_group_multiplier),
+      remoteName: account.remote_name || "",
     });
   };
 
@@ -507,6 +510,7 @@ export function ApiKeyAccountsView({
         apiKey: accountForm.apiKey,
         channelId: selectedChannel?.id ?? null,
         manualGroupMultiplier: accountForm.manualGroupMultiplier,
+        remoteName: accountForm.remoteName,
       });
       const previousOrigin = urlOrigin(editingAccount.base_url);
       const nextOrigin = urlOrigin(selectedChannel ? channelBaseUrl(selectedChannel) : null);
@@ -811,142 +815,144 @@ export function ApiKeyAccountsView({
       {editingChannel ? (
         <Modal title={"配置渠道 · " + channelDisplayName(editingChannel)} eyebrow="上游渠道" onClose={closeDialog} dialogRef={dialogRef} saving={savingDialog}>
           <form className="api-key-config-form api-key-channel-form" onSubmit={saveChannel}>
-            <label className="api-key-field">
-              <span>渠道名称</span>
-              <input
-                autoFocus
-                onChange={(event) => setChannelForm((current) => ({ ...current, displayName: event.target.value }))}
-                placeholder={displayHost(channelForm.baseUrl)}
-                value={channelForm.displayName}
-              />
-            </label>
-            <label className="api-key-field">
-              <span>推理地址</span>
-              <input
-                onChange={(event) => setChannelForm((current) => ({ ...current, baseUrl: event.target.value }))}
-                placeholder="https://example.com"
-                required
-                type="url"
-                value={channelForm.baseUrl}
-              />
-              <small>末尾 /v1、/api/v1 与多余斜杠会归并到同一渠道。</small>
-            </label>
-
-            <label className="api-key-field api-key-field--wide">
-              <span>管理地址（可选）</span>
-              <input
-                onChange={(event) => setChannelForm((current) => ({ ...current, managementBaseUrl: event.target.value }))}
-                placeholder="留空表示与推理地址相同"
-                type="url"
-                value={channelForm.managementBaseUrl}
-              />
-              <small>余额、分组和 Key 列表从管理地址读取；模型请求仍使用推理地址。</small>
-            </label>
-
-            <fieldset className="api-key-field api-key-field--wide">
-              <legend>上游协议</legend>
-              <div className="api-key-segmented">
-                {(["auto", "newapi", "sub2api"] as UpstreamType[]).map((type) => (
-                  <button
-                    aria-pressed={channelForm.upstreamType === type}
-                    className={channelForm.upstreamType === type ? "active" : ""}
-                    key={type}
-                    onClick={() => setChannelForm((current) => ({ ...current, upstreamType: type }))}
-                    type="button"
-                  >
-                    {statusLabel(type)}
-                  </button>
-                ))}
-              </div>
-            </fieldset>
-
-            <label className="api-key-field">
-              <span>Access Token</span>
-              <input
-                autoComplete="new-password"
-                disabled={channelForm.clearAccessToken}
-                onChange={(event) => setChannelForm((current) => ({ ...current, accessToken: event.target.value }))}
-                placeholder={editingChannel.access_token_set ? "已保存；留空保持" : "粘贴上游 Access Token"}
-                type="password"
-                value={channelForm.accessToken}
-              />
-              <label className="api-key-clear-token">
-                <input
-                  checked={channelForm.clearAccessToken}
-                  disabled={!editingChannel.access_token_set && !channelForm.accessToken}
-                  onChange={(event) =>
-                    setChannelForm((current) => ({
-                      ...current,
-                      accessToken: event.target.checked ? "" : current.accessToken,
-                      clearAccessToken: event.target.checked,
-                    }))
-                  }
-                  type="checkbox"
-                />
-                <span>清除已保存的 Access Token</span>
-              </label>
-            </label>
-
-            {showChannelRefreshToken ? (
+            <div className="api-key-config-fields">
               <label className="api-key-field">
-                <span>Refresh Token（自动续期）</span>
+                <span>渠道名称</span>
+                <input
+                  autoFocus
+                  onChange={(event) => setChannelForm((current) => ({ ...current, displayName: event.target.value }))}
+                  placeholder={displayHost(channelForm.baseUrl)}
+                  value={channelForm.displayName}
+                />
+              </label>
+              <label className="api-key-field">
+                <span>推理地址</span>
+                <input
+                  onChange={(event) => setChannelForm((current) => ({ ...current, baseUrl: event.target.value }))}
+                  placeholder="https://example.com"
+                  required
+                  type="url"
+                  value={channelForm.baseUrl}
+                />
+                <small>末尾 /v1、/api/v1 与多余斜杠会归并到同一渠道。</small>
+              </label>
+
+              <label className="api-key-field api-key-field--wide">
+                <span>管理地址（可选）</span>
+                <input
+                  onChange={(event) => setChannelForm((current) => ({ ...current, managementBaseUrl: event.target.value }))}
+                  placeholder="留空表示与推理地址相同"
+                  type="url"
+                  value={channelForm.managementBaseUrl}
+                />
+                <small>余额、分组和 Key 列表从管理地址读取；模型请求仍使用推理地址。</small>
+              </label>
+
+              <fieldset className="api-key-field api-key-field--wide">
+                <legend>上游协议</legend>
+                <div className="api-key-segmented">
+                  {(["auto", "newapi", "sub2api"] as UpstreamType[]).map((type) => (
+                    <button
+                      aria-pressed={channelForm.upstreamType === type}
+                      className={channelForm.upstreamType === type ? "active" : ""}
+                      key={type}
+                      onClick={() => setChannelForm((current) => ({ ...current, upstreamType: type }))}
+                      type="button"
+                    >
+                      {statusLabel(type)}
+                    </button>
+                  ))}
+                </div>
+              </fieldset>
+
+              <label className="api-key-field">
+                <span>Access Token</span>
                 <input
                   autoComplete="new-password"
-                  disabled={channelForm.clearRefreshToken}
-                  onChange={(event) =>
-                    setChannelForm((current) => ({ ...current, refreshToken: event.target.value }))
-                  }
-                  placeholder={editingChannel.refresh_token_set ? "已保存；留空保持" : "粘贴上游 Refresh Token"}
+                  disabled={channelForm.clearAccessToken}
+                  onChange={(event) => setChannelForm((current) => ({ ...current, accessToken: event.target.value }))}
+                  placeholder={editingChannel.access_token_set ? "已保存；留空保持" : "粘贴上游 Access Token"}
                   type="password"
-                  value={channelForm.refreshToken}
+                  value={channelForm.accessToken}
                 />
                 <label className="api-key-clear-token">
                   <input
-                    checked={channelForm.clearRefreshToken}
-                    disabled={!editingChannel.refresh_token_set && !channelForm.refreshToken}
+                    checked={channelForm.clearAccessToken}
+                    disabled={!editingChannel.access_token_set && !channelForm.accessToken}
                     onChange={(event) =>
                       setChannelForm((current) => ({
                         ...current,
-                        refreshToken: event.target.checked ? "" : current.refreshToken,
-                        clearRefreshToken: event.target.checked,
+                        accessToken: event.target.checked ? "" : current.accessToken,
+                        clearAccessToken: event.target.checked,
                       }))
                     }
                     type="checkbox"
                   />
-                  <span>清除已保存的 Refresh Token</span>
+                  <span>清除已保存的 Access Token</span>
                 </label>
-                <small>Access Token 返回 401 时用于自动续期；轮换后的 AT/RT 会由后端保存。</small>
               </label>
-            ) : null}
 
-            <label className="api-key-field">
-              <span>NewAPI 用户 ID（余额探测）</span>
-              <input
-                onChange={(event) => setChannelForm((current) => ({ ...current, upstreamUserId: event.target.value }))}
-                placeholder="填写数字用户 ID"
-                value={channelForm.upstreamUserId}
-              />
-              <small>NewAPI 用户余额接口通常要求 New-Api-User；请填写个人设置中显示的数字用户 ID。</small>
-            </label>
+              {showChannelRefreshToken ? (
+                <label className="api-key-field">
+                  <span>Refresh Token（自动续期）</span>
+                  <input
+                    autoComplete="new-password"
+                    disabled={channelForm.clearRefreshToken}
+                    onChange={(event) =>
+                      setChannelForm((current) => ({ ...current, refreshToken: event.target.value }))
+                    }
+                    placeholder={editingChannel.refresh_token_set ? "已保存；留空保持" : "粘贴上游 Refresh Token"}
+                    type="password"
+                    value={channelForm.refreshToken}
+                  />
+                  <label className="api-key-clear-token">
+                    <input
+                      checked={channelForm.clearRefreshToken}
+                      disabled={!editingChannel.refresh_token_set && !channelForm.refreshToken}
+                      onChange={(event) =>
+                        setChannelForm((current) => ({
+                          ...current,
+                          refreshToken: event.target.checked ? "" : current.refreshToken,
+                          clearRefreshToken: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                    <span>清除已保存的 Refresh Token</span>
+                  </label>
+                  <small>Access Token 返回 401 时用于自动续期；轮换后的 AT/RT 会由后端保存。</small>
+                </label>
+              ) : null}
 
-            <label className="api-key-field api-key-field--wide">
-              <span>手动充值成本（¥ / $1）</span>
-              <input
-                inputMode="decimal"
-                min="0"
-                onChange={(event) =>
-                  setChannelForm((current) => ({ ...current, manualRechargeMultiplier: event.target.value }))
-                }
-                placeholder="留空使用自动探测值"
-                step="any"
-                type="number"
-                value={channelForm.manualRechargeMultiplier}
-              />
-              <small>人民币实付 ÷ 获得的美元额度。例如 ¥1 获得 $10，填写 0.1，表示 ¥0.1 可使用 $1 额度。</small>
-            </label>
+              <label className="api-key-field">
+                <span>NewAPI 用户 ID（余额探测）</span>
+                <input
+                  onChange={(event) => setChannelForm((current) => ({ ...current, upstreamUserId: event.target.value }))}
+                  placeholder="填写数字用户 ID"
+                  value={channelForm.upstreamUserId}
+                />
+                <small>NewAPI 用户余额接口通常要求 New-Api-User；请填写个人设置中显示的数字用户 ID。</small>
+              </label>
 
-            <TokenGuide upstreamType={editingChannelType} />
-            {dialogError ? <div className="api-key-form-error api-key-field--wide" role="alert">{dialogError}</div> : null}
+              <label className="api-key-field api-key-field--wide">
+                <span>手动充值成本（¥ / $1）</span>
+                <input
+                  inputMode="decimal"
+                  min="0"
+                  onChange={(event) =>
+                    setChannelForm((current) => ({ ...current, manualRechargeMultiplier: event.target.value }))
+                  }
+                  placeholder="留空使用自动探测值"
+                  step="any"
+                  type="number"
+                  value={channelForm.manualRechargeMultiplier}
+                />
+                <small>人民币实付 ÷ 获得的美元额度。例如 ¥1 获得 $10，填写 0.1，表示 ¥0.1 可使用 $1 额度。</small>
+              </label>
+
+              <TokenGuide upstreamType={editingChannelType} />
+            </div>
+            <DialogError message={dialogError} />
             <DialogActions onCancel={closeDialog} saving={savingDialog} />
           </form>
         </Modal>
@@ -955,76 +961,88 @@ export function ApiKeyAccountsView({
       {editingAccount ? (
         <Modal title={"配置账号 · " + accountDisplayName(editingAccount)} eyebrow={"#" + editingAccount.sub2api_account_id} onClose={closeDialog} dialogRef={dialogRef} saving={savingDialog}>
           <form className="api-key-config-form" onSubmit={saveAccount}>
-            <label className="api-key-field api-key-field--wide">
-              <span>所属上游渠道</span>
-              <select
-                autoFocus
-                onChange={(event) =>
-                  setAccountForm((current) => ({
-                    ...current,
-                    channelId: event.target.value,
-                  }))
-                }
-                value={accountForm.channelId}
-              >
-                <option value="">未分配渠道</option>
-                {data.channels.map((channel) => (
-                  <option key={channelKey(channel)} value={String(channel.id)}>
-                    {channelDisplayName(channel)} · {displayHost(channelBaseUrl(channel))}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="api-key-field api-key-field--wide">
-              <span>账号 API Key</span>
-              <input
-                autoComplete="new-password"
-                onChange={(event) => setAccountForm((current) => ({ ...current, apiKey: event.target.value }))}
-                placeholder={credentialPlaceholder(editingAccount)}
-                type="password"
-                value={accountForm.apiKey}
-              />
-              <small>加密保存在本地数据库中；原值不会回显，留空保持已保存值。</small>
-            </label>
-
-            <div className="api-key-readonly-group api-key-field--wide">
-              <span>上游识别分组</span>
-              <strong>{editingAccount.selected_group_name || editingAccount.selected_group_id || "尚未识别"}</strong>
-              <small>
-                {finiteNumber(editingAccount.effective_group_multiplier) === null
-                  ? statusLabel(editingAccount.group_multiplier_status || "not_ready")
-                  : formatMultiplier(editingAccount.effective_group_multiplier) + " · " + sourceLabel(editingAccount.group_multiplier_source)}
-              </small>
-            </div>
-
-            {canSetManualMultiplier(editingAccount) ? (
+            <div className="api-key-config-fields">
               <label className="api-key-field api-key-field--wide">
-                <span>手动分组倍率</span>
+                <span>账号名称</span>
                 <input
-                  inputMode="decimal"
-                  min="0"
-                  onChange={(event) =>
-                    setAccountForm((current) => ({ ...current, manualGroupMultiplier: event.target.value }))
-                  }
-                  placeholder="上游未提供倍率时填写"
-                  step="any"
-                  type="number"
-                  value={accountForm.manualGroupMultiplier}
+                  autoFocus
+                  maxLength={100}
+                  onChange={(event) => setAccountForm((current) => ({ ...current, remoteName: event.target.value }))}
+                  required
+                  value={accountForm.remoteName}
                 />
-                <small>仅在上游无法解析该账号分组倍率时使用。</small>
               </label>
-            ) : null}
 
-            <div className="api-key-form-note api-key-field--wide">
-              <BadgeDollarSign size={16} />
-              <span>
-                {rateWritesEnabled
-                  ? "目标倍率 = 上游分组倍率 × 上游充值成本 ÷ 本地充值成本；保存后自动同步。"
-                  : "目标倍率 = 上游分组倍率 × 上游充值成本 ÷ 本地充值成本；自动同步关闭，仅计算目标倍率。"}
-              </span>
+              <label className="api-key-field api-key-field--wide">
+                <span>所属上游渠道</span>
+                <select
+                  onChange={(event) =>
+                    setAccountForm((current) => ({
+                      ...current,
+                      channelId: event.target.value,
+                    }))
+                  }
+                  value={accountForm.channelId}
+                >
+                  <option value="">未分配渠道</option>
+                  {data.channels.map((channel) => (
+                    <option key={channelKey(channel)} value={String(channel.id)}>
+                      {channelDisplayName(channel)} · {displayHost(channelBaseUrl(channel))}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="api-key-field api-key-field--wide">
+                <span>账号 API Key</span>
+                <input
+                  autoComplete="new-password"
+                  onChange={(event) => setAccountForm((current) => ({ ...current, apiKey: event.target.value }))}
+                  placeholder={credentialPlaceholder(editingAccount)}
+                  type="password"
+                  value={accountForm.apiKey}
+                />
+                <small>加密保存在本地数据库中；原值不会回显，留空保持已保存值。</small>
+              </label>
+
+              <div className="api-key-readonly-group api-key-field--wide">
+                <span>上游识别分组</span>
+                <strong>{editingAccount.selected_group_name || editingAccount.selected_group_id || "尚未识别"}</strong>
+                <small>
+                  {finiteNumber(editingAccount.effective_group_multiplier) === null
+                    ? statusLabel(editingAccount.group_multiplier_status || "not_ready")
+                    : formatMultiplier(editingAccount.effective_group_multiplier) + " · " + sourceLabel(editingAccount.group_multiplier_source)}
+                </small>
+              </div>
+
+              {canSetManualMultiplier(editingAccount) ? (
+                <label className="api-key-field api-key-field--wide">
+                  <span>手动分组倍率</span>
+                  <input
+                    inputMode="decimal"
+                    min="0"
+                    onChange={(event) =>
+                      setAccountForm((current) => ({ ...current, manualGroupMultiplier: event.target.value }))
+                    }
+                    placeholder="上游未提供倍率时填写"
+                    step="any"
+                    type="number"
+                    value={accountForm.manualGroupMultiplier}
+                  />
+                  <small>仅在上游无法解析该账号分组倍率时使用。</small>
+                </label>
+              ) : null}
+
+              <div className="api-key-form-note api-key-field--wide">
+                <BadgeDollarSign size={16} />
+                <span>
+                  {rateWritesEnabled
+                    ? "目标倍率 = 上游分组倍率 × 上游充值成本 ÷ 本地充值成本；保存后自动同步。"
+                    : "目标倍率 = 上游分组倍率 × 上游充值成本 ÷ 本地充值成本；自动同步关闭，仅计算目标倍率。"}
+                </span>
+              </div>
             </div>
-            {dialogError ? <div className="api-key-form-error api-key-field--wide" role="alert">{dialogError}</div> : null}
+            <DialogError message={dialogError} />
             <DialogActions onCancel={closeDialog} saving={savingDialog} />
           </form>
         </Modal>
@@ -1693,6 +1711,7 @@ function Modal({
   saving: boolean;
   children: React.ReactNode;
 }) {
+  const titleId = useId();
   return (
     <div
       className="api-key-modal-backdrop"
@@ -1700,9 +1719,9 @@ function Modal({
         if (event.target === event.currentTarget && !saving) onClose();
       }}
     >
-      <section aria-modal="true" className="api-key-dialog" ref={dialogRef} role="dialog">
+      <section aria-labelledby={titleId} aria-modal="true" className="api-key-dialog" ref={dialogRef} role="dialog">
         <div className="api-key-dialog-head">
-          <div><p>{eyebrow}</p><h2>{title}</h2></div>
+          <div><p>{eyebrow}</p><h2 id={titleId}>{title}</h2></div>
           <button aria-label="关闭配置" className="api-key-icon-button" disabled={saving} onClick={onClose} title="关闭" type="button">
             <X size={17} />
           </button>
@@ -1715,12 +1734,21 @@ function Modal({
 
 function DialogActions({ onCancel, saving }: { onCancel: () => void; saving: boolean }) {
   return (
-    <div className="api-key-dialog-actions api-key-field--wide">
+    <div className="api-key-dialog-actions">
       <button className="api-key-button api-key-button--secondary" disabled={saving} onClick={onCancel} type="button">取消</button>
       <button className="api-key-button api-key-button--primary" disabled={saving} type="submit">
         <Save size={16} />
         <span>{saving ? "保存中" : "保存配置"}</span>
       </button>
+    </div>
+  );
+}
+
+function DialogError({ message }: { message: string }) {
+  if (!message) return null;
+  return (
+    <div className="api-key-dialog-error">
+      <div className="api-key-form-error" role="alert">{message}</div>
     </div>
   );
 }

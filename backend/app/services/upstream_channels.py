@@ -98,6 +98,17 @@ class UpstreamChannelService:
         channel.last_error = None
         channel.last_discovered_at = None
 
+    def _known_secrets(
+        self,
+        config: UpstreamAccountConfig | None,
+        channel: UpstreamChannel | None = None,
+    ) -> tuple[str | None, ...]:
+        return (
+            *self.accounts._known_local_secrets(config),
+            decrypt_text(channel.encrypted_access_token) if channel is not None else None,
+            decrypt_text(channel.encrypted_refresh_token) if channel is not None else None,
+        )
+
     def _ensure_secret_storage_ready(self, payload: UpstreamChannelUpdate) -> None:
         if payload.access_token and len(payload.access_token) > MAX_UPSTREAM_TOKEN_LENGTH:
             raise UpstreamAccountServiceError("The access token is too long.", status_code=422)
@@ -418,9 +429,24 @@ class UpstreamChannelService:
         for account_id in sorted(remote_by_id):
             remote = remote_by_id[account_id]
             config = configs.get(account_id)
+            stored_channel = (
+                next((item for item in channels if item.id == config.channel_id), None)
+                if config is not None and config.channel_id is not None
+                else None
+            )
+            name_only_binding_change = bool(
+                config is not None
+                and self.accounts._config_binding_status(remote, config) == "mismatch"
+                and self.accounts._config_binding_differs_only_by_remote_name(
+                    remote,
+                    config,
+                    extra_secrets=self._known_secrets(config, stored_channel),
+                )
+            )
             if (
                 config is not None
                 and self.accounts._config_binding_status(remote, config) != "bound"
+                and not name_only_binding_change
             ):
                 continue
             remote_url = _remote_base_url(remote)
@@ -439,9 +465,7 @@ class UpstreamChannelService:
                 except ValueError:
                     canonical_url = None
 
-            channel: UpstreamChannel | None = None
-            if config is not None and config.channel_id is not None:
-                channel = next((item for item in channels if item.id == config.channel_id), None)
+            channel = stored_channel
             endpoint_changed = bool(
                 config is not None
                 and auto_assign_allowed
@@ -468,13 +492,38 @@ class UpstreamChannelService:
                     changed = True
 
             if config is None:
-                config = self.accounts._new_config(remote, account_id)
+                config = self.accounts._new_config(
+                    remote,
+                    account_id,
+                    secrets=self._known_secrets(None, channel),
+                )
                 config.base_url = canonical_url or config.base_url
                 config.channel_id = channel.id if channel is not None else None
                 db.add(config)
                 configs[account_id] = config
                 changed = True
             else:
+                known_secrets = self._known_secrets(config, channel)
+                remote_name = (
+                    _safe_text(
+                        self.accounts._remote_name(
+                            remote,
+                            account_id,
+                            secrets=known_secrets,
+                        ),
+                        secrets=known_secrets,
+                        limit=200,
+                    )
+                    or f"Account #{account_id}"
+                )
+                if name_only_binding_change:
+                    config.remote_identity_fingerprint = (
+                        self.accounts._require_remote_binding_fingerprint(remote)
+                    )
+                    changed = True
+                if config.remote_name != remote_name:
+                    config.remote_name = remote_name
+                    changed = True
                 if endpoint_changed and channel is not None:
                     config.channel_id = channel.id
                     config.base_url = canonical_url
@@ -502,8 +551,6 @@ class UpstreamChannelService:
                     changed = True
                 config.remote_platform = _safe_text(self.sub2api.account_platform(remote), limit=64)
                 config.remote_account_type = _safe_text(self.sub2api.account_type(remote), limit=32)
-                if not config.remote_name:
-                    config.remote_name = self.accounts._remote_name(remote, account_id)
                 current_rate = self.accounts._remote_current_rate(remote)
                 if current_rate is not None:
                     config.current_rate = current_rate
@@ -558,7 +605,11 @@ class UpstreamChannelService:
                 else None
             )
             config.target_rate = float(target) if target is not None else None
-        base = self.accounts._build_out(remote, config)
+        base = self.accounts._build_out(
+            remote,
+            config,
+            extra_secrets=self._known_secrets(config, channel),
+        )
         if channel is None:
             return base.model_copy(
                 update={
@@ -650,8 +701,12 @@ class UpstreamChannelService:
         for account_id in sorted(remote_by_id):
             config = configs[account_id]
             if self.accounts._config_binding_status(remote_by_id[account_id], config) != "bound":
-                account = self.accounts._build_out(remote_by_id[account_id], config)
                 channel = channels_by_id.get(config.channel_id) if config.channel_id is not None else None
+                account = self.accounts._build_out(
+                    remote_by_id[account_id],
+                    config,
+                    extra_secrets=self._known_secrets(config, channel),
+                )
                 if channel is None:
                     unassigned.append(account)
                 else:
@@ -1174,14 +1229,31 @@ class UpstreamChannelService:
             return
         if status != "apply_failed" and config.target_rate is not None:
             config.last_error = None
+        known_secrets = self._known_secrets(config, channel)
         db.add(
             UpstreamRateChangeLog(
                 sub2api_account_id=config.sub2api_account_id,
-                account_name=_safe_text(config.remote_name, limit=200),
+                account_name=_safe_text(
+                    config.remote_name,
+                    secrets=known_secrets,
+                    limit=200,
+                ),
                 channel_id=channel.id,
-                channel_name=_safe_text(channel.display_name, limit=200),
-                group_id=_safe_text(config.selected_group_id, limit=128),
-                group_name=_safe_text(config.selected_group_name, limit=200),
+                channel_name=_safe_text(
+                    channel.display_name,
+                    secrets=known_secrets,
+                    limit=200,
+                ),
+                group_id=_safe_text(
+                    config.selected_group_id,
+                    secrets=known_secrets,
+                    limit=128,
+                ),
+                group_name=_safe_text(
+                    config.selected_group_name,
+                    secrets=known_secrets,
+                    limit=200,
+                ),
                 old_group_multiplier=previous_group_multiplier,
                 new_group_multiplier=config.effective_group_multiplier,
                 old_upstream_multiplier=old_upstream_multiplier,

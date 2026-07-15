@@ -350,6 +350,74 @@ test("automatic upstream multipliers omit manual_group_multiplier", () => {
   assert.equal(Object.hasOwn(payload, "manual_group_multiplier"), false);
 });
 
+test("account rename payload trims changes and omits an unchanged remote name", () => {
+  const account = {
+    sub2api_account_id: 8,
+    identity_fingerprint: "b".repeat(64),
+    remote_name: "Current name",
+    effective_group_multiplier: 1,
+    group_multiplier_source: "upstream_key",
+    group_multiplier_status: "in_sync",
+  };
+  const renamed = buildUpstreamAccountUpdatePayload({
+    account,
+    apiKey: "",
+    channelId: 4,
+    manualGroupMultiplier: "",
+    remoteName: "  New name  ",
+  });
+  assert.equal(renamed.remote_name, "New name");
+
+  const unchanged = buildUpstreamAccountUpdatePayload({
+    account,
+    apiKey: "",
+    channelId: 4,
+    manualGroupMultiplier: "",
+    remoteName: " Current name ",
+  });
+  assert.equal(Object.hasOwn(unchanged, "remote_name"), false);
+});
+
+test("account rename payload rejects empty and oversized names", () => {
+  const account = {
+    sub2api_account_id: 8,
+    identity_fingerprint: "b".repeat(64),
+    remote_name: "Current name",
+    effective_group_multiplier: 1,
+    group_multiplier_source: "upstream_key",
+    group_multiplier_status: "in_sync",
+  };
+  const build = (remoteName: string) => buildUpstreamAccountUpdatePayload({
+    account,
+    apiKey: "",
+    channelId: 4,
+    manualGroupMultiplier: "",
+    remoteName,
+  });
+  assert.throws(() => build("   "), /不能为空/);
+  assert.throws(() => build("x".repeat(101)), /100/);
+});
+
+test("an unchanged legacy name over 100 characters does not block other updates", () => {
+  const legacyName = "x".repeat(150);
+  const payload = buildUpstreamAccountUpdatePayload({
+    account: {
+      sub2api_account_id: 8,
+      identity_fingerprint: "b".repeat(64),
+      remote_name: legacyName,
+      effective_group_multiplier: 1,
+      group_multiplier_source: "upstream_key",
+      group_multiplier_status: "in_sync",
+    },
+    apiKey: "new-key",
+    channelId: 4,
+    manualGroupMultiplier: "",
+    remoteName: legacyName,
+  });
+  assert.equal(Object.hasOwn(payload, "remote_name"), false);
+  assert.equal(payload.api_key, "new-key");
+});
+
 test("clearing an editable manual multiplier sends an intentional null", () => {
   const payload = buildUpstreamAccountUpdatePayload({
     account: {

@@ -10,6 +10,7 @@ from app.core.database import (
     Base,
     _migrate_upstream_channels,
     _migrate_upstream_rate_change_logs,
+    _scrub_upstream_plaintext_secret_copies,
 )
 
 
@@ -347,6 +348,76 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(columns["old_upstream_recharge_multiplier"][3], 0)
         self.assertEqual(columns["new_upstream_recharge_multiplier"][3], 0)
         self.assertEqual(tuple(row), (None, None, None, None))
+
+    async def test_scrubs_plaintext_secret_copies_from_names_and_rate_logs(self) -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        api_key = "sk-migration-secret"
+        channel_token = "Bearer at-migration-secret"
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(
+                    text(
+                        "INSERT INTO upstream_channels ("
+                        "id, display_name, canonical_base_url, upstream_type, "
+                        "encrypted_access_token, group_options, recharge_multiplier_status, "
+                        "balance_status, created_at, updated_at"
+                        ") VALUES ("
+                        "1, 'Channel', 'https://upstream.example', 'auto', :channel_token, "
+                        "'[]', 'not_discovered', 'not_checked', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+                        ")"
+                    ),
+                    {"channel_token": encrypt_text(channel_token)},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO upstream_account_configs ("
+                        "sub2api_account_id, channel_id, remote_name, encrypted_api_key, "
+                        "upstream_type, group_options, channel_auto_assign_disabled, "
+                        "api_key_origin_rebind_required, created_at, updated_at"
+                        ") VALUES ("
+                        "7, 1, :remote_name, :api_key, 'auto', '[]', 0, 0, "
+                        "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+                        ")"
+                    ),
+                    {
+                        "remote_name": f"account-{api_key}",
+                        "api_key": encrypt_text(api_key),
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO upstream_rate_change_logs ("
+                        "sub2api_account_id, account_name, reason, status, created_at"
+                        ") VALUES (7, :account_name, 'test', 'observed', CURRENT_TIMESTAMP)"
+                    ),
+                    {"account_name": f"rate-{channel_token[7:]}"},
+                )
+
+                await _scrub_upstream_plaintext_secret_copies(conn)
+                await _scrub_upstream_plaintext_secret_copies(conn)
+
+                remote_name = (
+                    await conn.execute(
+                        text(
+                            "SELECT remote_name FROM upstream_account_configs "
+                            "WHERE sub2api_account_id = 7"
+                        )
+                    )
+                ).scalar_one()
+                account_name = (
+                    await conn.execute(
+                        text(
+                            "SELECT account_name FROM upstream_rate_change_logs "
+                            "WHERE sub2api_account_id = 7"
+                        )
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+        self.assertEqual(remote_name, "account-[redacted]")
+        self.assertEqual(account_name, "rate-[redacted]")
 
 
 if __name__ == "__main__":

@@ -420,6 +420,141 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.refresh(by_id[7])
         self.assertEqual(by_id[7].encrypted_api_key, original_ciphertext)
 
+    async def test_remote_name_only_change_reconciles_cached_name_and_binding(self) -> None:
+        await self.service.overview(self.db)
+        stored = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == 7
+                )
+            )
+        ).scalar_one()
+        original_ciphertext = encrypt_text("sk-name-reconcile")
+        stored.encrypted_api_key = original_ciphertext
+        await self.db.commit()
+
+        self.sub2api.accounts[0]["name"] = "renamed-outside-the-plugin"
+        overview = await self.service.overview(self.db)
+        account = next(
+            account
+            for channel in overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == 7
+        )
+
+        await self.db.refresh(stored)
+        self.assertEqual(account.remote_name, "renamed-outside-the-plugin")
+        self.assertEqual(account.identity_binding_status, "bound")
+        self.assertTrue(account.managed)
+        self.assertTrue(account.api_key_set)
+        self.assertEqual(stored.remote_name, "renamed-outside-the-plugin")
+        self.assertEqual(
+            stored.remote_identity_fingerprint,
+            self.service.accounts._remote_binding_fingerprint(self.sub2api.accounts[0]),
+        )
+        self.assertEqual(stored.encrypted_api_key, original_ciphertext)
+
+    async def test_remote_name_reconciliation_redacts_known_credentials(self) -> None:
+        await self.service.overview(self.db)
+        configs = await self.db.execute(select(UpstreamAccountConfig))
+        by_id = {item.sub2api_account_id: item for item in configs.scalars().all()}
+        api_key = "sk-name-must-stay-encrypted"
+        access_token = "at-name-must-stay-encrypted"
+        by_id[7].encrypted_api_key = encrypt_text(api_key)
+        by_id[8].encrypted_access_token = encrypt_text(access_token)
+        await self.db.commit()
+
+        self.sub2api.accounts[0]["name"] = api_key
+        self.sub2api.accounts[1]["name"] = access_token
+        overview = await self.service.overview(self.db)
+        projected = {
+            account.sub2api_account_id: account
+            for channel in overview.channels
+            for account in channel.accounts
+        }
+
+        await self.db.refresh(by_id[7])
+        await self.db.refresh(by_id[8])
+        self.assertEqual(by_id[7].remote_name, "[redacted]")
+        self.assertEqual(by_id[8].remote_name, "[redacted]")
+        self.assertEqual(projected[7].remote_name, "[redacted]")
+        self.assertEqual(projected[8].remote_name, "[redacted]")
+        self.assertEqual(decrypt_text(by_id[7].encrypted_api_key), api_key)
+        self.assertEqual(decrypt_text(by_id[8].encrypted_access_token), access_token)
+
+        self.sub2api.accounts[0]["name"] = "ordinary-renamed-seven"
+        self.sub2api.accounts[1]["name"] = "ordinary-renamed-eight"
+        ordinary = await self.service.overview(self.db)
+        ordinary_by_id = {
+            account.sub2api_account_id: account
+            for channel in ordinary.channels
+            for account in channel.accounts
+        }
+        self.assertEqual(ordinary_by_id[7].remote_name, "ordinary-renamed-seven")
+        self.assertEqual(ordinary_by_id[8].remote_name, "ordinary-renamed-eight")
+        self.assertEqual(ordinary_by_id[7].identity_binding_status, "bound")
+        self.assertEqual(ordinary_by_id[8].identity_binding_status, "bound")
+
+    async def test_remote_name_reconciliation_recovers_from_a_redacted_channel_token(self) -> None:
+        refresh_secret = "rt-name-fingerprint-secret"
+        await self._configure_sub2api_credentials(refresh_token=refresh_secret)
+        remote = self.sub2api.accounts[0]
+
+        remote["name"] = refresh_secret
+        secret_overview = await self.service.overview(self.db)
+        secret_account = next(
+            account
+            for channel in secret_overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == int(remote["id"])
+        )
+        self.assertEqual(secret_account.remote_name, "[redacted]")
+
+        remote["name"] = "ordinary-name-after-secret"
+        ordinary_overview = await self.service.overview(self.db)
+        ordinary_account = next(
+            account
+            for channel in ordinary_overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == int(remote["id"])
+        )
+
+        self.assertEqual(ordinary_account.remote_name, "ordinary-name-after-secret")
+        self.assertEqual(ordinary_account.identity_binding_status, "bound")
+        self.assertTrue(ordinary_account.managed)
+
+    async def test_inventory_scrubs_bound_plaintext_remote_name(self) -> None:
+        await self.service.overview(self.db)
+        stored = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == 7
+                )
+            )
+        ).scalar_one()
+        secret = "sk-historical-remote-name"
+        self.sub2api.accounts[0]["name"] = secret
+        stored.encrypted_api_key = encrypt_text(secret)
+        stored.remote_name = secret
+        stored.remote_identity_fingerprint = (
+            self.service.accounts._require_remote_binding_fingerprint(
+                self.sub2api.accounts[0]
+            )
+        )
+        await self.db.commit()
+
+        overview = await self.service.overview(self.db)
+        projected = next(
+            account
+            for channel in overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == 7
+        )
+
+        await self.db.refresh(stored)
+        self.assertEqual(stored.remote_name, "[redacted]")
+        self.assertEqual(projected.remote_name, "[redacted]")
+
     async def test_manual_bulk_sync_claims_only_confirmed_legacy_null_bindings(self) -> None:
         overview = await self.service.overview(self.db)
         accounts = [account for channel in overview.channels for account in channel.accounts]
@@ -609,6 +744,54 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, stored.encrypted_access_token or "")
         self.assertNotEqual(stored.encrypted_refresh_token, refresh_secret)
         self.assertNotIn(refresh_secret, stored.encrypted_refresh_token or "")
+
+    async def test_account_discovery_redacts_channel_refresh_token_from_remote_name(self) -> None:
+        refresh_secret = "rt-remote-name-must-not-leak"
+        channel_id = await self._configure_sub2api_credentials(
+            refresh_token=refresh_secret,
+        )
+        remote = self.sub2api.accounts[0]
+        remote["name"] = refresh_secret
+        config = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == int(remote["id"])
+                )
+            )
+        ).scalar_one()
+        config.remote_identity_fingerprint = (
+            self.service.accounts._require_remote_binding_fingerprint(remote)
+        )
+        await self.db.commit()
+
+        overview = await self.service.overview(self.db)
+        projected = next(
+            account
+            for channel in overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == int(remote["id"])
+        )
+        listed = await self.service.accounts.list_accounts(self.db)
+        listed_account = next(
+            account for account in listed if account.sub2api_account_id == int(remote["id"])
+        )
+        with patch(
+            "app.services.upstream_accounts.discover_upstream",
+            new=AsyncMock(return_value=self._discovery_result()),
+        ):
+            discovered = await self.service.accounts.discover_account(
+                self.db,
+                int(remote["id"]),
+                listed_account.identity_fingerprint,
+            )
+
+        await self.db.refresh(config)
+        self.assertEqual(config.channel_id, channel_id)
+        self.assertEqual(projected.remote_name, "[redacted]")
+        self.assertEqual(listed_account.remote_name, "[redacted]")
+        self.assertEqual(discovered.remote_name, "[redacted]")
+        self.assertEqual(config.remote_name, "[redacted]")
+        self.assertNotIn(refresh_secret, discovered.model_dump_json())
 
     async def test_canonical_url_collision_is_rejected_without_modifying_channels(self) -> None:
         self.sub2api.accounts.append(
@@ -1653,11 +1836,20 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rate_logs_normalize_group_and_recharge_and_track_each_input_change(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
+        channel_access_token = "channel-management-token"
         await self.service.update_channel(
             self.db,
             channel_id,
-            UpstreamChannelUpdate(access_token="channel-management-token"),
+            UpstreamChannelUpdate(access_token=channel_access_token),
         )
+        configs = await self.db.execute(select(UpstreamAccountConfig))
+        by_id = {item.sub2api_account_id: item for item in configs.scalars().all()}
+        api_key = "sk-rate-log-name-secret"
+        by_id[7].encrypted_api_key = encrypt_text(api_key)
+        by_id[7].remote_name = api_key
+        by_id[8].encrypted_api_key = encrypt_text("sk-rate-log-eight")
+        by_id[8].remote_name = channel_access_token
+        await self.db.commit()
 
         runtime = SimpleNamespace(
             get_upstream_rate_sync_enabled=AsyncMock(return_value=True),
@@ -1707,6 +1899,18 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             .order_by(UpstreamRateChangeLog.id)
         )
         logs = list(result.scalars().all())
+        all_logs = list(
+            (
+                await self.db.execute(
+                    select(UpstreamRateChangeLog).order_by(UpstreamRateChangeLog.id)
+                )
+            ).scalars().all()
+        )
+        self.assertEqual({item.sub2api_account_id for item in all_logs}, {7, 8})
+        logged_names = [(item.sub2api_account_id, item.account_name) for item in all_logs]
+        self.assertEqual(logged_names[:2], [(7, "[redacted]"), (8, "[redacted]")])
+        self.assertNotIn(api_key, repr(logged_names))
+        self.assertNotIn(channel_access_token, repr(logged_names))
         self.assertEqual(
             [item.reason for item in logs],
             [

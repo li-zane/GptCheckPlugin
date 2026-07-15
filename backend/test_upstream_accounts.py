@@ -61,6 +61,7 @@ class FakeSub2Api(Sub2ApiClient):
         self.local_info: tuple[float, bool] = (1.0, True)
         self.local_error: BaseException | None = None
         self.update_calls: list[tuple[int, float]] = []
+        self.name_update_calls: list[tuple[int, str]] = []
         self.schedulable_calls: list[tuple[int, bool]] = []
         self.delete_calls: list[int] = []
         self.balance_calls: list[int] = []
@@ -86,6 +87,26 @@ class FakeSub2Api(Sub2ApiClient):
 
     async def get_account_current_rate_multiplier(self, account_id: str | int) -> float:
         return float(self.accounts[0]["rate_multiplier"])
+
+    async def update_account_name(
+        self,
+        account_id: str | int,
+        name: str,
+        *,
+        validate_current=None,
+    ) -> dict:
+        parsed_id = int(account_id)
+        account = await self.get_account_by_id(parsed_id)
+        if account is None:
+            raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
+        if validate_current is not None:
+            validate_current(account)
+        self.name_update_calls.append((parsed_id, name))
+        account["name"] = name
+        return account
+
+    async def get_account_by_id(self, account_id: str | int, **_kwargs) -> dict | None:
+        return await self.get_account(str(account_id))
 
     async def get_account(self, account: dict | str) -> dict | None:
         account_id = int(account if isinstance(account, str) else account["id"])
@@ -356,6 +377,20 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.refresh(stored)
         self.assertNotEqual(stored.remote_identity_fingerprint, original_binding)
         self.assertEqual(stored.encrypted_api_key, original_ciphertext)
+        self.assertEqual(stored.remote_name, "replacement-account")
+        self.assertEqual(rebound.remote_name, "replacement-account")
+
+    async def test_mismatched_remote_name_redacts_the_previous_api_key(self) -> None:
+        secret = "sk-previous-account-secret"
+        await self._manage(api_key=secret)
+
+        self.sub2api.accounts[0]["name"] = secret
+        self.sub2api.accounts[0]["created_at"] = "2026-07-15T12:00:00Z"
+        refreshed = (await self.service.list_accounts(self.db))[0]
+
+        self.assertEqual(refreshed.identity_binding_status, "mismatch")
+        self.assertEqual(refreshed.remote_name, "[redacted]")
+        self.assertNotIn(secret, refreshed.model_dump_json())
 
     async def test_legacy_unbound_config_binds_only_on_explicit_account_save(self) -> None:
         await self._manage(api_key="sk-legacy-binding")
@@ -1082,6 +1117,200 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(cleared.access_token_set)
         self.assertIsNone((await self._config()).encrypted_access_token)
 
+    async def test_origin_blocked_api_key_still_redacts_remote_metadata(self) -> None:
+        secret = "sk-origin-blocked-secret"
+        await self._manage(api_key=secret)
+        config = await self._config()
+        config.api_key_origin_rebind_required = True
+        self.sub2api.accounts[0]["name"] = secret
+        await self.db.commit()
+
+        listed = (await self.service.list_accounts(self.db))[0]
+
+        self.assertTrue(listed.api_key_origin_rebind_required)
+        self.assertFalse(listed.api_key_set)
+        self.assertEqual(listed.remote_name, "[redacted]")
+        self.assertNotIn(secret, listed.model_dump_json())
+
+    def test_remote_name_schema_rejects_blank_text(self) -> None:
+        with self.assertRaisesRegex(ValueError, "remote_name must not be blank"):
+            UpstreamAccountUpdate(
+                expected_identity_fingerprint="a" * 64,
+                remote_name="   ",
+            )
+
+    async def test_saving_api_key_scrubs_preexisting_plaintext_remote_name(self) -> None:
+        secret = "sk-name-before-credential"
+        self.sub2api.accounts[0]["name"] = secret
+        await UpstreamChannelService(self.sub2api).overview(self.db)
+        before = await self._config()
+        self.assertEqual(before.remote_name, secret)
+
+        saved = await self.service.upsert_account(
+            self.db,
+            7,
+            self._update(api_key=secret),
+        )
+
+        stored = await self._config()
+        self.assertEqual(stored.remote_name, "[redacted]")
+        self.assertEqual(saved.remote_name, "[redacted]")
+
+    async def test_remote_name_is_redacted_before_the_length_limit_is_applied(self) -> None:
+        secret = "QZ9v7-credential-crossing-the-boundary"
+        self.sub2api.accounts[0]["name"] = ("x" * 195) + secret
+
+        saved = await self._manage(api_key=secret)
+        stored = await self._config()
+
+        self.assertNotIn("QZ9v7", stored.remote_name or "")
+        self.assertNotIn("QZ9v7", saved.remote_name)
+        self.assertEqual(len(stored.remote_name or ""), 200)
+
+    async def test_saving_credentials_preserves_an_unchanged_legacy_long_name(self) -> None:
+        legacy_name = "legacy-" + ("x" * 143)
+        self.sub2api.accounts[0]["name"] = legacy_name
+        await UpstreamChannelService(self.sub2api).overview(self.db)
+
+        saved = await self.service.upsert_account(
+            self.db,
+            7,
+            self._update(api_key="sk-unrelated-new-credential"),
+        )
+
+        self.assertEqual((await self._config()).remote_name, legacy_name)
+        self.assertEqual(saved.remote_name, legacy_name)
+
+    async def test_remote_rename_updates_sub2api_name_and_binding_fingerprint(self) -> None:
+        await self._manage(api_key="sk-rename-preserved")
+        before = await self._config()
+        original_fingerprint = before.remote_identity_fingerprint
+        original_ciphertext = before.encrypted_api_key
+
+        renamed = await self.service.upsert_account(
+            self.db,
+            7,
+            self._update(remote_name="renamed-upstream-account"),
+        )
+
+        stored = await self._config()
+        self.assertEqual(self.sub2api.name_update_calls, [(7, "renamed-upstream-account")])
+        self.assertEqual(self.sub2api.accounts[0]["name"], "renamed-upstream-account")
+        self.assertEqual(renamed.remote_name, "renamed-upstream-account")
+        self.assertEqual(renamed.identity_binding_status, "bound")
+        self.assertEqual(
+            stored.remote_identity_fingerprint,
+            self.service._remote_binding_fingerprint(self.sub2api.accounts[0]),
+        )
+        self.assertNotEqual(stored.remote_identity_fingerprint, original_fingerprint)
+        self.assertEqual(stored.encrypted_api_key, original_ciphertext)
+
+    async def test_remote_rename_rejects_identity_change_before_put(self) -> None:
+        await self._manage(api_key="sk-rename-preflight")
+        before = await self._config()
+        original_name = before.remote_name
+        original_fingerprint = before.remote_identity_fingerprint
+        replacement = dict(self.sub2api.accounts[0])
+        replacement["created_at"] = "2026-07-15T12:00:00Z"
+        self.sub2api.get_account_by_id = AsyncMock(  # type: ignore[method-assign]
+            return_value=replacement
+        )
+
+        with self.assertRaises(UpstreamAccountServiceError) as context:
+            await self.service.upsert_account(
+                self.db,
+                7,
+                self._update(remote_name="must-not-reach-the-replacement"),
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(self.sub2api.name_update_calls, [])
+        stored = await self._config()
+        self.assertEqual(stored.remote_name, original_name)
+        self.assertEqual(stored.remote_identity_fingerprint, original_fingerprint)
+
+    async def test_identity_rebind_and_remote_rename_keep_the_renamed_fingerprint(self) -> None:
+        await self._manage(api_key="sk-rebind-and-rename")
+        self.sub2api.accounts[0]["name"] = "replacement-account"
+        self.sub2api.accounts[0]["created_at"] = "2026-07-15T12:00:00Z"
+        refreshed = (await self.service.list_accounts(self.db))[0]
+
+        renamed = await self.service.upsert_account(
+            self.db,
+            7,
+            UpstreamAccountUpdate(
+                expected_identity_fingerprint=refreshed.identity_fingerprint,
+                confirm_identity_rebind=True,
+                remote_name="renamed-replacement-account",
+            ),
+        )
+
+        stored = await self._config()
+        self.assertEqual(self.sub2api.name_update_calls, [(7, "renamed-replacement-account")])
+        self.assertEqual(renamed.identity_binding_status, "bound")
+        self.assertTrue(renamed.managed)
+        self.assertEqual(renamed.remote_name, "renamed-replacement-account")
+        self.assertEqual(
+            stored.remote_identity_fingerprint,
+            self.service._remote_binding_fingerprint(self.sub2api.accounts[0]),
+        )
+
+    async def test_remote_rename_failure_does_not_update_local_name_or_fingerprint(self) -> None:
+        await self._manage(api_key="sk-rename-failure")
+        before = await self._config()
+        original_name = before.remote_name
+        original_fingerprint = before.remote_identity_fingerprint
+        self.sub2api.update_account_name = AsyncMock(  # type: ignore[method-assign]
+            side_effect=Sub2ApiRequestError("unsafe remote failure")
+        )
+
+        with self.assertRaises(UpstreamAccountServiceError) as context:
+            await self.service.upsert_account(
+                self.db,
+                7,
+                self._update(remote_name="must-not-land-locally"),
+            )
+
+        self.assertEqual(context.exception.status_code, 502)
+        stored = await self._config()
+        self.assertEqual(stored.remote_name, original_name)
+        self.assertEqual(stored.remote_identity_fingerprint, original_fingerprint)
+
+    async def test_remote_rename_rejects_changed_immutable_identity_after_readback(self) -> None:
+        await self._manage(api_key="sk-rename-race")
+        before = await self._config()
+        original_name = before.remote_name
+        original_fingerprint = before.remote_identity_fingerprint
+
+        async def rename_replaced_account(
+            account_id: str | int,
+            name: str,
+            *,
+            validate_current=None,
+        ) -> dict:
+            renamed = await FakeSub2Api.update_account_name(
+                self.sub2api,
+                account_id,
+                name,
+                validate_current=validate_current,
+            )
+            renamed["created_at"] = "2026-07-15T12:00:00Z"
+            return renamed
+
+        self.sub2api.update_account_name = rename_replaced_account  # type: ignore[method-assign]
+
+        with self.assertRaises(UpstreamAccountServiceError) as context:
+            await self.service.upsert_account(
+                self.db,
+                7,
+                self._update(remote_name="replacement-name"),
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        stored = await self._config()
+        self.assertEqual(stored.remote_name, original_name)
+        self.assertEqual(stored.remote_identity_fingerprint, original_fingerprint)
+
     async def test_delete_validates_identity_and_removes_only_local_config(self) -> None:
         await self._manage(api_key="sk-local-only")
         fingerprint = await self._fingerprint()
@@ -1176,6 +1405,148 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             await client.update_account_rate_multiplier(17.5, 1.0)  # type: ignore[arg-type]
+
+    async def test_account_detail_uses_single_account_route_and_unwraps_data(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"id": 17, "name": "account-seventeen"}}
+        )
+        config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch:
+            account = await client.get_account_by_id(17)
+
+        self.assertEqual(account, {"id": 17, "name": "account-seventeen"})
+        client._request.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "GET",
+            "/admin/accounts/17",
+            config=config,
+        )
+
+    async def test_account_detail_maps_404_to_missing_and_rejects_mismatched_ids(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=Sub2ApiRequestError("missing", status_code=404)
+        )
+        _config, runtime_patch = self._runtime_patch()
+        with runtime_patch:
+            self.assertIsNone(await client.get_account_by_id(17))
+
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"id": 18, "name": "wrong-account"}}
+        )
+        _config, mismatch_runtime_patch = self._runtime_patch()
+        with mismatch_runtime_patch, self.assertRaises(Sub2ApiRequestError):
+            await client.get_account_by_id(17)
+
+    async def test_account_name_update_uses_put_and_reads_back_from_same_config(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"data": {"id": 17, "name": "old-name", "type": "apikey"}},
+                {},
+                {"data": {"id": 17, "name": "renamed", "type": "apikey"}},
+            ]
+        )
+        config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch:
+            updated = await client.update_account_name(17, "  renamed  ")
+
+        self.assertEqual(updated["name"], "renamed")
+        self.assertEqual(
+            client._request.await_args_list,  # type: ignore[attr-defined]
+            [
+                call("GET", "/admin/accounts/17", config=config),
+                call(
+                    "PUT",
+                    "/admin/accounts/17",
+                    config=config,
+                    json={"name": "renamed"},
+                ),
+                call("GET", "/admin/accounts/17", config=config),
+            ],
+        )
+
+    async def test_account_name_update_checks_precondition_before_put(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(return_value={})  # type: ignore[method-assign]
+        current = {"id": 17, "name": "old-name", "type": "apikey"}
+        client.get_account_by_id = AsyncMock(return_value=current)  # type: ignore[method-assign]
+        config, runtime_patch = self._runtime_patch()
+        checked: list[dict] = []
+
+        def reject(account: dict) -> None:
+            checked.append(account)
+            raise RuntimeError("stale identity")
+
+        with runtime_patch, self.assertRaisesRegex(RuntimeError, "stale identity"):
+            await client.update_account_name(17, "new-name", validate_current=reject)
+
+        self.assertEqual(checked, [current])
+        client.get_account_by_id.assert_awaited_once_with(17, config=config)  # type: ignore[attr-defined]
+        client._request.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_account_name_update_requires_confirming_readback(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(return_value={})  # type: ignore[method-assign]
+        client.get_account_by_id = AsyncMock(  # type: ignore[method-assign]
+            return_value={"id": 17, "name": "old-name", "type": "apikey"}
+        )
+        _config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch, self.assertRaises(Sub2ApiRequestError):
+            await client.update_account_name(17, "new-name")
+
+    async def test_account_name_update_recovers_a_lost_put_response_with_get_only(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=Sub2ApiRequestError("lost mutation response")
+        )
+        client.get_account_by_id = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"id": 17, "name": "old-name", "type": "apikey"},
+                {"id": 17, "name": "renamed", "type": "apikey"},
+            ]
+        )
+        config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch:
+            updated = await client.update_account_name(17, "renamed")
+
+        self.assertEqual(updated["name"], "renamed")
+        client._request.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "PUT",
+            "/admin/accounts/17",
+            config=config,
+            json={"name": "renamed"},
+        )
+        self.assertEqual(client.get_account_by_id.await_count, 2)  # type: ignore[attr-defined]
+        for readback_call in client.get_account_by_id.await_args_list:  # type: ignore[attr-defined]
+            self.assertEqual(readback_call.args, (17,))
+            self.assertEqual(readback_call.kwargs, {"config": config})
+
+    async def test_account_name_update_retries_only_readback_on_transient_failure(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(return_value={})  # type: ignore[method-assign]
+        client.get_account_by_id = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"id": 17, "name": "old-name", "type": "apikey"},
+                Sub2ApiRequestError("transient readback failure"),
+                {"id": 17, "name": "renamed", "type": "apikey"},
+            ]
+        )
+        config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch:
+            updated = await client.update_account_name(17, "renamed")
+
+        self.assertEqual(updated["name"], "renamed")
+        self.assertEqual(client._request.await_count, 1)  # type: ignore[attr-defined]
+        self.assertEqual(client.get_account_by_id.await_count, 3)  # type: ignore[attr-defined]
+        for readback_call in client.get_account_by_id.await_args_list:  # type: ignore[attr-defined]
+            self.assertEqual(readback_call.args, (17,))
+            self.assertEqual(readback_call.kwargs, {"config": config})
 
     async def test_export_maps_reordered_rows_by_explicit_account_id(self) -> None:
         client = Sub2ApiClient()

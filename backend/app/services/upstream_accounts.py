@@ -223,7 +223,7 @@ class UpstreamAccountService:
             sub2api_account_id=account_id,
             remote_identity_fingerprint=self._remote_binding_fingerprint(remote),
             remote_name=_safe_text(
-                self._remote_name(remote, account_id),
+                self._remote_name(remote, account_id, secrets=secrets),
                 secrets=secrets,
                 limit=200,
             ),
@@ -319,6 +319,52 @@ class UpstreamAccountService:
     def _remote_binding_fingerprint(self, account: dict[str, Any]) -> str | None:
         return self._remote_fingerprint(account, include_endpoint=False)
 
+    def _known_local_secrets(
+        self,
+        config: UpstreamAccountConfig | None,
+    ) -> tuple[str | None, str | None]:
+        if config is None:
+            return None, None
+        return (
+            decrypt_text(config.encrypted_api_key),
+            decrypt_text(config.encrypted_access_token),
+        )
+
+    @staticmethod
+    def _known_channel_secrets(
+        channel: UpstreamChannel | None,
+    ) -> tuple[str | None, str | None]:
+        if channel is None:
+            return None, None
+        return (
+            decrypt_text(channel.encrypted_access_token),
+            decrypt_text(channel.encrypted_refresh_token),
+        )
+
+    @staticmethod
+    async def _channel_for_config(
+        db: AsyncSession,
+        config: UpstreamAccountConfig | None,
+    ) -> UpstreamChannel | None:
+        if config is None or config.channel_id is None:
+            return None
+        return await db.get(UpstreamChannel, config.channel_id)
+
+    def _remote_rename_guard_fingerprint(self, account: dict[str, Any]) -> str:
+        fingerprint = self._remote_fingerprint(
+            account,
+            include_endpoint=True,
+            include_name=False,
+            require_created_at=True,
+        )
+        if fingerprint is None:
+            raise UpstreamAccountServiceError(
+                "sub2api did not provide the immutable account creation timestamp required "
+                "to rename this API key account.",
+                status_code=409,
+            )
+        return fingerprint
+
     def _require_remote_binding_fingerprint(self, account: dict[str, Any]) -> str:
         fingerprint = self._remote_binding_fingerprint(account)
         if fingerprint is None:
@@ -334,6 +380,8 @@ class UpstreamAccountService:
         account: dict[str, Any],
         *,
         include_endpoint: bool,
+        include_name: bool = True,
+        require_created_at: bool = False,
     ) -> str | None:
         account_id = self._numeric_remote_id(account)
         if account_id is None:
@@ -346,15 +394,16 @@ class UpstreamAccountService:
         account_type = normalized_text(self.sub2api.account_type(account), casefold=True)
         account_type = account_type.replace("-", "_").replace(" ", "_")
         created_at = normalized_text(_value(account, "created_at", "createdAt"))
-        if not include_endpoint and not created_at:
+        if (not include_endpoint or require_created_at) and not created_at:
             return None
         identity = {
             "id": account_id,
-            "name": normalized_text(self.sub2api.account_name(account)),
             "platform": normalized_text(self.sub2api.account_platform(account), casefold=True),
             "type": account_type,
             "created_at": created_at,
         }
+        if include_name:
+            identity["name"] = normalized_text(self.sub2api.account_name(account))
         if include_endpoint:
             identity["base_url"] = _remote_base_url(account) or ""
         encoded = json.dumps(
@@ -380,6 +429,41 @@ class UpstreamAccountService:
             return "mismatch"
         return "bound" if stored == current else "mismatch"
 
+    def _config_binding_differs_only_by_remote_name(
+        self,
+        account: dict[str, Any],
+        config: UpstreamAccountConfig,
+        *,
+        extra_secrets: tuple[str | None, ...] = (),
+    ) -> bool:
+        stored_fingerprint = str(config.remote_identity_fingerprint or "").strip().lower()
+        stored_name = _safe_text(config.remote_name, limit=200)
+        current_name = _safe_text(self.sub2api.account_name(account), limit=200)
+        if not stored_fingerprint or not current_name:
+            return False
+        configured_endpoint = _normalize_base_url(config.base_url)
+        remote_endpoint = _remote_base_url(account)
+        if (
+            configured_endpoint is not None
+            and remote_endpoint is not None
+            and configured_endpoint != remote_endpoint
+        ):
+            return False
+        previous_names: list[str | None] = [stored_name]
+        for secret in (*self._known_local_secrets(config), *extra_secrets):
+            previous_names.append(secret)
+            cleaned = str(secret or "").strip()
+            if cleaned.lower().startswith("bearer ") and cleaned[7:].strip():
+                previous_names.append(cleaned[7:].strip())
+        for previous_name in dict.fromkeys(previous_names):
+            if not previous_name or previous_name == current_name:
+                continue
+            previous_name_view = dict(account)
+            previous_name_view["name"] = previous_name
+            if self._remote_binding_fingerprint(previous_name_view) == stored_fingerprint:
+                return True
+        return False
+
     def _require_config_binding(
         self,
         account: dict[str, Any],
@@ -396,9 +480,15 @@ class UpstreamAccountService:
     def _remote_current_rate(self, account: dict[str, Any]) -> float | None:
         return _float_multiplier(account.get("rate_multiplier"), allow_zero=True)
 
-    def _remote_name(self, account: dict[str, Any], account_id: int) -> str:
+    def _remote_name(
+        self,
+        account: dict[str, Any],
+        account_id: int,
+        *,
+        secrets: tuple[str | None, ...] = (),
+    ) -> str:
         name = self.sub2api.account_name(account)
-        return _safe_text(name, limit=200) or f"Account #{account_id}"
+        return _safe_text(name, secrets=secrets, limit=200) or f"Account #{account_id}"
 
     def _group_options_out(
         self,
@@ -417,10 +507,13 @@ class UpstreamAccountService:
         self,
         account: dict[str, Any],
         config: UpstreamAccountConfig | None,
+        *,
+        extra_secrets: tuple[str | None, ...] = (),
     ) -> UpstreamAccountOut:
         account_id = self._numeric_remote_id(account)
         if account_id is None:
             raise UpstreamAccountServiceError("sub2api returned an invalid API key account id.")
+        secrets = (*self._known_local_secrets(config), *extra_secrets)
         binding_status = self._config_binding_status(account, config)
         identity_rebind_required = binding_status in {"unbound", "mismatch"}
         api_key_origin_rebind_required = bool(
@@ -440,13 +533,6 @@ class UpstreamAccountService:
             if current is not None and target is not None:
                 would_change = _quantize_rate(current) != _quantize_rate(target)
 
-        api_key = (
-            decrypt_text(config.encrypted_api_key)
-            if config is not None and not api_key_origin_rebind_required
-            else None
-        )
-        access_token = decrypt_text(config.encrypted_access_token) if config is not None else None
-        secrets = (api_key, access_token)
         recharge_source = config.recharge_multiplier_source if config is not None else None
         discovered_recharge = config.discovered_recharge_multiplier if config is not None else None
         if recharge_source == "default":
@@ -460,7 +546,7 @@ class UpstreamAccountService:
             api_key_origin_rebind_required=api_key_origin_rebind_required,
             remote_name=(
                 _safe_text(
-                    config.remote_name if config and config.remote_name else self._remote_name(account, account_id),
+                    self._remote_name(account, account_id, secrets=secrets),
                     secrets=secrets,
                     limit=200,
                 )
@@ -554,8 +640,29 @@ class UpstreamAccountService:
                 )
             )
             configs = {item.sub2api_account_id: item for item in result.scalars().all()}
+        channel_ids = sorted(
+            {
+                config.channel_id
+                for config in configs.values()
+                if config.channel_id is not None
+            }
+        )
+        channels: dict[int, UpstreamChannel] = {}
+        if channel_ids:
+            result = await db.execute(
+                select(UpstreamChannel).where(UpstreamChannel.id.in_(channel_ids))
+            )
+            channels = {item.id: item for item in result.scalars().all()}
         return [
-            self._build_out(remote_by_id[account_id], configs.get(account_id))
+            self._build_out(
+                remote_by_id[account_id],
+                configs.get(account_id),
+                extra_secrets=self._known_channel_secrets(
+                    channels.get(configs[account_id].channel_id)
+                    if account_id in configs and configs[account_id].channel_id is not None
+                    else None
+                ),
+            )
             for account_id in sorted(remote_by_id)
         ]
 
@@ -716,9 +823,8 @@ class UpstreamAccountService:
             config = result.scalar_one_or_none()
             is_new = config is None
             binding_rebound = False
-            binding_fingerprint = self._remote_binding_fingerprint(remote)
             if config is None:
-                binding_fingerprint = self._require_remote_binding_fingerprint(remote)
+                self._require_remote_binding_fingerprint(remote)
                 config = self._new_config(
                     remote,
                     account_id,
@@ -730,7 +836,7 @@ class UpstreamAccountService:
                 if binding_status == "mismatch" and not payload.confirm_identity_rebind:
                     self._require_config_binding(remote, config)
                 if binding_status in {"unbound", "mismatch"}:
-                    binding_fingerprint = self._require_remote_binding_fingerprint(remote)
+                    self._require_remote_binding_fingerprint(remote)
                     binding_rebound = True
 
             fields = payload.model_fields_set
@@ -754,9 +860,15 @@ class UpstreamAccountService:
             )
             current_access_token = decrypt_text(config.encrypted_access_token)
             previous_origin = upstream_url_origin(config.base_url)
-            selected_channel: UpstreamChannel | None = None
+            current_channel = await self._channel_for_config(db, config)
+            selected_channel = current_channel
+            if "channel_id" in fields:
+                selected_channel = (
+                    await db.get(UpstreamChannel, payload.channel_id)
+                    if payload.channel_id is not None
+                    else None
+                )
             if "channel_id" in fields and payload.channel_id is not None:
-                selected_channel = await db.get(UpstreamChannel, payload.channel_id)
                 if selected_channel is None:
                     raise UpstreamAccountServiceError(
                         "The upstream channel was not found.", status_code=404
@@ -773,13 +885,12 @@ class UpstreamAccountService:
                 or (payload.clear_access_token and current_access_token is not None)
             )
             known_secrets = (
-                payload.api_key or current_api_key,
-                payload.access_token or current_access_token,
-            )
-            remote_name = _safe_text(
-                self._remote_name(remote, account_id),
-                secrets=known_secrets,
-                limit=200,
+                payload.api_key,
+                current_api_key,
+                payload.access_token,
+                current_access_token,
+                *self._known_channel_secrets(current_channel),
+                *self._known_channel_secrets(selected_channel),
             )
             config.remote_platform = _safe_text(
                 self.sub2api.account_platform(remote),
@@ -806,12 +917,6 @@ class UpstreamAccountService:
             if identity_changed:
                 config.selected_group_id = None
                 config.selected_group_name = None
-            if "remote_name" in fields and payload.remote_name:
-                config.remote_name = _safe_text(
-                    payload.remote_name,
-                    secrets=known_secrets,
-                    limit=200,
-                )
             if "base_url" in fields:
                 config.base_url = payload.base_url
             if "upstream_type" in fields or is_new:
@@ -854,18 +959,67 @@ class UpstreamAccountService:
             elif payload.access_token:
                 config.encrypted_access_token = encrypt_text(payload.access_token)
 
+            if "remote_name" in fields and payload.remote_name:
+                requested_name = payload.remote_name
+                if requested_name != self._remote_name(remote, account_id):
+                    rename_guard = self._remote_rename_guard_fingerprint(remote)
+
+                    def validate_rename_candidate(candidate: dict[str, Any]) -> None:
+                        if self._remote_rename_guard_fingerprint(candidate) != rename_guard:
+                            raise UpstreamAccountServiceError(
+                                "The sub2api account identity changed before its name could be updated; "
+                                "refresh the account list and try again.",
+                                status_code=409,
+                            )
+
+                    try:
+                        renamed_remote = await self.sub2api.update_account_name(
+                            account_id,
+                            requested_name,
+                            validate_current=validate_rename_candidate,
+                        )
+                    except UpstreamAccountServiceError:
+                        raise
+                    except Exception as exc:
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        raise UpstreamAccountServiceError(
+                            "Unable to rename the sub2api API key account."
+                        ) from None
+                    if self._remote_rename_guard_fingerprint(renamed_remote) != rename_guard:
+                        raise UpstreamAccountServiceError(
+                            "The sub2api account identity changed while its name was being updated; "
+                            "refresh the account list and try again.",
+                            status_code=409,
+                        )
+                    remote = renamed_remote
+                config.remote_identity_fingerprint = self._require_remote_binding_fingerprint(
+                    remote
+                )
+
             if preview_invalidated and not is_new:
                 self._invalidate_preview(config)
 
             if binding_rebound:
-                config.remote_identity_fingerprint = binding_fingerprint
+                config.remote_identity_fingerprint = self._require_remote_binding_fingerprint(
+                    remote
+                )
+
+            config.remote_name = (
+                _safe_text(
+                    self._remote_name(remote, account_id, secrets=known_secrets),
+                    secrets=known_secrets,
+                    limit=200,
+                )
+                or f"Account #{account_id}"
+            )
 
             remote_rate = self._remote_current_rate(remote)
             if remote_rate is not None:
                 config.current_rate = remote_rate
             await db.commit()
             await db.refresh(config)
-            return self._build_out(remote, config)
+            return self._build_out(remote, config, extra_secrets=known_secrets)
 
     async def delete_account(
         self,
@@ -921,7 +1075,12 @@ class UpstreamAccountService:
                 raise UpstreamAccountServiceError(
                     "sub2api account state readback did not match the requested state."
                 )
-            return self._build_out(readback, config)
+            channel = await self._channel_for_config(db, config)
+            return self._build_out(
+                readback,
+                config,
+                extra_secrets=self._known_channel_secrets(channel),
+            )
 
     async def delete_remote_account(
         self,
@@ -1044,12 +1203,11 @@ class UpstreamAccountService:
     ) -> UpstreamAccountOut:
         self._require_config_binding(remote, config)
         now = _utcnow()
-        api_key = (
-            decrypt_text(config.encrypted_api_key)
-            if not config.api_key_origin_rebind_required
-            else None
-        )
-        access_token = decrypt_text(config.encrypted_access_token)
+        channel = await self._channel_for_config(db, config)
+        channel_secrets = self._known_channel_secrets(channel)
+        stored_api_key, access_token = self._known_local_secrets(config)
+        api_key = None if config.api_key_origin_rebind_required else stored_api_key
+        known_secrets = (stored_api_key, access_token, *channel_secrets)
         has_credentials = bool(api_key or access_token)
         has_base_url = bool(config.base_url)
 
@@ -1134,7 +1292,7 @@ class UpstreamAccountService:
                     if options_value is not None:
                         config.group_options = _sanitize_group_options(
                             options_value,
-                            secrets=(api_key, access_token),
+                            secrets=known_secrets,
                         )
                     raw_group = _value(
                         upstream_result,
@@ -1165,12 +1323,12 @@ class UpstreamAccountService:
                         errors.append("Upstream recharge multiplier is invalid.")
                     fresh_group_source = _safe_text(
                         _value(upstream_result, "discovered_group_multiplier_source"),
-                        secrets=(api_key, access_token),
+                        secrets=known_secrets,
                         limit=128,
                     )
                     fresh_recharge_source = _safe_text(
                         _value(upstream_result, "discovered_recharge_multiplier_source"),
-                        secrets=(api_key, access_token),
+                        secrets=known_secrets,
                         limit=128,
                     )
                     matched_group = _value(upstream_result, "matched_group")
@@ -1180,7 +1338,7 @@ class UpstreamAccountService:
                         config.selected_group_id = (
                             _safe_text(
                                 selected_id,
-                                secrets=(api_key, access_token),
+                                secrets=known_secrets,
                                 limit=128,
                             )
                             or config.selected_group_id
@@ -1189,7 +1347,7 @@ class UpstreamAccountService:
                         config.selected_group_name = (
                             _safe_text(
                                 selected_name,
-                                secrets=(api_key, access_token),
+                                secrets=known_secrets,
                                 limit=200,
                             )
                             or config.selected_group_name
@@ -1269,17 +1427,35 @@ class UpstreamAccountService:
         else:
             config.target_rate = None
 
-        config.remote_platform = _safe_text(self.sub2api.account_platform(remote), limit=64)
-        config.remote_account_type = _safe_text(self.sub2api.account_type(remote), limit=32)
-        if not config.remote_name:
-            config.remote_name = self._remote_name(remote, config.sub2api_account_id)
+        config.remote_platform = _safe_text(
+            self.sub2api.account_platform(remote),
+            secrets=known_secrets,
+            limit=64,
+        )
+        config.remote_account_type = _safe_text(
+            self.sub2api.account_type(remote),
+            secrets=known_secrets,
+            limit=32,
+        )
+        config.remote_name = (
+            _safe_text(
+                self._remote_name(
+                    remote,
+                    config.sub2api_account_id,
+                    secrets=known_secrets,
+                ),
+                secrets=known_secrets,
+                limit=200,
+            )
+            or f"Account #{config.sub2api_account_id}"
+        )
         config.last_error = " ".join(dict.fromkeys(errors)) or None
         config.last_discovered_at = now
         current_remote = await self._remote_account(config.sub2api_account_id)
         self._require_config_binding(current_remote, config)
         await db.commit()
         await db.refresh(config)
-        return self._build_out(remote, config)
+        return self._build_out(remote, config, extra_secrets=channel_secrets)
 
     async def discover_account(
         self,
@@ -1330,7 +1506,14 @@ class UpstreamAccountService:
                     config = self._new_config(remote, account_id)
                     db.add(config)
                 elif self._config_binding_status(remote, config) != "bound":
-                    accounts.append(self._build_out(remote, config))
+                    channel = await self._channel_for_config(db, config)
+                    accounts.append(
+                        self._build_out(
+                            remote,
+                            config,
+                            extra_secrets=self._known_channel_secrets(channel),
+                        )
+                    )
                     failed += 1
                     continue
                 account = await self._discover_locked(db, remote, config)
@@ -1420,7 +1603,12 @@ class UpstreamAccountService:
             await db.commit()
             await db.refresh(config)
             remote["rate_multiplier"] = readback
-            return self._build_out(remote, config)
+            channel = await self._channel_for_config(db, config)
+            return self._build_out(
+                remote,
+                config,
+                extra_secrets=self._known_channel_secrets(channel),
+            )
 
 
 _service: UpstreamAccountService | None = None
