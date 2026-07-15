@@ -240,6 +240,12 @@ class UpstreamAccountConfig(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     sub2api_account_id: Mapped[int] = mapped_column(Integer, unique=True, index=True, nullable=False)
+    remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    api_key_origin_rebind_required: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
     channel_id: Mapped[int | None] = mapped_column(
         ForeignKey("upstream_channels.id", ondelete="SET NULL"),
         index=True,

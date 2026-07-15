@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { upstreamRateChangeLogsPath } from "../src/api.ts";
+import {
+  api,
+  NO_FRONTEND_TIMEOUT,
+  upstreamRateChangeLogsPath,
+} from "../src/api.ts";
+import {
+  accountCanBeLivenessTested,
+  livenessAccountIds,
+  MAX_LIVENESS_ACCOUNTS,
+} from "../src/accountLiveness.ts";
 import {
   buildUpstreamAccountUpdatePayload,
   canSetManualMultiplier,
 } from "../src/upstreamAccountForm.ts";
+import { channelCredentialBindingChanged } from "../src/upstreamCredentialBinding.ts";
 import {
   clearUpstreamOverviewCache,
   readUpstreamOverviewCache,
@@ -28,11 +38,279 @@ import {
   upstreamDiscoveryCopy,
   upstreamMutationControlsDisabled,
 } from "../src/upstreamSyncPresentation.ts";
+import { sortUsageLimitSamples } from "../src/usageSampleSort.ts";
+import type { UpstreamChannelsResponse, UsageLimitSample } from "../src/types.ts";
+
+const usageSamples: UsageLimitSample[] = [
+  {
+    id: 2,
+    account_key: "two",
+    email: null,
+    sub2api_account_id: "2",
+    plan_cohort: "plus",
+    subscription_type: "plus",
+    subscription_label: "Plus",
+    reset_key: "two",
+    reset_at: null,
+    observed_limit: 20,
+    raw_spent: 20,
+    used_percent: 100,
+    created_at: "2026-07-15T01:00:00Z",
+    updated_at: "2026-07-15T03:00:00Z",
+  },
+  {
+    id: 1,
+    account_key: "one",
+    email: null,
+    sub2api_account_id: "1",
+    plan_cohort: "plus",
+    subscription_type: "plus",
+    subscription_label: "Plus",
+    reset_key: "one",
+    reset_at: null,
+    observed_limit: 10,
+    raw_spent: 10,
+    used_percent: 100,
+    created_at: "2026-07-15T01:00:00Z",
+    updated_at: "2026-07-15T04:00:00Z",
+  },
+];
+
+test("usage samples switch between quota and recorded-time directions", () => {
+  assert.deepEqual(sortUsageLimitSamples(usageSamples, "quota", "asc").map((sample) => sample.id), [1, 2]);
+  assert.deepEqual(sortUsageLimitSamples(usageSamples, "quota", "desc").map((sample) => sample.id), [2, 1]);
+  assert.deepEqual(sortUsageLimitSamples(usageSamples, "recorded_at", "asc").map((sample) => sample.id), [2, 1]);
+  assert.deepEqual(sortUsageLimitSamples(usageSamples, "recorded_at", "desc").map((sample) => sample.id), [1, 2]);
+});
+
+test("long-running workflows rely on backend deadlines and explicit cancellation", () => {
+  assert.equal(NO_FRONTEND_TIMEOUT, null);
+});
+
+test("liveness long requests have no timer but still honor explicit abort", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  let timerCalls = 0;
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout: ((...args: Parameters<typeof setTimeout>) => {
+      timerCalls += 1;
+      return setTimeout(...args);
+    }) as typeof window.setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+  })) as typeof fetch;
+  const controller = new AbortController();
+  try {
+    const request = api.testAccountLiveness(["1"], "gpt-test", controller.signal);
+    controller.abort();
+    await assert.rejects(request, (reason: unknown) => reason instanceof DOMException && reason.name === "AbortError");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(timerCalls, 0);
+});
+
+test("liveness selection accepts numeric OAuth accounts and rejects API-key accounts", () => {
+  assert.equal(accountCanBeLivenessTested({
+    account_type: "openai-oauth",
+    platform: "openai",
+    sub2api_account_id: "42",
+  }), true);
+  assert.equal(accountCanBeLivenessTested({
+    account_type: "api_key",
+    platform: "openai",
+    sub2api_account_id: "42",
+  }), false);
+  assert.equal(accountCanBeLivenessTested({
+    account_type: "oauth",
+    platform: "openai",
+    sub2api_account_id: "not-an-id",
+  }), false);
+});
+
+test("liveness request ids are deduplicated and capped at the backend limit", () => {
+  const accounts = Array.from({ length: MAX_LIVENESS_ACCOUNTS + 5 }, (_, index) => ({
+    account_type: "oauth",
+    platform: "openai",
+    sub2api_account_id: String(index + 1),
+  }));
+  accounts.splice(2, 0, { ...accounts[0] });
+  const ids = livenessAccountIds(accounts);
+  assert.equal(ids.length, MAX_LIVENESS_ACCOUNTS);
+  assert.equal(new Set(ids).size, MAX_LIVENESS_ACCOUNTS);
+  assert.deepEqual(ids.slice(0, 3), ["1", "2", "3"]);
+});
+
+test("stale-sensitive upstream mutations include the expected identity fingerprint", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const fingerprint = "a".repeat(64);
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({
+      path: String(input),
+      body: JSON.parse(String(init?.body || "{}")),
+    });
+    return new Response("{}", {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  try {
+    await api.updateUpstreamAccount(7, {
+      channel_id: null,
+      expected_identity_fingerprint: fingerprint,
+    });
+    await api.deleteUpstreamAccount(7, fingerprint);
+    await api.discoverUpstreamAccount(7, fingerprint);
+    await api.setUpstreamAccountEnabled(7, false, fingerprint);
+    await api.deleteRemoteUpstreamAccount(7, fingerprint);
+    await api.applyUpstreamAccountRate(7, 1.25, fingerprint);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(requests.map((request) => request.path), [
+    "/api/upstream-accounts/7",
+    "/api/upstream-accounts/7",
+    "/api/upstream-accounts/7/discover",
+    "/api/upstream-accounts/7/enabled",
+    "/api/upstream-accounts/7/remote",
+    "/api/upstream-accounts/7/apply",
+  ]);
+  for (const request of requests) {
+    assert.equal(request.body.expected_identity_fingerprint, fingerprint);
+  }
+});
+
+async function apiKeySyncRequestBody(
+  overview: UpstreamChannelsResponse,
+  confirmLegacyBindings: boolean,
+) {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ path: string; method: string; body: Record<string, unknown> | null }> = [];
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const path = String(input);
+    requests.push({
+      path,
+      method: init?.method || "GET",
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    });
+    return new Response(JSON.stringify({ total: 1, succeeded: 1, failed: 0, channels: [] }), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+
+  try {
+    await api.syncApiKeyAccounts(overview, confirmLegacyBindings);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(requests.map(({ path, method }) => ({ path, method })), [
+    { path: "/api/upstream-channels/discover-all", method: "POST" },
+  ]);
+  return requests[0].body;
+}
+
+const apiKeySyncOverview: UpstreamChannelsResponse = {
+  channels: [{
+    id: 9,
+    accounts: [
+      {
+        sub2api_account_id: 2,
+        identity_fingerprint: "b".repeat(64),
+        api_key_origin_rebind_required: true,
+      },
+      {
+        sub2api_account_id: 3,
+        identity_fingerprint: "c".repeat(64),
+        identity_binding_status: "bound",
+      },
+    ],
+  }],
+  unassigned_accounts: [
+    {
+      sub2api_account_id: "1",
+      identity_fingerprint: "a".repeat(64),
+      identity_binding_status: "unbound",
+    },
+  ],
+};
+
+test("confirmed API account sync sends strict identity bindings", async () => {
+  assert.deepEqual(await apiKeySyncRequestBody(apiKeySyncOverview, true), {
+    confirm_legacy_bindings: true,
+    account_bindings: [
+      { sub2api_account_id: 1, expected_identity_fingerprint: "a".repeat(64) },
+      { sub2api_account_id: 2, expected_identity_fingerprint: "b".repeat(64) },
+    ],
+  });
+});
+
+test("unconfirmed API account sync omits binding confirmation payload", async () => {
+  assert.deepEqual(await apiKeySyncRequestBody(apiKeySyncOverview, false), {});
+});
+
+test("confirmed API account sync with no accounts omits binding confirmation payload", async () => {
+  assert.deepEqual(await apiKeySyncRequestBody({ channels: [], unassigned_accounts: [] }, true), {});
+});
+
+test("confirmed API account sync supports more than 500 pending bindings", async () => {
+  const pendingAccounts = Array.from({ length: 501 }, (_, index) => ({
+    sub2api_account_id: index + 1,
+    identity_fingerprint: (index + 1).toString(16).padStart(64, "0"),
+    identity_binding_status: "unbound" as const,
+  }));
+  const body = await apiKeySyncRequestBody(
+    { channels: [], unassigned_accounts: pendingAccounts },
+    true,
+  );
+  assert.equal(body?.confirm_legacy_bindings, true);
+  assert.equal((body?.account_bindings as unknown[]).length, 501);
+});
+
+test("channel credential rebind checks canonical and management origins independently", () => {
+  const channel = {
+    id: 1,
+    canonical_base_url: "https://api.old.example/v1",
+    management_base_url: "https://manage.example/admin",
+  };
+  assert.equal(channelCredentialBindingChanged(
+    channel,
+    "https://api.new.example/v1",
+    "https://manage.example/other",
+  ), true);
+  assert.equal(channelCredentialBindingChanged(
+    channel,
+    "https://api.old.example/v2",
+    "https://manage.example/other",
+  ), false);
+});
 
 test("manual and fallback-manual multipliers remain editable", () => {
   for (const group_multiplier_source of ["manual", "fallback_manual"]) {
     const account = {
       sub2api_account_id: 7,
+      identity_fingerprint: "a".repeat(64),
       effective_group_multiplier: 2,
       group_multiplier_source,
       group_multiplier_status: "in_sync",
@@ -45,6 +323,7 @@ test("manual and fallback-manual multipliers remain editable", () => {
       manualGroupMultiplier: "0.25",
     }), {
       channel_id: 3,
+      expected_identity_fingerprint: "a".repeat(64),
       manual_group_multiplier: 0.25,
       api_key: "key-value",
     });
@@ -55,6 +334,7 @@ test("automatic upstream multipliers omit manual_group_multiplier", () => {
   const payload = buildUpstreamAccountUpdatePayload({
     account: {
       sub2api_account_id: 8,
+      identity_fingerprint: "b".repeat(64),
       effective_group_multiplier: 1,
       group_multiplier_source: "upstream_key",
       group_multiplier_status: "in_sync",
@@ -63,7 +343,10 @@ test("automatic upstream multipliers omit manual_group_multiplier", () => {
     channelId: 4,
     manualGroupMultiplier: "",
   });
-  assert.deepEqual(payload, { channel_id: 4 });
+  assert.deepEqual(payload, {
+    channel_id: 4,
+    expected_identity_fingerprint: "b".repeat(64),
+  });
   assert.equal(Object.hasOwn(payload, "manual_group_multiplier"), false);
 });
 
@@ -71,6 +354,7 @@ test("clearing an editable manual multiplier sends an intentional null", () => {
   const payload = buildUpstreamAccountUpdatePayload({
     account: {
       sub2api_account_id: 9,
+      identity_fingerprint: "c".repeat(64),
       effective_group_multiplier: 0.5,
       group_multiplier_source: "manual",
       group_multiplier_status: "manual",

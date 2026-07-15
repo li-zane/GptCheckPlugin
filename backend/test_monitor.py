@@ -1,6 +1,7 @@
+import asyncio
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.monitor import MonitorService
 from app.services.sub2api import Sub2ApiClient
@@ -69,6 +70,107 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
             {"oauth@example.com", "api-key@example.com"}
         )
         record.assert_awaited_once()
+
+    async def test_sync_once_returns_result_when_post_commit_audit_fails(self) -> None:
+        account = {
+            "id": 1,
+            "email": "oauth@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "status": "active",
+            "schedulable": True,
+            "credentials": {"refresh_token": "redacted"},
+        }
+        sub2api = Sub2ApiClient()
+        sub2api.list_accounts = AsyncMock(return_value=[account])  # type: ignore[method-assign]
+        service = object.__new__(MonitorService)
+        service.sub2api = sub2api
+        service.runtime_config = SimpleNamespace(get_recovery_enabled=AsyncMock(return_value=False))
+        service.refresh_service = SimpleNamespace()
+        service._upsert_snapshot = AsyncMock(return_value=(False, False))  # type: ignore[method-assign]
+        service._ensure_routed_mailbox = AsyncMock()  # type: ignore[method-assign]
+        service._clear_account_exceptions = AsyncMock()  # type: ignore[method-assign]
+        service._delete_missing_remote_accounts = AsyncMock(return_value=(0, 0))  # type: ignore[method-assign]
+        db = AsyncMock()
+
+        with (
+            patch("app.services.monitor.AsyncSessionLocal", return_value=_SessionContext(db)),
+            patch(
+                "app.services.monitor.record_event",
+                new=AsyncMock(side_effect=RuntimeError("audit unavailable")),
+            ),
+        ):
+            result = await service.sync_once(reason="manual")
+
+        self.assertEqual(result.total_seen, 1)
+        db.rollback.assert_awaited_once()
+
+    async def test_monitor_loop_continues_when_failure_audit_is_unavailable(self) -> None:
+        service = object.__new__(MonitorService)
+        service._stop = asyncio.Event()
+        service._wake = asyncio.Event()
+        service.sub2api = Sub2ApiClient()
+        service.runtime_config = SimpleNamespace(get_automation_paused=AsyncMock(return_value=False))
+        service.sync_once = AsyncMock(side_effect=RuntimeError("sync unavailable"))  # type: ignore[method-assign]
+        service._wait_for_startup_delay = AsyncMock()  # type: ignore[method-assign]
+
+        async def stop_after_iteration() -> None:
+            service._stop.set()
+
+        service._wait_for_next_run = AsyncMock(side_effect=stop_after_iteration)  # type: ignore[method-assign]
+        db = AsyncMock()
+        with (
+            patch("app.services.monitor.AsyncSessionLocal", return_value=_SessionContext(db)),
+            patch(
+                "app.services.monitor.record_event",
+                new=AsyncMock(side_effect=RuntimeError("audit unavailable")),
+            ),
+        ):
+            await service._loop()
+
+        service._wait_for_next_run.assert_awaited_once()  # type: ignore[attr-defined]
+        db.rollback.assert_awaited_once()
+
+    async def test_upsert_snapshot_never_persists_api_key_aliases(self) -> None:
+        account = {
+            "id": 7,
+            "email": "oauth@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "status": "active",
+            "schedulable": True,
+            "credentials": {
+                "api_key": "first-secret",
+                "nested": {"apiKey": "second-secret", "apikey": "third-secret"},
+            },
+        }
+        service = object.__new__(MonitorService)
+        service.sub2api = Sub2ApiClient()
+        service._sync_phone_from_account_note = AsyncMock()  # type: ignore[method-assign]
+        db = SimpleNamespace(
+            scalar=AsyncMock(return_value=None),
+            add=MagicMock(),
+            commit=AsyncMock(),
+        )
+
+        with patch("app.services.monitor.AsyncSessionLocal", return_value=_SessionContext(db)):
+            await service._upsert_snapshot(
+                "oauth@example.com",
+                account,
+                is_error=False,
+                is_deactive=False,
+            )
+
+        snapshot = db.add.call_args.args[0]
+        self.assertEqual(snapshot.raw["credentials"]["api_key"], "***redacted***")
+        self.assertEqual(
+            snapshot.raw["credentials"]["nested"],
+            {"apiKey": "***redacted***", "apikey": "***redacted***"},
+        )
+        serialized = str(snapshot.raw)
+        self.assertNotIn("first-secret", serialized)
+        self.assertNotIn("second-secret", serialized)
+        self.assertNotIn("third-secret", serialized)
 
 
 if __name__ == "__main__":

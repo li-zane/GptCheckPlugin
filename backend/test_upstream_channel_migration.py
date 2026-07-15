@@ -155,6 +155,11 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(columns["upstream_type"][3], 1)
         self.assertIn("channel_id", columns)
         self.assertIn("balance_status", columns)
+        self.assertIn("remote_identity_fingerprint", columns)
+        self.assertEqual(columns["remote_identity_fingerprint"][3], 0)
+        self.assertIn("api_key_origin_rebind_required", columns)
+        self.assertEqual(columns["api_key_origin_rebind_required"][3], 1)
+        self.assertEqual(str(columns["api_key_origin_rebind_required"][4]), "0")
         self.assertEqual(columns["channel_auto_assign_disabled"][3], 1)
         self.assertTrue(
             set(models.UpstreamAccountConfig.__table__.columns.keys()).issubset(columns)
@@ -166,6 +171,8 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(migrated_rows), 4)
         self.assertTrue(all(not row.channel_auto_assign_disabled for row in migrated_rows))
+        self.assertTrue(all(row.remote_identity_fingerprint is None for row in migrated_rows))
+        self.assertTrue(all(not row.api_key_origin_rebind_required for row in migrated_rows))
         self.assertTrue(all(row.balance_status is None for row in migrated_rows))
 
     async def test_explicitly_unassigned_account_stays_unassigned_on_migration_rerun(self) -> None:

@@ -2239,7 +2239,7 @@ def _exclude_from_aggregate(row: dict[str, Any], window: dict[str, Any]) -> bool
         row.get("deactive")
         or row.get("error")
         or row.get("usage_error")
-        or row.get("rate_limited")
+        or window.get("rate_limited")
         or window.get("window_kind") == "none"
     )
 

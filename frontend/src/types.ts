@@ -28,6 +28,8 @@ export type Account = {
   refreshing: boolean;
   auto_refresh_locked: boolean;
   last_error: string | null;
+  sub2api_error_code: number | null;
+  sub2api_error_message: string | null;
   last_seen_at: string;
   updated_at: string;
   is_duplicate: boolean;
@@ -54,6 +56,34 @@ export type Account = {
   phone_sms_url: string | null;
   phone_sms_cdk: string | null;
   phone_sms_recharge_url: string | null;
+};
+
+export type AccountLivenessModel = {
+  id: string;
+  display_name: string;
+};
+
+export type AccountLivenessModels = {
+  source_account_id: string;
+  models: AccountLivenessModel[];
+};
+
+export type AccountLivenessTestItem = {
+  account_id: string;
+  email: string | null;
+  account_name: string | null;
+  success: boolean;
+  error: string | null;
+  duration_ms: number;
+};
+
+export type AccountLivenessTestResult = {
+  message: string;
+  model_id: string;
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: AccountLivenessTestItem[];
 };
 
 export type Mailbox = {
@@ -398,6 +428,7 @@ export type AppSettingsUpdate = {
   sub2api_port?: number;
   sub2api_x_api_key?: string;
   clear_sub2api_x_api_key?: boolean;
+  confirm_sub2api_credential_rebind?: boolean;
   sub2api_auto_recover_state?: boolean;
   automation_paused?: boolean;
   recovery_enabled?: boolean;
@@ -445,6 +476,11 @@ export type UpstreamGroupOption = {
  */
 export type UpstreamAccount = {
   sub2api_account_id: number | string;
+  /** Stable, non-secret identity used to reject stale mutations after a remote ID is reused. */
+  identity_fingerprint?: string;
+  identity_binding_status?: "unmanaged" | "unbound" | "bound" | "mismatch";
+  identity_rebind_required?: boolean;
+  api_key_origin_rebind_required?: boolean;
   channel_id?: number | string | null;
   remote_name?: string | null;
   remote_platform?: string | null;
@@ -496,6 +532,7 @@ export type UpstreamAccount = {
 };
 
 export type UpstreamAccountUpdate = {
+  expected_identity_fingerprint: string;
   channel_id?: number | string | null;
   remote_name?: string | null;
   base_url?: string | null;
@@ -507,6 +544,7 @@ export type UpstreamAccountUpdate = {
   access_token?: string;
   clear_access_token?: boolean;
   confirm_credential_rebind?: boolean;
+  confirm_identity_rebind?: boolean;
   manual_group_multiplier?: number | null;
   manual_recharge_multiplier?: number | null;
 };
@@ -559,6 +597,21 @@ export type UpstreamChannelDiscoverAllResult = {
   failed: number;
   channels: UpstreamChannel[];
 };
+
+export type UpstreamLegacyIdentityBinding = {
+  sub2api_account_id: number;
+  expected_identity_fingerprint: string;
+};
+
+export type UpstreamChannelDiscoverAllRequest =
+  | {
+      confirm_legacy_bindings: true;
+      account_bindings: UpstreamLegacyIdentityBinding[];
+    }
+  | {
+      confirm_legacy_bindings?: never;
+      account_bindings?: never;
+    };
 
 export type UpstreamChannelUpdate = {
   display_name?: string | null;

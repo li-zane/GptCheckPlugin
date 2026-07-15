@@ -106,7 +106,7 @@ class OpenAiOAuthRefresher:
             def remember_url(value: Any) -> None:
                 text = str(value or "")
                 try:
-                    if self._code_from_url(text, context.state):
+                    if self._code_from_url(text, context.state, context.redirect_uri):
                         observed_callback_urls.append(text)
                 except RuntimeError:
                     observed_callback_urls.append(text)
@@ -122,9 +122,11 @@ class OpenAiOAuthRefresher:
 
                 deadline = asyncio.get_running_loop().time() + max(self.settings.verification_code_timeout_seconds + 90, 240)
                 while asyncio.get_running_loop().time() < deadline:
-                    code = self._code_from_url(page.url, context.state)
+                    code = self._code_from_url(page.url, context.state, context.redirect_uri)
                     if not code and observed_callback_urls:
-                        code = self._code_from_url(observed_callback_urls[-1], context.state)
+                        code = self._code_from_url(
+                            observed_callback_urls[-1], context.state, context.redirect_uri
+                        )
                     if code:
                         return await self._exchange_code(context, code, email)
 
@@ -304,9 +306,13 @@ class OpenAiOAuthRefresher:
                 "OpenAI-Sentinel-Token": '{"e":"q2n8w7x5z1"}',
             },
             json={"username": {"kind": "email", "value": email}},
+            allow_redirects=False,
         )
         if email_response.status_code >= 400:
             return self._http_error("OpenAI OAuth email submission", email_response)
+        email_location = self._location(email_response)
+        if email_location:
+            return await self._follow_protocol_url(session, email_location, context)
         email_payload = self._json_object(email_response)
         page_type = self._page_type(email_payload)
         if page_type == "login_password":
@@ -335,6 +341,7 @@ class OpenAiOAuthRefresher:
                 "Referer": "https://auth.openai.com/email-verification",
             },
             json={"code": code},
+            allow_redirects=False,
         )
         if otp_response.status_code >= 400:
             return self._http_error("OpenAI OAuth OTP validation", otp_response)
@@ -345,7 +352,7 @@ class OpenAiOAuthRefresher:
         page_type = self._page_type(otp_payload)
         if page_type == "login_password":
             return OpenAiOAuthOutcome(status="failed", error="Password login is required after OTP validation.")
-        next_url = self._continue_url(otp_payload) or self._payload_url(otp_payload)
+        next_url = self._continue_url(otp_payload) or self._payload_url(otp_payload) or self._location(otp_response)
         if next_url:
             return await self._follow_protocol_url(session, next_url, context)
         return OpenAiOAuthOutcome(
@@ -354,16 +361,25 @@ class OpenAiOAuthRefresher:
         )
 
     async def _follow_protocol_url(self, session: Any, url: str, context: OAuthContext) -> OpenAiOAuthOutcome:
-        current_url = url
+        current_url = urljoin(context.auth_url, url)
         for _ in range(12):
-            callback_code = self._code_from_url(current_url, context.state)
+            callback_code = self._code_from_url(
+                current_url, context.state, context.redirect_uri
+            )
             if callback_code:
                 return OpenAiOAuthOutcome(status="ok", access_token=callback_code)
             if _is_add_phone_text(current_url):
                 return OpenAiOAuthOutcome(status="add_phone", error=ADD_PHONE_ERROR)
+            if not _is_allowed_protocol_continuation(current_url, context):
+                return OpenAiOAuthOutcome(
+                    status="failed",
+                    error="OpenAI OAuth continuation changed to an untrusted origin.",
+                )
 
             response = await session.get(current_url, allow_redirects=False)
-            callback_code = self._code_from_response(response, context.state)
+            callback_code = self._code_from_response(
+                response, context.state, context.redirect_uri
+            )
             if callback_code:
                 return OpenAiOAuthOutcome(status="ok", access_token=callback_code)
             text = str(getattr(response, "text", ""))[:4000]
@@ -505,19 +521,33 @@ class OpenAiOAuthRefresher:
             return None
         return urljoin(str(getattr(response, "url", "")), value.strip())
 
-    def _code_from_response(self, response: Any, state: str) -> str | None:
+    def _code_from_response(
+        self,
+        response: Any,
+        state: str,
+        redirect_uri: str,
+    ) -> str | None:
         location = self._location(response)
         if location:
-            code = self._code_from_url(location, state)
+            code = self._code_from_url(location, state, redirect_uri)
             if code:
                 return code
-        return self._code_from_url(str(getattr(response, "url", "")), state)
+        return self._code_from_url(str(getattr(response, "url", "")), state, redirect_uri)
 
-    def _code_from_url(self, url: str | None, state: str) -> str | None:
+    def _code_from_url(
+        self,
+        url: str | None,
+        state: str,
+        redirect_uri: str,
+    ) -> str | None:
         if not url:
             return None
         parsed = urlparse(str(url))
-        query = parse_qs(parsed.query)
+        if not _same_oauth_redirect_target(parsed, urlparse(redirect_uri)):
+            return None
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if any(len(query.get(key, [])) > 1 for key in ("state", "code", "error", "error_description")):
+            return None
         returned_state = (query.get("state") or [""])[0]
         if returned_state != state:
             return None
@@ -980,6 +1010,48 @@ class OpenAiOAuthRefresher:
                         continue
             await asyncio.sleep(0.1)
         return None
+
+
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    parsed = urlparse(value)
+    scheme = parsed.scheme.casefold()
+    hostname = (parsed.hostname or "").casefold()
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+    return scheme, hostname, port
+
+
+def _same_oauth_redirect_target(actual: Any, expected: Any) -> bool:
+    actual_origin = _url_origin(actual.geturl())
+    expected_origin = _url_origin(expected.geturl())
+    if actual_origin is None or actual_origin != expected_origin:
+        return False
+    actual_path = actual.path or "/"
+    expected_path = expected.path or "/"
+    return (
+        actual_path == expected_path
+        and actual.params == expected.params
+        and not actual.fragment
+        and not expected.fragment
+    )
+
+
+def _is_allowed_protocol_continuation(url: str, context: OAuthContext) -> bool:
+    candidate_origin = _url_origin(url)
+    if candidate_origin is None:
+        return False
+    allowed_origins = {
+        origin
+        for origin in (_url_origin(context.auth_url), _url_origin(AUTH_ACCOUNTS_BASE))
+        if origin is not None
+    }
+    return candidate_origin in allowed_origins
 
 
 def _pkce_code_verifier() -> str:

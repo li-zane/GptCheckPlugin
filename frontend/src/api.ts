@@ -1,6 +1,8 @@
 import type {
   Account,
   AccountExceptionRecord,
+  AccountLivenessModels,
+  AccountLivenessTestResult,
   AppEvent,
   AppSettings,
   AppSettingsUpdate,
@@ -22,6 +24,7 @@ import type {
   UpstreamAccount,
   UpstreamAccountUpdate,
   UpstreamChannel,
+  UpstreamChannelDiscoverAllRequest,
   UpstreamChannelDiscoverAllResult,
   UpstreamChannelsResponse,
   UpstreamChannelUpdate,
@@ -39,25 +42,45 @@ export class ApiError extends Error {
 }
 
 export const AUTH_EXPIRED_EVENT = "sub2api-at-auth-expired";
+export const NO_FRONTEND_TIMEOUT = null;
 
-async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 30_000): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, timeoutMs: number | null = 30_000): Promise<T> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  const { signal: externalSignal, headers: initHeaders, ...requestInit } = init;
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) {
+    abortFromCaller();
+  } else {
+    externalSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  }
+  const timeout = timeoutMs === null
+    ? null
+    : window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
   const response = await fetch(path, {
     credentials: "include",
-    signal: controller.signal,
     headers: {
       "Content-Type": "application/json",
       "X-Requested-With": "sub2api-at-guardian",
-      ...(init.headers || {}),
+      ...(initHeaders || {}),
     },
-    ...init,
+    ...requestInit,
+    signal: controller.signal,
   }).catch((error) => {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("请求超时，请稍后重试或检查邮箱令牌/网络。");
+    if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+      if (timedOut) {
+        throw new Error("请求超时，请稍后重试或检查后端和网络状态。");
+      }
+      throw new DOMException("请求已取消", "AbortError");
     }
     throw error;
-  }).finally(() => window.clearTimeout(timeout));
+  }).finally(() => {
+    if (timeout !== null) window.clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", abortFromCaller);
+  });
 
   if (!response.ok) {
     let message = fallbackHttpErrorMessage(response);
@@ -112,7 +135,28 @@ export const api = {
   logout: () => request<{ message: string }>("/api/auth/logout", { method: "POST" }),
   summary: () => request<Summary>("/api/dashboard/summary"),
   accounts: () => request<Account[]>("/api/accounts"),
-  sync: () => request<SyncResult>("/api/accounts/sync", { method: "POST" }, 180_000),
+  accountLivenessModels: (accountIds: string[], signal?: AbortSignal) =>
+    request<AccountLivenessModels>(
+      "/api/accounts/liveness-models",
+      {
+        method: "POST",
+        body: JSON.stringify({ account_ids: accountIds }),
+        signal,
+      },
+      NO_FRONTEND_TIMEOUT,
+    ),
+  testAccountLiveness: (accountIds: string[], modelId: string, signal?: AbortSignal) =>
+    request<AccountLivenessTestResult>(
+      "/api/accounts/liveness-test",
+      {
+        method: "POST",
+        body: JSON.stringify({ account_ids: accountIds, model_id: modelId }),
+        signal,
+      },
+      NO_FRONTEND_TIMEOUT,
+    ),
+  sync: (signal?: AbortSignal) =>
+    request<SyncResult>("/api/accounts/sync", { method: "POST", signal }, NO_FRONTEND_TIMEOUT),
   usageEstimate: (refresh = true) =>
     request<UsageEstimate>(`/api/accounts/usage-estimate?refresh=${refresh ? "true" : "false"}`, {}, 180_000),
   usageLimitSamples: () => request<UsageLimitSamples>("/api/accounts/usage-limit-samples"),
@@ -196,35 +240,51 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
-  setUpstreamAccountEnabled: (accountId: number | string, enabled: boolean) =>
+  setUpstreamAccountEnabled: (accountId: number | string, enabled: boolean, expectedIdentityFingerprint: string) =>
     request<UpstreamAccount>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}/enabled`, {
       method: "PATCH",
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify({ enabled, expected_identity_fingerprint: expectedIdentityFingerprint }),
     }),
-  deleteRemoteUpstreamAccount: (accountId: number | string) =>
+  deleteRemoteUpstreamAccount: (accountId: number | string, expectedIdentityFingerprint: string) =>
     request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}/remote`, {
       method: "DELETE",
-      body: JSON.stringify({ confirmed_account_id: accountId }),
+      body: JSON.stringify({
+        confirmed_account_id: accountId,
+        expected_identity_fingerprint: expectedIdentityFingerprint,
+      }),
     }),
   upstreamRateChangeLogs: (
     limit = 50,
     beforeId?: number | null,
     filters?: { startDate?: string; endDate?: string; timeZone?: string },
   ) => request<UpstreamRateChangeLog[]>(upstreamRateChangeLogsPath(limit, beforeId, filters)),
-  deleteUpstreamAccount: (accountId: number | string) =>
-    request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}`, { method: "DELETE" }),
-  discoverUpstreamAccount: (accountId: number | string) =>
+  deleteUpstreamAccount: (accountId: number | string, expectedIdentityFingerprint: string) =>
+    request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expected_identity_fingerprint: expectedIdentityFingerprint }),
+    }),
+  discoverUpstreamAccount: (accountId: number | string, expectedIdentityFingerprint: string) =>
     request<UpstreamAccount>(
       `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/discover`,
-      { method: "POST" },
+      {
+        method: "POST",
+        body: JSON.stringify({ expected_identity_fingerprint: expectedIdentityFingerprint }),
+      },
       90_000,
     ),
-  applyUpstreamAccountRate: (accountId: number | string, confirmedTargetRate: number) =>
+  applyUpstreamAccountRate: (
+    accountId: number | string,
+    confirmedTargetRate: number,
+    expectedIdentityFingerprint: string,
+  ) =>
     request<UpstreamAccount>(
       `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/apply`,
       {
         method: "POST",
-        body: JSON.stringify({ confirmed_target_rate: confirmedTargetRate }),
+        body: JSON.stringify({
+          confirmed_target_rate: confirmedTargetRate,
+          expected_identity_fingerprint: expectedIdentityFingerprint,
+        }),
       },
       90_000,
     ),
@@ -240,6 +300,65 @@ export const api = {
       { method: "POST" },
       90_000,
     ),
-  discoverAllUpstreamChannels: () =>
-    request<UpstreamChannelDiscoverAllResult>("/api/upstream-channels/discover-all", { method: "POST" }, 180_000),
+  discoverAllUpstreamChannels: (signal?: AbortSignal) =>
+    request<UpstreamChannelDiscoverAllResult>(
+      "/api/upstream-channels/discover-all",
+      { method: "POST", signal },
+      NO_FRONTEND_TIMEOUT,
+    ),
+  syncApiKeyAccounts: (
+    overview: UpstreamChannelsResponse,
+    confirmLegacyBindings: boolean,
+    signal?: AbortSignal,
+  ) => {
+    const accountBindings = confirmLegacyBindings
+      ? upstreamLegacyIdentityBindings(overview)
+      : [];
+    const payload: UpstreamChannelDiscoverAllRequest = accountBindings.length
+      ? {
+          confirm_legacy_bindings: true,
+          account_bindings: accountBindings,
+        }
+      : {};
+    return request<UpstreamChannelDiscoverAllResult>(
+      "/api/upstream-channels/discover-all",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+        signal,
+      },
+      NO_FRONTEND_TIMEOUT,
+    );
+  },
 };
+
+export function upstreamLegacyIdentityBindings(overview: UpstreamChannelsResponse) {
+  const accounts = [
+    ...overview.channels.flatMap((channel) => channel.accounts || []),
+    ...overview.unassigned_accounts,
+  ];
+  const bindings = new Map<number, string>();
+  for (const account of accounts) {
+    if (
+      account.identity_binding_status !== "unbound"
+      && account.api_key_origin_rebind_required !== true
+    ) {
+      continue;
+    }
+    const accountId = Number(account.sub2api_account_id);
+    const fingerprint = String(account.identity_fingerprint || "").trim();
+    if (!Number.isSafeInteger(accountId) || accountId <= 0 || !/^[a-f0-9]{64}$/.test(fingerprint)) {
+      throw new Error("API Key 账号身份信息无效，请刷新后重试。");
+    }
+    if (bindings.has(accountId)) {
+      throw new Error("API Key 账号列表包含重复 ID，请刷新后重试。");
+    }
+    bindings.set(accountId, fingerprint);
+  }
+  return [...bindings]
+    .sort(([left], [right]) => left - right)
+    .map(([sub2api_account_id, expected_identity_fingerprint]) => ({
+      sub2api_account_id,
+      expected_identity_fingerprint,
+    }));
+}

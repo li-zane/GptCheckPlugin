@@ -14,6 +14,7 @@ from app.schemas import (
     UpstreamAccountUpdate,
     UpstreamApplyRequest,
     UpstreamDiscoverAllOut,
+    UpstreamIdentityRequest,
     UpstreamRateChangeLogOut,
     UpstreamRemoteDeleteRequest,
 )
@@ -149,11 +150,19 @@ async def upsert_upstream_account(
 @router.delete("/{sub2api_account_id}", response_model=MessageResponse)
 async def delete_upstream_account(
     sub2api_account_id: AccountId,
+    payload: UpstreamIdentityRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     service: UpstreamAccountService = Depends(get_upstream_account_service),
 ) -> MessageResponse:
-    removed = await service.delete_account(db, sub2api_account_id)
+    try:
+        removed = await service.delete_account(
+            db,
+            sub2api_account_id,
+            payload.expected_identity_fingerprint,
+        )
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
     if removed:
         return MessageResponse(message=f"Removed local upstream configuration for account #{sub2api_account_id}.")
     return MessageResponse(message=f"Account #{sub2api_account_id} was not locally managed.")
@@ -168,7 +177,12 @@ async def set_upstream_account_enabled(
     service: UpstreamAccountService = Depends(get_upstream_account_service),
 ) -> UpstreamAccountOut:
     try:
-        return await service.set_account_enabled(db, sub2api_account_id, payload.enabled)
+        return await service.set_account_enabled(
+            db,
+            sub2api_account_id,
+            payload.enabled,
+            payload.expected_identity_fingerprint,
+        )
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
 
@@ -184,7 +198,11 @@ async def delete_remote_upstream_account(
     if payload.confirmed_account_id != sub2api_account_id:
         raise HTTPException(status_code=409, detail="The account deletion confirmation is stale.")
     try:
-        await service.delete_remote_account(db, sub2api_account_id)
+        await service.delete_remote_account(
+            db,
+            sub2api_account_id,
+            payload.expected_identity_fingerprint,
+        )
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
     return MessageResponse(message=f"Deleted sub2api API key account #{sub2api_account_id}.")
@@ -193,12 +211,17 @@ async def delete_remote_upstream_account(
 @router.post("/{sub2api_account_id}/discover", response_model=UpstreamAccountOut)
 async def discover_upstream_account(
     sub2api_account_id: AccountId,
+    payload: UpstreamIdentityRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     service: UpstreamAccountService = Depends(get_upstream_account_service),
 ) -> UpstreamAccountOut:
     try:
-        return await service.discover_account(db, sub2api_account_id)
+        return await service.discover_account(
+            db,
+            sub2api_account_id,
+            payload.expected_identity_fingerprint,
+        )
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
 
@@ -216,6 +239,7 @@ async def apply_upstream_account_rate(
             db,
             sub2api_account_id,
             payload.confirmed_target_rate,
+            payload.expected_identity_fingerprint,
         )
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None

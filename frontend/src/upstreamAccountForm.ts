@@ -34,12 +34,23 @@ export function buildUpstreamAccountUpdatePayload({
   channelId: number | string | null;
   manualGroupMultiplier: string;
 }): UpstreamAccountUpdate {
-  const payload: UpstreamAccountUpdate = { channel_id: channelId };
+  const payload: UpstreamAccountUpdate = {
+    channel_id: channelId,
+    expected_identity_fingerprint: expectedIdentityFingerprint(account),
+  };
   if (canSetManualMultiplier(account)) {
     payload.manual_group_multiplier = optionalPositiveNumber(manualGroupMultiplier, "手动分组倍率");
   }
   if (apiKey.trim()) payload.api_key = apiKey.trim();
   return payload;
+}
+
+export function expectedIdentityFingerprint(account: UpstreamAccount) {
+  const fingerprint = String(account.identity_fingerprint || "").trim();
+  if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
+    throw new Error("账号身份校验信息已过期，请刷新 API Key 账号列表后重试。");
+  }
+  return fingerprint;
 }
 
 function optionalPositiveNumber(value: string, label: string) {

@@ -164,6 +164,8 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         columns.add("channel_id")
     optional_account_columns = {
         "channel_auto_assign_disabled": "BOOLEAN NOT NULL DEFAULT 0",
+        "remote_identity_fingerprint": "VARCHAR(64)",
+        "api_key_origin_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "remote_name": "VARCHAR(200)",
         "remote_platform": "VARCHAR(64)",
         "remote_account_type": "VARCHAR(32)",

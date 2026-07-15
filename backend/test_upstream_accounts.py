@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import httpx
 from fastapi import FastAPI
@@ -16,7 +16,7 @@ from app.core.database import Base, get_db
 from app.core.security import require_admin
 from app.core.validation import sanitized_request_validation_handler
 from app.models import UpstreamAccountConfig
-from app.schemas import UpstreamAccountUpdate
+from app.schemas import UpstreamAccountOut, UpstreamAccountUpdate
 from app.services.sub2api import (
     MAX_SUB2API_ACCOUNT_PAGES,
     MAX_SUB2API_RESPONSE_BYTES,
@@ -43,6 +43,7 @@ class FakeSub2Api(Sub2ApiClient):
                 "platform": "openai",
                 "type": "apikey",
                 "status": "active",
+                "created_at": "2026-07-01T00:00:00Z",
                 "rate_multiplier": 0.8,
                 "credentials": {"base_url": "https://upstream.example.com/v1"},
             }
@@ -62,11 +63,13 @@ class FakeSub2Api(Sub2ApiClient):
         self.update_calls: list[tuple[int, float]] = []
         self.schedulable_calls: list[tuple[int, bool]] = []
         self.delete_calls: list[int] = []
+        self.balance_calls: list[int] = []
 
     async def list_api_key_accounts(self) -> list[dict]:
         return self.accounts
 
     async def get_account_balance(self, account: dict | str | int) -> dict:
+        self.balance_calls.append(int(account if not isinstance(account, dict) else account["id"]))
         if self.balance_error is not None:
             raise self.balance_error
         return dict(self.balance_result)
@@ -150,7 +153,15 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         return await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(**values),
+            self._update(**values),
+        )
+
+    def _update(self, **values: object) -> UpstreamAccountUpdate:
+        return UpstreamAccountUpdate(
+            expected_identity_fingerprint=self.service._remote_identity_fingerprint(
+                self.sub2api.accounts[0]
+            ),
+            **values,
         )
 
     async def _config(self) -> UpstreamAccountConfig:
@@ -159,6 +170,16 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         return result.scalar_one()
 
+    async def _fingerprint(self) -> str:
+        return (await self.service.list_accounts(self.db))[0].identity_fingerprint
+
+    async def _discover(self):
+        return await self.service.discover_account(
+            self.db,
+            7,
+            await self._fingerprint(),
+        )
+
     async def test_list_includes_unmanaged_remote_api_key_account(self) -> None:
         accounts = await self.service.list_accounts(self.db)
 
@@ -166,6 +187,283 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(accounts[0].managed)
         self.assertEqual(accounts[0].base_url, "https://upstream.example.com")
         self.assertEqual(accounts[0].current_rate, 0.8)
+        self.assertRegex(accounts[0].identity_fingerprint, r"^[0-9a-f]{64}$")
+
+    async def test_duplicate_valid_remote_ids_fail_closed_for_list_and_point_lookup(self) -> None:
+        duplicate = dict(self.sub2api.accounts[0])
+        duplicate["name"] = "different-account-with-same-id"
+        duplicate["credentials"] = {"base_url": "https://different.example/v1"}
+        self.sub2api.accounts.append(duplicate)
+
+        with self.assertRaises(UpstreamAccountServiceError) as list_context:
+            await self.service.list_accounts(self.db)
+        with self.assertRaises(UpstreamAccountServiceError) as point_context:
+            await self.service.upsert_account(
+                self.db,
+                7,
+                self._update(base_url="https://upstream.example.com"),
+            )
+
+        self.assertEqual(list_context.exception.status_code, 502)
+        self.assertEqual(point_context.exception.status_code, 502)
+
+    async def test_identity_fingerprint_ignores_mutable_state_but_changes_with_identity(self) -> None:
+        first = (await self.service.list_accounts(self.db))[0]
+        self.sub2api.accounts[0]["rate_multiplier"] = 9.5
+        self.sub2api.accounts[0]["status"] = "error"
+        self.sub2api.accounts[0]["schedulable"] = False
+        state_changed = (await self.service.list_accounts(self.db))[0]
+        self.sub2api.accounts[0]["name"] = "replacement-account"
+        identity_changed = (await self.service.list_accounts(self.db))[0]
+
+        self.assertEqual(first.identity_fingerprint, state_changed.identity_fingerprint)
+        self.assertNotEqual(first.identity_fingerprint, identity_changed.identity_fingerprint)
+
+    async def test_remote_mutations_reject_stale_identity_fingerprint(self) -> None:
+        await self._manage(api_key="sk-stale-identity")
+        displayed = (await self.service.list_accounts(self.db))[0]
+        self.sub2api.accounts[0]["name"] = "replacement-account"
+
+        with self.assertRaises(UpstreamAccountServiceError) as enabled_context:
+            await self.service.set_account_enabled(
+                self.db,
+                7,
+                False,
+                displayed.identity_fingerprint,
+            )
+        with self.assertRaises(UpstreamAccountServiceError) as delete_context:
+            await self.service.delete_remote_account(
+                self.db,
+                7,
+                displayed.identity_fingerprint,
+            )
+        with self.assertRaises(UpstreamAccountServiceError) as apply_context:
+            await self.service.apply_account(
+                self.db,
+                7,
+                1.0,
+                displayed.identity_fingerprint,
+            )
+
+        self.assertEqual(enabled_context.exception.status_code, 409)
+        self.assertEqual(delete_context.exception.status_code, 409)
+        self.assertEqual(apply_context.exception.status_code, 409)
+        self.assertEqual(self.sub2api.schedulable_calls, [])
+        self.assertEqual(self.sub2api.delete_calls, [])
+        self.assertEqual(self.sub2api.update_calls, [])
+
+    async def test_id_reuse_blocks_local_update_delete_and_discovery_before_side_effects(
+        self,
+    ) -> None:
+        await self._manage(api_key="sk-original-identity")
+        displayed = (await self.service.list_accounts(self.db))[0]
+        original = await self._config()
+        original_base_url = original.base_url
+        self.sub2api.accounts[0]["name"] = "replacement-account"
+        discovery = AsyncMock(return_value=discovery_result(group=1.0, recharge=1.0))
+
+        with self.assertRaises(UpstreamAccountServiceError) as update_context:
+            await self.service.upsert_account(
+                self.db,
+                7,
+                UpstreamAccountUpdate(
+                    expected_identity_fingerprint=displayed.identity_fingerprint,
+                    base_url="https://replacement.example.com",
+                    confirm_credential_rebind=True,
+                ),
+            )
+        with self.assertRaises(UpstreamAccountServiceError) as delete_context:
+            await self.service.delete_account(
+                self.db,
+                7,
+                displayed.identity_fingerprint,
+            )
+        with patch("app.services.upstream_accounts.discover_upstream", new=discovery):
+            with self.assertRaises(UpstreamAccountServiceError) as discover_context:
+                await self.service.discover_account(
+                    self.db,
+                    7,
+                    displayed.identity_fingerprint,
+                )
+
+        self.assertEqual(
+            [
+                update_context.exception.status_code,
+                delete_context.exception.status_code,
+                discover_context.exception.status_code,
+            ],
+            [409, 409, 409],
+        )
+        config = await self._config()
+        self.assertEqual(config.base_url, original_base_url)
+        self.assertEqual(self.sub2api.balance_calls, [])
+        discovery.assert_not_awaited()
+
+    async def test_id_reuse_after_refresh_stays_quarantined_until_explicit_rebind(self) -> None:
+        await self._manage(api_key="sk-original-identity")
+        original = (await self.service.list_accounts(self.db))[0]
+        stored = await self._config()
+        original_binding = stored.remote_identity_fingerprint
+        original_ciphertext = stored.encrypted_api_key
+
+        self.sub2api.accounts[0]["name"] = "replacement-account"
+        self.sub2api.accounts[0]["created_at"] = "2026-07-15T12:00:00Z"
+        refreshed = (await self.service.list_accounts(self.db))[0]
+
+        self.assertNotEqual(refreshed.identity_fingerprint, original.identity_fingerprint)
+        self.assertEqual(refreshed.identity_binding_status, "mismatch")
+        self.assertTrue(refreshed.identity_rebind_required)
+        self.assertFalse(refreshed.managed)
+        self.assertFalse(refreshed.api_key_set)
+        self.assertNotIn("original-identity", refreshed.model_dump_json())
+
+        with self.assertRaises(UpstreamAccountServiceError) as enabled_context:
+            await self.service.set_account_enabled(
+                self.db,
+                7,
+                False,
+                refreshed.identity_fingerprint,
+            )
+        with self.assertRaises(UpstreamAccountServiceError) as update_context:
+            await self.service.upsert_account(
+                self.db,
+                7,
+                UpstreamAccountUpdate(
+                    expected_identity_fingerprint=refreshed.identity_fingerprint,
+                    remote_name="replacement-account",
+                ),
+            )
+
+        self.assertEqual(enabled_context.exception.status_code, 409)
+        self.assertEqual(update_context.exception.status_code, 409)
+        self.assertEqual(self.sub2api.schedulable_calls, [])
+        await self.db.refresh(stored)
+        self.assertEqual(stored.remote_identity_fingerprint, original_binding)
+        self.assertEqual(stored.encrypted_api_key, original_ciphertext)
+
+        rebound = await self.service.upsert_account(
+            self.db,
+            7,
+            UpstreamAccountUpdate(
+                expected_identity_fingerprint=refreshed.identity_fingerprint,
+                confirm_identity_rebind=True,
+            ),
+        )
+        self.assertEqual(rebound.identity_binding_status, "bound")
+        self.assertFalse(rebound.identity_rebind_required)
+        self.assertTrue(rebound.managed)
+        self.assertTrue(rebound.api_key_set)
+        await self.db.refresh(stored)
+        self.assertNotEqual(stored.remote_identity_fingerprint, original_binding)
+        self.assertEqual(stored.encrypted_api_key, original_ciphertext)
+
+    async def test_legacy_unbound_config_binds_only_on_explicit_account_save(self) -> None:
+        await self._manage(api_key="sk-legacy-binding")
+        stored = await self._config()
+        stored.remote_identity_fingerprint = None
+        await self.db.commit()
+
+        listed = (await self.service.list_accounts(self.db))[0]
+        self.assertEqual(listed.identity_binding_status, "unbound")
+        self.assertFalse(listed.managed)
+        self.assertFalse(listed.api_key_set)
+
+        rebound = await self.service.upsert_account(
+            self.db,
+            7,
+            UpstreamAccountUpdate(
+                expected_identity_fingerprint=listed.identity_fingerprint,
+            ),
+        )
+        self.assertEqual(rebound.identity_binding_status, "bound")
+        self.assertTrue(rebound.api_key_set)
+        await self.db.refresh(stored)
+        self.assertEqual(
+            stored.remote_identity_fingerprint,
+            self.service._remote_binding_fingerprint(self.sub2api.accounts[0]),
+        )
+
+    async def test_missing_created_at_cannot_be_claimed_or_receive_credentials(self) -> None:
+        self.sub2api.accounts[0].pop("created_at")
+        remote = self.sub2api.accounts[0]
+        config = self.service._new_config(remote, 7)
+        self.db.add(config)
+        await self.db.commit()
+
+        listed = (await self.service.list_accounts(self.db))[0]
+        self.assertEqual(listed.identity_binding_status, "unbound")
+        self.assertTrue(listed.identity_rebind_required)
+        self.assertFalse(listed.managed)
+        self.assertFalse(listed.api_key_set)
+
+        with self.assertRaises(UpstreamAccountServiceError) as manage_context:
+            await self.service.upsert_account(
+                self.db,
+                7,
+                UpstreamAccountUpdate(
+                    expected_identity_fingerprint=listed.identity_fingerprint,
+                    api_key="sk-must-not-be-saved",
+                ),
+            )
+        with self.assertRaises(UpstreamAccountServiceError) as claim_context:
+            await self.service.bind_legacy_identities(
+                self.db,
+                {7: listed.identity_fingerprint},
+            )
+        with self.assertRaises(UpstreamAccountServiceError) as enable_context:
+            await self.service.set_account_enabled(
+                self.db,
+                7,
+                False,
+                listed.identity_fingerprint,
+            )
+
+        self.assertEqual(
+            [
+                manage_context.exception.status_code,
+                claim_context.exception.status_code,
+                enable_context.exception.status_code,
+            ],
+            [409, 409, 409],
+        )
+        await self.db.refresh(config)
+        self.assertIsNone(config.remote_identity_fingerprint)
+        self.assertIsNone(config.encrypted_api_key)
+        self.assertEqual(self.sub2api.schedulable_calls, [])
+
+    async def test_new_api_key_clears_origin_rebind_without_decrypting_old_key(self) -> None:
+        await self._manage(api_key="sk-old-origin")
+        config = await self._config()
+        old_ciphertext = config.encrypted_api_key
+        config.api_key_origin_rebind_required = True
+        await self.db.commit()
+
+        blocked = (await self.service.list_accounts(self.db))[0]
+        self.assertTrue(blocked.api_key_origin_rebind_required)
+        self.assertFalse(blocked.api_key_set)
+
+        from app.core.crypto import decrypt_text as real_decrypt_text
+
+        def reject_old_ciphertext(value: str | None) -> str | None:
+            if value == old_ciphertext:
+                raise AssertionError("origin-blocked API key was decrypted")
+            return real_decrypt_text(value)
+
+        with patch(
+            "app.services.upstream_accounts.decrypt_text",
+            side_effect=reject_old_ciphertext,
+        ):
+            updated = await self.service.upsert_account(
+                self.db,
+                7,
+                self._update(api_key="sk-new-origin"),
+            )
+
+        self.assertFalse(updated.api_key_origin_rebind_required)
+        self.assertTrue(updated.api_key_set)
+        await self.db.refresh(config)
+        self.assertFalse(config.api_key_origin_rebind_required)
+        self.assertEqual(real_decrypt_text(config.encrypted_api_key), "sk-new-origin")
 
     async def test_explicit_channel_unassignment_survives_overview_roundtrip(self) -> None:
         channel_service = UpstreamChannelService(accounts=self.service)
@@ -175,7 +473,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         detached = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(channel_id=None),
+            self._update(channel_id=None),
         )
         roundtrip = await channel_service.overview(self.db)
         stored = await self._config()
@@ -192,7 +490,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(channel_id=channel_id),
+            self._update(channel_id=channel_id),
         )
         rebound = await channel_service.overview(self.db)
         stored = await self._config()
@@ -207,7 +505,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pinned.channels[0].canonical_base_url, "https://upstream.example.com")
 
     async def test_discover_unmanaged_account_opts_in_and_reads_balance_without_key(self) -> None:
-        account = await self.service.discover_account(self.db, 7)
+        account = await self._discover()
 
         self.assertTrue(account.managed)
         self.assertEqual(account.base_url, "https://upstream.example.com")
@@ -228,6 +526,25 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.accounts[0].managed)
         self.assertEqual(result.accounts[0].balance_status, "ok")
 
+    async def test_discover_all_does_not_count_failed_manual_fallback_as_success(self) -> None:
+        await self._manage(
+            api_key="sk-failed-fallback",
+            manual_group_multiplier=1.2,
+            manual_recharge_multiplier=1.1,
+        )
+        self.sub2api.balance_result = {"status": "unsupported"}
+
+        with patch(
+            "app.services.upstream_accounts.discover_upstream",
+            new=AsyncMock(return_value=discovery_result(group=None, recharge=None, status="error")),
+        ):
+            result = await self.service.discover_all(self.db)
+
+        self.assertEqual((result.total, result.succeeded, result.failed), (1, 0, 1))
+        self.assertIsNotNone(result.accounts[0].target_rate)
+        self.assertEqual(result.accounts[0].group_multiplier_status, "fallback_manual")
+        self.assertEqual(result.accounts[0].recharge_multiplier_status, "fallback_manual")
+
     async def test_upsert_encrypts_and_blank_api_key_preserves_ciphertext(self) -> None:
         secret = "sk-live-super-secret-value"
         created = await self._manage(api_key=secret)
@@ -242,7 +559,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         updated = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(api_key="   ", manual_group_multiplier=2),
+            self._update(api_key="   ", manual_group_multiplier=2),
         )
         config = await self._config()
         self.assertEqual(config.encrypted_api_key, original_ciphertext)
@@ -279,7 +596,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovered),
         ) as call:
-            account = await self.service.discover_account(self.db, 7)
+            account = await self._discover()
 
         self.assertEqual(account.target_rate, 1.0001)
         self.assertEqual(account.group_multiplier_source, "groups.available")
@@ -300,7 +617,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=1.0, recharge=0.1)),
         ):
-            account = await self.service.discover_account(self.db, 7)
+            account = await self._discover()
 
         self.assertEqual(account.local_recharge_multiplier, 0.1)
         self.assertEqual(account.effective_recharge_multiplier, 0.1)
@@ -321,7 +638,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovered),
         ):
-            account = await self.service.discover_account(self.db, 7)
+            account = await self._discover()
 
         self.assertEqual(account.upstream_type, "auto")
         self.assertEqual(account.resolved_upstream_type, "newapi")
@@ -332,14 +649,14 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=2.0, recharge=1.0)),
         ):
-            preview = await self.service.discover_account(self.db, 7)
+            preview = await self._discover()
         self.assertEqual(preview.target_rate, 2.0)
         self.assertTrue(preview.group_options)
 
         changed = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(manual_group_multiplier=3.0),
+            self._update(manual_group_multiplier=3.0),
         )
 
         self.assertIsNone(changed.target_rate)
@@ -364,7 +681,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         same = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(
+            self._update(
                 base_url="https://upstream.example.com",
                 upstream_type="sub2api",
                 api_key="sk-original",
@@ -376,7 +693,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         changed_base = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(
+            self._update(
                 base_url="https://new-upstream.example.com",
                 confirm_credential_rebind=True,
             ),
@@ -387,12 +704,12 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(selected_group_id="silver", selected_group_name="Silver"),
+            self._update(selected_group_id="silver", selected_group_name="Silver"),
         )
         changed_type = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(upstream_type="newapi"),
+            self._update(upstream_type="newapi"),
         )
         self.assertIsNone(changed_type.selected_group_id)
         self.assertIsNone(changed_type.selected_group_name)
@@ -400,12 +717,12 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(selected_group_id="bronze", selected_group_name="Bronze"),
+            self._update(selected_group_id="bronze", selected_group_name="Bronze"),
         )
         changed_key = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(api_key="sk-replaced"),
+            self._update(api_key="sk-replaced"),
         )
         self.assertIsNone(changed_key.selected_group_id)
         self.assertIsNone(changed_key.selected_group_name)
@@ -413,12 +730,12 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(selected_group_id="vip", selected_group_name="VIP"),
+            self._update(selected_group_id="vip", selected_group_name="VIP"),
         )
         changed_token = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(access_token="access-replaced"),
+            self._update(access_token="access-replaced"),
         )
         self.assertIsNone(changed_token.selected_group_id)
         self.assertIsNone(changed_token.selected_group_name)
@@ -426,7 +743,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         explicit_new = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(
+            self._update(
                 api_key="sk-third",
                 selected_group_id="new-group",
                 selected_group_name="New Group",
@@ -447,7 +764,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.upsert_account(
                 self.db,
                 7,
-                UpstreamAccountUpdate(base_url="https://replacement.example.com"),
+                self._update(base_url="https://replacement.example.com"),
             )
 
         self.assertEqual(context.exception.status_code, 409)
@@ -464,7 +781,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovered),
         ):
-            account = await self.service.discover_account(self.db, 7)
+            account = await self._discover()
 
         self.assertIsNone(account.discovered_recharge_multiplier)
         self.assertEqual(account.effective_recharge_multiplier, 1.0)
@@ -480,16 +797,21 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=2.0, recharge=1.0)),
         ):
-            first = await self.service.discover_account(self.db, 7)
+            first = await self._discover()
         self.assertEqual(first.target_rate, 2.0)
 
         with patch(
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=None, recharge=None, status="error")),
         ):
-            failed = await self.service.discover_account(self.db, 7)
+            failed = await self._discover()
             with self.assertRaises(UpstreamAccountServiceError) as context:
-                await self.service.apply_account(self.db, 7, first.target_rate or 0)
+                await self.service.apply_account(
+                    self.db,
+                    7,
+                    first.target_rate or 0,
+                    await self._fingerprint(),
+                )
 
         self.assertIsNone(failed.effective_recharge_multiplier)
         self.assertEqual(failed.recharge_multiplier_status, "discovery_failed")
@@ -506,9 +828,9 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=invalid),
         ):
-            preview = await self.service.discover_account(self.db, 7)
+            preview = await self._discover()
             with self.assertRaises(UpstreamAccountServiceError) as context:
-                await self.service.apply_account(self.db, 7, 2.0)
+                await self.service.apply_account(self.db, 7, 2.0, await self._fingerprint())
 
         self.assertIsNone(preview.target_rate)
         self.assertEqual(preview.recharge_multiplier_status, "invalid")
@@ -524,7 +846,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=partial),
         ):
-            account = await self.service.discover_account(self.db, 7)
+            account = await self._discover()
 
         self.assertEqual(account.effective_group_multiplier, 2.0)
         self.assertIsNone(account.effective_recharge_multiplier)
@@ -537,11 +859,11 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             manual_recharge_multiplier=1e-300,
         )
 
-        preview = await self.service.discover_account(self.db, 7)
+        preview = await self._discover()
         self.assertIsNone(preview.target_rate)
         self.assertIn("outside the supported range", preview.last_error or "")
         with self.assertRaises(UpstreamAccountServiceError) as context:
-            await self.service.apply_account(self.db, 7, 1.0)
+            await self.service.apply_account(self.db, 7, 1.0, await self._fingerprint())
 
         self.assertEqual(context.exception.status_code, 409)
         self.assertEqual(self.sub2api.update_calls, [])
@@ -552,7 +874,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             manual_recharge_multiplier=1000,
         )
 
-        preview = await self.service.discover_account(self.db, 7)
+        preview = await self._discover()
 
         self.assertIsNone(preview.target_rate)
         self.assertIn("outside the supported range", preview.last_error or "")
@@ -560,13 +882,13 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_insecure_direct_discovery_is_rejected_with_422(self) -> None:
         with self.assertRaises(ValueError):
-            UpstreamAccountUpdate(base_url="http://upstream.example.com", api_key="sk-no-http")
+            self._update(base_url="http://upstream.example.com", api_key="sk-no-http")
         self.assertEqual(self.sub2api.update_calls, [])
 
     async def test_manual_group_works_without_upstream_credentials(self) -> None:
         await self._manage(manual_group_multiplier=3.0, manual_recharge_multiplier=1.5)
 
-        account = await self.service.discover_account(self.db, 7)
+        account = await self._discover()
 
         self.assertEqual(account.group_multiplier_source, "manual")
         self.assertEqual(account.recharge_multiplier_source, "manual")
@@ -575,12 +897,12 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_balance_failure_preserves_last_successful_values(self) -> None:
         secret = "sk-never-leak-balance"
         await self._manage(manual_group_multiplier=1.0)
-        first = await self.service.discover_account(self.db, 7)
+        first = await self._discover()
         self.assertEqual(first.balance_remaining, 12500.25)
         self.assertIsNotNone(first.balance_checked_at)
 
         self.sub2api.balance_error = Sub2ApiRequestError(f"HTTP body contained {secret}")
-        second = await self.service.discover_account(self.db, 7)
+        second = await self._discover()
 
         self.assertEqual(second.balance_remaining, 12500.25)
         self.assertEqual(second.balance_checked_at, first.balance_checked_at)
@@ -593,14 +915,14 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         await self._manage(manual_group_multiplier=1.0)
         self.sub2api.balance_result["remaining"] = -40.904106
 
-        account = await self.service.discover_account(self.db, 7)
+        account = await self._discover()
 
         self.assertEqual(account.balance_status, "ok")
         self.assertAlmostEqual(account.balance_remaining or 0, -40.904106)
 
     async def test_invalid_present_balance_number_preserves_last_successful_snapshot(self) -> None:
         await self._manage(manual_group_multiplier=1.0, manual_recharge_multiplier=1.0)
-        first = await self.service.discover_account(self.db, 7)
+        first = await self._discover()
         self.assertEqual(first.balance_status, "ok")
         old_snapshot = (
             first.balance_remaining,
@@ -617,7 +939,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "used": 1,
             "checked_at": "2026-07-14T12:00:00Z",
         }
-        second = await self.service.discover_account(self.db, 7)
+        second = await self._discover()
 
         self.assertEqual(second.balance_status, "error")
         self.assertEqual(
@@ -661,7 +983,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=reflected),
         ):
-            account = await self.service.discover_account(self.db, 7)
+            account = await self._discover()
 
         config = await self._config()
         persisted = str(
@@ -687,7 +1009,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=2.0, recharge=2.0)),
         ):
-            first = await self.service.discover_account(self.db, 7)
+            first = await self._discover()
         self.assertEqual(len(first.group_options), 1)
 
         self.sub2api.balance_error = Sub2ApiRequestError(f"unsafe {secret}")
@@ -695,7 +1017,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(side_effect=RuntimeError(f"unsafe {secret}")),
         ):
-            second = await self.service.discover_account(self.db, 7)
+            second = await self._discover()
 
         self.assertEqual(len(second.group_options), 1)
         self.assertEqual(second.group_multiplier_source, "manual")
@@ -708,14 +1030,19 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=1.0, recharge=1.0)),
         ):
-            initial = await self.service.discover_account(self.db, 7)
+            initial = await self._discover()
 
         with patch(
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=2.0, recharge=1.0)),
         ):
             with self.assertRaises(UpstreamAccountServiceError) as context:
-                await self.service.apply_account(self.db, 7, initial.target_rate or 0)
+                await self.service.apply_account(
+                    self.db,
+                    7,
+                    initial.target_rate or 0,
+                    await self._fingerprint(),
+                )
 
         self.assertEqual(context.exception.status_code, 409)
         self.assertEqual(self.sub2api.update_calls, [])
@@ -726,7 +1053,12 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             "app.services.upstream_accounts.discover_upstream",
             new=AsyncMock(return_value=discovery_result(group=1.11115, recharge=1.0)),
         ):
-            account = await self.service.apply_account(self.db, 7, 1.1112)
+            account = await self.service.apply_account(
+                self.db,
+                7,
+                1.1112,
+                await self._fingerprint(),
+            )
 
         self.assertEqual(self.sub2api.update_calls, [(7, 1.1112)])
         self.assertEqual(account.current_rate, 1.1112)
@@ -738,35 +1070,44 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         first = await self._config()
         original_ciphertext = first.encrypted_access_token
 
-        await self.service.upsert_account(self.db, 7, UpstreamAccountUpdate(access_token=""))
+        await self.service.upsert_account(self.db, 7, self._update(access_token=""))
         preserved = await self._config()
         self.assertEqual(preserved.encrypted_access_token, original_ciphertext)
 
         cleared = await self.service.upsert_account(
             self.db,
             7,
-            UpstreamAccountUpdate(clear_access_token=True),
+            self._update(clear_access_token=True),
         )
         self.assertFalse(cleared.access_token_set)
         self.assertIsNone((await self._config()).encrypted_access_token)
 
-    async def test_delete_removes_only_local_config_without_remote_call(self) -> None:
+    async def test_delete_validates_identity_and_removes_only_local_config(self) -> None:
         await self._manage(api_key="sk-local-only")
-        self.sub2api.list_api_key_accounts = AsyncMock(  # type: ignore[method-assign]
-            side_effect=AssertionError("remote delete/list must not be called")
+        fingerprint = await self._fingerprint()
+        list_accounts = AsyncMock(wraps=self.sub2api.list_api_key_accounts)
+        self.sub2api.list_api_key_accounts = list_accounts  # type: ignore[method-assign]
+        self.sub2api.delete_account = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("remote deletion must not be called")
         )
 
-        removed = await self.service.delete_account(self.db, 7)
+        removed = await self.service.delete_account(self.db, 7, fingerprint)
 
         self.assertTrue(removed)
         result = await self.db.execute(select(UpstreamAccountConfig))
         self.assertIsNone(result.scalar_one_or_none())
-        self.sub2api.list_api_key_accounts.assert_not_awaited()  # type: ignore[attr-defined]
+        list_accounts.assert_awaited_once_with()
+        self.sub2api.delete_account.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_disable_updates_and_verifies_real_sub2api_account(self) -> None:
         await self._manage(api_key="sk-disable-test")
 
-        account = await self.service.set_account_enabled(self.db, 7, False)
+        account = await self.service.set_account_enabled(
+            self.db,
+            7,
+            False,
+            await self._fingerprint(),
+        )
 
         self.assertEqual(self.sub2api.schedulable_calls, [(7, False)])
         self.assertFalse(account.remote_schedulable)
@@ -775,7 +1116,11 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_remote_delete_removes_sub2api_account_and_local_config(self) -> None:
         await self._manage(api_key="sk-delete-test")
 
-        deleted = await self.service.delete_remote_account(self.db, 7)
+        deleted = await self.service.delete_remote_account(
+            self.db,
+            7,
+            await self._fingerprint(),
+        )
 
         self.assertTrue(deleted)
         self.assertEqual(self.sub2api.delete_calls, [7])
@@ -795,7 +1140,12 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=discovery_result(group=1.2, recharge=1.0)),
         ):
             with self.assertRaises(UpstreamAccountServiceError) as context:
-                await self.service.apply_account(self.db, 7, 1.2)
+                await self.service.apply_account(
+                    self.db,
+                    7,
+                    1.2,
+                    await self._fingerprint(),
+                )
 
         self.assertEqual(context.exception.status_code, 502)
         config = await self._config()
@@ -845,6 +1195,138 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
             exported,
             {17: "sk-seventeen-private", 18: "sk-eighteen-private"},
         )
+
+    async def test_export_maps_backup_rows_by_unique_non_secret_identity(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": {
+                    "accounts": [
+                        {
+                            "name": "account-eighteen",
+                            "platform": "anthropic",
+                            "type": "apikey",
+                            "credentials": {
+                                "base_url": "https://upstream-eighteen.example/api/v1",
+                                "api_key": "sk-eighteen-private",
+                            },
+                        },
+                        {
+                            "name": "account-seventeen",
+                            "platform": "openai",
+                            "type": "api_key",
+                            "credentials": {
+                                "base_url": "https://upstream-seventeen.example/v1",
+                                "api_key": "sk-seventeen-private",
+                            },
+                        },
+                    ],
+                    "proxies": [],
+                }
+            }
+        )
+        client.list_accounts = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "id": "17",
+                    "name": "account-seventeen",
+                    "platform": "OPENAI",
+                    "type": "api-key",
+                    "credentials": {"base_url": "https://upstream-seventeen.example"},
+                },
+                {
+                    "id": "18",
+                    "name": "account-eighteen",
+                    "platform": "anthropic",
+                    "type": "apikey",
+                    "credentials": {"base_url": "https://upstream-eighteen.example"},
+                },
+            ]
+        )
+        config, runtime_patch = self._runtime_patch()
+        with runtime_patch:
+            exported = await client.export_api_key_secrets([17, 18])
+
+        self.assertEqual(
+            exported,
+            {17: "sk-seventeen-private", 18: "sk-eighteen-private"},
+        )
+        expected_export_call = call(
+            "GET",
+            "/admin/accounts/data",
+            config=config,
+            params={"ids": "17,18", "include_proxies": "false"},
+        )
+        self.assertEqual(client._request.await_count, 2)  # type: ignore[attr-defined]
+        self.assertEqual(
+            client._request.await_args_list,  # type: ignore[attr-defined]
+            [expected_export_call, expected_export_call],
+        )
+        self.assertEqual(client.list_accounts.await_count, 2)  # type: ignore[attr-defined]
+
+    async def test_export_backup_rows_with_duplicate_identity_fail_closed(self) -> None:
+        client = Sub2ApiClient()
+        exported_account = {
+            "name": "duplicate",
+            "platform": "openai",
+            "type": "apikey",
+            "credentials": {
+                "base_url": "https://duplicate.example/v1",
+                "api_key": "sk-private",
+            },
+        }
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"accounts": [exported_account]}}
+        )
+        client.list_accounts = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "id": 17,
+                    "name": "duplicate",
+                    "platform": "openai",
+                    "type": "apikey",
+                    "credentials": {"base_url": "https://duplicate.example"},
+                },
+                {
+                    "id": 18,
+                    "name": "duplicate",
+                    "platform": "openai",
+                    "type": "apikey",
+                    "credentials": {"base_url": "https://duplicate.example"},
+                },
+            ]
+        )
+        _config, runtime_patch = self._runtime_patch()
+        with runtime_patch:
+            exported = await client.export_api_key_secrets([17, 18])
+
+        self.assertEqual(exported, {})
+
+    async def test_export_malformed_explicit_id_does_not_fall_back_to_identity(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": [
+                    {
+                        "id": "not-a-number",
+                        "name": "account-seventeen",
+                        "platform": "openai",
+                        "type": "apikey",
+                        "credentials": {
+                            "base_url": "https://upstream-seventeen.example",
+                            "api_key": "sk-seventeen-private",
+                        },
+                    }
+                ]
+            }
+        )
+        client.list_accounts = AsyncMock()  # type: ignore[method-assign]
+        _config, runtime_patch = self._runtime_patch()
+        with runtime_patch:
+            exported = await client.export_api_key_secrets([17])
+
+        self.assertEqual(exported, {})
+        client.list_accounts.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_export_without_explicit_ids_fails_closed(self) -> None:
         client = Sub2ApiClient()
@@ -982,6 +1464,132 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpstreamAccountAuthenticationTests(unittest.TestCase):
+    def test_point_mutation_routes_forward_the_expected_identity_fingerprint(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-accounts")
+        db = AsyncMock()
+        fingerprint = "a" * 64
+        account_out = UpstreamAccountOut(
+            sub2api_account_id=7,
+            identity_fingerprint=fingerprint,
+            remote_name="account-seven",
+            managed=True,
+        )
+        service = SimpleNamespace(
+            upsert_account=AsyncMock(return_value=account_out),
+            delete_account=AsyncMock(return_value=True),
+            set_account_enabled=AsyncMock(return_value=account_out),
+            delete_remote_account=AsyncMock(return_value=True),
+            discover_account=AsyncMock(return_value=account_out),
+            apply_account=AsyncMock(return_value=account_out),
+        )
+
+        async def fake_db():
+            yield db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = fake_db
+        app.dependency_overrides[get_upstream_account_service] = lambda: service
+        with TestClient(app) as client:
+            updated = client.put(
+                "/api/upstream-accounts/7",
+                json={
+                    "remote_name": "account-seven",
+                    "expected_identity_fingerprint": fingerprint,
+                },
+            )
+            local_deleted = client.request(
+                "DELETE",
+                "/api/upstream-accounts/7",
+                json={"expected_identity_fingerprint": fingerprint},
+            )
+            enabled = client.patch(
+                "/api/upstream-accounts/7/enabled",
+                json={"enabled": False, "expected_identity_fingerprint": fingerprint},
+            )
+            deleted = client.request(
+                "DELETE",
+                "/api/upstream-accounts/7/remote",
+                json={
+                    "confirmed_account_id": 7,
+                    "expected_identity_fingerprint": fingerprint,
+                },
+            )
+            discovered = client.post(
+                "/api/upstream-accounts/7/discover",
+                json={"expected_identity_fingerprint": fingerprint},
+            )
+            applied = client.post(
+                "/api/upstream-accounts/7/apply",
+                json={
+                    "confirmed_target_rate": 1.25,
+                    "expected_identity_fingerprint": fingerprint,
+                },
+            )
+
+        self.assertEqual(
+            [
+                updated.status_code,
+                local_deleted.status_code,
+                enabled.status_code,
+                deleted.status_code,
+                discovered.status_code,
+                applied.status_code,
+            ],
+            [200, 200, 200, 200, 200, 200],
+        )
+        forwarded_update = service.upsert_account.await_args.args[2]
+        self.assertIsInstance(forwarded_update, UpstreamAccountUpdate)
+        self.assertEqual(forwarded_update.expected_identity_fingerprint, fingerprint)
+        service.delete_account.assert_awaited_once_with(db, 7, fingerprint)
+        service.set_account_enabled.assert_awaited_once_with(db, 7, False, fingerprint)
+        service.delete_remote_account.assert_awaited_once_with(db, 7, fingerprint)
+        service.discover_account.assert_awaited_once_with(db, 7, fingerprint)
+        service.apply_account.assert_awaited_once_with(db, 7, 1.25, fingerprint)
+
+    def test_point_mutation_routes_require_an_identity_fingerprint(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-accounts")
+        service = SimpleNamespace(
+            upsert_account=AsyncMock(),
+            delete_account=AsyncMock(),
+            set_account_enabled=AsyncMock(),
+            delete_remote_account=AsyncMock(),
+            discover_account=AsyncMock(),
+            apply_account=AsyncMock(),
+        )
+
+        async def fake_db():
+            yield AsyncMock()
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = fake_db
+        app.dependency_overrides[get_upstream_account_service] = lambda: service
+        with TestClient(app) as client:
+            responses = [
+                client.put("/api/upstream-accounts/7", json={"remote_name": "account-seven"}),
+                client.request("DELETE", "/api/upstream-accounts/7", json={}),
+                client.patch("/api/upstream-accounts/7/enabled", json={"enabled": False}),
+                client.request(
+                    "DELETE",
+                    "/api/upstream-accounts/7/remote",
+                    json={"confirmed_account_id": 7},
+                ),
+                client.post("/api/upstream-accounts/7/discover", json={}),
+                client.post(
+                    "/api/upstream-accounts/7/apply",
+                    json={"confirmed_target_rate": 1.25},
+                ),
+            ]
+
+        self.assertEqual([response.status_code for response in responses], [422] * 6)
+        service.upsert_account.assert_not_awaited()
+        service.delete_account.assert_not_awaited()
+        service.set_account_enabled.assert_not_awaited()
+        service.delete_remote_account.assert_not_awaited()
+        service.discover_account.assert_not_awaited()
+        service.apply_account.assert_not_awaited()
+
     def test_every_route_requires_admin_session(self) -> None:
         app = FastAPI()
         app.include_router(router, prefix="/api/upstream-accounts")
@@ -1025,7 +1633,13 @@ class UpstreamAccountAuthenticationTests(unittest.TestCase):
         app.dependency_overrides[get_db] = fake_db
         app.dependency_overrides[get_upstream_account_service] = lambda: service
         with TestClient(app) as client:
-            response = client.put("/api/upstream-accounts/7", json={"api_key": secret})
+            response = client.put(
+                "/api/upstream-accounts/7",
+                json={
+                    "api_key": secret,
+                    "expected_identity_fingerprint": "a" * 64,
+                },
+            )
 
         self.assertEqual(response.status_code, 422)
         self.assertNotIn(secret, response.text)
@@ -1046,7 +1660,11 @@ class UpstreamAccountAuthenticationTests(unittest.TestCase):
         with TestClient(app) as client:
             response = client.put(
                 "/api/upstream-accounts/7",
-                json={"api_key": secret, "base_url": "file:///private/path"},
+                json={
+                    "api_key": secret,
+                    "base_url": "file:///private/path",
+                    "expected_identity_fingerprint": "a" * 64,
+                },
             )
 
         self.assertEqual(response.status_code, 422)

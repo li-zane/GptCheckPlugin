@@ -19,6 +19,16 @@ from app.core.crypto import encrypt_text
 STARTUP_SYNC_DELAY_SECONDS = 10
 
 
+async def _record_event_best_effort(db, *args, **kwargs) -> None:
+    try:
+        await record_event(db, *args, **kwargs)
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+
 class MonitorService:
     def __init__(self, refresh_service: RefreshService | None = None, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -53,7 +63,11 @@ class MonitorService:
                 await self.sync_once(reason="scheduled")
             except Exception as exc:
                 async with AsyncSessionLocal() as db:
-                    await record_event(db, "monitor_failed", f"Monitor failed: {exc}")
+                    await _record_event_best_effort(
+                        db,
+                        "monitor_failed",
+                        f"Monitor failed: {self.sub2api.redact_error_text(exc)}",
+                    )
             await self._wait_for_next_run()
 
     async def _wait_for_startup_delay(self) -> None:
@@ -149,7 +163,7 @@ class MonitorService:
         )
 
         async with AsyncSessionLocal() as db:
-            await record_event(
+            await _record_event_best_effort(
                 db,
                 "monitor_sync",
                 (
@@ -336,10 +350,14 @@ class MonitorService:
                     details={"reason": "missing_mailbox"},
                     commit=False,
                 )
+            await db.commit()
             if should_record:
-                await record_event(db, "refresh_skipped_missing_mailbox", reason, email)
-            else:
-                await db.commit()
+                await _record_event_best_effort(
+                    db,
+                    "refresh_skipped_missing_mailbox",
+                    reason,
+                    email,
+                )
 
     async def _mark_recovery_disabled(self, email: str) -> None:
         reason = "Recovery is disabled in settings; account was checked only and refresh was not queued."
@@ -360,10 +378,14 @@ class MonitorService:
                     details={"reason": "recovery_disabled"},
                     commit=False,
                 )
+            await db.commit()
             if should_record:
-                await record_event(db, "refresh_skipped_recovery_disabled", reason, email)
-            else:
-                await db.commit()
+                await _record_event_best_effort(
+                    db,
+                    "refresh_skipped_recovery_disabled",
+                    reason,
+                    email,
+                )
 
     async def _record_sync_exception(
         self,

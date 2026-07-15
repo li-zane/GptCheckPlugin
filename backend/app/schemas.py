@@ -59,6 +59,8 @@ class AccountOut(BaseModel):
     refreshing: bool
     auto_refresh_locked: bool = False
     last_error: str | None
+    sub2api_error_code: int | None = None
+    sub2api_error_message: str | None = None
     last_seen_at: datetime
     updated_at: datetime
     is_duplicate: bool = False
@@ -402,6 +404,69 @@ class SelectedAccountDeleteRequest(BaseModel):
     accounts: list[SelectedAccountDeleteItem] = Field(default_factory=list, max_length=500)
 
 
+class AccountLivenessSelection(BaseModel):
+    account_ids: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("account_ids")
+    @classmethod
+    def validate_account_ids(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_account_id in value:
+            account_id = str(raw_account_id or "").strip()
+            if not account_id.isdigit() or not 0 < int(account_id) <= JS_SAFE_INTEGER_MAX:
+                raise ValueError("account_ids must contain positive numeric sub2api account ids")
+            if account_id not in seen:
+                normalized.append(account_id)
+                seen.add(account_id)
+        if not normalized:
+            raise ValueError("at least one sub2api account id is required")
+        return normalized
+
+
+class AccountLivenessModelsRequest(AccountLivenessSelection):
+    pass
+
+
+class AccountLivenessTestRequest(AccountLivenessSelection):
+    model_id: str = Field(min_length=1, max_length=200)
+
+    @field_validator("model_id")
+    @classmethod
+    def validate_model_id(cls, value: str) -> str:
+        model_id = value.strip()
+        if not model_id or any(ord(character) < 32 for character in model_id):
+            raise ValueError("model_id must be a non-empty printable value")
+        return model_id
+
+
+class AccountLivenessModelOut(BaseModel):
+    id: str
+    display_name: str
+
+
+class AccountLivenessModelsOut(BaseModel):
+    source_account_id: str
+    models: list[AccountLivenessModelOut]
+
+
+class AccountLivenessTestItemOut(BaseModel):
+    account_id: str
+    email: str | None = None
+    account_name: str | None = None
+    success: bool
+    error: str | None = None
+    duration_ms: int
+
+
+class AccountLivenessTestResult(MessageResponse):
+    model_id: str
+    total: int
+    succeeded: int
+    failed: int
+    results: list[AccountLivenessTestItemOut]
+
+
 class Sub2ApiSyncResult(MessageResponse):
     total_seen: int
     error_seen: int
@@ -485,6 +550,7 @@ class AppSettingsUpdate(BaseModel):
     sub2api_port: int | None = Field(default=None, ge=1, le=65535)
     sub2api_x_api_key: str | None = Field(default=None, max_length=500)
     clear_sub2api_x_api_key: bool = False
+    confirm_sub2api_credential_rebind: bool = False
     sub2api_auto_recover_state: bool | None = None
     automation_paused: bool | None = None
     recovery_enabled: bool | None = None
@@ -551,6 +617,11 @@ class UpstreamGroupOptionOut(BaseModel):
 
 
 class UpstreamAccountUpdate(BaseModel):
+    expected_identity_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
     remote_name: str | None = Field(default=None, max_length=200)
     base_url: str | None = Field(default=None, max_length=500)
@@ -562,6 +633,7 @@ class UpstreamAccountUpdate(BaseModel):
     access_token: str | None = None
     clear_access_token: bool = False
     confirm_credential_rebind: bool = False
+    confirm_identity_rebind: bool = False
     manual_group_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
     manual_recharge_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
 
@@ -630,16 +702,55 @@ class UpstreamChannelUpdate(BaseModel):
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 
+
+class UpstreamLegacyIdentityBinding(BaseModel):
+    sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    expected_identity_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
+class UpstreamChannelDiscoverAllRequest(BaseModel):
+    confirm_legacy_bindings: bool = False
+    account_bindings: list[UpstreamLegacyIdentityBinding] = Field(
+        default_factory=list,
+        max_length=10_000,
+    )
+
+    @field_validator("account_bindings")
+    @classmethod
+    def validate_unique_account_bindings(
+        cls,
+        value: list[UpstreamLegacyIdentityBinding],
+    ) -> list[UpstreamLegacyIdentityBinding]:
+        account_ids = [item.sub2api_account_id for item in value]
+        if len(account_ids) != len(set(account_ids)):
+            raise ValueError("account_bindings must contain unique sub2api account ids")
+        return value
+
 class UpstreamApplyRequest(BaseModel):
     confirmed_target_rate: float = Field(gt=0, le=1000, allow_inf_nan=False)
+    expected_identity_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 class UpstreamAccountEnabledUpdate(BaseModel):
     enabled: bool
+    expected_identity_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 class UpstreamRemoteDeleteRequest(BaseModel):
     confirmed_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    expected_identity_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class UpstreamIdentityRequest(BaseModel):
+    expected_identity_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class UpstreamRateChangeLogOut(BaseModel):
@@ -672,6 +783,10 @@ class UpstreamRateChangeLogOut(BaseModel):
 
 class UpstreamAccountOut(BaseModel):
     sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    identity_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    identity_binding_status: Literal["unmanaged", "unbound", "bound", "mismatch"] = "unmanaged"
+    identity_rebind_required: bool = False
+    api_key_origin_rebind_required: bool = False
     channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
     channel_name: str | None = None
     remote_name: str

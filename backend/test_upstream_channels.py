@@ -19,6 +19,7 @@ from app.core.validation import sanitized_request_validation_handler
 from app.models import UpstreamAccountConfig, UpstreamChannel, UpstreamRateChangeLog
 from app.schemas import (
     UpstreamAccountUpdate,
+    UpstreamChannelDiscoverAllRequest,
     UpstreamChannelDiscoverAllOut,
     UpstreamChannelUpdate,
 )
@@ -46,6 +47,7 @@ class FakeSub2Api(Sub2ApiClient):
                 "platform": "openai",
                 "type": "apikey",
                 "status": "active",
+                "created_at": "2026-07-01T00:00:07Z",
                 "rate_multiplier": 1.0,
                 "credentials": {"base_url": "https://UPSTREAM.example/v1"},
             },
@@ -55,6 +57,7 @@ class FakeSub2Api(Sub2ApiClient):
                 "platform": "anthropic",
                 "type": "api_key",
                 "status": "active",
+                "created_at": "2026-07-01T00:00:08Z",
                 "rate_multiplier": 0.5,
                 "credentials": {"base_url": "https://upstream.example/api/v1/"},
             },
@@ -119,6 +122,13 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         await self.engine.dispose()
 
+    def _account_update(self, account_id: int, **values: object) -> UpstreamAccountUpdate:
+        remote = next(account for account in self.sub2api.accounts if int(account["id"]) == account_id)
+        return UpstreamAccountUpdate(
+            expected_identity_fingerprint=self.service.accounts._remote_identity_fingerprint(remote),
+            **values,
+        )
+
     async def _configure_sub2api_credentials(
         self,
         *,
@@ -178,6 +188,111 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         channels = await self.db.execute(select(UpstreamChannel))
         self.assertEqual(len(channels.scalars().all()), 1)
 
+    async def test_concurrent_overview_serializes_inventory_creation(self) -> None:
+        async with self.session_factory() as first_db, self.session_factory() as second_db:
+            first, second = await asyncio.gather(
+                self.service.overview(first_db),
+                self.service.overview(second_db),
+            )
+
+        self.assertEqual(len(first.channels), 1)
+        self.assertEqual(len(second.channels), 1)
+        async with self.session_factory() as verifier:
+            channels = list((await verifier.execute(select(UpstreamChannel))).scalars())
+            configs = list(
+                (await verifier.execute(select(UpstreamAccountConfig))).scalars()
+            )
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(len(configs), 2)
+
+    async def test_overview_and_account_discovery_share_config_creation_locks(self) -> None:
+        expected_fingerprint = self.service.accounts._remote_identity_fingerprint(
+            self.sub2api.accounts[0]
+        )
+        async with self.session_factory() as overview_db, self.session_factory() as account_db:
+            overview, account = await asyncio.gather(
+                self.service.overview(overview_db),
+                self.service.accounts.discover_account(
+                    account_db,
+                    7,
+                    expected_fingerprint,
+                ),
+            )
+
+        self.assertEqual(len(overview.channels), 1)
+        self.assertEqual(account.sub2api_account_id, 7)
+        async with self.session_factory() as verifier:
+            configs = list(
+                (
+                    await verifier.execute(
+                        select(UpstreamAccountConfig).where(
+                            UpstreamAccountConfig.sub2api_account_id == 7
+                        )
+                    )
+                ).scalars()
+            )
+        self.assertEqual(len(configs), 1)
+
+    async def test_overview_and_account_discover_all_share_config_creation_locks(self) -> None:
+        async with self.session_factory() as overview_db, self.session_factory() as account_db:
+            overview, discovery = await asyncio.gather(
+                self.service.overview(overview_db),
+                self.service.accounts.discover_all(account_db),
+            )
+
+        self.assertEqual(len(overview.channels), 1)
+        self.assertEqual(discovery.total, 2)
+        async with self.session_factory() as verifier:
+            configs = list(
+                (await verifier.execute(select(UpstreamAccountConfig))).scalars()
+            )
+        self.assertEqual(
+            sorted(config.sub2api_account_id for config in configs),
+            [7, 8],
+        )
+
+    async def test_inventory_and_channel_url_update_never_leak_unique_errors(self) -> None:
+        overview = await self.service.overview(self.db)
+        original_channel_id = overview.channels[0].id
+        self.sub2api.accounts[0]["credentials"]["base_url"] = (
+            "https://replacement.example/v1"
+        )
+        self.sub2api.accounts[1]["credentials"]["base_url"] = (
+            "https://replacement.example/v1"
+        )
+        payload = UpstreamChannelUpdate(
+            base_url="https://replacement.example",
+            confirm_credential_rebind=True,
+        )
+
+        async with self.session_factory() as overview_db, self.session_factory() as update_db:
+            results = await asyncio.gather(
+                self.service.overview(overview_db),
+                self.service.update_channel(
+                    update_db,
+                    original_channel_id,
+                    payload,
+                ),
+                return_exceptions=True,
+            )
+
+        for result in results:
+            if isinstance(result, Exception):
+                self.assertIsInstance(result, UpstreamAccountServiceError)
+                self.assertEqual(result.status_code, 409)
+        async with self.session_factory() as verifier:
+            replacement_channels = list(
+                (
+                    await verifier.execute(
+                        select(UpstreamChannel).where(
+                            UpstreamChannel.canonical_base_url
+                            == "https://replacement.example"
+                        )
+                    )
+                ).scalars()
+            )
+        self.assertEqual(len(replacement_channels), 1)
+
     async def test_auto_assigned_account_follows_remote_endpoint_change(self) -> None:
         overview = await self.service.overview(self.db)
         original_channel = overview.channels[0]
@@ -216,6 +331,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             [7],
         )
         self.assertFalse(replacement.accounts[0].api_key_set)
+        self.assertTrue(replacement.accounts[0].api_key_origin_rebind_required)
         self.assertFalse(replacement.access_token_set)
 
         await self.db.refresh(stored)
@@ -223,6 +339,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.base_url, "https://replacement.example")
         self.assertIsNone(stored.encrypted_api_key)
         self.assertIsNone(stored.encrypted_access_token)
+        self.assertTrue(stored.api_key_origin_rebind_required)
         self.assertIsNone(stored.selected_group_id)
         self.assertIsNone(stored.selected_group_name)
         self.assertIsNone(stored.manual_group_multiplier)
@@ -231,6 +348,237 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             stored.last_error,
             "The upstream endpoint changed; rediscovery is required.",
         )
+
+        bound = await self.service.accounts.bind_legacy_identities(
+            self.db,
+            {7: replacement.accounts[0].identity_fingerprint},
+        )
+        self.assertEqual(bound, 1)
+        await self.db.refresh(stored)
+        self.assertFalse(stored.api_key_origin_rebind_required)
+
+    async def test_reused_id_is_quarantined_from_overview_and_background_rate_sync(self) -> None:
+        channel = (await self.service.overview(self.db)).channels[0]
+        configs = await self.db.execute(select(UpstreamAccountConfig))
+        by_id = {item.sub2api_account_id: item for item in configs.scalars().all()}
+        original_ciphertext = encrypt_text("sk-original-seven")
+        by_id[7].encrypted_api_key = original_ciphertext
+        by_id[8].encrypted_api_key = encrypt_text("sk-current-eight")
+        await self.db.commit()
+
+        self.sub2api.accounts[0]["name"] = "replacement-seven"
+        self.sub2api.accounts[0]["created_at"] = "2026-07-15T12:00:00Z"
+        overview = await self.service.overview(self.db)
+
+        self.assertEqual(
+            [account.sub2api_account_id for account in overview.channels[0].accounts],
+            [7, 8],
+        )
+        self.assertEqual(overview.unassigned_accounts, [])
+        isolated = overview.channels[0].accounts[0]
+        self.assertEqual(isolated.identity_binding_status, "mismatch")
+        self.assertTrue(isolated.identity_rebind_required)
+        self.assertFalse(isolated.managed)
+        self.assertFalse(isolated.api_key_set)
+        await self.db.refresh(by_id[7])
+        self.assertEqual(by_id[7].encrypted_api_key, original_ciphertext)
+
+        result = SimpleNamespace(
+            upstream_type="newapi",
+            status="ok",
+            groups=[{"id": "vip", "name": "VIP", "multiplier": 2.0}],
+            account_group_matches={
+                7: {"id": "vip", "name": "VIP", "multiplier": 2.0},
+                8: {"id": "vip", "name": "VIP", "multiplier": 2.0},
+            },
+            discovered_recharge_multiplier=0.1,
+            discovered_recharge_multiplier_source="status.price",
+            recharge_discovery_status="ok",
+            balance_remaining=100,
+            balance_total=None,
+            balance_used=None,
+            balance_unit="USD",
+            balance_status="ok",
+            balance_message="Balance available.",
+        )
+        runtime = SimpleNamespace(
+            get_upstream_rate_sync_enabled=AsyncMock(return_value=True),
+            get_automation_paused=AsyncMock(return_value=False),
+        )
+        discovery = AsyncMock(return_value=result)
+        with (
+            patch("app.services.upstream_channels.discover_upstream", new=discovery),
+            patch(
+                "app.services.upstream_channels.get_runtime_config_service",
+                return_value=runtime,
+            ),
+        ):
+            await self.service.discover_channel(self.db, channel.id)
+
+        self.assertEqual(discovery.await_args.kwargs["account_api_keys"], {8: "sk-current-eight"})
+        self.assertNotIn(7, [account_id for account_id, _rate in self.sub2api.rate_update_calls])
+        await self.db.refresh(by_id[7])
+        self.assertEqual(by_id[7].encrypted_api_key, original_ciphertext)
+
+    async def test_manual_bulk_sync_claims_only_confirmed_legacy_null_bindings(self) -> None:
+        overview = await self.service.overview(self.db)
+        accounts = [account for channel in overview.channels for account in channel.accounts]
+        confirmations = {
+            account.sub2api_account_id: account.identity_fingerprint
+            for account in accounts
+        }
+        configs = await self.db.execute(select(UpstreamAccountConfig))
+        stored = list(configs.scalars().all())
+        for config in stored:
+            config.remote_identity_fingerprint = None
+        await self.db.commit()
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=self._discovery_result()),
+        ):
+            result = await self.service.discover_all(
+                self.db,
+                legacy_bindings=confirmations,
+            )
+
+        self.assertEqual(result.total, 1)
+        for config in stored:
+            await self.db.refresh(config)
+            remote = next(
+                account
+                for account in self.sub2api.accounts
+                if int(account["id"]) == config.sub2api_account_id
+            )
+            self.assertEqual(
+                config.remote_identity_fingerprint,
+                self.service.accounts._remote_binding_fingerprint(remote),
+            )
+
+    def test_confirmation_schema_supports_more_than_500_pending_accounts(self) -> None:
+        payload = UpstreamChannelDiscoverAllRequest(
+            confirm_legacy_bindings=True,
+            account_bindings=[
+                {
+                    "sub2api_account_id": account_id,
+                    "expected_identity_fingerprint": f"{account_id:064x}",
+                }
+                for account_id in range(1, 502)
+            ],
+        )
+
+        self.assertEqual(len(payload.account_bindings), 501)
+
+    async def test_one_confirmation_covers_legacy_binding_and_endpoint_migration(self) -> None:
+        await self.service.overview(self.db)
+        replacement_key = "sk-replacement-eight"
+        self.sub2api.accounts[1]["credentials"]["base_url"] = (
+            "https://replacement.example/v1"
+        )
+        self.sub2api.exported_api_keys[8] = replacement_key
+
+        configs = await self.db.execute(select(UpstreamAccountConfig))
+        stored = list(configs.scalars().all())
+        for config in stored:
+            config.remote_identity_fingerprint = None
+        await self.db.commit()
+
+        confirmation_overview = await self.service.overview(self.db)
+        visible_accounts = [
+            account
+            for channel in confirmation_overview.channels
+            for account in channel.accounts
+        ]
+        confirmations = {
+            account.sub2api_account_id: account.identity_fingerprint
+            for account in visible_accounts
+        }
+        pending = next(
+            account for account in visible_accounts if account.sub2api_account_id == 8
+        )
+        self.assertEqual(pending.identity_binding_status, "unbound")
+        self.assertFalse(pending.api_key_origin_rebind_required)
+
+        discovery = AsyncMock(return_value=self._discovery_result())
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=discovery,
+        ):
+            result = await self.service.discover_all(
+                self.db,
+                legacy_bindings=confirmations,
+            )
+
+        self.assertEqual(result.total, 2)
+        async with self.session_factory() as verifier:
+            rebound = (
+                await verifier.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.sub2api_account_id == 8
+                    )
+                )
+            ).scalar_one()
+            self.assertEqual(rebound.base_url, "https://replacement.example")
+            self.assertFalse(rebound.api_key_origin_rebind_required)
+            self.assertEqual(decrypt_text(rebound.encrypted_api_key), replacement_key)
+
+        replacement_call = next(
+            call
+            for call in discovery.await_args_list
+            if call.kwargs["base_url"] == "https://replacement.example"
+        )
+        self.assertEqual(
+            replacement_call.kwargs["account_api_keys"],
+            {8: replacement_key},
+        )
+
+    async def test_background_sync_never_claims_legacy_null_bindings(self) -> None:
+        await self.service.overview(self.db)
+        configs = await self.db.execute(select(UpstreamAccountConfig))
+        stored = list(configs.scalars().all())
+        for config in stored:
+            config.remote_identity_fingerprint = None
+        await self.db.commit()
+
+        discovery = AsyncMock(return_value=self._discovery_result())
+        with patch("app.services.upstream_channels.discover_upstream", new=discovery):
+            result = await self.service.discover_all(self.db)
+
+        self.assertEqual((result.total, result.succeeded, result.failed), (1, 0, 1))
+        discovery.assert_not_awaited()
+        for config in stored:
+            await self.db.refresh(config)
+            self.assertIsNone(config.remote_identity_fingerprint)
+
+    async def test_live_confirmation_double_checks_before_clearing_origin_rebind(self) -> None:
+        overview = await self.service.overview(self.db)
+        account = overview.channels[0].accounts[0]
+        config = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == account.sub2api_account_id
+                )
+            )
+        ).scalar_one()
+        config.api_key_origin_rebind_required = True
+        await self.db.commit()
+        original_remote_accounts = self.service.accounts._remote_accounts
+        remote_reads = AsyncMock(side_effect=original_remote_accounts)
+
+        with patch.object(
+            self.service.accounts,
+            "_remote_accounts",
+            new=remote_reads,
+        ):
+            rebound = await self.service.accounts.bind_legacy_identities(
+                self.db,
+                {account.sub2api_account_id: account.identity_fingerprint},
+            )
+
+        self.assertEqual(rebound, 1)
+        self.assertEqual(remote_reads.await_count, 2)
+        await self.db.refresh(config)
+        self.assertFalse(config.api_key_origin_rebind_required)
 
     async def test_channel_token_is_encrypted_and_never_returned(self) -> None:
         channel = (await self.service.overview(self.db)).channels[0]
@@ -594,6 +942,77 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored)
         self.assertIsNone(stored.management_base_url)
 
+    async def test_canonical_origin_change_is_checked_independently_from_management_origin(self) -> None:
+        channel = (await self.service.overview(self.db)).channels[0]
+        configured = await self.service.update_channel(
+            self.db,
+            channel.id,
+            UpstreamChannelUpdate(
+                management_base_url="https://management.example/api/v1",
+                access_token="retained-channel-token",
+                confirm_credential_rebind=True,
+            ),
+        )
+
+        with self.assertRaises(UpstreamAccountServiceError) as context:
+            await self.service.update_channel(
+                self.db,
+                channel.id,
+                UpstreamChannelUpdate(base_url="https://replacement.example/v1"),
+            )
+
+        self.assertEqual(context.exception.status_code, 409)
+        await self.db.rollback()
+        stored = await self.db.get(UpstreamChannel, channel.id)
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored.canonical_base_url, configured.canonical_base_url)
+        self.assertEqual(stored.management_base_url, "https://management.example")
+
+    async def test_confirmed_canonical_origin_change_clears_account_origin_rebind_flags(self) -> None:
+        channel = (await self.service.overview(self.db)).channels[0]
+        configs_result = await self.db.execute(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.channel_id == channel.id
+            )
+        )
+        configs = list(configs_result.scalars().all())
+        for config in configs:
+            config.api_key_origin_rebind_required = True
+        await self.db.commit()
+
+        updated = await self.service.update_channel(
+            self.db,
+            channel.id,
+            UpstreamChannelUpdate(
+                base_url="https://replacement.example/v1",
+                confirm_credential_rebind=True,
+            ),
+        )
+
+        self.assertEqual(updated.canonical_base_url, "https://replacement.example")
+        for config in configs:
+            await self.db.refresh(config)
+            self.assertFalse(config.api_key_origin_rebind_required)
+
+    async def test_discover_all_does_not_count_failed_manual_fallback_as_success(self) -> None:
+        channel = (await self.service.overview(self.db)).channels[0]
+        await self.service.update_channel(
+            self.db,
+            channel.id,
+            UpstreamChannelUpdate(manual_recharge_multiplier=2.0),
+        )
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=self._discovery_result(status="error")),
+        ):
+            result = await self.service.discover_all(self.db)
+
+        self.assertEqual((result.total, result.succeeded, result.failed), (1, 0, 1))
+        self.assertEqual(result.channels[0].recharge_multiplier_status, "fallback_manual")
+        self.assertEqual(result.channels[0].last_error, "Upstream channel discovery failed.")
+
     async def test_failed_management_discovery_uses_one_api_key_balance_without_summing(self) -> None:
         channel = (await self.service.overview(self.db)).channels[0]
         self.sub2api.balance_results = {
@@ -821,7 +1240,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.accounts.upsert_account(
                     concurrent_db,
                     7,
-                    UpstreamAccountUpdate(manual_group_multiplier=4.0),
+                    self._account_update(7, manual_group_multiplier=4.0),
                 )
             return result
 
@@ -853,7 +1272,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.accounts.upsert_account(
                     concurrent_db,
                     8,
-                    UpstreamAccountUpdate(api_key=newly_saved_key),
+                    self._account_update(8, api_key=newly_saved_key),
                 )
             return {8: stale_exported_key} if 8 in account_ids else {}
 
@@ -882,6 +1301,242 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             ).scalar_one()
             self.assertEqual(decrypt_text(stored.encrypted_api_key), newly_saved_key)
 
+    async def test_identity_rebind_during_export_drops_stale_exported_key(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        configs_result = await self.db.execute(select(UpstreamAccountConfig))
+        configs_by_id = {
+            config.sub2api_account_id: config
+            for config in configs_result.scalars().all()
+        }
+        configs_by_id[7].encrypted_api_key = encrypt_text("sk-current-seven")
+        configs_by_id[8].encrypted_api_key = None
+        await self.db.commit()
+        configs = await self.service._bound_configs(self.db, channel_id)
+        stale_exported_key = "sk-exported-before-identity-rebind"
+
+        async def export_after_identity_rebind(account_ids: list[int]) -> dict[int, str]:
+            self.sub2api.export_calls.append(list(account_ids))
+            replacement = dict(self.sub2api.accounts[1])
+            replacement["name"] = "replacement-eight"
+            replacement["created_at"] = "2026-07-15T12:00:08Z"
+            self.sub2api.accounts[1] = replacement
+            async with self.session_factory() as concurrent_db:
+                await self.service.accounts.upsert_account(
+                    concurrent_db,
+                    8,
+                    self._account_update(8, confirm_identity_rebind=True),
+                )
+            return {8: stale_exported_key} if 8 in account_ids else {}
+
+        with patch.object(
+            self.sub2api,
+            "export_api_key_secrets",
+            new=AsyncMock(side_effect=export_after_identity_rebind),
+        ):
+            exported = await self.service._account_api_keys(
+                self.db,
+                configs,
+                channel_id,
+            )
+
+        self.assertEqual(self.sub2api.export_calls, [[8]])
+        self.assertEqual(exported.get(7), "sk-current-seven")
+        self.assertNotIn(8, exported)
+        async with self.session_factory() as verifier:
+            stored = (
+                await verifier.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.sub2api_account_id == 8
+                    )
+                )
+            ).scalar_one()
+            self.assertIsNone(stored.encrypted_api_key)
+            self.assertEqual(
+                stored.remote_identity_fingerprint,
+                self.service.accounts._remote_binding_fingerprint(
+                    self.sub2api.accounts[1]
+                ),
+            )
+
+    async def test_origin_rebind_flag_set_during_export_blocks_persist_and_fallback(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        configs_result = await self.db.execute(select(UpstreamAccountConfig))
+        configs_by_id = {
+            config.sub2api_account_id: config
+            for config in configs_result.scalars().all()
+        }
+        configs_by_id[7].encrypted_api_key = encrypt_text("sk-current-seven")
+        configs_by_id[8].encrypted_api_key = None
+        await self.db.commit()
+        configs = await self.service._bound_configs(self.db, channel_id)
+        stale_exported_key = "sk-exported-before-origin-rebind"
+
+        async def export_after_origin_rebind(account_ids: list[int]) -> dict[int, str]:
+            self.sub2api.export_calls.append(list(account_ids))
+            async with self.session_factory() as concurrent_db:
+                stored = (
+                    await concurrent_db.execute(
+                        select(UpstreamAccountConfig).where(
+                            UpstreamAccountConfig.sub2api_account_id == 8
+                        )
+                    )
+                ).scalar_one()
+                stored.api_key_origin_rebind_required = True
+                stored.encrypted_api_key = None
+                await concurrent_db.commit()
+            return {8: stale_exported_key} if 8 in account_ids else {}
+
+        with patch.object(
+            self.sub2api,
+            "export_api_key_secrets",
+            new=AsyncMock(side_effect=export_after_origin_rebind),
+        ):
+            exported = await self.service._account_api_keys(
+                self.db,
+                configs,
+                channel_id,
+            )
+
+        self.assertEqual(self.sub2api.export_calls, [[8]])
+        self.assertEqual(exported.get(7), "sk-current-seven")
+        self.assertNotIn(8, exported)
+        async with self.session_factory() as verifier:
+            stored = (
+                await verifier.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.sub2api_account_id == 8
+                    )
+                )
+            ).scalar_one()
+            self.assertTrue(stored.api_key_origin_rebind_required)
+            self.assertIsNone(stored.encrypted_api_key)
+
+    async def test_remote_endpoint_change_during_export_drops_exported_key(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        configs_result = await self.db.execute(select(UpstreamAccountConfig))
+        configs_by_id = {
+            config.sub2api_account_id: config
+            for config in configs_result.scalars().all()
+        }
+        configs_by_id[7].encrypted_api_key = encrypt_text("sk-current-seven")
+        configs_by_id[8].encrypted_api_key = None
+        await self.db.commit()
+        configs = await self.service._bound_configs(self.db, channel_id)
+        replacement_key = "sk-key-from-replacement-origin"
+
+        async def export_after_endpoint_change(account_ids: list[int]) -> dict[int, str]:
+            self.sub2api.export_calls.append(list(account_ids))
+            replacement = dict(self.sub2api.accounts[1])
+            replacement["credentials"] = {
+                **replacement["credentials"],
+                "base_url": "https://replacement.example/v1",
+            }
+            self.sub2api.accounts[1] = replacement
+            return {8: replacement_key} if 8 in account_ids else {}
+
+        with patch.object(
+            self.sub2api,
+            "export_api_key_secrets",
+            new=AsyncMock(side_effect=export_after_endpoint_change),
+        ):
+            exported = await self.service._account_api_keys(
+                self.db,
+                configs,
+                channel_id,
+            )
+
+        self.assertEqual(self.sub2api.export_calls, [[8]])
+        self.assertEqual(exported.get(7), "sk-current-seven")
+        self.assertNotIn(8, exported)
+        async with self.session_factory() as verifier:
+            stored = (
+                await verifier.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.sub2api_account_id == 8
+                    )
+                )
+            ).scalar_one()
+            self.assertIsNone(stored.encrypted_api_key)
+            self.assertFalse(stored.api_key_origin_rebind_required)
+            self.assertEqual(stored.base_url, "https://upstream.example")
+
+    async def test_remote_endpoint_mismatch_blocks_an_already_stored_key(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        configs_result = await self.db.execute(select(UpstreamAccountConfig))
+        configs_by_id = {
+            config.sub2api_account_id: config
+            for config in configs_result.scalars().all()
+        }
+        configs_by_id[8].encrypted_api_key = encrypt_text("sk-stored-for-old-origin")
+        await self.db.commit()
+        self.sub2api.accounts[1]["credentials"]["base_url"] = (
+            "https://replacement.example/v1"
+        )
+        configs = await self.service._bound_configs(self.db, channel_id)
+
+        account_api_keys = await self.service._account_api_keys(
+            self.db,
+            configs,
+            channel_id,
+        )
+
+        self.assertNotIn(8, account_api_keys)
+        async with self.session_factory() as verifier:
+            stored = (
+                await verifier.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.sub2api_account_id == 8
+                    )
+                )
+            ).scalar_one()
+            self.assertEqual(
+                decrypt_text(stored.encrypted_api_key),
+                "sk-stored-for-old-origin",
+            )
+
+    async def test_manual_channel_with_explicit_key_ignores_remote_endpoint_metadata(self) -> None:
+        await self.service.overview(self.db)
+        manual_channel = UpstreamChannel(
+            display_name="Manual upstream",
+            canonical_base_url="https://manual.example",
+            upstream_type="auto",
+            group_options=[],
+            recharge_multiplier_status="not_discovered",
+            balance_status="not_checked",
+        )
+        self.db.add(manual_channel)
+        await self.db.commit()
+        await self.db.refresh(manual_channel)
+        manual_key = "sk-explicit-manual-origin"
+
+        await self.service.accounts.upsert_account(
+            self.db,
+            8,
+            self._account_update(
+                8,
+                channel_id=manual_channel.id,
+                api_key=manual_key,
+                confirm_credential_rebind=True,
+            ),
+        )
+
+        configs = await self.service._bound_configs(self.db, manual_channel.id)
+        account_api_keys = await self.service._account_api_keys(
+            self.db,
+            configs,
+            manual_channel.id,
+        )
+
+        self.assertEqual(account_api_keys, {8: manual_key})
+        stored = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == 8
+                )
+            )
+        ).scalar_one()
+        self.assertTrue(stored.channel_auto_assign_disabled)
+
     async def test_api_key_export_is_batched_at_sub2api_limit(self) -> None:
         for account_id in range(9, 208):
             self.sub2api.accounts.append(
@@ -891,6 +1546,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
                     "platform": "openai",
                     "type": "apikey",
                     "status": "active",
+                    "created_at": f"2026-07-02T00:{account_id % 60:02}:00Z",
                     "rate_multiplier": 1.0,
                     "credentials": {"base_url": "https://upstream.example/v1"},
                 }
@@ -928,7 +1584,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.accounts.upsert_account(
                     concurrent_db,
                     7,
-                    UpstreamAccountUpdate(
+                    self._account_update(
+                        7,
                         channel_id=other_channel.id,
                         confirm_credential_rebind=True,
                     ),
@@ -936,7 +1593,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.accounts.upsert_account(
                     concurrent_db,
                     8,
-                    UpstreamAccountUpdate(api_key=retry_api_key),
+                    self._account_update(8, api_key=retry_api_key),
                 )
             return Sub2ApiTokenPair(
                 access_token="rotated-source-token",

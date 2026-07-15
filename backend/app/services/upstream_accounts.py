@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import math
+import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -218,6 +221,7 @@ class UpstreamAccountService:
     ) -> UpstreamAccountConfig:
         return UpstreamAccountConfig(
             sub2api_account_id=account_id,
+            remote_identity_fingerprint=self._remote_binding_fingerprint(remote),
             remote_name=_safe_text(
                 self._remote_name(remote, account_id),
                 secrets=secrets,
@@ -272,17 +276,122 @@ class UpstreamAccountService:
 
     async def _remote_accounts(self) -> list[dict[str, Any]]:
         try:
-            return await self.sub2api.list_api_key_accounts()
+            accounts = await self.sub2api.list_api_key_accounts()
         except Exception as exc:
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise UpstreamAccountServiceError("Unable to read API key accounts from sub2api.") from None
 
-    async def _remote_account(self, account_id: int) -> dict[str, Any]:
+        seen_ids: set[int] = set()
+        for account in accounts:
+            account_id = self._numeric_remote_id(account)
+            if account_id is None:
+                continue
+            if account_id in seen_ids:
+                raise UpstreamAccountServiceError("sub2api returned duplicate API key account ids.")
+            seen_ids.add(account_id)
+        return accounts
+
+    async def _remote_account(
+        self,
+        account_id: int,
+        expected_identity_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
         for account in await self._remote_accounts():
             if self._numeric_remote_id(account) == account_id:
+                if (
+                    expected_identity_fingerprint is not None
+                    and self._remote_identity_fingerprint(account) != expected_identity_fingerprint
+                ):
+                    raise UpstreamAccountServiceError(
+                        "The sub2api account identity changed; refresh the account list and try again.",
+                        status_code=409,
+                    )
                 return account
         raise UpstreamAccountServiceError("The sub2api API key account was not found.", status_code=404)
+
+    def _remote_identity_fingerprint(self, account: dict[str, Any]) -> str:
+        fingerprint = self._remote_fingerprint(account, include_endpoint=True)
+        if fingerprint is None:
+            raise UpstreamAccountServiceError("sub2api returned an invalid API key account identity.")
+        return fingerprint
+
+    def _remote_binding_fingerprint(self, account: dict[str, Any]) -> str | None:
+        return self._remote_fingerprint(account, include_endpoint=False)
+
+    def _require_remote_binding_fingerprint(self, account: dict[str, Any]) -> str:
+        fingerprint = self._remote_binding_fingerprint(account)
+        if fingerprint is None:
+            raise UpstreamAccountServiceError(
+                "sub2api did not provide the immutable account creation timestamp required "
+                "to confirm this API key account identity.",
+                status_code=409,
+            )
+        return fingerprint
+
+    def _remote_fingerprint(
+        self,
+        account: dict[str, Any],
+        *,
+        include_endpoint: bool,
+    ) -> str | None:
+        account_id = self._numeric_remote_id(account)
+        if account_id is None:
+            raise UpstreamAccountServiceError("sub2api returned an invalid API key account id.")
+
+        def normalized_text(value: Any, *, casefold: bool = False) -> str:
+            text = unicodedata.normalize("NFKC", str(value or "").strip())
+            return text.casefold() if casefold else text
+
+        account_type = normalized_text(self.sub2api.account_type(account), casefold=True)
+        account_type = account_type.replace("-", "_").replace(" ", "_")
+        created_at = normalized_text(_value(account, "created_at", "createdAt"))
+        if not include_endpoint and not created_at:
+            return None
+        identity = {
+            "id": account_id,
+            "name": normalized_text(self.sub2api.account_name(account)),
+            "platform": normalized_text(self.sub2api.account_platform(account), casefold=True),
+            "type": account_type,
+            "created_at": created_at,
+        }
+        if include_endpoint:
+            identity["base_url"] = _remote_base_url(account) or ""
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _config_binding_status(
+        self,
+        account: dict[str, Any],
+        config: UpstreamAccountConfig | None,
+    ) -> str:
+        if config is None:
+            return "unmanaged"
+        stored = (config.remote_identity_fingerprint or "").strip().lower()
+        if not stored:
+            return "unbound"
+        current = self._remote_binding_fingerprint(account)
+        if current is None:
+            return "mismatch"
+        return "bound" if stored == current else "mismatch"
+
+    def _require_config_binding(
+        self,
+        account: dict[str, Any],
+        config: UpstreamAccountConfig | None,
+    ) -> None:
+        status = self._config_binding_status(account, config)
+        if status in {"unbound", "mismatch"}:
+            raise UpstreamAccountServiceError(
+                "The local upstream configuration is bound to a different or unconfirmed "
+                "sub2api account identity; explicitly rebind it before continuing.",
+                status_code=409,
+            )
 
     def _remote_current_rate(self, account: dict[str, Any]) -> float | None:
         return _float_multiplier(account.get("rate_multiplier"), allow_zero=True)
@@ -312,6 +421,13 @@ class UpstreamAccountService:
         account_id = self._numeric_remote_id(account)
         if account_id is None:
             raise UpstreamAccountServiceError("sub2api returned an invalid API key account id.")
+        binding_status = self._config_binding_status(account, config)
+        identity_rebind_required = binding_status in {"unbound", "mismatch"}
+        api_key_origin_rebind_required = bool(
+            config is not None and config.api_key_origin_rebind_required
+        )
+        if binding_status != "bound":
+            config = None
         remote_current_rate = self._remote_current_rate(account)
         current_rate = remote_current_rate
         if current_rate is None and config is not None:
@@ -324,7 +440,11 @@ class UpstreamAccountService:
             if current is not None and target is not None:
                 would_change = _quantize_rate(current) != _quantize_rate(target)
 
-        api_key = decrypt_text(config.encrypted_api_key) if config is not None else None
+        api_key = (
+            decrypt_text(config.encrypted_api_key)
+            if config is not None and not api_key_origin_rebind_required
+            else None
+        )
         access_token = decrypt_text(config.encrypted_access_token) if config is not None else None
         secrets = (api_key, access_token)
         recharge_source = config.recharge_multiplier_source if config is not None else None
@@ -334,6 +454,10 @@ class UpstreamAccountService:
 
         return UpstreamAccountOut(
             sub2api_account_id=account_id,
+            identity_fingerprint=self._remote_identity_fingerprint(account),
+            identity_binding_status=binding_status,
+            identity_rebind_required=identity_rebind_required,
+            api_key_origin_rebind_required=api_key_origin_rebind_required,
             remote_name=(
                 _safe_text(
                     config.remote_name if config and config.remote_name else self._remote_name(account, account_id),
@@ -370,8 +494,11 @@ class UpstreamAccountService:
             selected_group_id=_safe_text(config.selected_group_id if config else None, secrets=secrets, limit=128),
             selected_group_name=_safe_text(config.selected_group_name if config else None, secrets=secrets, limit=200),
             api_key_set=bool(
-                (config and config.encrypted_api_key)
-                or self.sub2api.account_has_api_key(account)
+                not api_key_origin_rebind_required
+                and (
+                    (config and config.encrypted_api_key)
+                    or self.sub2api.account_has_api_key(account)
+                )
             ),
             api_key_hint=None,
             access_token_set=bool(config and config.encrypted_access_token),
@@ -399,7 +526,13 @@ class UpstreamAccountService:
             balance_status=config.balance_status if config else "not_checked",
             balance_message=_safe_text(config.balance_message if config else None, secrets=secrets, limit=300),
             balance_checked_at=config.balance_checked_at if config else None,
-            last_error=config.last_error if config else None,
+            last_error=(
+                config.last_error
+                if config
+                else "Local upstream configuration requires explicit identity rebind."
+                if identity_rebind_required
+                else None
+            ),
             last_discovered_at=config.last_discovered_at if config else None,
             last_applied_at=config.last_applied_at if config else None,
             created_at=config.created_at if config else None,
@@ -425,6 +558,120 @@ class UpstreamAccountService:
             self._build_out(remote_by_id[account_id], configs.get(account_id))
             for account_id in sorted(remote_by_id)
         ]
+
+    async def bind_legacy_identities(
+        self,
+        db: AsyncSession,
+        expected_fingerprints: dict[int, str],
+    ) -> int:
+        if not expected_fingerprints:
+            return 0
+
+        remote_by_id = {
+            account_id: account
+            for account in await self._remote_accounts()
+            if (account_id := self._numeric_remote_id(account)) is not None
+        }
+        requested_ids = sorted(expected_fingerprints)
+        result = await db.execute(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id.in_(requested_ids)
+            )
+        )
+        configs = {
+            config.sub2api_account_id: config
+            for config in result.scalars().all()
+        }
+
+        pending_bindings: dict[int, str] = {}
+        pending_origin_rebinds: dict[int, str] = {}
+        for account_id in requested_ids:
+            remote = remote_by_id.get(account_id)
+            if (
+                remote is None
+                or self._remote_identity_fingerprint(remote)
+                != expected_fingerprints[account_id]
+            ):
+                raise UpstreamAccountServiceError(
+                    "The legacy identity confirmation is stale; refresh the API key account list.",
+                    status_code=409,
+                )
+            binding_fingerprint = self._require_remote_binding_fingerprint(remote)
+            config = configs.get(account_id)
+            if config is None:
+                continue
+            binding_status = self._config_binding_status(remote, config)
+            if binding_status == "unbound":
+                pending_bindings[account_id] = binding_fingerprint
+            elif binding_status == "bound" and config.api_key_origin_rebind_required:
+                pending_origin_rebinds[account_id] = binding_fingerprint
+            elif binding_status != "bound":
+                raise UpstreamAccountServiceError(
+                    "A sub2api account identity changed and cannot be bulk rebound.",
+                    status_code=409,
+                )
+
+        if not pending_bindings and not pending_origin_rebinds:
+            return 0
+
+        # Revalidate the complete confirmation immediately before the conditional
+        # updates so a replaced remote id cannot inherit a legacy configuration.
+        current_by_id = {
+            account_id: account
+            for account in await self._remote_accounts()
+            if (account_id := self._numeric_remote_id(account)) is not None
+        }
+        for account_id in requested_ids:
+            remote = current_by_id.get(account_id)
+            if (
+                remote is None
+                or self._remote_identity_fingerprint(remote)
+                != expected_fingerprints[account_id]
+            ):
+                raise UpstreamAccountServiceError(
+                    "The legacy identity confirmation is stale; refresh the API key account list.",
+                    status_code=409,
+                )
+            expected_binding = (
+                pending_bindings.get(account_id)
+                or pending_origin_rebinds.get(account_id)
+            )
+            if (
+                expected_binding is not None
+                and self._require_remote_binding_fingerprint(remote) != expected_binding
+            ):
+                raise UpstreamAccountServiceError(
+                    "The legacy identity confirmation is stale; refresh the API key account list.",
+                    status_code=409,
+                )
+
+        bound = 0
+        for account_id, fingerprint in pending_bindings.items():
+            result = await db.execute(
+                update(UpstreamAccountConfig)
+                .where(
+                    UpstreamAccountConfig.sub2api_account_id == account_id,
+                    UpstreamAccountConfig.remote_identity_fingerprint.is_(None),
+                )
+                .values(remote_identity_fingerprint=fingerprint)
+                .execution_options(synchronize_session=False)
+            )
+            bound += int(result.rowcount or 0)
+        for account_id, fingerprint in pending_origin_rebinds.items():
+            result = await db.execute(
+                update(UpstreamAccountConfig)
+                .where(
+                    UpstreamAccountConfig.sub2api_account_id == account_id,
+                    UpstreamAccountConfig.remote_identity_fingerprint == fingerprint,
+                    UpstreamAccountConfig.api_key_origin_rebind_required.is_(True),
+                )
+                .values(api_key_origin_rebind_required=False)
+                .execution_options(synchronize_session=False)
+            )
+            bound += int(result.rowcount or 0)
+        await db.commit()
+        db.expire_all()
+        return bound
 
     def _ensure_secret_storage_ready(self, payload: UpstreamAccountUpdate) -> None:
         if payload.api_key and len(payload.api_key) > 4096:
@@ -457,7 +704,10 @@ class UpstreamAccountService:
         lock = await self._lock_for(account_id)
         async with lock:
             self._ensure_secret_storage_ready(payload)
-            remote = await self._remote_account(account_id)
+            remote = await self._remote_account(
+                account_id,
+                payload.expected_identity_fingerprint,
+            )
             result = await db.execute(
                 select(UpstreamAccountConfig).where(
                     UpstreamAccountConfig.sub2api_account_id == account_id
@@ -465,13 +715,23 @@ class UpstreamAccountService:
             )
             config = result.scalar_one_or_none()
             is_new = config is None
+            binding_rebound = False
+            binding_fingerprint = self._remote_binding_fingerprint(remote)
             if config is None:
+                binding_fingerprint = self._require_remote_binding_fingerprint(remote)
                 config = self._new_config(
                     remote,
                     account_id,
                     secrets=(payload.api_key, payload.access_token),
                 )
                 db.add(config)
+            else:
+                binding_status = self._config_binding_status(remote, config)
+                if binding_status == "mismatch" and not payload.confirm_identity_rebind:
+                    self._require_config_binding(remote, config)
+                if binding_status in {"unbound", "mismatch"}:
+                    binding_fingerprint = self._require_remote_binding_fingerprint(remote)
+                    binding_rebound = True
 
             fields = payload.model_fields_set
             preview_fields = {
@@ -486,8 +746,12 @@ class UpstreamAccountService:
             }
             preview_invalidated = bool(fields & preview_fields) or bool(
                 payload.api_key or payload.access_token or payload.clear_access_token
+            ) or binding_rebound
+            current_api_key = (
+                decrypt_text(config.encrypted_api_key)
+                if not config.api_key_origin_rebind_required
+                else None
             )
-            current_api_key = decrypt_text(config.encrypted_api_key)
             current_access_token = decrypt_text(config.encrypted_access_token)
             previous_origin = upstream_url_origin(config.base_url)
             selected_channel: UpstreamChannel | None = None
@@ -498,6 +762,8 @@ class UpstreamAccountService:
                         "The upstream channel was not found.", status_code=404
                     )
             identity_changed = (
+                binding_rebound
+                or
                 ("channel_id" in fields and payload.channel_id != config.channel_id)
                 or
                 ("base_url" in fields and payload.base_url != config.base_url)
@@ -581,6 +847,8 @@ class UpstreamAccountService:
 
             if payload.api_key:
                 config.encrypted_api_key = encrypt_text(payload.api_key)
+            if payload.api_key or payload.confirm_credential_rebind:
+                config.api_key_origin_rebind_required = False
             if payload.clear_access_token:
                 config.encrypted_access_token = None
             elif payload.access_token:
@@ -589,6 +857,9 @@ class UpstreamAccountService:
             if preview_invalidated and not is_new:
                 self._invalidate_preview(config)
 
+            if binding_rebound:
+                config.remote_identity_fingerprint = binding_fingerprint
+
             remote_rate = self._remote_current_rate(remote)
             if remote_rate is not None:
                 config.current_rate = remote_rate
@@ -596,9 +867,15 @@ class UpstreamAccountService:
             await db.refresh(config)
             return self._build_out(remote, config)
 
-    async def delete_account(self, db: AsyncSession, account_id: int) -> bool:
+    async def delete_account(
+        self,
+        db: AsyncSession,
+        account_id: int,
+        expected_identity_fingerprint: str,
+    ) -> bool:
         lock = await self._lock_for(account_id)
         async with lock:
+            remote = await self._remote_account(account_id, expected_identity_fingerprint)
             result = await db.execute(
                 select(UpstreamAccountConfig).where(
                     UpstreamAccountConfig.sub2api_account_id == account_id
@@ -607,6 +884,7 @@ class UpstreamAccountService:
             config = result.scalar_one_or_none()
             if config is None:
                 return False
+            self._require_config_binding(remote, config)
             await db.delete(config)
             await db.commit()
             return True
@@ -616,13 +894,23 @@ class UpstreamAccountService:
         db: AsyncSession,
         account_id: int,
         enabled: bool,
+        expected_identity_fingerprint: str,
     ) -> UpstreamAccountOut:
         lock = await self._lock_for(account_id)
         async with lock:
-            remote = await self._remote_account(account_id)
+            remote = await self._remote_account(account_id, expected_identity_fingerprint)
+            result = await db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == account_id
+                )
+            )
+            config = result.scalar_one_or_none()
+            self._require_config_binding(remote, config)
             try:
                 await self.sub2api.set_account_schedulable(account_id, enabled)
-                readback = await self.sub2api.get_account(str(account_id))
+                readback = await self._remote_account(account_id, expected_identity_fingerprint)
+            except UpstreamAccountServiceError:
+                raise
             except Exception as exc:
                 if isinstance(exc, asyncio.CancelledError):
                     raise
@@ -633,17 +921,24 @@ class UpstreamAccountService:
                 raise UpstreamAccountServiceError(
                     "sub2api account state readback did not match the requested state."
                 )
+            return self._build_out(readback, config)
+
+    async def delete_remote_account(
+        self,
+        db: AsyncSession,
+        account_id: int,
+        expected_identity_fingerprint: str,
+    ) -> bool:
+        lock = await self._lock_for(account_id)
+        async with lock:
+            remote = await self._remote_account(account_id, expected_identity_fingerprint)
             result = await db.execute(
                 select(UpstreamAccountConfig).where(
                     UpstreamAccountConfig.sub2api_account_id == account_id
                 )
             )
-            return self._build_out(readback, result.scalar_one_or_none())
-
-    async def delete_remote_account(self, db: AsyncSession, account_id: int) -> bool:
-        lock = await self._lock_for(account_id)
-        async with lock:
-            remote = await self._remote_account(account_id)
+            config = result.scalar_one_or_none()
+            self._require_config_binding(remote, config)
             try:
                 deleted = await self.sub2api.delete_account(remote)
             except Exception as exc:
@@ -658,12 +953,6 @@ class UpstreamAccountService:
                     status_code=404,
                 )
 
-            result = await db.execute(
-                select(UpstreamAccountConfig).where(
-                    UpstreamAccountConfig.sub2api_account_id == account_id
-                )
-            )
-            config = result.scalar_one_or_none()
             channel_id = config.channel_id if config is not None else None
             if config is not None:
                 await db.delete(config)
@@ -685,7 +974,11 @@ class UpstreamAccountService:
         result = discover_upstream(
             base_url=config.base_url or "",
             upstream_type=config.upstream_type,
-            api_key=decrypt_text(config.encrypted_api_key),
+            api_key=(
+                decrypt_text(config.encrypted_api_key)
+                if not config.api_key_origin_rebind_required
+                else None
+            ),
             access_token=decrypt_text(config.encrypted_access_token),
             new_api_user=config.upstream_user_id,
             selected_group_id=config.selected_group_id,
@@ -749,8 +1042,13 @@ class UpstreamAccountService:
         remote: dict[str, Any],
         config: UpstreamAccountConfig,
     ) -> UpstreamAccountOut:
+        self._require_config_binding(remote, config)
         now = _utcnow()
-        api_key = decrypt_text(config.encrypted_api_key)
+        api_key = (
+            decrypt_text(config.encrypted_api_key)
+            if not config.api_key_origin_rebind_required
+            else None
+        )
         access_token = decrypt_text(config.encrypted_access_token)
         has_credentials = bool(api_key or access_token)
         has_base_url = bool(config.base_url)
@@ -977,6 +1275,8 @@ class UpstreamAccountService:
             config.remote_name = self._remote_name(remote, config.sub2api_account_id)
         config.last_error = " ".join(dict.fromkeys(errors)) or None
         config.last_discovered_at = now
+        current_remote = await self._remote_account(config.sub2api_account_id)
+        self._require_config_binding(current_remote, config)
         await db.commit()
         await db.refresh(config)
         return self._build_out(remote, config)
@@ -985,10 +1285,11 @@ class UpstreamAccountService:
         self,
         db: AsyncSession,
         account_id: int,
+        expected_identity_fingerprint: str,
     ) -> UpstreamAccountOut:
         lock = await self._lock_for(account_id)
         async with lock:
-            remote = await self._remote_account(account_id)
+            remote = await self._remote_account(account_id, expected_identity_fingerprint)
             result = await db.execute(
                 select(UpstreamAccountConfig).where(
                     UpstreamAccountConfig.sub2api_account_id == account_id
@@ -998,6 +1299,8 @@ class UpstreamAccountService:
             if config is None:
                 config = self._new_config(remote, account_id)
                 db.add(config)
+            else:
+                self._require_config_binding(remote, config)
             return await self._discover_locked(db, remote, config)
 
     async def discover_all(self, db: AsyncSession) -> UpstreamDiscoverAllOut:
@@ -1008,29 +1311,38 @@ class UpstreamAccountService:
         }
         if not remote_by_id:
             return UpstreamDiscoverAllOut(total=0, succeeded=0, failed=0, accounts=[])
-        result = await db.execute(
-            select(UpstreamAccountConfig).where(
-                UpstreamAccountConfig.sub2api_account_id.in_(sorted(remote_by_id))
-            )
-        )
-        configs = {
-            config.sub2api_account_id: config
-            for config in result.scalars().all()
-        }
         accounts: list[UpstreamAccountOut] = []
         succeeded = 0
         failed = 0
         for account_id in sorted(remote_by_id):
             remote = remote_by_id[account_id]
-            config = configs.get(account_id)
-            if config is None:
-                config = self._new_config(remote, account_id)
-                db.add(config)
             lock = await self._lock_for(account_id)
             async with lock:
+                result = await db.execute(
+                    select(UpstreamAccountConfig)
+                    .where(
+                        UpstreamAccountConfig.sub2api_account_id == account_id
+                    )
+                    .execution_options(populate_existing=True)
+                )
+                config = result.scalar_one_or_none()
+                if config is None:
+                    config = self._new_config(remote, account_id)
+                    db.add(config)
+                elif self._config_binding_status(remote, config) != "bound":
+                    accounts.append(self._build_out(remote, config))
+                    failed += 1
+                    continue
                 account = await self._discover_locked(db, remote, config)
             accounts.append(account)
-            if account.target_rate is not None or account.balance_status in {"ok", "success", "available"}:
+            discovery_failed = "Upstream discovery failed." in (account.last_error or "")
+            if (
+                not discovery_failed
+                and (
+                    account.target_rate is not None
+                    or account.balance_status in {"ok", "success", "available"}
+                )
+            ):
                 succeeded += 1
             else:
                 failed += 1
@@ -1046,10 +1358,11 @@ class UpstreamAccountService:
         db: AsyncSession,
         account_id: int,
         confirmed_target_rate: float,
+        expected_identity_fingerprint: str,
     ) -> UpstreamAccountOut:
         lock = await self._lock_for(account_id)
         async with lock:
-            remote = await self._remote_account(account_id)
+            remote = await self._remote_account(account_id, expected_identity_fingerprint)
             result = await db.execute(
                 select(UpstreamAccountConfig).where(
                     UpstreamAccountConfig.sub2api_account_id == account_id
@@ -1061,6 +1374,7 @@ class UpstreamAccountService:
                     "Save the upstream account configuration before applying a rate.",
                     status_code=404,
                 )
+            self._require_config_binding(remote, config)
 
             discovered = await self._discover_locked(db, remote, config)
             target = _decimal_multiplier(discovered.target_rate, allow_zero=True)
@@ -1078,6 +1392,8 @@ class UpstreamAccountService:
                     status_code=409,
                 )
 
+            remote = await self._remote_account(account_id, expected_identity_fingerprint)
+            self._require_config_binding(remote, config)
             try:
                 await self.sub2api.update_account_rate_multiplier(account_id, float(target))
                 readback = await self.sub2api.get_account_current_rate_multiplier(account_id)

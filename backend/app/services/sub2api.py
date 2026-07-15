@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import calendar
 import copy
@@ -10,6 +11,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.core.upstream_urls import canonicalize_upstream_url
 from app.services.runtime_config import EffectiveSub2ApiConfig, get_runtime_config_service
 
 
@@ -61,14 +63,70 @@ ACCOUNT_NAME_PATHS = (
 # A 100-account page can exceed 1 MiB because sub2api includes OAuth metadata.
 MAX_SUB2API_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SUB2API_ERROR_PREVIEW_BYTES = 500
+MAX_SUB2API_TEST_STREAM_BYTES = 64 * 1024
+MAX_SUB2API_TEST_LINE_BYTES = 16 * 1024
+SUB2API_REQUEST_TOTAL_TIMEOUT_SECONDS = 90.0
+SUB2API_TEST_TOTAL_TIMEOUT_SECONDS = 70.0
+MAX_REMOTE_ACCOUNT_ERROR_CHARS = 500
 MAX_SUB2API_ACCOUNT_PAGES = 100
 MAX_SUB2API_ACCOUNTS = 10_000
+SENSITIVE_ERROR_FIELD_PATTERN = (
+    r"(?:access[-_]?token|refresh[-_]?token|id[-_]?token|token|rt|"
+    r"api[-_]?key|apikey|x[-_]?api[-_]?key|password|client[-_]?secret|secret|"
+    r"authorization|proxy[-_]?authorization|cookie|set[-_]?cookie)"
+)
+SENSITIVE_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)"
+    r"\s*:\s*[^\r\n]*"
+)
+SENSITIVE_QUERY_RE = re.compile(
+    rf"(?i)([?&]{SENSITIVE_ERROR_FIELD_PATTERN}=)[^&#\s]*"
+)
+SENSITIVE_ERROR_RE = re.compile(
+    rf"(?i)([\"']?{SENSITIVE_ERROR_FIELD_PATTERN}[\"']?\s*[:=]\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)"
+)
+SENSITIVE_ERROR_BRIDGE_RE = re.compile(
+    r"(?i)(\b(?:x[-_\s]?api[-_\s]?key|api[-_\s]?key)\b"
+    r"\s+(?:is|was|provided|supplied)\s*:\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)"
+)
+AUTH_SCHEME_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[^\r\n]*")
 
 
 class Sub2ApiRequestError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+def redact_sub2api_error_text(
+    value: Any,
+    *,
+    known_credentials: tuple[str, ...] | list[str] | set[str] = (),
+    limit: int | None = MAX_REMOTE_ACCOUNT_ERROR_CHARS,
+    strip_whitespace: bool = True,
+) -> str:
+    text = str(value or "")
+    text = SENSITIVE_HEADER_RE.sub(
+        lambda match: f"{match.group(1)}: ***redacted***",
+        text,
+    )
+    text = SENSITIVE_QUERY_RE.sub(r"\1***redacted***", text)
+    text = SENSITIVE_ERROR_RE.sub(r"\1***redacted***", text)
+    text = SENSITIVE_ERROR_BRIDGE_RE.sub(r"\1***redacted***", text)
+    text = AUTH_SCHEME_RE.sub(r"\1 ***redacted***", text)
+    for credential in sorted(
+        {str(item) for item in known_credentials if str(item)},
+        key=len,
+        reverse=True,
+    ):
+        text = text.replace(credential, "***redacted***")
+    if strip_whitespace:
+        text = text.strip()
+    if limit is None:
+        return text
+    return text[: max(0, limit)]
 
 
 async def _read_bounded_response(
@@ -88,6 +146,34 @@ async def _read_bounded_response(
         chunks.append(chunk)
         size += len(chunk)
     return b"".join(chunks), False
+
+
+async def _iter_bounded_response_lines(response: httpx.Response):
+    pending = bytearray()
+    consumed = 0
+    async for chunk in response.aiter_bytes():
+        consumed += len(chunk)
+        if consumed > MAX_SUB2API_TEST_STREAM_BYTES:
+            raise Sub2ApiRequestError("sub2api account test response was too large.")
+        pending.extend(chunk)
+        while True:
+            newline_at = pending.find(b"\n")
+            if newline_at < 0:
+                if len(pending) > MAX_SUB2API_TEST_LINE_BYTES:
+                    raise Sub2ApiRequestError("sub2api account test response line was too large.")
+                break
+            raw_line = bytes(pending[:newline_at])
+            del pending[: newline_at + 1]
+            if len(raw_line) > MAX_SUB2API_TEST_LINE_BYTES:
+                raise Sub2ApiRequestError("sub2api account test response line was too large.")
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            yield raw_line.decode("utf-8", errors="replace")
+
+    if pending:
+        if len(pending) > MAX_SUB2API_TEST_LINE_BYTES:
+            raise Sub2ApiRequestError("sub2api account test response line was too large.")
+        yield bytes(pending).decode("utf-8", errors="replace")
 
 
 def _deep_get(data: Any, path: str) -> Any:
@@ -200,13 +286,27 @@ def sanitize_payload(value: Any) -> Any:
         sanitized: dict[str, Any] = {}
         for key, child in value.items():
             lowered = str(key).lower()
-            if lowered == "rt" or any(marker in lowered for marker in ("token", "secret", "password", "cookie", "authorization")):
+            normalized = re.sub(r"[^a-z0-9]", "", lowered)
+            if (
+                normalized == "rt"
+                or "apikey" in normalized
+                or any(
+                    marker in normalized
+                    for marker in ("token", "secret", "password", "cookie", "authorization")
+                )
+            ):
                 sanitized[key] = "***redacted***" if child else child
             else:
                 sanitized[key] = sanitize_payload(child)
         return sanitized
     if isinstance(value, list):
         return [sanitize_payload(child) for child in value]
+    if isinstance(value, str):
+        return redact_sub2api_error_text(
+            value,
+            limit=None,
+            strip_whitespace=False,
+        )
     return value
 
 
@@ -415,8 +515,38 @@ class Sub2ApiClient:
     ) -> None:
         self.settings = settings or get_settings()
         self.transport = transport
+        self._known_credentials: set[str] = set()
+        configured_token = str(getattr(self.settings, "sub2api_auth_token", "") or "").strip()
+        if configured_token:
+            self._known_credentials.add(configured_token)
+
+    def _remember_config_credential(self, config: EffectiveSub2ApiConfig) -> None:
+        token = str(config.auth_token or "").strip()
+        if token:
+            self._known_credentials.add(token)
+
+    def _redact_error_text(
+        self,
+        value: Any,
+        *,
+        limit: int = MAX_REMOTE_ACCOUNT_ERROR_CHARS,
+    ) -> str:
+        return redact_sub2api_error_text(
+            value,
+            known_credentials=self._known_credentials,
+            limit=limit,
+        )
+
+    def redact_error_text(
+        self,
+        value: Any,
+        *,
+        limit: int = MAX_REMOTE_ACCOUNT_ERROR_CHARS,
+    ) -> str:
+        return self._redact_error_text(value, limit=limit)
 
     def _headers(self, config: EffectiveSub2ApiConfig) -> dict[str, str]:
+        self._remember_config_credential(config)
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         token = config.auth_token.strip()
         if token:
@@ -435,41 +565,58 @@ class Sub2ApiClient:
         config: EffectiveSub2ApiConfig | None = None,
         **kwargs: Any,
     ) -> Any:
-        active_config = config or await get_runtime_config_service().get_sub2api_config()
-        async with httpx.AsyncClient(
-            timeout=30.0,
-            headers=self._headers(active_config),
-            trust_env=False,
-            transport=self.transport,
-        ) as client:
-            url = self._url(active_config, path)
-            async with client.stream(method, url, **kwargs) as response:
-                status_code = response.status_code
-                if status_code < 200 or status_code >= 300:
-                    body, _truncated = await _read_bounded_response(
-                        response,
-                        limit=MAX_SUB2API_ERROR_PREVIEW_BYTES,
-                    )
-                    detail = body.decode("utf-8", errors="replace")
-                    raise Sub2ApiRequestError(
-                        f"sub2api request failed: HTTP {status_code} for {method} {url}. {detail}",
-                        status_code=status_code,
-                    )
-                body, truncated = await _read_bounded_response(
-                    response,
-                    limit=MAX_SUB2API_RESPONSE_BYTES,
-                )
-            if truncated:
-                raise Sub2ApiRequestError(
-                    f"sub2api response exceeded {MAX_SUB2API_RESPONSE_BYTES} bytes for {method} {url}."
-                )
-            if not body:
-                return None
-            try:
-                return json.loads(body)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                preview = body[:MAX_SUB2API_ERROR_PREVIEW_BYTES].decode("utf-8", errors="replace")
-                raise Sub2ApiRequestError(f"sub2api returned non-JSON response for {method} {url}: {preview}") from exc
+        deadline = (
+            asyncio.get_running_loop().time()
+            + SUB2API_REQUEST_TOTAL_TIMEOUT_SECONDS
+        )
+        try:
+            async with asyncio.timeout_at(deadline):
+                active_config = config or await get_runtime_config_service().get_sub2api_config()
+                async with httpx.AsyncClient(
+                    timeout=30.0,
+                    headers=self._headers(active_config),
+                    trust_env=False,
+                    transport=self.transport,
+                ) as client:
+                    url = self._url(active_config, path)
+                    async with client.stream(method, url, **kwargs) as response:
+                        status_code = response.status_code
+                        if status_code < 200 or status_code >= 300:
+                            _body, truncated = await _read_bounded_response(
+                                response,
+                                limit=MAX_SUB2API_ERROR_PREVIEW_BYTES,
+                            )
+                            body_state = "exceeded the diagnostic limit" if truncated else "was omitted"
+                            raise Sub2ApiRequestError(
+                                self._redact_error_text(
+                                    f"sub2api request failed: HTTP {status_code} for {method} {url}; "
+                                    f"remote response body {body_state}."
+                                ),
+                                status_code=status_code,
+                            )
+                        body, truncated = await _read_bounded_response(
+                            response,
+                            limit=MAX_SUB2API_RESPONSE_BYTES,
+                        )
+                    if truncated:
+                        raise Sub2ApiRequestError(
+                            f"sub2api response exceeded {MAX_SUB2API_RESPONSE_BYTES} bytes for {method} {url}."
+                        )
+                    if not body:
+                        return None
+                    try:
+                        return json.loads(body)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise Sub2ApiRequestError(
+                            self._redact_error_text(
+                                f"sub2api returned non-JSON response for {method} {url}; "
+                                "remote response body was omitted."
+                            )
+                        ) from exc
+        except Sub2ApiRequestError:
+            raise
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            raise Sub2ApiRequestError("sub2api request timed out.") from exc
 
     def _unwrap(self, payload: Any) -> Any:
         if isinstance(payload, dict):
@@ -486,8 +633,12 @@ class Sub2ApiClient:
                     return payload[key]
         return payload
 
-    async def list_accounts(self) -> list[dict[str, Any]]:
-        config = await get_runtime_config_service().get_sub2api_config()
+    async def list_accounts(
+        self,
+        *,
+        config: EffectiveSub2ApiConfig | None = None,
+    ) -> list[dict[str, Any]]:
+        config = config or await get_runtime_config_service().get_sub2api_config()
         payload = await self._request("GET", config.accounts_path, config=config, params={"page": 1, "page_size": 100})
         accounts = self._unwrap(payload)
         if not isinstance(accounts, list):
@@ -524,6 +675,74 @@ class Sub2ApiClient:
                 result.append(account)
         return result
 
+    def _api_key_export_identity(
+        self,
+        account: dict[str, Any],
+    ) -> tuple[str, str, str, str] | None:
+        name = self.account_name(account)
+        platform = self.account_platform(account)
+        raw_type = _first_value(
+            account,
+            ("type",),
+            ("account_type",),
+            ("auth_type",),
+        )
+        base_url = _first_string(
+            account,
+            ("credentials", "base_url"),
+            ("credentials", "baseURL"),
+            ("credentials", "api_base"),
+            ("credentials", "api_base_url"),
+            ("credentials", "base_uri"),
+            ("credentials", "endpoint"),
+            ("base_url",),
+            ("baseURL",),
+            ("api_base",),
+            ("api_base_url",),
+            ("base_uri",),
+            ("endpoint",),
+        )
+        if not name or not platform or not isinstance(raw_type, str) or not base_url:
+            return None
+        normalized_type = raw_type.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized_type not in {"apikey", "api_key"}:
+            return None
+        try:
+            normalized_base_url = canonicalize_upstream_url(base_url)
+        except (TypeError, ValueError):
+            return None
+        return (
+            name,
+            platform.strip().lower(),
+            "api_key",
+            normalized_base_url,
+        )
+
+    def _api_key_inventory(
+        self,
+        accounts: list[dict[str, Any]],
+        requested: set[int],
+    ) -> dict[int, tuple[str, str, str, str]] | None:
+        by_id: dict[int, tuple[str, str, str, str]] = {}
+        by_identity: dict[tuple[str, str, str, str], int] = {}
+        for account in accounts:
+            account_type = (self.account_type(account) or "").strip().lower()
+            normalized_type = account_type.replace("-", "_").replace(" ", "_")
+            if normalized_type not in {"apikey", "api_key"}:
+                continue
+            account_id = _positive_int(self.account_id(account))
+            identity = self._api_key_export_identity(account)
+            if account_id is None or identity is None:
+                return None
+            if account_id in by_id or identity in by_identity:
+                return None
+            by_id[account_id] = identity
+            by_identity[identity] = account_id
+
+        if not requested.issubset(by_id):
+            return None
+        return by_id
+
     async def export_api_key_secrets(self, account_ids: list[int]) -> dict[int, str]:
         """Read API keys from the protected local admin export without caching them."""
 
@@ -537,20 +756,26 @@ class Sub2ApiClient:
             return {}
 
         config = await get_runtime_config_service().get_sub2api_config()
-        try:
-            payload = await self._request(
-                "GET",
-                f"{config.accounts_path}/data",
-                config=config,
-                params={
-                    "ids": ",".join(str(account_id) for account_id in normalized_ids),
-                    "include_proxies": "false",
-                },
-            )
-        except Sub2ApiRequestError:
-            return {}
-        exported = self._unwrap(payload)
-        if not isinstance(exported, list):
+        export_params = {
+            "ids": ",".join(str(account_id) for account_id in normalized_ids),
+            "include_proxies": "false",
+        }
+
+        async def request_export() -> list[Any] | None:
+            try:
+                payload = await self._request(
+                    "GET",
+                    f"{config.accounts_path}/data",
+                    config=config,
+                    params=export_params,
+                )
+            except Sub2ApiRequestError:
+                return None
+            unwrapped = self._unwrap(payload)
+            return unwrapped if isinstance(unwrapped, list) else None
+
+        exported = await request_export()
+        if exported is None:
             return {}
 
         requested = set(normalized_ids)
@@ -579,21 +804,20 @@ class Sub2ApiClient:
                 return None
             return api_key
 
-        response_ids = [
-            _positive_int(
-                _first_value(
-                    item,
-                    ("id",),
-                    ("account_id",),
-                    ("accountId",),
-                )
+        raw_response_ids = [
+            _first_value(
+                item,
+                ("id",),
+                ("account_id",),
+                ("accountId",),
             )
             if isinstance(item, dict)
             else None
             for item in exported
         ]
+        response_ids = [_positive_int(value) for value in raw_response_ids]
         result: dict[int, str] = {}
-        if any(account_id is not None for account_id in response_ids):
+        if any(value is not None for value in raw_response_ids):
             duplicate_ids: set[int] = set()
             for account_id, item in zip(response_ids, exported, strict=True):
                 if account_id is None or account_id not in requested:
@@ -608,9 +832,55 @@ class Sub2ApiClient:
                 result.pop(account_id, None)
             return result
 
-        # A credential must never be associated by response position. Older
-        # exports that omit stable account ids are intentionally unsupported.
-        return {}
+        # Current sub2api backup exports deliberately omit database ids. The
+        # first export only detects that compatibility format; its secrets are
+        # discarded. Only a second export bracketed by stable inventories can
+        # supply returned credentials.
+        exported = []
+        try:
+            before_accounts = await self.list_accounts(config=config)
+        except Sub2ApiRequestError:
+            return {}
+
+        exported = await request_export()
+        if exported is None:
+            return {}
+        if any(
+            _first_value(item, ("id",), ("account_id",), ("accountId",)) is not None
+            for item in exported
+            if isinstance(item, dict)
+        ):
+            return {}
+        try:
+            after_accounts = await self.list_accounts(config=config)
+        except Sub2ApiRequestError:
+            return {}
+
+        before_by_id = self._api_key_inventory(before_accounts, requested)
+        after_by_id = self._api_key_inventory(after_accounts, requested)
+        if before_by_id is None or after_by_id is None or before_by_id != after_by_id:
+            return {}
+
+        exported_by_identity: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for item in exported:
+            if not isinstance(item, dict):
+                return {}
+            identity = self._api_key_export_identity(item)
+            if identity is None or identity in exported_by_identity or exported_key(item) is None:
+                return {}
+            exported_by_identity[identity] = item
+
+        expected_identities = {before_by_id[account_id] for account_id in requested}
+        if set(exported_by_identity) != expected_identities:
+            return {}
+
+        for account_id in requested:
+            identity = before_by_id[account_id]
+            item = exported_by_identity[identity]
+            api_key = exported_key(item)
+            if api_key:
+                result[account_id] = api_key
+        return result
 
     async def get_account_balance(self, account: dict[str, Any] | str | int) -> dict[str, Any]:
         raw_account_id = account if isinstance(account, (str, int)) else self.account_id(account)
@@ -939,6 +1209,136 @@ class Sub2ApiClient:
             if isinstance(value, str) and value.strip() and not _looks_redacted(value):
                 return True
         return False
+
+    async def get_account_models(self, account: dict[str, Any] | str) -> list[dict[str, str]]:
+        account_id = account if isinstance(account, str) else self.account_id(account)
+        if not account_id:
+            raise ValueError("Cannot list sub2api account models without id.")
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        payload = await self._request(
+            "GET",
+            f"{config.accounts_path}/{account_id}/models",
+            config=config,
+        )
+        models = self._unwrap(payload)
+        if not isinstance(models, list):
+            return []
+
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or item.get("model_id") or "").strip()
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            display_name = str(
+                item.get("display_name")
+                or item.get("displayName")
+                or item.get("name")
+                or model_id
+            ).strip()
+            result.append({"id": model_id, "display_name": display_name or model_id})
+        return result
+
+    async def test_account_connection(
+        self,
+        account: dict[str, Any] | str,
+        model_id: str,
+        *,
+        prompt: str = "hi",
+    ) -> tuple[bool, str | None]:
+        account_id = account if isinstance(account, str) else self.account_id(account)
+        if not account_id:
+            raise ValueError("Cannot test sub2api account without id.")
+        selected_model = str(model_id or "").strip()
+        if not selected_model:
+            raise ValueError("Cannot test sub2api account without model id.")
+
+        deadline = asyncio.get_running_loop().time() + SUB2API_TEST_TOTAL_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout_at(deadline):
+                config = await get_runtime_config_service().get_sub2api_config()
+                return await self._test_account_connection_request(
+                    account_id,
+                    selected_model,
+                    prompt,
+                    config,
+                )
+        except Sub2ApiRequestError:
+            raise
+        except TimeoutError as exc:
+            raise Sub2ApiRequestError("sub2api account test request timed out.") from exc
+        except httpx.HTTPError as exc:
+            detail = self._redact_error_text(exc)
+            raise Sub2ApiRequestError(f"sub2api account test request failed: {detail}") from exc
+
+    async def _test_account_connection_request(
+        self,
+        account_id: str,
+        selected_model: str,
+        prompt: str,
+        config: EffectiveSub2ApiConfig,
+    ) -> tuple[bool, str | None]:
+        url = self._url(config, f"{config.accounts_path}/{account_id}/test")
+        timeout = httpx.Timeout(60.0, connect=10.0)
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers=self._headers(config),
+            trust_env=False,
+            transport=self.transport,
+        ) as client:
+            async with client.stream(
+                "POST",
+                url,
+                json={"model_id": selected_model, "prompt": prompt, "mode": "default"},
+            ) as response:
+                if response.status_code < 200 or response.status_code >= 300:
+                    _body, truncated = await _read_bounded_response(
+                        response,
+                        limit=MAX_SUB2API_ERROR_PREVIEW_BYTES,
+                    )
+                    body_state = "exceeded the diagnostic limit" if truncated else "was omitted"
+                    raise Sub2ApiRequestError(
+                        f"sub2api account test failed: HTTP {response.status_code}; "
+                        f"remote response body {body_state}.",
+                        status_code=response.status_code,
+                    )
+
+                completed: bool | None = None
+                error_message: str | None = None
+                async for line in _iter_bounded_response_lines(response):
+                    stripped = line.strip()
+                    if not stripped.startswith("data:"):
+                        continue
+                    event_text = stripped[5:].strip()
+                    if not event_text or event_text == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(event_text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = str(event.get("type") or "").strip().lower()
+                    if event_type == "error":
+                        error_message = self._redact_error_text(
+                            event.get("error") or event.get("text") or "sub2api test failed."
+                        )
+                    elif event_type == "test_complete":
+                        completed = event.get("success") is True
+                        if not completed:
+                            error_message = self._redact_error_text(
+                                event.get("error") or error_message or "sub2api test failed."
+                            )
+
+                if completed is True:
+                    return True, None
+                if error_message:
+                    return False, error_message
+                return False, "sub2api 测试未返回完成状态。"
 
     async def test_account_for_deactivation(self, account: dict[str, Any] | str) -> bool | None:
         account_id = account if isinstance(account, str) else self.account_id(account)
@@ -1517,7 +1917,44 @@ class Sub2ApiClient:
                 continue
             text = str(value).strip()
             if text:
-                return text
+                return self._redact_error_text(
+                    text,
+                    limit=MAX_REMOTE_ACCOUNT_ERROR_CHARS,
+                ) or None
+        return None
+
+    def account_error_status_code(self, account: dict[str, Any]) -> int | None:
+        explicit = _first_value(
+            account,
+            ("status_code",),
+            ("statusCode",),
+            ("http_status",),
+            ("httpStatus",),
+            ("error", "status"),
+            ("error", "status_code"),
+            ("error", "statusCode"),
+            ("error_code",),
+            ("errorCode",),
+            ("last_error_code",),
+            ("lastErrorCode",),
+        )
+        parsed = _positive_int(explicit)
+        if parsed is not None and 100 <= parsed <= 599:
+            return parsed
+
+        message = self.account_error_message(account)
+        if not message:
+            return None
+        for pattern in (
+            r"\((\d{3})\)",
+            r"\bHTTP\s+(\d{3})\b",
+            r"\bstatus(?:\s+code)?[\s\"':=]+(\d{3})\b",
+        ):
+            match = re.search(pattern, message, flags=re.IGNORECASE)
+            if match:
+                parsed = int(match.group(1))
+                if 100 <= parsed <= 599:
+                    return parsed
         return None
 
     def account_phone_note_text(self, account: dict[str, Any]) -> str:

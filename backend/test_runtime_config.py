@@ -7,19 +7,49 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.services.runtime_config as runtime_config
+from app.api.settings import router as settings_router
 from app.core.config import Settings
 from app.core.database import Base
+from app.core.security import require_admin
 from app.models import AppSetting, UpstreamRateChangeLog, utcnow
 from app.schemas import AppSettingsUpdate
-from app.services.runtime_config import ProbeHit, RuntimeConfigService
+from app.services.runtime_config import (
+    MAX_CONFIGURED_PROBE_RESPONSE_BYTES,
+    ProbeHit,
+    RuntimeConfigService,
+    RuntimeConfigServiceError,
+)
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_settings_route_maps_credential_rebind_conflict_to_409(self) -> None:
+        app = FastAPI()
+        app.include_router(settings_router, prefix="/api/settings")
+        service = SimpleNamespace(
+            update_public_settings=AsyncMock(
+                side_effect=RuntimeConfigServiceError("credential rebind confirmation required", status_code=409)
+            )
+        )
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        with (
+            patch("app.api.settings.get_runtime_config_service", return_value=service),
+            TestClient(app) as client,
+        ):
+            response = client.put(
+                "/api/settings",
+                json={"sub2api_base_url": "https://replacement.example/api/v1"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"detail": "credential rebind confirmation required"})
+
     def test_test_environment_never_persists_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir)
@@ -177,6 +207,162 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(result["port"], 443)
         self.assertEqual(result["checked_ports"], [443, 18080])
         service._find_sub2api.assert_not_awaited()  # type: ignore[attr-defined]
+
+    def test_runtime_origin_change_requires_explicit_credential_rebind(self) -> None:
+        asyncio.run(self._assert_runtime_origin_change_requires_explicit_credential_rebind())
+
+    async def _assert_runtime_origin_change_requires_explicit_credential_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = _FakeSettings(Path(tmpdir))
+            settings.sub2api_auth_token = "retained-sub2api-administrator-key"
+            settings.sub2api_auth_header = "x-api-key"
+            settings.sub2api_auth_scheme = ""
+            service = RuntimeConfigService(settings)
+            engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            original_sessionmaker = runtime_config.AsyncSessionLocal
+            runtime_config.AsyncSessionLocal = session_factory
+            try:
+                with self.assertRaises(RuntimeConfigServiceError) as context:
+                    await service.update_public_settings(
+                        {"sub2api_base_url": "https://replacement.example/api/v1"}
+                    )
+                self.assertEqual(context.exception.status_code, 409)
+
+                updated = await service.update_public_settings(
+                    {
+                        "sub2api_base_url": "https://replacement.example/api/v1",
+                        "confirm_sub2api_credential_rebind": True,
+                    }
+                )
+                self.assertEqual(updated["sub2api_base_url"], "https://replacement.example/api/v1")
+            finally:
+                runtime_config.AsyncSessionLocal = original_sessionmaker
+                await engine.dispose()
+
+    def test_scan_does_not_auto_apply_a_cross_origin_credential_rebind(self) -> None:
+        asyncio.run(self._assert_scan_does_not_auto_apply_a_cross_origin_credential_rebind())
+
+    async def _assert_scan_does_not_auto_apply_a_cross_origin_credential_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = RuntimeConfigService(_FakeSettings(Path(tmpdir)))
+            config = SimpleNamespace(
+                base_url="http://localhost:8080/api/v1",
+                auth_token="retained-administrator-key",
+            )
+            hit = ProbeHit(
+                base_url="http://127.0.0.1:18080/api/v1",
+                port=18080,
+                status="200",
+                message="candidate detected",
+            )
+            db = AsyncMock()
+            service.get_sub2api_config = AsyncMock(return_value=config)  # type: ignore[method-assign]
+            service._candidate_ports = Mock(return_value=[8080, 18080])  # type: ignore[method-assign]
+            service._probe_configured_sub2api = AsyncMock(return_value=None)  # type: ignore[method-assign]
+            service._find_sub2api = AsyncMock(return_value=hit)  # type: ignore[method-assign]
+            service._put = AsyncMock()  # type: ignore[method-assign]
+            with patch.object(runtime_config, "AsyncSessionLocal", return_value=_SessionContext(db)):
+                result = await service.scan_sub2api_ports(apply=True)
+
+        self.assertTrue(result["found"])
+        self.assertFalse(result["applied"])
+        self.assertIn("明确确认", result["message"])
+        persisted_keys = [args.args[1] for args in service._put.await_args_list]  # type: ignore[attr-defined]
+        self.assertNotIn("sub2api_base_url", persisted_keys)
+
+    def test_runtime_origin_change_can_clear_the_retained_credential(self) -> None:
+        asyncio.run(self._assert_runtime_origin_change_can_clear_the_retained_credential())
+
+    async def _assert_runtime_origin_change_can_clear_the_retained_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = _FakeSettings(Path(tmpdir))
+            settings.sub2api_auth_token = "legacy-sub2api-administrator-key"
+            settings.sub2api_auth_header = "x-api-key"
+            settings.sub2api_auth_scheme = ""
+            service = RuntimeConfigService(settings)
+            engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            original_sessionmaker = runtime_config.AsyncSessionLocal
+            runtime_config.AsyncSessionLocal = session_factory
+            try:
+                await service.update_public_settings(
+                    {
+                        "sub2api_base_url": "https://replacement.example/api/v1",
+                        "clear_sub2api_x_api_key": True,
+                    }
+                )
+                effective = await service.get_sub2api_config()
+                self.assertEqual(effective.base_url, "https://replacement.example/api/v1")
+                self.assertEqual(effective.auth_token, "")
+            finally:
+                runtime_config.AsyncSessionLocal = original_sessionmaker
+                await engine.dispose()
+
+    def test_candidate_ports_are_bounded_to_configured_explicit_and_common_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = _FakeSettings(Path(tmpdir))
+            settings.sub2api_scan_ports = [28080]
+            service = RuntimeConfigService(settings)
+            ports = service._candidate_ports("http://localhost:18090/api/v1")
+
+        self.assertEqual(ports[0:2], [18090, 28080])
+        self.assertIn(8080, ports)
+        self.assertIn(18080, ports)
+        self.assertNotIn(3000, ports)
+        self.assertNotIn(5432, ports)
+        self.assertNotIn(6379, ports)
+        self.assertNotIn(49152, ports)
+
+    def test_configured_probe_stops_reading_after_raw_byte_limit(self) -> None:
+        asyncio.run(self._assert_configured_probe_stops_reading_after_raw_byte_limit())
+
+    async def _assert_configured_probe_stops_reading_after_raw_byte_limit(self) -> None:
+        class CountingStream(httpx.AsyncByteStream):
+            def __init__(self) -> None:
+                self.chunks_read = 0
+
+            async def __aiter__(self):
+                for _ in range(100):
+                    self.chunks_read += 1
+                    yield b"x" * (MAX_CONFIGURED_PROBE_RESPONSE_BYTES // 4)
+
+        stream = CountingStream()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=stream,
+                request=request,
+            )
+
+        real_async_client = httpx.AsyncClient
+
+        def configured_client(**kwargs: object) -> httpx.AsyncClient:
+            return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = RuntimeConfigService(_FakeSettings(Path(tmpdir)))
+            config = SimpleNamespace(
+                base_url="https://configured.example/api/v1",
+                accounts_path="/admin/accounts",
+                auth_token="",
+                auth_header="x-api-key",
+                auth_scheme="",
+            )
+            with patch(
+                "app.services.runtime_config.httpx.AsyncClient",
+                side_effect=configured_client,
+            ):
+                hit = await service._probe_configured_sub2api(config)
+
+        self.assertIsNone(hit)
+        self.assertLess(stream.chunks_read, 100)
 
     def test_usage_limit_default_ranges_reject_reversed_bounds(self) -> None:
         with self.assertRaises(ValidationError):
@@ -437,6 +623,7 @@ class _FakeSettings:
         self.sub2api_auto_clear_error = True
         self.sub2api_auto_recover_state = True
         self.sub2api_scan_timeout_seconds = 0.5
+        self.sub2api_scan_ports = [8080, 18080]
         self.automation_paused = False
         self.recovery_enabled = False
         self.monitor_interval_seconds = 300

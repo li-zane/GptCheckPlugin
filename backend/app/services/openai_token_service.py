@@ -15,6 +15,15 @@ from app.core.config import Settings, get_settings
 ACCOUNT_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
 
 
+class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _build_no_redirect_opener():
+    return urllib_request.build_opener(_NoRedirectHandler())
+
+
 class OpenAiTokenRefreshError(RuntimeError):
     pass
 
@@ -154,7 +163,7 @@ class OpenAiTokenService:
                 headers=_account_check_headers(token, self.settings.openai_oauth_user_agent),
                 method="GET",
             )
-            with urllib_request.build_opener().open(request, timeout=20) as response:
+            with _build_no_redirect_opener().open(request, timeout=20) as response:
                 body = response.read().decode(response.headers.get_content_charset() or "utf-8")
                 parsed = json.loads(body)
                 if not isinstance(parsed, dict):

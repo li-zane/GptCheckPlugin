@@ -1,6 +1,8 @@
+import asyncio
 import calendar
 import re
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
@@ -24,6 +26,11 @@ from app.models import (
 from app.schemas import (
     AccountExceptionRecordOut,
     AccountDeleteUnlockUpdate,
+    AccountLivenessModelsOut,
+    AccountLivenessModelsRequest,
+    AccountLivenessTestItemOut,
+    AccountLivenessTestRequest,
+    AccountLivenessTestResult,
     AccountOut,
     AccountRefreshUnlockUpdate,
     DeactivatedCleanupResult,
@@ -53,7 +60,11 @@ from app.services.events import record_event
 from app.services.monitor import get_monitor_service
 from app.services.refresh import get_refresh_service
 from app.services.runtime_config import get_runtime_config_service
-from app.services.sub2api import Sub2ApiClient, Sub2ApiRequestError, looks_deactive_text
+from app.services.sub2api import (
+    Sub2ApiClient,
+    Sub2ApiRequestError,
+    looks_deactive_text,
+)
 from app.services.subscription_refresh import refresh_subscriptions
 from app.services.usage_estimate import (
     LIMIT_SAMPLE_FULL_PERCENT,
@@ -73,6 +84,7 @@ from app.services.usage_refresh import get_usage_refresh_service
 
 router = APIRouter()
 _ACCOUNT_DELETE_UNLOCK_PREFIX = "account_delete_unlock."
+_ACCOUNT_LIVENESS_MAX_CONCURRENCY = 5
 
 _SUBSCRIPTION_KEYS = (
     "subscription_starts_at",
@@ -83,6 +95,17 @@ _SUBSCRIPTION_KEYS = (
     "subscription_plan",
     "has_active_subscription",
 )
+
+
+def _account_liveness_ineligibility(
+    sub2api: Sub2ApiClient,
+    account: dict[str, Any],
+) -> str | None:
+    if not sub2api.is_gpt_account(account):
+        return "此账号不是 GPT 平台账号。"
+    if not sub2api.is_oauth_account(account):
+        return "此账号不是 OAuth 账号；API Key 账号不能使用此测活功能。"
+    return None
 
 
 def _deletable_duplicate_account_ids(
@@ -587,6 +610,8 @@ async def list_accounts(
         effective_deactive = _effective_deactive(sub2api, account, snapshot)
         remote_deactive = sub2api.is_deactive_account(account)
         remote_error = sub2api.is_error_account(account) or effective_deactive
+        sub2api_error_code = sub2api.account_error_status_code(account) if remote_error else None
+        sub2api_error_message = sub2api.account_error_message(account) if remote_error else None
         mailbox_bound = normalized in bound_emails
         phone_data = phone_by_email.get(normalized) or {}
         delete_unlockable = _manual_error_delete_unlockable(
@@ -596,7 +621,11 @@ async def list_accounts(
             is_duplicate=is_duplicate,
         )
         delete_unlocked = bool(account_id and account_id in delete_unlocked_ids)
-        last_error = None if remote_healthy else snapshot.last_error if snapshot else None
+        last_error = (
+            None
+            if remote_healthy or snapshot is None
+            else sub2api.redact_error_text(snapshot.last_error) or None
+        )
         subscription_metadata = _merge_subscription_metadata(
             _snapshot_subscription_metadata(snapshot),
             _merge_subscription_metadata(_subscription_metadata(account), _subscription_metadata(snapshot.raw if snapshot else None)),
@@ -620,6 +649,8 @@ async def list_accounts(
                 refreshing=snapshot.refreshing if snapshot else False,
                 auto_refresh_locked=snapshot.auto_refresh_locked if snapshot else False,
                 last_error=last_error,
+                sub2api_error_code=sub2api_error_code,
+                sub2api_error_message=sub2api_error_message,
                 last_seen_at=snapshot.last_seen_at if snapshot else now,
                 updated_at=snapshot.updated_at if snapshot else now,
                 is_duplicate=is_duplicate,
@@ -651,12 +682,14 @@ async def list_accounts(
         account_id = snapshot.sub2api_account_id
         mailbox_bound = normalized in bound_emails
         phone_data = phone_by_email.get(normalized) or {}
-        remote_error = snapshot.deactive or bool(snapshot.last_error) or sub2api.is_error_account(
-            {
-                "status": snapshot.status,
-                "schedulable": snapshot.schedulable,
-            }
-        )
+        snapshot_raw = snapshot.raw if isinstance(snapshot.raw, dict) else {}
+        snapshot_remote = {
+            **snapshot_raw,
+            "status": snapshot.status,
+            "schedulable": snapshot.schedulable,
+        }
+        snapshot_has_remote_error = sub2api.is_error_account(snapshot_remote)
+        remote_error = snapshot.deactive or bool(snapshot.last_error) or snapshot_has_remote_error
         delete_unlockable = _manual_error_delete_unlockable(
             remote_error=remote_error,
             effective_deactive=snapshot.deactive,
@@ -683,7 +716,17 @@ async def list_accounts(
                 deactive=snapshot.deactive,
                 refreshing=snapshot.refreshing,
                 auto_refresh_locked=snapshot.auto_refresh_locked,
-                last_error=snapshot.last_error,
+                last_error=sub2api.redact_error_text(snapshot.last_error) or None,
+                sub2api_error_code=(
+                    sub2api.account_error_status_code(snapshot_remote)
+                    if snapshot_has_remote_error
+                    else None
+                ),
+                sub2api_error_message=(
+                    sub2api.account_error_message(snapshot_remote)
+                    if snapshot_has_remote_error
+                    else None
+                ),
                 last_seen_at=snapshot.last_seen_at,
                 updated_at=snapshot.updated_at,
                 remote_error=remote_error,
@@ -828,6 +871,164 @@ async def update_usage_estimate_preference(
     await db.commit()
     state = "enabled" if payload.enabled else "disabled"
     return MessageResponse(message=f"Usage estimate {state} for {snapshot.email}.")
+
+
+@router.post("/liveness-models", response_model=AccountLivenessModelsOut)
+async def get_account_liveness_models(
+    payload: AccountLivenessModelsRequest,
+    _: dict = Depends(require_admin),
+) -> AccountLivenessModelsOut:
+    sub2api = Sub2ApiClient()
+    try:
+        remote_accounts = await sub2api.list_accounts()
+    except Sub2ApiRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=sub2api.redact_error_text(exc),
+        ) from exc
+
+    remote_by_id = {
+        account_id: account
+        for account in remote_accounts
+        if (account_id := sub2api.account_id(account))
+    }
+    eligible_count = 0
+    rejection_reasons: list[str] = []
+    for account_id in payload.account_ids:
+        account = remote_by_id.get(account_id)
+        if account is None:
+            rejection_reasons.append(f"账号 {account_id} 已不在 sub2api 中。")
+            continue
+        ineligibility = _account_liveness_ineligibility(sub2api, account)
+        if ineligibility:
+            rejection_reasons.append(f"账号 {account_id}: {ineligibility}")
+            continue
+        eligible_count += 1
+        try:
+            models = await sub2api.get_account_models(account)
+        except Sub2ApiRequestError as exc:
+            diagnostic = sub2api.redact_error_text(exc) or "sub2api 请求失败。"
+            rejection_reasons.append(f"账号 {account_id} 无法读取模型：{diagnostic}")
+            continue
+        if models:
+            return AccountLivenessModelsOut(source_account_id=account_id, models=models)
+        rejection_reasons.append(f"账号 {account_id} 未返回可用模型。")
+
+    if eligible_count == 0:
+        diagnostic = " ".join(rejection_reasons[:3])
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "所选账号中没有可测活的 OAuth GPT 账号。"
+                + (f" {diagnostic}" if diagnostic else "")
+            ),
+        )
+    diagnostic = " ".join(rejection_reasons[:3])
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=(
+            f"已按选择顺序尝试 {eligible_count} 个 OAuth GPT 账号，"
+            "sub2api 均未返回可用于测活的模型。"
+            + (f" {diagnostic}" if diagnostic else "")
+        ),
+    )
+
+
+@router.post("/liveness-test", response_model=AccountLivenessTestResult)
+async def test_selected_account_liveness(
+    payload: AccountLivenessTestRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AccountLivenessTestResult:
+    sub2api = Sub2ApiClient()
+    try:
+        remote_accounts = await sub2api.list_accounts()
+    except Sub2ApiRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=sub2api.redact_error_text(exc),
+        ) from exc
+
+    remote_by_id = {
+        account_id: account
+        for account in remote_accounts
+        if (account_id := sub2api.account_id(account))
+    }
+    semaphore = asyncio.Semaphore(_ACCOUNT_LIVENESS_MAX_CONCURRENCY)
+
+    async def test_one(account_id: str) -> AccountLivenessTestItemOut:
+        account = remote_by_id.get(account_id)
+        if account is None:
+            return AccountLivenessTestItemOut(
+                account_id=account_id,
+                success=False,
+                error="sub2api 中已找不到此账号。",
+                duration_ms=0,
+            )
+
+        email = sub2api.account_email(account)
+        account_name = sub2api.account_name(account) or email
+        ineligibility = _account_liveness_ineligibility(sub2api, account)
+        if ineligibility:
+            return AccountLivenessTestItemOut(
+                account_id=account_id,
+                email=email,
+                account_name=account_name,
+                success=False,
+                error=ineligibility,
+                duration_ms=0,
+            )
+
+        started_at = perf_counter()
+        try:
+            async with semaphore:
+                success, error = await sub2api.test_account_connection(account, payload.model_id)
+        except (Sub2ApiRequestError, ValueError) as exc:
+            success = False
+            error = sub2api.redact_error_text(exc)
+        except Exception as exc:
+            success = False
+            error = sub2api.redact_error_text(exc) or "账号测活失败。"
+        duration_ms = max(0, round((perf_counter() - started_at) * 1000))
+        return AccountLivenessTestItemOut(
+            account_id=account_id,
+            email=email,
+            account_name=account_name,
+            success=success,
+            error=None if success else error or "账号测活失败。",
+            duration_ms=duration_ms,
+        )
+
+    results = list(await asyncio.gather(*(test_one(account_id) for account_id in payload.account_ids)))
+    succeeded = sum(1 for result in results if result.success)
+    failed = len(results) - succeeded
+    message = f"OAuth 账号测活完成：成功 {succeeded} 个，失败 {failed} 个。"
+    try:
+        await record_event(
+            db,
+            "account_liveness_test",
+            message,
+            details={
+                "model_id": payload.model_id,
+                "total": len(results),
+                "succeeded": succeeded,
+                "failed": failed,
+                "max_concurrency": _ACCOUNT_LIVENESS_MAX_CONCURRENCY,
+            },
+        )
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+    return AccountLivenessTestResult(
+        message=message,
+        model_id=payload.model_id,
+        total=len(results),
+        succeeded=succeeded,
+        failed=failed,
+        results=results,
+    )
 
 
 @router.post("/sync", response_model=Sub2ApiSyncResult)

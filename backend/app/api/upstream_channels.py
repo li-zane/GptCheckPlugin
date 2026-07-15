@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import require_admin
 from app.schemas import (
+    UpstreamChannelDiscoverAllRequest,
     UpstreamChannelDiscoverAllOut,
     UpstreamChannelOut,
     UpstreamChannelUpdate,
@@ -40,12 +41,23 @@ async def upstream_channel_overview(
 
 @router.post("/discover-all", response_model=UpstreamChannelDiscoverAllOut)
 async def discover_all_upstream_channels(
+    payload: UpstreamChannelDiscoverAllRequest | None = None,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     service: UpstreamChannelService = Depends(get_upstream_channel_service),
 ) -> UpstreamChannelDiscoverAllOut:
     try:
-        result = await service.discover_all(db)
+        legacy_bindings = None
+        if payload is not None and payload.confirm_legacy_bindings:
+            legacy_bindings = {
+                item.sub2api_account_id: item.expected_identity_fingerprint
+                for item in payload.account_bindings
+            }
+        result = (
+            await service.discover_all(db, legacy_bindings=legacy_bindings)
+            if legacy_bindings is not None
+            else await service.discover_all(db)
+        )
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
     try:

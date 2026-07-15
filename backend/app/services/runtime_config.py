@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import subprocess
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
@@ -55,6 +54,20 @@ KEY_DISPLAY_TIMEZONE = "display_timezone"
 KEY_SITE_NAME = "site_name"
 KEY_AUTOMATION_PAUSED = "automation_paused"
 
+MAX_CONFIGURED_PROBE_RESPONSE_BYTES = 512 * 1024
+COMMON_SUB2API_PORTS = (8080, 18080, 18090)
+
+
+class RuntimeConfigServiceError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int = 422) -> None:
+        super().__init__(message)
+        self.public_message = message
+        self.status_code = status_code
+
+
+class _ProbeResponseRejected(RuntimeError):
+    pass
+
 
 @dataclass(frozen=True)
 class EffectiveSub2ApiConfig:
@@ -83,8 +96,8 @@ class RuntimeConfigService:
     async def get_sub2api_config(self) -> EffectiveSub2ApiConfig:
         values = await self._load_values()
         runtime_key = decrypt_text(values.get(KEY_SUB2API_X_API_KEY))
-        if runtime_key:
-            auth_token = runtime_key
+        if KEY_SUB2API_X_API_KEY in values:
+            auth_token = runtime_key or ""
             auth_header = "x-api-key"
             auth_scheme = ""
         else:
@@ -225,7 +238,7 @@ class RuntimeConfigService:
         base_url = _normalize_base_url(values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url)
         runtime_key = decrypt_text(values.get(KEY_SUB2API_X_API_KEY))
         env_x_api_key = self._env_x_api_key()
-        effective_x_api_key = runtime_key or env_x_api_key
+        effective_x_api_key = runtime_key if KEY_SUB2API_X_API_KEY in values else env_x_api_key
         return {
             "sub2api_base_url": base_url,
             "sub2api_port": _port_from_url(base_url),
@@ -331,17 +344,39 @@ class RuntimeConfigService:
         current_base_url = _normalize_base_url(
             current_values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url
         )
-        x_api_key_for_file = self._x_api_key_for_file(payload, current_values)
-        explicit_runtime_key_change = bool(payload.get("clear_sub2api_x_api_key")) or bool(
+        next_base_url = current_base_url
+        if payload.get("sub2api_base_url") is not None or payload.get("sub2api_port") is not None:
+            next_base_url = _normalize_base_url(payload.get("sub2api_base_url") or current_base_url)
+            if payload.get("sub2api_port") is not None:
+                next_base_url = _replace_port(next_base_url, int(payload["sub2api_port"]))
+
+        current_runtime_key = decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY))
+        current_auth_token = (
+            current_runtime_key or ""
+            if KEY_SUB2API_X_API_KEY in current_values
+            else self.settings.sub2api_auth_token.strip()
+        )
+        replacing_key = bool(
             isinstance(payload.get("sub2api_x_api_key"), str)
             and payload["sub2api_x_api_key"].strip()
         )
+        clearing_key = bool(payload.get("clear_sub2api_x_api_key"))
+        if (
+            _sub2api_origin(next_base_url) != _sub2api_origin(current_base_url)
+            and current_auth_token
+            and not replacing_key
+            and not clearing_key
+            and not payload.get("confirm_sub2api_credential_rebind")
+        ):
+            raise RuntimeConfigServiceError(
+                "Changing the sub2api origin while retaining its credential requires explicit confirmation.",
+                status_code=409,
+            )
+        x_api_key_for_file = self._x_api_key_for_file(payload, current_values)
+        explicit_runtime_key_change = clearing_key or replacing_key
 
         async with AsyncSessionLocal() as db:
             if payload.get("sub2api_base_url") is not None or payload.get("sub2api_port") is not None:
-                next_base_url = _normalize_base_url(payload.get("sub2api_base_url") or current_base_url)
-                if payload.get("sub2api_port") is not None:
-                    next_base_url = _replace_port(next_base_url, int(payload["sub2api_port"]))
                 await self._put(db, KEY_SUB2API_BASE_URL, next_base_url)
                 await self._put(db, KEY_SUB2API_BASE_URL_SOURCE, "manual")
 
@@ -462,7 +497,9 @@ class RuntimeConfigService:
                 await self._put(db, KEY_SITE_NAME, _clean_site_name(str(payload["site_name"]), self.settings.app_name))
 
             if payload.get("clear_sub2api_x_api_key"):
-                await self._delete(db, KEY_SUB2API_X_API_KEY)
+                # An explicit empty marker prevents the in-memory environment
+                # credential from becoming active again before restart.
+                await self._put(db, KEY_SUB2API_X_API_KEY, "")
             else:
                 raw_key = payload.get("sub2api_x_api_key")
                 if isinstance(raw_key, str) and raw_key.strip():
@@ -483,20 +520,34 @@ class RuntimeConfigService:
         checked_ports = self._candidate_ports(config.base_url)
         configured_hit = await self._probe_configured_sub2api(config)
         hit = configured_hit or await self._find_sub2api(checked_ports, config)
+        credential_rebind_blocked = bool(
+            hit
+            and apply
+            and str(getattr(config, "auth_token", "")).strip()
+            and _sub2api_origin(hit.base_url) != _sub2api_origin(config.base_url)
+        )
+        should_apply = bool(hit and apply and not credential_rebind_blocked)
 
         if hit:
             status = "found"
             message = hit.message
+            if credential_rebind_blocked:
+                message = (
+                    f"{message} 检测结果未自动应用：切换来源并保留现有凭据需要在设置中明确确认。"
+                )
             base_url = hit.base_url
             port = hit.port
         else:
             status = "not_found"
-            message = "未在候选端口发现 sub2api，请手动设置端口或调整 SUB2API_SCAN_PORTS。"
+            message = (
+                "当前配置地址和受限本地候选端口均未发现 sub2api；"
+                "请手动设置地址/端口，或调整 SUB2API_SCAN_PORTS。"
+            )
             base_url = None
             port = None
 
         async with AsyncSessionLocal() as db:
-            if hit and apply:
+            if should_apply:
                 await self._put(db, KEY_SUB2API_BASE_URL, hit.base_url)
                 if configured_hit is None:
                     await self._put(db, KEY_SUB2API_BASE_URL_SOURCE, "auto")
@@ -512,9 +563,9 @@ class RuntimeConfigService:
             "status": status,
             "message": message,
             "checked_ports": checked_ports,
-            "applied": bool(hit and apply),
+            "applied": should_apply,
         }
-        if hit and apply:
+        if should_apply:
             current_values = await self._load_values()
             self._persist_settings_file(
                 await self.get_public_settings(),
@@ -526,17 +577,21 @@ class RuntimeConfigService:
         self,
         config: EffectiveSub2ApiConfig,
     ) -> ProbeHit | None:
-        timeout = httpx.Timeout(max(2.0, self.settings.sub2api_scan_timeout_seconds))
+        timeout = httpx.Timeout(self._probe_operation_timeout())
         accounts_url = f"{config.base_url.rstrip('/')}{config.accounts_path}"
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
-                headers=_headers_for_probe(config),
+                headers={**_headers_for_probe(config), "Accept-Encoding": "identity"},
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
-                response = await client.get(accounts_url, params={"page": 1, "page_size": 1})
-        except httpx.HTTPError:
+                response = await self._bounded_probe_get(
+                    client,
+                    accounts_url,
+                    params={"page": 1, "page_size": 1},
+                )
+        except (httpx.HTTPError, TimeoutError, _ProbeResponseRejected):
             return None
 
         port = _port_from_url(config.base_url)
@@ -573,7 +628,7 @@ class RuntimeConfigService:
         if current_port:
             ports.append(current_port)
         ports.extend(self.settings.sub2api_scan_ports)
-        ports.extend(_local_listening_ports())
+        ports.extend(COMMON_SUB2API_PORTS)
         return list(dict.fromkeys(port for port in ports if 0 < int(port) <= 65535))
 
     async def _find_sub2api(
@@ -581,12 +636,12 @@ class RuntimeConfigService:
         ports: list[int],
         config: EffectiveSub2ApiConfig,
     ) -> ProbeHit | None:
-        timeout = httpx.Timeout(self.settings.sub2api_scan_timeout_seconds)
+        timeout = httpx.Timeout(self._probe_operation_timeout())
         async with httpx.AsyncClient(
             timeout=timeout,
             # Discovery must not broadcast the administrator token to every
             # process that happens to listen on loopback.
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", "Accept-Encoding": "identity"},
             follow_redirects=False,
             trust_env=False,
         ) as client:
@@ -608,7 +663,7 @@ class RuntimeConfigService:
         base_url = f"{root}/api/v1"
         accounts_url = f"{base_url}/admin/accounts"
         try:
-            response = await client.get(accounts_url)
+            response = await self._bounded_probe_get(client, accounts_url)
             if response.status_code in {401, 403} and _looks_like_sub2api_auth_response(response):
                 return ProbeHit(
                     base_url=base_url,
@@ -623,11 +678,11 @@ class RuntimeConfigService:
                     status=str(response.status_code),
                     message=f"已检测到 {base_url}（/admin/accounts 返回账号 JSON）。",
                 )
-        except httpx.HTTPError:
+        except (httpx.HTTPError, TimeoutError, _ProbeResponseRejected):
             pass
 
         try:
-            response = await client.get(f"{root}/openapi.json")
+            response = await self._bounded_probe_get(client, f"{root}/openapi.json")
             if response.status_code == 200 and _looks_like_sub2api(response.text):
                 return ProbeHit(
                     base_url=base_url,
@@ -635,10 +690,40 @@ class RuntimeConfigService:
                     status="openapi",
                     message=f"已检测到 {base_url}（OpenAPI 匹配 sub2api）。",
                 )
-        except httpx.HTTPError:
+        except (httpx.HTTPError, TimeoutError, _ProbeResponseRejected):
             pass
 
         return None
+
+    async def _bounded_probe_get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        total_timeout = self._probe_total_timeout()
+        deadline = monotonic() + total_timeout
+        async with asyncio.timeout(total_timeout):
+            async with client.stream("GET", url, params=params) as response:
+                body = await _read_bounded_probe_body(response, deadline=deadline)
+                return httpx.Response(
+                    response.status_code,
+                    headers=response.headers,
+                    content=body,
+                    request=response.request,
+                )
+
+    def _probe_operation_timeout(self) -> float:
+        return _bounded_float_or_default(
+            self.settings.sub2api_scan_timeout_seconds,
+            0.8,
+            0.1,
+            10.0,
+        )
+
+    def _probe_total_timeout(self) -> float:
+        return min(15.0, max(1.0, self._probe_operation_timeout() * 3.0))
 
     async def _load_values(self) -> dict[str, str | None]:
         async with AsyncSessionLocal() as db:
@@ -651,6 +736,8 @@ class RuntimeConfigService:
         raw_key = payload.get("sub2api_x_api_key")
         if isinstance(raw_key, str) and raw_key.strip():
             return raw_key.strip()
+        if KEY_SUB2API_X_API_KEY in current_values:
+            return decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY)) or ""
         return decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY)) or self._env_x_api_key() or None
 
     def _persist_settings_file(
@@ -712,11 +799,6 @@ class RuntimeConfigService:
             db.add(setting)
         setting.value = value
 
-    async def _delete(self, db: AsyncSession, key: str) -> None:
-        setting = await db.get(AppSetting, key)
-        if setting is not None:
-            await db.delete(setting)
-
     def _env_x_api_key(self) -> str:
         header = self.settings.sub2api_auth_header.strip().lower()
         if header in {"x-api-key", "x-api", "x-api_key"}:
@@ -739,6 +821,11 @@ def _headers_for_probe(config: EffectiveSub2ApiConfig) -> dict[str, str]:
 
 def _normalize_base_url(value: str) -> str:
     return normalize_sub2api_base_url(value)
+
+
+def _sub2api_origin(value: str) -> tuple[str, str]:
+    parsed = urlparse(_normalize_base_url(value))
+    return parsed.scheme.casefold(), parsed.netloc.casefold()
 
 
 def _replace_port(base_url: str, port: int) -> str:
@@ -921,6 +1008,44 @@ def _looks_like_sub2api_accounts_response(response: httpx.Response) -> bool:
     return _looks_like_sub2api_accounts_payload(payload)
 
 
+async def _read_bounded_probe_body(
+    response: httpx.Response,
+    *,
+    deadline: float,
+) -> bytes:
+    raw_content_length = response.headers.get("content-length")
+    if raw_content_length:
+        try:
+            content_length = int(raw_content_length)
+        except ValueError as exc:
+            raise _ProbeResponseRejected("Invalid probe response length.") from exc
+        if content_length < 0 or content_length > MAX_CONFIGURED_PROBE_RESPONSE_BYTES:
+            raise _ProbeResponseRejected("Probe response exceeded the byte limit.")
+
+    # MockTransport and custom transports may return a response whose bounded
+    # in-memory body is already materialized before the stream context opens.
+    if response.is_stream_consumed:
+        if monotonic() >= deadline:
+            raise _ProbeResponseRejected("Probe response exceeded the total deadline.")
+        body = response.content
+        if len(body) > MAX_CONFIGURED_PROBE_RESPONSE_BYTES:
+            raise _ProbeResponseRejected("Probe response exceeded the byte limit.")
+        return body
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_raw():
+        if monotonic() >= deadline:
+            raise _ProbeResponseRejected("Probe response exceeded the total deadline.")
+        total += len(chunk)
+        if total > MAX_CONFIGURED_PROBE_RESPONSE_BYTES:
+            raise _ProbeResponseRejected("Probe response exceeded the byte limit.")
+        chunks.append(chunk)
+    if monotonic() >= deadline:
+        raise _ProbeResponseRejected("Probe response exceeded the total deadline.")
+    return b"".join(chunks)
+
+
 def _looks_like_sub2api_auth_response(response: httpx.Response) -> bool:
     text = response.text.lower()
     if "authorization required" in text or "unauthorized" in text:
@@ -957,72 +1082,6 @@ def _contains_account_list(payload: dict[str, Any]) -> bool:
         if isinstance(payload.get(key), list):
             return True
     return False
-
-
-def _local_listening_ports() -> list[int]:
-    commands = (
-        [["netstat", "-ano", "-p", "tcp"]]
-        if sys.platform.startswith("win")
-        else [["ss", "-ltn"], ["netstat", "-ltn"]]
-    )
-    for command in commands:
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                encoding="utf-8",
-                errors="ignore",
-                text=True,
-                timeout=1.5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        ports = _parse_listening_ports(completed.stdout)
-        if ports:
-            return ports
-    return []
-
-
-def _parse_listening_ports(output: str) -> list[int]:
-    ports: list[int] = []
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        lowered = line.lower()
-        if "listen" not in lowered:
-            continue
-        parts = line.split()
-        local_address = _pick_local_address(parts)
-        if not local_address:
-            continue
-        port = _port_from_socket_address(local_address)
-        if port:
-            ports.append(port)
-    return list(dict.fromkeys(ports))
-
-
-def _pick_local_address(parts: list[str]) -> str | None:
-    if not parts:
-        return None
-    if parts[0].lower().startswith("tcp") and len(parts) >= 2:
-        if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit():
-            return parts[3]
-        return parts[1]
-    if parts[0].lower() == "listen" and len(parts) >= 4:
-        return parts[3]
-    return None
-
-
-def _port_from_socket_address(value: str) -> int | None:
-    match = re.search(r":(\d+)$", value)
-    if not match:
-        match = re.search(r"\]:(\d+)$", value)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
 
 
 _runtime_config_service: RuntimeConfigService | None = None

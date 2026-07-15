@@ -60,6 +60,7 @@ class UpstreamChannelService:
         self.sub2api = self.accounts.sub2api
         self._locks: dict[int, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        self._inventory_lock = asyncio.Lock()
 
     async def _lock_for(self, channel_id: int) -> asyncio.Lock:
         async with self._locks_guard:
@@ -133,7 +134,27 @@ class UpstreamChannelService:
         result = await db.execute(
             select(UpstreamAccountConfig).where(UpstreamAccountConfig.channel_id == channel_id)
         )
-        return list(result.scalars().all())
+        return await self._filter_current_bindings(list(result.scalars().all()))
+
+    async def _filter_current_bindings(
+        self,
+        configs: list[UpstreamAccountConfig],
+    ) -> list[UpstreamAccountConfig]:
+        if not configs:
+            return []
+        remote_by_id = {
+            account_id: account
+            for account in await self.accounts._remote_accounts()
+            if (account_id := self.accounts._numeric_remote_id(account)) is not None
+        }
+        return [
+            config
+            for config in configs
+            if (
+                (remote := remote_by_id.get(config.sub2api_account_id)) is not None
+                and self.accounts._config_binding_status(remote, config) == "bound"
+            )
+        ]
 
     async def _account_api_keys(
         self,
@@ -141,23 +162,142 @@ class UpstreamChannelService:
         configs: list[UpstreamAccountConfig],
         channel_id: int,
     ) -> dict[int, str]:
-        account_api_keys: dict[int, str] = {}
+        channel = await self._load_channel(db, channel_id)
+        try:
+            channel_base_url = canonicalize_upstream_url(channel.canonical_base_url)
+        except ValueError:
+            configs.clear()
+            return {}
+
+        async def live_strict_fingerprints(
+            candidates: list[UpstreamAccountConfig],
+        ) -> dict[int, str]:
+            remote_by_id = {
+                account_id: account
+                for account in await self.accounts._remote_accounts()
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
+            }
+            fingerprints: dict[int, str] = {}
+            for config in candidates:
+                remote = remote_by_id.get(config.sub2api_account_id)
+                if remote is None or self.accounts._config_binding_status(remote, config) != "bound":
+                    continue
+                has_stored_key = bool(decrypt_text(config.encrypted_api_key))
+                requires_remote_origin = (
+                    not config.channel_auto_assign_disabled or not has_stored_key
+                )
+                if requires_remote_origin:
+                    if _remote_base_url(remote) != channel_base_url:
+                        continue
+                    fingerprint = self.accounts._remote_identity_fingerprint(remote)
+                else:
+                    # A manually pinned channel with an explicitly retained or
+                    # supplied key is bound to the local channel origin, not the
+                    # remote metadata endpoint. Stable account identity still
+                    # has to match.
+                    fingerprint = self.accounts._require_remote_binding_fingerprint(remote)
+                fingerprints[config.sub2api_account_id] = fingerprint
+            return fingerprints
+
+        async def reload_current(
+            candidates: list[UpstreamAccountConfig],
+            *,
+            expected_strict_fingerprints: dict[int, str] | None = None,
+        ) -> tuple[list[UpstreamAccountConfig], dict[int, str]]:
+            candidate_ids = [config.id for config in candidates]
+            if not candidate_ids:
+                return [], {}
+            current_result = await db.execute(
+                select(UpstreamAccountConfig)
+                .where(UpstreamAccountConfig.id.in_(candidate_ids))
+                .execution_options(populate_existing=True)
+            )
+            current = [
+                config
+                for config in current_result.scalars().all()
+                if (
+                    config.channel_id == channel_id
+                    and not config.api_key_origin_rebind_required
+                )
+            ]
+            strict_fingerprints = await live_strict_fingerprints(current)
+            if expected_strict_fingerprints is not None:
+                strict_fingerprints = {
+                    account_id: fingerprint
+                    for account_id, fingerprint in strict_fingerprints.items()
+                    if fingerprint == expected_strict_fingerprints.get(account_id)
+                }
+            current = [
+                config
+                for config in current
+                if config.sub2api_account_id in strict_fingerprints
+            ]
+            return current, strict_fingerprints
+
+        configs[:], export_started_strict_fingerprints = await reload_current(configs)
         missing_account_ids: list[int] = []
         for config in configs:
             api_key = decrypt_text(config.encrypted_api_key)
-            if api_key:
-                account_api_keys[config.sub2api_account_id] = api_key
-            else:
+            if not api_key:
                 missing_account_ids.append(config.sub2api_account_id)
         if not missing_account_ids:
-            return account_api_keys
+            configs[:], _strict_fingerprints = await reload_current(
+                configs,
+                expected_strict_fingerprints=export_started_strict_fingerprints,
+            )
+            return {
+                config.sub2api_account_id: api_key
+                for config in configs
+                if (
+                    not config.api_key_origin_rebind_required
+                    and (api_key := decrypt_text(config.encrypted_api_key))
+                )
+            }
+        export_started_fingerprints = {
+            config.sub2api_account_id: config.remote_identity_fingerprint.strip().lower()
+            for config in configs
+            if config.remote_identity_fingerprint
+        }
         try:
             exported: dict[int, str] = {}
             for start in range(0, len(missing_account_ids), API_KEY_EXPORT_BATCH_SIZE):
                 batch = missing_account_ids[start : start + API_KEY_EXPORT_BATCH_SIZE]
                 exported.update(await self.sub2api.export_api_key_secrets(batch))
         except Exception:
-            return account_api_keys
+            configs[:], _strict_fingerprints = await reload_current(
+                configs,
+                expected_strict_fingerprints=export_started_strict_fingerprints,
+            )
+            return {
+                config.sub2api_account_id: api_key
+                for config in configs
+                if (
+                    not config.api_key_origin_rebind_required
+                    and (api_key := decrypt_text(config.encrypted_api_key))
+                )
+            }
+        configs[:], checked_strict_fingerprints = await reload_current(
+            configs,
+            expected_strict_fingerprints=export_started_strict_fingerprints,
+        )
+        checked_fingerprints = {
+            config.sub2api_account_id: config.remote_identity_fingerprint.strip().lower()
+            for config in configs
+            if (
+                config.remote_identity_fingerprint
+                and config.remote_identity_fingerprint.strip().lower()
+                == export_started_fingerprints.get(config.sub2api_account_id)
+            )
+        }
+        currently_bound_ids = set(checked_fingerprints)
+        missing_account_ids = [
+            account_id for account_id in missing_account_ids if account_id in currently_bound_ids
+        ]
+        exported = {
+            account_id: api_key
+            for account_id, api_key in exported.items()
+            if account_id in currently_bound_ids
+        }
         settings = get_settings()
         can_persist = not (
             settings.app_env == "production"
@@ -176,6 +316,9 @@ class UpstreamChannelService:
                             UpstreamAccountConfig.sub2api_account_id == account_id,
                             UpstreamAccountConfig.channel_id == channel_id,
                             UpstreamAccountConfig.encrypted_api_key.is_(None),
+                            UpstreamAccountConfig.remote_identity_fingerprint
+                            == checked_fingerprints[account_id],
+                            UpstreamAccountConfig.api_key_origin_rebind_required.is_(False),
                         )
                         .values(encrypted_api_key=encrypt_text(api_key))
                         .execution_options(synchronize_session=False)
@@ -190,25 +333,25 @@ class UpstreamChannelService:
                     status_code=503,
                 ) from None
 
-        # Re-read the binding and stored value after the conditional update.
-        # A concurrent account save wins, and accounts moved to another channel
-        # are excluded from this channel's discovery request.
-        current_result = await db.execute(
-            select(UpstreamAccountConfig)
-            .where(
-                UpstreamAccountConfig.id.in_(
-                    [config.id for config in configs]
-                )
-            )
-            .execution_options(populate_existing=True)
+        # Re-read both the persistent identity binding and the live remote
+        # identity. An export can only be used for the fingerprint checked after
+        # that export; a concurrent identity or origin rebind wins.
+        configs[:], _final_strict_fingerprints = await reload_current(
+            configs,
+            expected_strict_fingerprints=checked_strict_fingerprints,
         )
-        configs[:] = [
-            config
-            for config in current_result.scalars().all()
-            if config.channel_id == channel_id
-        ]
         account_api_keys = {}
         for config in configs:
+            checked_fingerprint = checked_fingerprints.get(config.sub2api_account_id)
+            current_fingerprint = (
+                config.remote_identity_fingerprint or ""
+            ).strip().lower()
+            if (
+                config.api_key_origin_rebind_required
+                or not checked_fingerprint
+                or current_fingerprint != checked_fingerprint
+            ):
+                continue
             api_key = decrypt_text(config.encrypted_api_key)
             if not api_key:
                 api_key = exported.get(config.sub2api_account_id)
@@ -220,6 +363,8 @@ class UpstreamChannelService:
     def _account_rate_input_snapshot(config: UpstreamAccountConfig) -> tuple[Any, ...]:
         return (
             config.channel_id,
+            config.remote_identity_fingerprint,
+            config.api_key_origin_rebind_required,
             config.encrypted_api_key,
             config.selected_group_id,
             config.selected_group_name,
@@ -231,11 +376,37 @@ class UpstreamChannelService:
         self,
         db: AsyncSession,
     ) -> tuple[dict[int, dict[str, Any]], dict[int, UpstreamAccountConfig], dict[int, UpstreamChannel]]:
+        # Production runs one backend process. Serialize the read-create-commit
+        # inventory transaction so overlapping page loads cannot race unique
+        # channel/account inserts and escape as an unhandled IntegrityError.
+        async with self._inventory_lock:
+            return await self._sync_inventory_unlocked(db)
+
+    async def _sync_inventory_unlocked(
+        self,
+        db: AsyncSession,
+    ) -> tuple[dict[int, dict[str, Any]], dict[int, UpstreamAccountConfig], dict[int, UpstreamChannel]]:
         remote_by_id = {
             account_id: account
             for account in await self.accounts._remote_accounts()
             if (account_id := self.accounts._numeric_remote_id(account)) is not None
         }
+        account_locks: list[asyncio.Lock] = []
+        try:
+            for account_id in sorted(remote_by_id):
+                lock = await self.accounts._lock_for(account_id)
+                await lock.acquire()
+                account_locks.append(lock)
+            return await self._sync_inventory_rows(db, remote_by_id)
+        finally:
+            for lock in reversed(account_locks):
+                lock.release()
+
+    async def _sync_inventory_rows(
+        self,
+        db: AsyncSession,
+        remote_by_id: dict[int, dict[str, Any]],
+    ) -> tuple[dict[int, dict[str, Any]], dict[int, UpstreamAccountConfig], dict[int, UpstreamChannel]]:
         channel_result = await db.execute(select(UpstreamChannel))
         channels = list(channel_result.scalars().all())
         channels_by_url = {item.canonical_base_url: item for item in channels}
@@ -247,6 +418,11 @@ class UpstreamChannelService:
         for account_id in sorted(remote_by_id):
             remote = remote_by_id[account_id]
             config = configs.get(account_id)
+            if (
+                config is not None
+                and self.accounts._config_binding_status(remote, config) != "bound"
+            ):
+                continue
             remote_url = _remote_base_url(remote)
             configured_url: str | None = None
             if config is not None and config.base_url:
@@ -305,8 +481,9 @@ class UpstreamChannelService:
                     config.upstream_type = channel.upstream_type
                     config.resolved_upstream_type = channel.resolved_upstream_type
                     config.upstream_user_id = channel.upstream_user_id
-                    config.encrypted_access_token = channel.encrypted_access_token
+                    config.encrypted_access_token = None
                     config.encrypted_api_key = None
+                    config.api_key_origin_rebind_required = True
                     config.selected_group_id = None
                     config.selected_group_name = None
                     config.manual_group_multiplier = None
@@ -472,6 +649,21 @@ class UpstreamChannelService:
         unassigned: list[UpstreamAccountOut] = []
         for account_id in sorted(remote_by_id):
             config = configs[account_id]
+            if self.accounts._config_binding_status(remote_by_id[account_id], config) != "bound":
+                account = self.accounts._build_out(remote_by_id[account_id], config)
+                channel = channels_by_id.get(config.channel_id) if config.channel_id is not None else None
+                if channel is None:
+                    unassigned.append(account)
+                else:
+                    grouped[channel.id].append(
+                        account.model_copy(
+                            update={
+                                "channel_id": channel.id,
+                                "channel_name": channel.display_name,
+                            }
+                        )
+                    )
+                continue
             channel = channels_by_id.get(config.channel_id) if config.channel_id is not None else None
             account = self._project_account(
                 remote_by_id[account_id],
@@ -504,6 +696,26 @@ class UpstreamChannelService:
         channel_id: int,
         payload: UpstreamChannelUpdate,
     ) -> UpstreamChannelOut:
+        # Channel URL changes and inventory auto-creation share the same unique
+        # canonical URL namespace, so their check-and-commit sections must not
+        # overlap.
+        async with self._inventory_lock:
+            await self._update_channel_locked(db, channel_id, payload)
+        overview = await self.overview(db)
+        result = next((item for item in overview.channels if item.id == channel_id), None)
+        if result is None:
+            raise UpstreamAccountServiceError(
+                "The upstream channel has no API key accounts.",
+                status_code=409,
+            )
+        return result
+
+    async def _update_channel_locked(
+        self,
+        db: AsyncSession,
+        channel_id: int,
+        payload: UpstreamChannelUpdate,
+    ) -> None:
         lock = await self._lock_for(channel_id)
         async with lock:
             self._ensure_secret_storage_ready(payload)
@@ -511,7 +723,8 @@ class UpstreamChannelService:
             fields = payload.model_fields_set
             current_token = decrypt_text(channel.encrypted_access_token)
             current_refresh_token = decrypt_text(channel.encrypted_refresh_token)
-            previous_origin = upstream_url_origin(
+            previous_canonical_origin = upstream_url_origin(channel.canonical_base_url)
+            previous_management_origin = upstream_url_origin(
                 channel.management_base_url or channel.canonical_base_url
             )
             identity_changed = False
@@ -563,13 +776,16 @@ class UpstreamChannelService:
             if "manual_recharge_multiplier" in fields:
                 channel.manual_recharge_multiplier = payload.manual_recharge_multiplier
 
-            next_origin = upstream_url_origin(
+            next_canonical_origin = upstream_url_origin(channel.canonical_base_url)
+            next_management_origin = upstream_url_origin(
                 channel.management_base_url or channel.canonical_base_url
             )
+            canonical_origin_changed = next_canonical_origin != previous_canonical_origin
             if (
-                previous_origin is not None
-                and next_origin is not None
-                and next_origin != previous_origin
+                (
+                    canonical_origin_changed
+                    or next_management_origin != previous_management_origin
+                )
                 and not payload.confirm_credential_rebind
             ):
                 raise UpstreamAccountServiceError(
@@ -597,21 +813,23 @@ class UpstreamChannelService:
                 )
             if base_url_changed:
                 account_values["channel_auto_assign_disabled"] = True
-            await db.execute(
-                update(UpstreamAccountConfig)
-                .where(UpstreamAccountConfig.channel_id == channel_id)
-                .values(**account_values)
-                .execution_options(synchronize_session=False)
-            )
+            if canonical_origin_changed and payload.confirm_credential_rebind:
+                account_values["api_key_origin_rebind_required"] = False
+            bound_configs = await self._bound_configs(db, channel_id)
+            if bound_configs:
+                await db.execute(
+                    update(UpstreamAccountConfig)
+                    .where(
+                        UpstreamAccountConfig.id.in_(
+                            [config.id for config in bound_configs]
+                        )
+                    )
+                    .values(**account_values)
+                    .execution_options(synchronize_session=False)
+                )
 
             await db.commit()
             db.expire_all()
-            await db.refresh(channel)
-            overview = await self.overview(db)
-            result = next((item for item in overview.channels if item.id == channel_id), None)
-            if result is None:
-                raise UpstreamAccountServiceError("The upstream channel has no API key accounts.", status_code=409)
-            return result
 
     @staticmethod
     def _selected_group(config: UpstreamAccountConfig, groups: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -913,6 +1131,10 @@ class UpstreamChannelService:
                         if not await self._automatic_rate_write_allowed():
                             status = "skipped"
                         else:
+                            current_remote = await self.accounts._remote_account(
+                                config.sub2api_account_id
+                            )
+                            self.accounts._require_config_binding(current_remote, config)
                             await self.sub2api.update_account_rate_multiplier(
                                 config.sub2api_account_id,
                                 float(_quantize_rate(target)),
@@ -1002,6 +1224,11 @@ class UpstreamChannelService:
         async with lock:
             channel = await self._load_channel(db, channel_id)
             configs = await self._bound_configs(db, channel_id)
+            if not configs:
+                raise UpstreamAccountServiceError(
+                    "The upstream channel has no identity-bound API key accounts.",
+                    status_code=409,
+                )
             access_token = decrypt_text(channel.encrypted_access_token)
             refresh_token = decrypt_text(channel.encrypted_refresh_token)
             account_api_keys = await self._account_api_keys(db, configs, channel.id)
@@ -1066,14 +1293,12 @@ class UpstreamChannelService:
                         for config in current_configs.scalars().all()
                         if config.channel_id == channel.id
                     ]
-                    account_api_keys = {
-                        config.sub2api_account_id: stored_key
-                        for config in configs
-                        if (
-                            stored_key := decrypt_text(config.encrypted_api_key)
-                            or account_api_keys.get(config.sub2api_account_id)
-                        )
-                    }
+                    configs = await self._filter_current_bindings(configs)
+                    account_api_keys = await self._account_api_keys(
+                        db,
+                        configs,
+                        channel.id,
+                    )
 
                     access_token = token_pair.access_token
                     retry = discover_upstream(
@@ -1112,6 +1337,13 @@ class UpstreamChannelService:
                         or config.channel_id != channel.id
                         or self._account_rate_input_snapshot(config) != expected_inputs
                     ):
+                        continue
+                    try:
+                        current_remote = await self.accounts._remote_account(
+                            config.sub2api_account_id
+                        )
+                        self.accounts._require_config_binding(current_remote, config)
+                    except UpstreamAccountServiceError:
                         continue
                     if not discovery_succeeded:
                         config.target_rate = None
@@ -1176,8 +1408,21 @@ class UpstreamChannelService:
             raise UpstreamAccountServiceError("The upstream channel has no API key accounts.", status_code=409)
         return found
 
-    async def discover_all(self, db: AsyncSession) -> UpstreamChannelDiscoverAllOut:
+    async def discover_all(
+        self,
+        db: AsyncSession,
+        *,
+        legacy_bindings: dict[int, str] | None = None,
+    ) -> UpstreamChannelDiscoverAllOut:
+        if legacy_bindings is not None:
+            await self.accounts.bind_legacy_identities(db, legacy_bindings)
         overview = await self.overview(db)
+        if legacy_bindings is not None:
+            # The first confirmation can bind a legacy row whose live endpoint
+            # differs from its stored channel. Inventory sync then creates the
+            # origin-rebind tombstone; revalidate the same strict fingerprints
+            # once more so this single informed confirmation covers both steps.
+            await self.accounts.bind_legacy_identities(db, legacy_bindings)
         channels: list[UpstreamChannelOut] = []
         succeeded = 0
         failed = 0
@@ -1188,7 +1433,11 @@ class UpstreamChannelService:
                 failed += 1
                 continue
             channels.append(discovered)
-            if discovered.recharge_multiplier_status in {"ok", "default_missing", "fallback_manual"}:
+            discovery_failed = discovered.last_error == "Upstream channel discovery failed."
+            if (
+                not discovery_failed
+                and discovered.recharge_multiplier_status in {"ok", "default_missing", "fallback_manual"}
+            ):
                 succeeded += 1
             else:
                 failed += 1

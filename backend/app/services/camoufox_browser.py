@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,10 +25,60 @@ class BrowserContextHandle:
 
 def browser_profile_dir(email: str, settings: Settings | None = None) -> str:
     active_settings = settings or get_settings()
-    slug = re.sub(r"[^a-z0-9._-]+", "_", email.lower()).strip("._-") or "default"
+    normalized_email = email.strip().lower()
+    owner_digest = hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()
+    readable = re.sub(r"[^a-z0-9._-]+", "_", normalized_email).strip("._-")[:48] or "account"
+    slug = f"{readable}-{owner_digest[:16]}"
     path = active_settings.project_root / "data" / "browser-profiles" / slug
     path.mkdir(parents=True, exist_ok=True)
+    _ensure_profile_owner(path / ".account-owner", owner_digest)
     return str(path)
+
+
+def _ensure_profile_owner(owner_marker: Any, owner_digest: str) -> None:
+    for attempt in range(4):
+        try:
+            recorded_owner = owner_marker.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            recorded_owner = None
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError("Browser profile ownership marker is unreadable.") from exc
+
+        if recorded_owner == owner_digest:
+            return
+        if recorded_owner:
+            raise RuntimeError("Browser profile ownership does not match the requested account.")
+        if recorded_owner == "":
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
+            try:
+                owner_marker.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RuntimeError("Browser profile ownership marker cannot be recovered.") from exc
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=owner_marker.parent,
+            prefix=".account-owner.",
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                handle.write(f"{owner_digest}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary_name, owner_marker)
+            except FileExistsError:
+                continue
+            return
+        finally:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+    raise RuntimeError("Browser profile ownership marker could not be established.")
 
 
 async def launch_browser_context(playwright: Any, email: str, settings: Settings | None = None) -> BrowserContextHandle:

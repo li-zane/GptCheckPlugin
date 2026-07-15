@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import hashlib
 import html
 import imaplib
@@ -25,6 +24,7 @@ from app.models import MailboxCredential
 CODE_RE = re.compile(r"\b(\d{6})\b")
 IMAP_UID_RE = re.compile(rb"\bUID\s+(\d+)\b")
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
+AUTH_METHOD_RE = re.compile(r"\b(spf|dkim|dmarc|compauth|arc)\s*=\s*([a-z]+)", re.IGNORECASE)
 FOLDER_MAP = {
     "inbox": "inbox",
     "junk": "junkemail",
@@ -34,6 +34,83 @@ FOLDER_MAP = {
 OUTLOOK_REST_BASE = "https://outlook.office.com/api/v2.0"
 GMAIL_IMAP_HOST = "imap.gmail.com"
 GMAIL_IMAP_PORT = 993
+_RECIPIENT_HEADERS = (
+    "To",
+    "Cc",
+    "Delivered-To",
+    "X-Original-To",
+    "Original-Recipient",
+    "Final-Recipient",
+    "Envelope-To",
+    "X-Envelope-To",
+    "X-Forwarded-To",
+    "X-MS-Exchange-Organization-OriginalEnvelopeRecipients",
+)
+_OPENAI_SENDER_DOMAINS = ("openai.com", "chatgpt.com")
+
+
+class _ProxyImap4Ssl(imaplib.IMAP4_SSL):
+    def __init__(self, host: str, port: int, *, proxy_url: str, timeout: float | None = None) -> None:
+        self._proxy_url = proxy_url
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout: float | None) -> socket.socket:
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+
+        proxy = urllib_parse.urlparse(self._proxy_url)
+        scheme = (proxy.scheme or "").lower()
+        if scheme == "https":
+            raise ValueError("HTTPS Gmail proxies are not supported because TLS-to-proxy is unavailable.")
+        if scheme not in {"http", "socks5", "socks5h"}:
+            raise ValueError("Unsupported Gmail proxy scheme.")
+        if not proxy.hostname or proxy.port is None:
+            raise ValueError("Gmail proxy URL must include a host and port.")
+
+        import socks
+
+        proxy_type = socks.PROXY_TYPE_HTTP if scheme == "http" else socks.SOCKS5
+        raw_socket = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_socket.set_proxy(
+            proxy_type,
+            proxy.hostname,
+            proxy.port,
+            rdns=scheme == "socks5h",
+            username=urllib_parse.unquote(proxy.username) if proxy.username else None,
+            password=urllib_parse.unquote(proxy.password) if proxy.password else None,
+        )
+        if timeout is not None:
+            raw_socket.settimeout(timeout)
+        try:
+            raw_socket.connect((self.host, self.port))
+            return self.ssl_context.wrap_socket(raw_socket, server_hostname=self.host)
+        except Exception:
+            raw_socket.close()
+            raise
+
+
+def _best_effort_close_imap(client: imaplib.IMAP4) -> None:
+    try:
+        client.logout()
+        return
+    except Exception:
+        pass
+
+    try:
+        client.shutdown()
+        return
+    except Exception:
+        pass
+
+    try:
+        sock = getattr(client, "sock", None)
+    except Exception:
+        return
+    if sock is not None:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -57,6 +134,8 @@ class MailMessage:
     received_at: datetime | None
     text: str | None = None
     code: str | None = None
+    recipients: tuple[str, ...] = ()
+    sender_authenticated: bool = False
 
 
 @dataclass
@@ -118,6 +197,9 @@ class OutlookGraphAdapter:
         last_error: str | None = None
         for folder in ("inbox", "junk"):
             result = await self.fetch_messages(credential, folder, 10)
+            target_recipient = credential.gpt_email.strip().casefold()
+            if result.status == "ok" and not _mail_result_usable_for_code(result, target_recipient):
+                result = await self._fetch_messages_for_code(credential, folder, 10)
             if result.new_refresh_token:
                 new_refresh_token = result.new_refresh_token
             if result.new_access_token:
@@ -141,6 +223,8 @@ class OutlookGraphAdapter:
             )
             for message in messages:
                 if message.received_at and message.received_at < after:
+                    continue
+                if target_recipient not in message.recipients or not message.sender_authenticated:
                     continue
                 code = message.code or extract_code(message.subject, message.body_preview, message.text)
                 if code:
@@ -178,7 +262,37 @@ class OutlookGraphAdapter:
                 error=f"Mailbox read timed out after {self.settings.mail_read_timeout_seconds} seconds.",
             )
 
-    async def _fetch_messages_inner(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
+    async def _fetch_messages_for_code(
+        self,
+        credential: MailboxCredential,
+        folder: str,
+        limit: int,
+    ) -> MailMessagesResult:
+        try:
+            return await asyncio.wait_for(
+                self._fetch_messages_inner(
+                    credential,
+                    folder,
+                    limit,
+                    target_recipient=credential.gpt_email.strip().casefold(),
+                ),
+                timeout=self.settings.mail_read_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error=f"Mailbox read timed out after {self.settings.mail_read_timeout_seconds} seconds.",
+            )
+
+    async def _fetch_messages_inner(
+        self,
+        credential: MailboxCredential,
+        folder: str,
+        limit: int,
+        *,
+        target_recipient: str | None = None,
+    ) -> MailMessagesResult:
         decrypted_client_id = decrypt_text(credential.encrypted_client_id)
         decrypted_refresh_token = decrypt_text(credential.encrypted_refresh_token)
         encrypted_access_token = getattr(credential, "encrypted_access_token", None)
@@ -199,10 +313,12 @@ class OutlookGraphAdapter:
         errors: list[str] = []
         if access_token:
             result = await self._fetch_with_stored_access_token(access_token, folder, limit)
-            if result.status == "ok":
+            if _mail_result_usable_for_code(result, target_recipient):
                 return result
             if result.error:
                 errors.append(result.error)
+            elif result.status == "ok":
+                errors.append("Stored access_token returned an unauthenticated verification message.")
         if not client_id or not refresh_token:
             error = "Missing client_id or refresh_token."
             if errors:
@@ -215,11 +331,13 @@ class OutlookGraphAdapter:
             if strategy in {"graph_imap", "o2_wl_imap"} and _has_imap_network_failure(errors):
                 continue
             result = await self._fetch_with_strategy(credential, folder, limit, client_id, refresh_token, base_cache_key, strategy)
-            if result.status == "ok":
+            if _mail_result_usable_for_code(result, target_recipient):
                 self._strategy_cache[base_cache_key] = strategy
                 return result
             if result.error:
                 errors.append(result.error)
+            elif result.status == "ok":
+                errors.append(f"{strategy} returned an unauthenticated verification message.")
 
         return MailMessagesResult(
             status="failed",
@@ -514,10 +632,18 @@ class OutlookGraphAdapter:
             "$select": ",".join(select_fields),
         }
         messages: list[MailMessage] = []
+        pages = 0
 
         try:
             async with httpx.AsyncClient(timeout=self.settings.mail_token_timeout_seconds) as client:
                 while url and len(messages) < limit:
+                    pages += 1
+                    if pages > 10:
+                        return MailMessagesResult(
+                            status="failed",
+                            messages=[],
+                            error="Graph mail pagination exceeded the page limit.",
+                        )
                     response = await client.get(
                         url,
                         params=params,
@@ -537,7 +663,15 @@ class OutlookGraphAdapter:
                             messages.append(_normalize_graph_message(item, "junk" if folder == "junk" else "inbox"))
                             if len(messages) >= limit:
                                 break
-                    url = payload.get("@odata.nextLink")
+                    raw_next_link = payload.get("@odata.nextLink")
+                    try:
+                        url = _safe_graph_next_link(raw_next_link)
+                    except ValueError:
+                        return MailMessagesResult(
+                            status="failed",
+                            messages=[],
+                            error="Graph mail pagination returned an invalid destination.",
+                        )
                     params = None
         except httpx.HTTPError as exc:
             return MailMessagesResult(status="failed", messages=[], error=f"Graph mail request failed: {exc}")
@@ -551,7 +685,7 @@ class OutlookGraphAdapter:
         params = {
             "$top": str(limit),
             "$orderby": "ReceivedDateTime DESC",
-            "$select": "Id,Subject,BodyPreview,ReceivedDateTime,From,ToRecipients,Body",
+            "$select": "Id,Subject,BodyPreview,ReceivedDateTime,From,ToRecipients,CcRecipients,InternetMessageHeaders,Body",
         }
 
         try:
@@ -726,10 +860,7 @@ class OutlookGraphAdapter:
                     self._imap_host_cooldown[host] = time.monotonic() + self.settings.outlook_imap_failure_cooldown_seconds
             finally:
                 if client is not None:
-                    try:
-                        client.logout()
-                    except imaplib.IMAP4.error:
-                        pass
+                    _best_effort_close_imap(client)
         return MailMessagesResult(status="failed", messages=[], error="; ".join(errors))
 
     def _fetch_password_imap_messages_sync(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
@@ -762,10 +893,7 @@ class OutlookGraphAdapter:
                     self._imap_host_cooldown[host] = time.monotonic() + self.settings.outlook_imap_failure_cooldown_seconds
             finally:
                 if client is not None:
-                    try:
-                        client.logout()
-                    except imaplib.IMAP4.error:
-                        pass
+                    _best_effort_close_imap(client)
         return MailMessagesResult(status="failed", messages=[], error="; ".join(errors))
 
     def _read_imap_messages(self, client: imaplib.IMAP4_SSL, folder: str, limit: int) -> list[MailMessage]:
@@ -788,7 +916,10 @@ class OutlookGraphAdapter:
 
         fetch_spec = (
             "(BODY.PEEK[HEADER.FIELDS "
-            "(FROM SUBJECT DATE MESSAGE-ID CONTENT-TYPE CONTENT-TRANSFER-ENCODING MIME-VERSION)] "
+            "(FROM TO CC DELIVERED-TO X-ORIGINAL-TO ORIGINAL-RECIPIENT FINAL-RECIPIENT "
+            "ENVELOPE-TO X-ENVELOPE-TO X-FORWARDED-TO "
+            "X-MS-EXCHANGE-ORGANIZATION-ORIGINALENVELOPERECIPIENTS SUBJECT DATE MESSAGE-ID "
+            "AUTHENTICATION-RESULTS CONTENT-TYPE CONTENT-TRANSFER-ENCODING MIME-VERSION)] "
             "BODY.PEEK[TEXT]<0.4096>)"
         )
         uid_set = b",".join(latest_uids).decode("ascii", errors="ignore")
@@ -895,6 +1026,9 @@ class GmailImapAdapter:
             for message in messages:
                 if message.received_at and message.received_at < after:
                     continue
+                target_recipient = credential.gpt_email.strip().casefold()
+                if target_recipient not in message.recipients or not message.sender_authenticated:
+                    continue
                 code = message.code or extract_code(message.subject, message.body_preview, message.text)
                 if code:
                     return MailFetchResult(status="ok", code=code)
@@ -934,52 +1068,31 @@ class GmailImapAdapter:
             return MailMessagesResult(status="failed", messages=[], error="Missing mailbox password for Gmail IMAP.")
 
         client: imaplib.IMAP4_SSL | None = None
-        original_socket = socket.socket
-        original_getaddrinfo = socket.getaddrinfo
         proxy_url = str(getattr(credential, "proxy_url", None) or "").strip() or None
         try:
+            client_type = _ProxyImap4Ssl if proxy_url else imaplib.IMAP4_SSL
+            client_kwargs: dict[str, Any] = {
+                "timeout": self.settings.outlook_imap_timeout_seconds,
+            }
             if proxy_url:
-                import socks
-
-                parsed_proxy = urllib_parse.urlparse(proxy_url)
-                scheme = (parsed_proxy.scheme or "").lower()
-                proxy_type = socks.PROXY_TYPE_HTTP if scheme in {"http", "https"} else socks.SOCKS5
-                rdns = scheme == "socks5h"
-                socks.set_default_proxy(
-                    proxy_type,
-                    parsed_proxy.hostname,
-                    parsed_proxy.port,
-                    rdns=rdns,
-                    username=urllib_parse.unquote(parsed_proxy.username) if parsed_proxy.username else None,
-                    password=urllib_parse.unquote(parsed_proxy.password) if parsed_proxy.password else None,
-                )
-                socket.socket = _ipv4_only_socket_factory(socks.socksocket)
-                socket.getaddrinfo = _ipv4_only_getaddrinfo_factory(original_getaddrinfo)
-            client = imaplib.IMAP4_SSL(
-                GMAIL_IMAP_HOST,
-                GMAIL_IMAP_PORT,
-                timeout=self.settings.outlook_imap_timeout_seconds,
-            )
+                client_kwargs["proxy_url"] = proxy_url
+            client = client_type(GMAIL_IMAP_HOST, GMAIL_IMAP_PORT, **client_kwargs)
             client.login(credential.mailbox_email, password)
             messages = self._read_filtered_messages(client, credential, folder, limit)
             return MailMessagesResult(status="ok", messages=messages)
         except imaplib.IMAP4.error as exc:
             return MailMessagesResult(status="failed", messages=[], error=f"Gmail IMAP login failed: {exc}")
+        except (ImportError, ValueError) as exc:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error=f"Gmail proxy configuration failed: {exc}",
+            )
         except OSError as exc:
             return MailMessagesResult(status="failed", messages=[], error=f"Gmail IMAP connection failed: {exc}")
         finally:
             if client is not None:
-                try:
-                    client.logout()
-                except imaplib.IMAP4.error:
-                    pass
-            if proxy_url:
-                with contextlib.suppress(Exception):
-                    import socks
-
-                    socks.set_default_proxy()
-                socket.socket = original_socket
-                socket.getaddrinfo = original_getaddrinfo
+                _best_effort_close_imap(client)
 
     def _read_filtered_messages(
         self,
@@ -1064,6 +1177,160 @@ class MailAdapterRegistry:
         return await adapter.fetch_messages(credential, folder, limit)
 
 
+_RECIPIENT_HEADER_NAMES = {name.casefold() for name in _RECIPIENT_HEADERS}
+
+
+def _safe_graph_next_link(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid Graph nextLink")
+    resolved = urllib_parse.urljoin("https://graph.microsoft.com/", value.strip())
+    parsed = urllib_parse.urlparse(resolved)
+    if (
+        parsed.scheme.casefold() != "https"
+        or (parsed.hostname or "").casefold() != "graph.microsoft.com"
+        or parsed.port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.startswith("/v1.0/")
+        or parsed.fragment
+    ):
+        raise ValueError("invalid Graph nextLink")
+    return resolved
+
+
+def _microsoft_message_recipients(
+    item: dict[str, Any],
+    *,
+    recipient_keys: tuple[str, ...],
+    headers_key: str,
+) -> tuple[str, ...]:
+    candidates: set[str] = set()
+    for key in recipient_keys:
+        candidates.update(_extract_email_candidates(item.get(key)))
+    headers = item.get(headers_key)
+    if isinstance(headers, list):
+        for header in headers:
+            if not isinstance(header, dict):
+                continue
+            name = str(header.get("name") or header.get("Name") or "").strip().casefold()
+            if name not in _RECIPIENT_HEADER_NAMES:
+                continue
+            candidates.update(_extract_email_candidates(header.get("value") or header.get("Value")))
+    return tuple(sorted(candidates))
+
+
+def _microsoft_sender_authenticated(
+    item: dict[str, Any],
+    *,
+    sender_address: str | None,
+    headers_key: str,
+) -> bool:
+    headers = item.get(headers_key)
+    authentication_results: list[str] = []
+    if isinstance(headers, list):
+        for header in headers:
+            if not isinstance(header, dict):
+                continue
+            name = str(header.get("name") or header.get("Name") or "").strip().casefold()
+            if name != "authentication-results":
+                continue
+            value = str(header.get("value") or header.get("Value") or "").strip()
+            if value:
+                authentication_results.append(value)
+    return _openai_sender_authenticated(sender_address, authentication_results)
+
+
+def _openai_sender_authenticated(
+    sender_address: str | None,
+    authentication_results: list[str],
+) -> bool:
+    sender_domain = _email_domain(sender_address)
+    if not _is_openai_domain(sender_domain) or not authentication_results:
+        return False
+
+    # The receiving provider prepends its own Authentication-Results header.
+    # Ignore later headers because they can be supplied by the sender.
+    result = re.sub(r"\s+", " ", authentication_results[0]).strip().casefold()
+    if not _looks_like_provider_authentication_result(result):
+        return False
+
+    method_matches = list(AUTH_METHOD_RE.finditer(result))
+    for index, method_match in enumerate(method_matches):
+        method, status = method_match.groups()
+        method = method.casefold()
+        if status.casefold() != "pass" or method not in {"dkim", "dmarc"}:
+            continue
+        block_end = method_matches[index + 1].start() if index + 1 < len(method_matches) else len(result)
+        result_block = result[method_match.start():block_end]
+        identity_keys = ("header.d", "header.i") if method == "dkim" else ("header.from",)
+        for identity_key in identity_keys:
+            pattern = rf"\b{re.escape(identity_key)}\s*=\s*[\"']?@?([a-z0-9.-]+)"
+            for matched_domain in re.findall(pattern, result_block):
+                if _is_openai_domain(matched_domain.rstrip(".")):
+                    return True
+    return False
+
+
+def _looks_like_provider_authentication_result(value: str) -> bool:
+    prefix = value.split(";", 1)[0].strip().rstrip(".")
+    if "=" in prefix:
+        # Exchange Online commonly omits authserv-id and starts with spf=.
+        return True
+    auth_service = prefix.split()[0] if prefix else ""
+    return (
+        auth_service == "mx.google.com"
+        or auth_service.endswith(".outlook.com")
+        or auth_service.endswith(".protection.outlook.com")
+    )
+
+
+def _email_domain(address: str | None) -> str:
+    parsed_address = parseaddr(str(address or ""))[1].strip().casefold()
+    if "@" not in parsed_address:
+        return ""
+    return parsed_address.rsplit("@", 1)[1].rstrip(".")
+
+
+def _is_openai_domain(domain: str) -> bool:
+    return any(domain == root or domain.endswith(f".{root}") for root in _OPENAI_SENDER_DOMAINS)
+
+
+def _mail_result_usable_for_code(
+    result: MailMessagesResult,
+    target_recipient: str | None,
+) -> bool:
+    if result.status != "ok":
+        return False
+    if not target_recipient:
+        return True
+    candidates = [
+        message
+        for message in result.messages
+        if target_recipient in message.recipients
+        and (message.code or extract_code(message.subject, message.body_preview, message.text))
+    ]
+    return not candidates or any(message.sender_authenticated for message in candidates)
+
+
+def _message_recipient_candidates(*messages: dict[str, Any]) -> tuple[str, ...]:
+    candidates: set[str] = set()
+    for message in messages:
+        for key in (
+            "to",
+            "cc",
+            "recipients",
+            "to_recipients",
+            "toRecipients",
+            "delivered_to",
+            "original_recipient",
+            "originalRecipients",
+        ):
+            candidates.update(_extract_email_candidates(message.get(key)))
+    return tuple(sorted(candidates))
+
+
 def _normalize_graph_message(item: dict[str, Any], folder: str) -> MailMessage:
     sender_name = None
     sender_address = None
@@ -1093,6 +1360,16 @@ def _normalize_graph_message(item: dict[str, Any], folder: str) -> MailMessage:
         received_at=_parse_graph_time(str(item.get("receivedDateTime") or "").strip() or None),
         text=text_content or None,
         code=code,
+        recipients=_microsoft_message_recipients(
+            item,
+            recipient_keys=("toRecipients", "ccRecipients"),
+            headers_key="internetMessageHeaders",
+        ),
+        sender_authenticated=_microsoft_sender_authenticated(
+            item,
+            sender_address=sender_address,
+            headers_key="internetMessageHeaders",
+        ),
     )
 
 
@@ -1136,6 +1413,16 @@ def _normalize_outlook_rest_message(item: dict[str, Any], folder: str) -> MailMe
         received_at=_parse_graph_time(str(item.get("ReceivedDateTime") or "").strip() or None),
         text=text_content or None,
         code=code,
+        recipients=_microsoft_message_recipients(
+            item,
+            recipient_keys=("ToRecipients", "CcRecipients"),
+            headers_key="InternetMessageHeaders",
+        ),
+        sender_authenticated=_microsoft_sender_authenticated(
+            item,
+            sender_address=sender_address,
+            headers_key="InternetMessageHeaders",
+        ),
     )
 
 
@@ -1172,6 +1459,7 @@ def _custom_message_to_mail_message(message: Any, folder: str) -> MailMessage:
         received_at=_parse_graph_time(message.get("received_at") or message.get("receivedDateTime")),
         text=str(body_text) if body_text else None,
         code=message.get("code") or extract_code(str(message.get("subject") or ""), str(body_text or "")),
+        recipients=_message_recipient_candidates(message),
     )
 
 
@@ -1223,7 +1511,35 @@ def _external_message_to_mail_message(message: Any, folder: str, index: int) -> 
         received_at=_parse_mail_time(_pick_mail_value(message, "date", "received_at", "sent_at", "created_at", "internalDate")),
         text=text_source,
         code=code,
+        recipients=_message_recipient_candidates(message, raw),
+        sender_authenticated=_openai_sender_authenticated(
+            sender_address,
+            _external_authentication_results(message, raw),
+        ),
     )
+
+
+def _external_authentication_results(*sources: dict[str, Any]) -> list[str]:
+    results: list[str] = []
+    for source in sources:
+        for key in ("authentication_results", "authenticationResults"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                results.append(value.strip())
+            elif isinstance(value, list):
+                results.extend(str(item).strip() for item in value if str(item).strip())
+        headers = source.get("headers") or source.get("internetMessageHeaders")
+        if isinstance(headers, list):
+            for header in headers:
+                if not isinstance(header, dict):
+                    continue
+                name = str(header.get("name") or header.get("Name") or "").strip().casefold()
+                if name != "authentication-results":
+                    continue
+                value = str(header.get("value") or header.get("Value") or "").strip()
+                if value:
+                    results.append(value)
+    return results
 
 
 def _external_sender_parts(sender: Any) -> tuple[str | None, str | None]:
@@ -1310,6 +1626,15 @@ def _imap_message_to_mail_message(raw: bytes, fallback_id: str, folder: str) -> 
         received_at=_parse_email_time(message.get("Date")),
         text=body_text,
         code=extract_code(subject, body_text, html_content),
+        recipients=tuple(sorted(_extract_original_recipients_from_message(message))),
+        sender_authenticated=_openai_sender_authenticated(
+            sender_address,
+            [
+                decoded
+                for value in message.get_all("Authentication-Results", [])
+                if (decoded := (_decode_header_value(value) or value).strip())
+            ],
+        ),
     )
 
 
@@ -1323,8 +1648,7 @@ def _imap_chunks_match_recipient(chunks: list[bytes], recipient_email: str) -> b
     if not recipient_email:
         return False
     message = message_from_bytes(_imap_chunks_to_raw_message(chunks))
-    text_content, html_content = _message_texts(message)
-    return recipient_email in _extract_original_recipients_from_message(message, text_content, html_content)
+    return recipient_email in _extract_original_recipients_from_message(message)
 
 
 def _group_imap_fetch_parts(fetch_data: list[Any]) -> dict[str, list[bytes]]:
@@ -1441,76 +1765,11 @@ def _extract_email_candidates(value: Any) -> set[str]:
     return candidates
 
 
-def _ipv4_only_socket_factory(base_socket_type: Any):
-    def create_socket(family: int = socket.AF_INET, type: int = socket.SOCK_STREAM, proto: int = 0, fileno: int | None = None):
-        target_family = socket.AF_INET if family == socket.AF_UNSPEC else family
-        if target_family == socket.AF_INET6:
-            target_family = socket.AF_INET
-        if fileno is None:
-            return base_socket_type(target_family, type, proto)
-        return base_socket_type(target_family, type, proto, fileno)
-
-    return create_socket
-
-
-def _ipv4_only_getaddrinfo_factory(original_getaddrinfo: Any):
-    def getaddrinfo(host: str, port: int, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0):
-        target_family = socket.AF_INET if family in {0, socket.AF_UNSPEC, socket.AF_INET6} else family
-        return original_getaddrinfo(host, port, target_family, type, proto, flags)
-
-    return getaddrinfo
-
-
-def _extract_original_recipients_from_message(
-    message: Any,
-    text_content: str | None = None,
-    html_content: str | None = None,
-) -> set[str]:
+def _extract_original_recipients_from_message(message: Any) -> set[str]:
     candidates: set[str] = set()
-    header_names = (
-        "To",
-        "Cc",
-        "Delivered-To",
-        "X-Original-To",
-        "Original-Recipient",
-        "Final-Recipient",
-        "Envelope-To",
-        "X-Envelope-To",
-        "X-Forwarded-To",
-        "X-MS-Exchange-Organization-OriginalEnvelopeRecipients",
-    )
-    for header_name in header_names:
+    for header_name in _RECIPIENT_HEADERS:
         for value in message.get_all(header_name, []):
             candidates.update(_extract_email_candidates(_decode_header_value(value) or value))
-
-    source = "\n".join(
-        filter(
-            None,
-            [
-                _decode_header_value(message.get("Subject")),
-                text_content,
-                _strip_html(html_content) if html_content else None,
-            ],
-        )
-    )
-    for label in (
-        "Delivered-To",
-        "X-Original-To",
-        "Original-Recipient",
-        "Final-Recipient",
-        "Envelope-To",
-        "X-Envelope-To",
-        "X-Forwarded-To",
-        "To",
-        "收件人",
-        "收件邮箱",
-    ):
-        pattern = re.compile(
-            rf"{re.escape(label)}\s*[:：]\s*[<\"']?([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{{2,}})",
-            re.IGNORECASE,
-        )
-        for match in pattern.finditer(source):
-            candidates.add(match.group(1).lower())
     return candidates
 
 

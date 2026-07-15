@@ -36,7 +36,10 @@ class UpstreamURLTests(unittest.TestCase):
     def test_account_and_channel_inputs_share_canonicalization(self) -> None:
         expected = "https://example.com/prefix"
         self.assertEqual(
-            UpstreamAccountUpdate(base_url="https://EXAMPLE.com:443/prefix/v1/").base_url,
+            UpstreamAccountUpdate(
+                expected_identity_fingerprint="0" * 64,
+                base_url="https://EXAMPLE.com:443/prefix/v1/",
+            ).base_url,
             expected,
         )
         self.assertEqual(

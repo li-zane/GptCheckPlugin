@@ -347,6 +347,21 @@ button:active:not(:disabled) {
   background: var(--sidebar-hover);
 }
 
+.sidebar-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: auto;
+}
+
+.sidebar-actions .ghost-button {
+  margin-top: 0;
+  width: 100%;
+}
+
+.sidebar-theme-toggle {
+  min-width: 0;
+}
+
 .workspace {
   height: 100vh;
   min-width: 0;
@@ -1238,6 +1253,29 @@ h2 {
 
 .usage-sample-table {
   min-width: 1030px;
+}
+
+.usage-sample-sort {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  display: inline-flex;
+  font: inherit;
+  gap: 5px;
+  padding: 0;
+}
+
+.usage-sample-sort svg {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.usage-sample-sort:hover,
+.usage-sample-sort:focus-visible,
+.usage-sample-sort.active,
+.usage-sample-sort.active svg {
+  color: var(--primary);
 }
 
 .usage-sample-delete {
@@ -3059,6 +3097,156 @@ select:focus {
   min-width: min(920px, calc(100vw - 44px));
 }
 
+.liveness-dialog {
+  max-width: 1040px;
+  min-width: min(1040px, calc(100vw - 44px));
+}
+
+.liveness-controls {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.liveness-model-field {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.liveness-model-field > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.liveness-model-field select {
+  min-width: 0;
+  width: 100%;
+}
+
+.liveness-model-source {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.liveness-selection-count {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.25;
+  min-height: 32px;
+  padding: 5px 9px;
+}
+
+.liveness-selection-count.is-over-limit {
+  background: var(--warn-bg);
+  border-color: var(--warn-line);
+  color: var(--warn-ink);
+}
+
+.liveness-start-button {
+  min-width: 132px;
+}
+
+.liveness-running {
+  align-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  display: flex;
+  gap: 10px;
+  min-height: 54px;
+  padding: 10px 14px;
+}
+
+.liveness-summary {
+  border-bottom: 1px solid var(--line);
+  border-top: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(80px, 0.4fr)) minmax(180px, 1fr);
+}
+
+.liveness-summary > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px 12px;
+}
+
+.liveness-summary > div + div {
+  border-left: 1px solid var(--line);
+}
+
+.liveness-summary span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.liveness-summary strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.liveness-success-text {
+  color: var(--ok-ink);
+}
+
+.liveness-failure-text,
+.liveness-error-text {
+  color: var(--danger-ink);
+}
+
+.liveness-results {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-height: min(460px, calc(100vh - 310px));
+  overflow: auto;
+}
+
+.liveness-results table {
+  min-width: 820px;
+}
+
+.liveness-results thead {
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.liveness-results td:last-child {
+  max-width: 360px;
+  overflow-wrap: anywhere;
+}
+
+.liveness-account-identity {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.liveness-account-identity strong,
+.liveness-account-identity span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.liveness-account-identity span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .phone-dialog-grid {
   display: grid;
   gap: 12px;
@@ -3283,6 +3471,20 @@ select:focus {
     display: none;
   }
 
+  .sidebar-actions {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 4px;
+    margin-left: auto;
+    margin-top: 0;
+  }
+
+  .sidebar-actions .ghost-button {
+    min-width: 40px;
+    padding: 11px;
+    width: auto;
+  }
+
   .brand {
     min-width: 48px;
   }
@@ -3362,6 +3564,96 @@ select:focus {
   .mail-dialog {
     min-width: calc(100vw - 28px);
     padding: 14px;
+  }
+
+  .liveness-controls {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .liveness-start-button {
+    width: 100%;
+  }
+
+  .liveness-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .liveness-summary > div:last-child {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    grid-column: 1 / -1;
+  }
+
+  .liveness-results {
+    max-height: max(180px, calc(100vh - 390px));
+  }
+
+  .liveness-results table,
+  .liveness-results tbody {
+    display: block;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .liveness-results thead {
+    display: none;
+  }
+
+  .liveness-results tr {
+    display: grid;
+    gap: 10px 12px;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    padding: 12px;
+  }
+
+  .liveness-results tr + tr {
+    border-top: 1px solid var(--line);
+  }
+
+  .liveness-results td {
+    border: 0;
+    min-width: 0;
+    padding: 0;
+  }
+
+  .liveness-results td:first-child,
+  .liveness-results td:last-child {
+    grid-column: 1 / -1;
+    max-width: none;
+  }
+
+  .liveness-results td:nth-child(2),
+  .liveness-results td:nth-child(3),
+  .liveness-results td:nth-child(4),
+  .liveness-results td:last-child {
+    display: grid;
+    gap: 3px;
+  }
+
+  .liveness-results td:nth-child(2)::before,
+  .liveness-results td:nth-child(3)::before,
+  .liveness-results td:nth-child(4)::before,
+  .liveness-results td:last-child::before {
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 10px;
+  }
+
+  .liveness-results td:nth-child(2)::before {
+    content: "sub2api ID";
+  }
+
+  .liveness-results td:nth-child(3)::before {
+    content: "结果";
+  }
+
+  .liveness-results td:nth-child(4)::before {
+    content: "耗时";
+  }
+
+  .liveness-results td:last-child::before {
+    content: "详情";
   }
 
   .mail-tabs {
@@ -4818,7 +5110,7 @@ button.api-key-group-chip--more {
 .api-key-account-grid {
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   min-width: 0;
   padding: 4px 12px 12px;
 }
@@ -4828,7 +5120,7 @@ button.api-key-group-chip--more {
   border: 1px solid var(--line);
   border-radius: 6px;
   display: grid;
-  grid-template-rows: auto minmax(72px, 1fr) auto;
+  grid-template-rows: auto minmax(58px, 1fr) auto;
   min-width: 0;
   overflow: hidden;
 }
@@ -4841,7 +5133,7 @@ button.api-key-group-chip--more {
   align-content: start;
   display: grid;
   gap: 4px;
-  min-height: 70px;
+  min-height: 94px;
   min-width: 0;
   padding: 10px 10px 8px;
 }
@@ -4862,46 +5154,32 @@ button.api-key-group-chip--more {
 
 .api-key-account-card-head .api-key-inline-chips {
   min-height: 20px;
-  overflow: hidden;
+  overflow: visible;
 }
 
-.api-key-account-card-facts {
+.api-key-account-meta-chips,
+.api-key-account-rate-chips {
+  flex-wrap: nowrap;
+}
+
+.api-key-account-card-group {
+  align-content: start;
   border-top: 1px solid var(--line);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(2, minmax(64px, auto));
+  gap: 5px;
   min-width: 0;
+  padding: 9px 10px 10px;
 }
 
-.api-key-account-card-fact {
-  align-content: start;
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-  padding: 9px 10px;
-}
-
-.api-key-account-card-fact + .api-key-account-card-fact {
-  border-left: 1px solid var(--line);
-  text-align: right;
-}
-
-.api-key-account-card-fact > span,
-.api-key-account-card-fact > small {
+.api-key-account-card-group > span {
   color: var(--muted);
   font-size: 9px;
+  font-weight: 700;
   line-height: 1.3;
 }
 
-.api-key-account-card-fact > strong {
-  color: var(--ink);
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .api-key-account-group-line {
-  align-items: center;
+  align-items: flex-start;
   display: flex;
   gap: 5px;
   min-width: 0;
@@ -4911,10 +5189,9 @@ button.api-key-group-chip--more {
   color: var(--ink);
   flex: 1 1 auto;
   font-size: 11px;
+  line-height: 1.4;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .api-key-account-group-rate {
@@ -4932,18 +5209,42 @@ button.api-key-group-chip--more {
   padding: 3px 6px;
 }
 
-.api-key-account-card-fact--current > strong {
-  color: var(--green);
+.api-key-account-rate-chip {
+  cursor: help;
+  gap: 3px;
   font-variant-numeric: tabular-nums;
+  max-width: none;
 }
 
-.api-key-account-card-fact--target > strong {
-  color: var(--blue);
-  font-variant-numeric: tabular-nums;
+.api-key-account-rate-chip > span {
+  font-size: 8px;
+  font-weight: 650;
+  opacity: 0.82;
 }
 
-.api-key-account-card-fact--target.is-pending > strong {
-  color: var(--amber);
+.api-key-account-rate-chip > strong {
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.api-key-account-rate-chip--current {
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+}
+
+.api-key-account-rate-chip--combined {
+  background: var(--violet-bg);
+  color: var(--violet-ink);
+}
+
+.api-key-account-rate-chip--target {
+  background: var(--info-bg);
+  color: var(--info-ink);
+}
+
+.api-key-account-rate-chip--target.is-pending {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
 }
 
 .api-key-account-card-actions {
@@ -5250,7 +5551,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-grid {
-  align-items: start;
+  align-items: stretch;
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr));
@@ -5259,12 +5560,14 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-card {
-  align-self: start;
+  align-self: stretch;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-  display: grid;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
   min-width: 0;
   overflow: hidden;
   position: relative;
@@ -5548,7 +5851,9 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-accounts {
+  align-content: start;
   display: grid;
+  flex: 1 1 auto;
   min-width: 0;
 }
 

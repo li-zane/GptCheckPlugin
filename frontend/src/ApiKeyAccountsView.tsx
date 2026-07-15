@@ -29,7 +29,12 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "./api";
-import { buildUpstreamAccountUpdatePayload, canSetManualMultiplier } from "./upstreamAccountForm";
+import {
+  buildUpstreamAccountUpdatePayload,
+  canSetManualMultiplier,
+  expectedIdentityFingerprint,
+} from "./upstreamAccountForm";
+import { channelCredentialBindingChanged } from "./upstreamCredentialBinding";
 import { rateChangeReasonLabel, upstreamStatusLabel, upstreamStatusTone } from "./upstreamLabels";
 import {
   accountBillingRateChange,
@@ -108,7 +113,7 @@ export function ApiKeyAccountsView({
   displayTimeZone,
   globallyBusy,
   onCacheChange,
-  onBusyChange,
+  onOperationStart,
   rateWritesEnabled,
   refreshVersion,
 }: {
@@ -117,7 +122,7 @@ export function ApiKeyAccountsView({
   displayTimeZone: string;
   globallyBusy: boolean;
   onCacheChange: (data: UpstreamChannelsResponse, baseUrl: string) => void;
-  onBusyChange: (busy: boolean) => void;
+  onOperationStart: () => () => void;
   rateWritesEnabled: boolean;
   refreshVersion: number;
 }) {
@@ -147,16 +152,20 @@ export function ApiKeyAccountsView({
   const [savingDialog, setSavingDialog] = useState(false);
   const [liveDataValidated, setLiveDataValidated] = useState(false);
   const requestSequence = useRef(0);
+  const rateLogsRequestSequence = useRef(0);
+  const activeCacheBaseUrlRef = useRef(cacheBaseUrl);
   const hasDataRef = useRef(Boolean(cachedData));
   const refreshVersionRef = useRef(refreshVersion);
   const dialogRef = useRef<HTMLElement | null>(null);
   const lastFocusedElementRef = useRef<HTMLElement | null>(null);
-  const localMutationBusy = bulkDiscovering
+  const localMutationBusy = savingDialog
+    || bulkDiscovering
     || Object.keys(busyChannels).length > 0
     || Object.keys(busyAccounts).length > 0;
 
   const loadData = useCallback(async (preserveFeedback = false) => {
     const sequence = ++requestSequence.current;
+    const requestBaseUrl = cacheBaseUrl;
     setLiveDataValidated(false);
     if (hasDataRef.current) {
       setRefreshing(true);
@@ -166,7 +175,10 @@ export function ApiKeyAccountsView({
     if (!preserveFeedback) setError("");
     try {
       const response = await api.upstreamChannels();
-      if (sequence !== requestSequence.current) return;
+      if (
+        sequence !== requestSequence.current
+        || activeCacheBaseUrlRef.current !== requestBaseUrl
+      ) return;
       const normalized = {
         ...response,
         channels: Array.isArray(response.channels) ? response.channels : [],
@@ -177,16 +189,41 @@ export function ApiKeyAccountsView({
       onCacheChange(normalized, cacheBaseUrl);
       setLiveDataValidated(true);
     } catch (reason) {
-      if (sequence === requestSequence.current) {
+       if (
+         sequence === requestSequence.current
+         && activeCacheBaseUrlRef.current === requestBaseUrl
+       ) {
         setError(errorMessage(reason, "上游渠道读取失败"));
       }
     } finally {
-      if (sequence === requestSequence.current) {
+      if (
+        sequence === requestSequence.current
+        && activeCacheBaseUrlRef.current === requestBaseUrl
+      ) {
         setLoading(false);
         setRefreshing(false);
       }
     }
   }, [cacheBaseUrl, onCacheChange]);
+
+  useEffect(() => {
+    if (activeCacheBaseUrlRef.current === cacheBaseUrl) return;
+    requestSequence.current += 1;
+    activeCacheBaseUrlRef.current = cacheBaseUrl;
+    hasDataRef.current = Boolean(cachedData);
+    setData(cachedData || emptyData);
+    setLoading(!cachedData);
+    setRefreshing(Boolean(cachedData));
+    setLiveDataValidated(false);
+    setError("");
+    setNotice("");
+    rateLogsRequestSequence.current += 1;
+    setRateLogs([]);
+    setRateLogsLoading(false);
+    setRateLogsHasMore(false);
+    setRateLogsLoaded(false);
+    setRateLogsError("");
+  }, [cacheBaseUrl, cachedData]);
 
   useEffect(() => {
     if (!cachedData || hasDataRef.current) return;
@@ -203,16 +240,19 @@ export function ApiKeyAccountsView({
   useEffect(() => {
     if (refreshVersionRef.current === refreshVersion) return;
     refreshVersionRef.current = refreshVersion;
-    void loadData(true);
+    setError("");
+    setNotice("");
+    rateLogsRequestSequence.current += 1;
+    setRateLogs([]);
+    setRateLogsLoading(false);
+    setRateLogsHasMore(false);
+    setRateLogsError("");
+    setRateLogsLoaded(false);
+    void loadData();
   }, [loadData, refreshVersion]);
 
-  useEffect(() => {
-    onBusyChange(localMutationBusy);
-  }, [localMutationBusy, onBusyChange]);
-
-  useEffect(() => () => onBusyChange(false), [onBusyChange]);
-
   const loadRateLogs = useCallback(async (append = false) => {
+    const sequence = ++rateLogsRequestSequence.current;
     setRateLogsLoading(true);
     setRateLogsError("");
     try {
@@ -222,14 +262,17 @@ export function ApiKeyAccountsView({
         endDate: rateLogFilters.endDate || undefined,
         timeZone: displayTimeZone,
       });
+      if (sequence !== rateLogsRequestSequence.current) return;
       setRateLogs((current) => append ? [...current, ...next] : next);
       setRateLogsHasMore(next.length === 50);
       setRateLogsLoaded(true);
     } catch (reason) {
-      setRateLogsError(errorMessage(reason, "倍率变化记录读取失败"));
-      setRateLogsLoaded(true);
+      if (sequence === rateLogsRequestSequence.current) {
+        setRateLogsError(errorMessage(reason, "倍率变化记录读取失败"));
+        setRateLogsLoaded(true);
+      }
     } finally {
-      setRateLogsLoading(false);
+      if (sequence === rateLogsRequestSequence.current) setRateLogsLoading(false);
     }
   }, [displayTimeZone, rateLogFilters, rateLogs]);
 
@@ -243,7 +286,9 @@ export function ApiKeyAccountsView({
       return;
     }
     setRateLogsError("");
+    rateLogsRequestSequence.current += 1;
     setRateLogs([]);
+    setRateLogsLoading(false);
     setRateLogsHasMore(false);
     setRateLogFilters(rateLogDraftFilters);
     setRateLogsLoaded(false);
@@ -253,7 +298,9 @@ export function ApiKeyAccountsView({
     const emptyFilters = { startDate: "", endDate: "" };
     setRateLogDraftFilters(emptyFilters);
     setRateLogsError("");
+    rateLogsRequestSequence.current += 1;
     setRateLogs([]);
+    setRateLogsLoading(false);
     setRateLogsHasMore(false);
     setRateLogFilters(emptyFilters);
     setRateLogsLoaded(false);
@@ -390,6 +437,7 @@ export function ApiKeyAccountsView({
   const saveChannel = async (event: FormEvent) => {
     event.preventDefault();
     if (!editingChannel) return;
+    const finishOperation = onOperationStart();
     setSavingDialog(true);
     setDialogError("");
     try {
@@ -398,12 +446,10 @@ export function ApiKeyAccountsView({
       assertHttpsUrl(baseUrl);
       const managementBaseUrl = channelForm.managementBaseUrl.trim();
       if (managementBaseUrl) assertHttpsUrl(managementBaseUrl);
-      const previousOrigin = urlOrigin(
-        editingChannel.management_base_url || channelBaseUrl(editingChannel),
-      );
-      const nextOrigin = urlOrigin(managementBaseUrl || baseUrl);
-      const credentialRebind = Boolean(
-        previousOrigin && nextOrigin && previousOrigin !== nextOrigin,
+      const credentialRebind = channelCredentialBindingChanged(
+        editingChannel,
+        baseUrl,
+        managementBaseUrl,
       );
       if (
         credentialRebind &&
@@ -444,12 +490,14 @@ export function ApiKeyAccountsView({
       setDialogError(errorMessage(reason, "渠道配置保存失败"));
     } finally {
       setSavingDialog(false);
+      finishOperation();
     }
   };
 
   const saveAccount = async (event: FormEvent) => {
     event.preventDefault();
     if (!editingAccount) return;
+    const finishOperation = onOperationStart();
     setSavingDialog(true);
     setDialogError("");
     try {
@@ -474,9 +522,22 @@ export function ApiKeyAccountsView({
         return;
       }
       payload.confirm_credential_rebind = credentialRebind;
+      if (editingAccount.identity_rebind_required) {
+        const confirmed = window.confirm(
+          editingAccount.identity_binding_status === "mismatch"
+            ? "检测到 sub2api 账号 ID 对应的身份已经变化。继续会把保留的本地上游配置和凭据重新绑定到当前账号，是否确认？"
+            : "这是升级前尚未绑定身份的本地配置。继续会把它认领到当前 sub2api 账号，是否确认？",
+        );
+        if (!confirmed) return;
+        payload.confirm_identity_rebind = true;
+      }
       await api.updateUpstreamAccount(editingAccount.sub2api_account_id, payload);
       closeDialog();
       await loadData(true);
+      rateLogsRequestSequence.current += 1;
+      setRateLogs([]);
+      setRateLogsLoading(false);
+      setRateLogsHasMore(false);
       setRateLogsLoaded(false);
       setError("");
       setNotice(
@@ -488,22 +549,29 @@ export function ApiKeyAccountsView({
       setDialogError(errorMessage(reason, "账号配置保存失败"));
     } finally {
       setSavingDialog(false);
+      finishOperation();
     }
   };
 
   const discoverChannel = async (channel: UpstreamChannel) => {
+    const finishOperation = onOperationStart();
     setChannelBusy(channel, "discover");
     setError("");
     setNotice("");
     try {
       await api.discoverUpstreamChannel(channel.id);
       await loadData(true);
+      rateLogsRequestSequence.current += 1;
+      setRateLogs([]);
+      setRateLogsLoading(false);
+      setRateLogsHasMore(false);
       setRateLogsLoaded(false);
       setNotice(channelDiscoverySuccessMessage(rateWritesEnabled, channelDisplayName(channel)));
     } catch (reason) {
       setError(errorMessage(reason, channelDiscoveryErrorMessage(rateWritesEnabled, channelDisplayName(channel))));
     } finally {
       setChannelBusy(channel, null);
+      finishOperation();
     }
   };
 
@@ -512,34 +580,46 @@ export function ApiKeyAccountsView({
       setNotice(upstreamDiscoveryCopy(rateWritesEnabled).empty);
       return;
     }
+    const finishOperation = onOperationStart();
     setBulkDiscovering(true);
     setError("");
     setNotice("");
     try {
-      const result = await api.discoverAllUpstreamChannels();
+      const result = await api.syncApiKeyAccounts(data, false);
       await loadData(true);
+      rateLogsRequestSequence.current += 1;
+      setRateLogs([]);
+      setRateLogsLoading(false);
+      setRateLogsHasMore(false);
       setRateLogsLoaded(false);
       setNotice(apiAccountSyncMessage(result, rateWritesEnabled));
     } catch (reason) {
       setError(errorMessage(reason, upstreamDiscoveryCopy(rateWritesEnabled).allError));
     } finally {
       setBulkDiscovering(false);
+      finishOperation();
     }
   };
 
   const toggleAccountEnabled = async (account: UpstreamAccount) => {
+    const finishOperation = onOperationStart();
     const currentlyEnabled = account.remote_schedulable !== false;
     setAccountBusy(account, currentlyEnabled ? "disable" : "enable");
     setError("");
     setNotice("");
     try {
-      await api.setUpstreamAccountEnabled(account.sub2api_account_id, !currentlyEnabled);
+      await api.setUpstreamAccountEnabled(
+        account.sub2api_account_id,
+        !currentlyEnabled,
+        expectedIdentityFingerprint(account),
+      );
       await loadData(true);
       setNotice(accountDisplayName(account) + (currentlyEnabled ? " 已禁用。" : " 已启用。"));
     } catch (reason) {
       setError(errorMessage(reason, currentlyEnabled ? "账号禁用失败" : "账号启用失败"));
     } finally {
       setAccountBusy(account, null);
+      finishOperation();
     }
   };
 
@@ -550,18 +630,27 @@ export function ApiKeyAccountsView({
         " 及其本地上游配置会一并删除，此操作无法撤销。",
     );
     if (!confirmed) return;
+    const finishOperation = onOperationStart();
     setAccountBusy(account, "delete");
     setError("");
     setNotice("");
     try {
-      await api.deleteRemoteUpstreamAccount(account.sub2api_account_id);
+      await api.deleteRemoteUpstreamAccount(
+        account.sub2api_account_id,
+        expectedIdentityFingerprint(account),
+      );
       await loadData(true);
+      rateLogsRequestSequence.current += 1;
+      setRateLogs([]);
+      setRateLogsLoading(false);
+      setRateLogsHasMore(false);
       setRateLogsLoaded(false);
       setNotice("已从 sub2api 删除 " + accountDisplayName(account) + "。");
     } catch (reason) {
       setError(errorMessage(reason, "sub2api 账号删除失败"));
     } finally {
       setAccountBusy(account, null);
+      finishOperation();
     }
   };
 
@@ -1229,6 +1318,7 @@ function AccountCard({
   rateWritesEnabled: boolean;
 }) {
   const busy = Boolean(busyAction) || globallyDisabled;
+  const identityBlocked = Boolean(account.identity_rebind_required);
   const current = finiteNumber(account.current_rate);
   const target = finiteNumber(account.target_rate);
   const groupMultiplier = finiteNumber(account.effective_group_multiplier);
@@ -1245,48 +1335,74 @@ function AccountCard({
         + "（分组倍率 × 上游充值成本）";
   const enabled = account.remote_schedulable !== false;
   const effectiveStatus = enabled ? account.remote_status || "enabled" : "disabled";
+  const currentRateLabel = formatMultiplier(current);
+  const targetRateLabel = formatMultiplier(target);
+  const combinedRateLabel = formatMultiplier(normalizedMultiplier);
+  const rechargeMultiplierLabel = formatMultiplier(account.effective_recharge_multiplier);
+  const combinedRateTitle = normalizedMultiplier === null
+    ? "综合倍率暂不可用：缺少上游充值倍率或分组倍率"
+    : `综合倍率为 ${combinedRateLabel}（上游充值倍率 ${rechargeMultiplierLabel} × 分组倍率 ${formatMultiplier(groupMultiplier)}）`;
+  const currentRateTitle = `当前 sub2api 中账号计费倍率为 ${currentRateLabel}`;
+  const targetRateTitle = `根据上游分组倍率和充值成本计算的目标计费倍率为 ${targetRateLabel}；${accountRateStatusLabel(target, account.would_change, rateWritesEnabled)}`;
   return (
     <article className={"api-key-account-card" + (enabled ? "" : " api-key-account-card--disabled")}>
       <header className="api-key-account-card-head">
         <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
         <span className="api-key-mono">#{account.sub2api_account_id}</span>
-        <div className="api-key-inline-chips">
+        <div className="api-key-inline-chips api-key-account-meta-chips">
           <StatusChip status={effectiveStatus} />
           {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
+          {identityBlocked ? (
+            <span className="api-key-chip api-key-chip--warn">
+              {account.identity_binding_status === "mismatch" ? "身份已变化" : "身份待认领"}
+            </span>
+          ) : null}
+        </div>
+        <div className="api-key-inline-chips api-key-account-rate-chips">
+          <span
+            aria-label={combinedRateTitle}
+            className="api-key-chip api-key-account-rate-chip api-key-account-rate-chip--combined"
+            title={combinedRateTitle}
+          >
+            <span>综合</span>
+            <strong>{combinedRateLabel}</strong>
+          </span>
+          <span
+            aria-label={currentRateTitle}
+            className="api-key-chip api-key-account-rate-chip api-key-account-rate-chip--current"
+            title={currentRateTitle}
+          >
+            <span>当前</span>
+            <strong>{currentRateLabel}</strong>
+          </span>
+          <span
+            aria-label={targetRateTitle}
+            className={
+              "api-key-chip api-key-account-rate-chip api-key-account-rate-chip--target"
+              + (account.would_change === true ? " is-pending" : "")
+            }
+            title={targetRateTitle}
+          >
+            <span>目标</span>
+            <strong>{targetRateLabel}</strong>
+          </span>
         </div>
       </header>
-      <div className="api-key-account-card-facts">
-        <div className="api-key-account-card-fact">
-          <span>分组</span>
-          <div className="api-key-account-group-line">
-            <strong title={account.selected_group_name || account.selected_group_id || "未识别"}>
-              {account.selected_group_name || account.selected_group_id || "未识别"}
-            </strong>
-            {groupMultiplier !== null ? (
-              <span
-                aria-label={groupMultiplierTitle}
-                className="api-key-account-group-rate"
-                title={groupMultiplierTitle}
-              >
-                {formatMultiplier(groupMultiplier)}
-              </span>
-            ) : null}
-          </div>
-        </div>
-        <div className="api-key-account-card-fact api-key-account-card-fact--rate api-key-account-card-fact--current">
-          <span>当前倍率</span>
-          <strong>{formatMultiplier(current)}</strong>
-          <small>sub2api 当前值</small>
-        </div>
-        <div
-          className={
-            "api-key-account-card-fact api-key-account-card-fact--rate api-key-account-card-fact--target"
-            + (account.would_change === true ? " is-pending" : "")
-          }
-        >
-          <span>目标倍率</span>
-          <strong>{formatMultiplier(target)}</strong>
-          <small>{accountRateStatusLabel(target, account.would_change, rateWritesEnabled)}</small>
+      <div className="api-key-account-card-group">
+        <span>上游分组</span>
+        <div className="api-key-account-group-line">
+          <strong title={account.selected_group_name || account.selected_group_id || "未识别"}>
+            {account.selected_group_name || account.selected_group_id || "未识别"}
+          </strong>
+          {groupMultiplier !== null ? (
+            <span
+              aria-label={groupMultiplierTitle}
+              className="api-key-account-group-rate"
+              title={groupMultiplierTitle}
+            >
+              {formatMultiplier(groupMultiplier)}
+            </span>
+          ) : null}
         </div>
       </div>
       <footer className="api-key-account-card-actions">
@@ -1304,7 +1420,7 @@ function AccountCard({
           aria-label={(enabled ? "禁用 " : "启用 ") + accountDisplayName(account)}
           aria-pressed={!enabled}
           className={"api-key-icon-button " + (enabled ? "api-key-icon-button--disable" : "api-key-icon-button--enable")}
-          disabled={busy}
+          disabled={busy || identityBlocked}
           onClick={onToggle}
           title={enabled ? "禁用账号" : "启用账号"}
           type="button"
@@ -1314,7 +1430,7 @@ function AccountCard({
         <button
           aria-label={"从 sub2api 删除 " + accountDisplayName(account)}
           className="api-key-icon-button api-key-icon-button--danger"
-          disabled={busy}
+          disabled={busy || identityBlocked}
           onClick={onDelete}
           title="删除 sub2api 账号"
           type="button"
@@ -1630,8 +1746,8 @@ function StatusChip({ status }: { status?: string | null }) {
 }
 
 function PlatformChip({ platform }: { platform: string }) {
-  const value = platform.trim().toLowerCase();
-  return <span className="api-key-chip api-key-chip--info">{statusLabel(value)}</span>;
+  const value = platform.trim();
+  return <span className="api-key-chip api-key-chip--info" title={`平台：${value}`}>{value}</span>;
 }
 
 function channelKey(channel: UpstreamChannel) {

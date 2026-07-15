@@ -1,6 +1,9 @@
 import {
   Activity,
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ChevronDown,
   CheckCircle2,
   Clock3,
@@ -39,7 +42,17 @@ import { createContext, FormEvent, useCallback, useContext, useEffect, useLayout
 
 import { api, AUTH_EXPIRED_EVENT } from "./api";
 import { ApiKeyAccountsView } from "./ApiKeyAccountsView";
+import {
+  accountCanBeLivenessTested,
+  livenessAccountIds,
+  MAX_LIVENESS_ACCOUNTS,
+} from "./accountLiveness";
 import { apiAccountSyncMessage } from "./upstreamSyncPresentation";
+import {
+  sortUsageLimitSamples,
+  type UsageSampleSortDirection,
+  type UsageSampleSortField,
+} from "./usageSampleSort";
 import {
   clearUpstreamOverviewCache,
   getUpstreamOverviewSessionStorage,
@@ -50,6 +63,8 @@ import {
 import type {
   Account,
   AccountExceptionRecord,
+  AccountLivenessModel,
+  AccountLivenessTestResult,
   AccountUsageEstimate,
   AppEvent,
   AppSettings,
@@ -185,6 +200,11 @@ function App() {
   const [apiKeyRefreshVersion, setApiKeyRefreshVersion] = useState(0);
   const [apiKeyViewBusy, setApiKeyViewBusy] = useState(false);
   const apiKeyAccountsCacheBaseUrlRef = useRef<string | null>(null);
+  const apiKeyViewOperationTokensRef = useRef(new Set<symbol>());
+  const loadAllRequestSequenceRef = useRef(0);
+  const settingsMutationGenerationRef = useRef(0);
+  const settingsMutationPendingRef = useRef(false);
+  const syncOperationRef = useRef(false);
   const [usageEstimate, setUsageEstimate] = useState<UsageEstimate | null>(null);
   const [usageLimitSamples, setUsageLimitSamples] = useState<UsageLimitSamples | null>(null);
   const [usageLimitSamplesLoading, setUsageLimitSamplesLoading] = useState(false);
@@ -194,14 +214,29 @@ function App() {
   const [usageEstimateRefreshed, setUsageEstimateRefreshed] = useState(false);
   const [notice, setNotice] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const [oauthSyncBusy, setOAuthSyncBusy] = useState(false);
+  const [apiKeySyncBusy, setApiKeySyncBusy] = useState(false);
   const siteName = settings.site_name?.trim() || defaultSiteName;
   const now = useRefreshClock();
   const lastOAuthSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
   const lastApiKeySyncEvent = useMemo(() => latestEventByKinds(events, ["manual_upstream_sync"]), [events]);
   const oauthSyncActionTime = lastOAuthSyncEvent?.created_at ?? null;
   const apiKeySyncActionTime = lastApiKeySyncEvent?.created_at ?? null;
-  const syncBusy = busy || apiKeyViewBusy;
+  const syncBusy = busy || oauthSyncBusy || apiKeySyncBusy || apiKeyViewBusy;
   const toggleTheme = useCallback(() => setTheme((current) => (current === "dark" ? "light" : "dark")), []);
+
+  const beginApiKeyViewOperation = useCallback(() => {
+    const token = Symbol("api-key-view-operation");
+    apiKeyViewOperationTokensRef.current.add(token);
+    setApiKeyViewBusy(true);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      apiKeyViewOperationTokensRef.current.delete(token);
+      setApiKeyViewBusy(apiKeyViewOperationTokensRef.current.size > 0);
+    };
+  }, []);
 
   const cacheApiKeyAccounts = useCallback((response: UpstreamChannelsResponse, responseBaseUrl: string) => {
     const activeBaseUrl = apiKeyAccountsCacheBaseUrlRef.current;
@@ -211,6 +246,9 @@ function App() {
   }, []);
 
   const loadAll = useCallback(async ({ includePhones = true }: { includePhones?: boolean } = {}) => {
+    if (settingsMutationPendingRef.current) return;
+    const requestSequence = ++loadAllRequestSequenceRef.current;
+    const settingsGeneration = settingsMutationGenerationRef.current;
     const phonePromise = includePhones ? api.phones().catch(() => null) : Promise.resolve<PhoneNumber[] | null>(null);
     const exceptionRecordsPromise = api.exceptionRecords().catch(() => null);
     const [nextSummary, nextAccounts, nextMailboxes, nextPhones, nextJobs, nextEvents, nextExceptionRecords, nextSettings] = await Promise.all([
@@ -223,6 +261,10 @@ function App() {
       exceptionRecordsPromise,
       api.settings(),
     ]);
+    if (
+      requestSequence !== loadAllRequestSequenceRef.current
+      || settingsGeneration !== settingsMutationGenerationRef.current
+    ) return;
     setSummary(nextSummary);
     setAccounts(nextAccounts);
     setMailboxes(nextMailboxes);
@@ -402,11 +444,34 @@ function App() {
   };
 
   const saveSettings = async (payload: AppSettingsUpdate) => {
+    const previousSub2ApiBaseUrl = settings.sub2api_base_url;
+    const nextSub2ApiBaseUrl = payload.sub2api_base_url || previousSub2ApiBaseUrl;
+    const reusesExistingCredential = settings.sub2api_x_api_key_set
+      && !payload.clear_sub2api_x_api_key
+      && !payload.sub2api_x_api_key?.trim();
+    const changesCredentialOrigin =
+      credentialBindingOrigin(previousSub2ApiBaseUrl) !== credentialBindingOrigin(nextSub2ApiBaseUrl);
+    if (
+      changesCredentialOrigin
+      && reusesExistingCredential
+      && !payload.confirm_sub2api_credential_rebind
+    ) {
+      const confirmed = window.confirm(
+        "sub2api 域名已改变。继续会把当前管理凭据重新绑定到新域名，是否确认？",
+      );
+      if (!confirmed) return;
+      payload = { ...payload, confirm_sub2api_credential_rebind: true };
+    }
+    settingsMutationGenerationRef.current += 1;
+    loadAllRequestSequenceRef.current += 1;
+    settingsMutationPendingRef.current = true;
     setBusy(true);
     setNotice("");
     try {
-      const previousSub2ApiBaseUrl = settings.sub2api_base_url;
       const nextSettings = await api.updateSettings(payload);
+      settingsMutationGenerationRef.current += 1;
+      loadAllRequestSequenceRef.current += 1;
+      settingsMutationPendingRef.current = false;
       setSettings(nextSettings);
       if (nextSettings.sub2api_base_url !== previousSub2ApiBaseUrl) {
         clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
@@ -420,22 +485,81 @@ function App() {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "设置保存失败");
     } finally {
+      settingsMutationPendingRef.current = false;
       setBusy(false);
     }
   };
 
-  const runOAuthSync = () =>
-    runAction(async () => {
+  const runSyncAction = async (
+    kind: "oauth" | "api-key",
+    action: () => Promise<unknown>,
+    success: string,
+  ) => {
+    if (
+      syncOperationRef.current
+      || busy
+      || apiKeyViewOperationTokensRef.current.size > 0
+    ) return;
+    syncOperationRef.current = true;
+    if (kind === "oauth") setOAuthSyncBusy(true);
+    else setApiKeySyncBusy(true);
+    setNotice("");
+    try {
+      const result = await action();
+      setNotice(
+        result && typeof result === "object" && "message" in result && typeof result.message === "string"
+          ? result.message
+          : success,
+      );
+      await loadAll();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "同步失败");
+    } finally {
+      if (kind === "oauth") setOAuthSyncBusy(false);
+      else setApiKeySyncBusy(false);
+      syncOperationRef.current = false;
+    }
+  };
+
+  const runOAuthSync = () => void runSyncAction(
+    "oauth",
+    async () => {
       const result = await api.sync();
       const estimate = await loadUsageEstimate(false).catch(() => null);
       if (estimate) setUsageEstimateRefreshed(true);
       return result;
-    }, "OAuth 账号同步完成");
+    },
+    "OAuth 账号同步完成",
+  );
 
-  const runApiKeySync = () =>
-    runAction(async () => {
+  const runApiKeySync = () => void runSyncAction(
+    "api-key",
+    async () => {
+      const overview = await api.upstreamChannels();
+      const upstreamAccounts = [
+        ...overview.channels.flatMap((channel) => channel.accounts || []),
+        ...overview.unassigned_accounts,
+      ];
+      const unboundCount = upstreamAccounts.filter(
+        (account) => account.identity_binding_status === "unbound",
+      ).length;
+      const originRebindCount = upstreamAccounts.filter(
+        (account) => account.api_key_origin_rebind_required === true,
+      ).length;
+      const confirmationRequired = unboundCount > 0 || originRebindCount > 0;
+      if (
+        confirmationRequired
+        && !window.confirm(
+          "本次同步发现需要显式确认的 API Key 账号：\n"
+            + `- 升级前身份待绑定：${unboundCount} 个\n`
+            + `- 上游端点变化、API Key 来源待重新绑定：${originRebindCount} 个\n\n`
+            + "同一账号可能同时计入两项。继续会将已保存的加密 API Key 绑定到当前账号身份和当前上游端点，并探测分组与倍率。请确认你已核对这些账号和端点，是否继续？",
+        )
+      ) {
+        return { message: "已取消 API 账号同步。" };
+      }
       try {
-        const result = await api.discoverAllUpstreamChannels();
+        const result = await api.syncApiKeyAccounts(overview, confirmationRequired);
         return {
           message: apiAccountSyncMessage(
             result,
@@ -447,7 +571,9 @@ function App() {
         setApiKeyAccountsCache(null);
         setApiKeyRefreshVersion((current) => current + 1);
       }
-    }, "API 账号同步完成");
+    },
+    "API 账号同步完成",
+  );
 
   if (authState === "checking") {
     return <BootScreen />;
@@ -518,27 +644,31 @@ function App() {
           })}
         </nav>
 
-        <button
-          aria-label="退出"
-          className="ghost-button"
-          type="button"
-          title="退出"
-          onClick={async () => {
-            setBusy(true);
-            try {
-              await api.logout();
-            } finally {
-              setBusy(false);
-              clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
-              apiKeyAccountsCacheBaseUrlRef.current = null;
-              setApiKeyAccountsCache(null);
-              setAuthState("out");
-            }
-          }}
-        >
-          <LogOut size={17} />
-          <span>退出</span>
-        </button>
+        <div className="sidebar-actions">
+          <ThemeToggle sidebar theme={theme} onToggleTheme={toggleTheme} />
+          <button
+            aria-label="退出"
+            className="ghost-button"
+            disabled={syncBusy}
+            type="button"
+            title="退出"
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await api.logout();
+              } finally {
+                setBusy(false);
+                clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+                apiKeyAccountsCacheBaseUrlRef.current = null;
+                setApiKeyAccountsCache(null);
+                setAuthState("out");
+              }
+            }}
+          >
+            <LogOut size={17} />
+            <span>退出</span>
+          </button>
+        </div>
       </aside>
 
       <section className="workspace">
@@ -548,19 +678,20 @@ function App() {
             <h1>{titleFor(view)}</h1>
           </div>
           <div className="topbar-actions">
-            <ThemeToggle theme={theme} onToggleTheme={toggleTheme} />
             {notice ? <span className="notice">{notice}</span> : null}
             <ToolbarTimeButton
-              busy={syncBusy}
+              disabled={syncBusy}
               icon={RefreshCcw}
               label="同步 OAuth 账号"
+              loading={oauthSyncBusy}
               onClick={runOAuthSync}
               time={oauthSyncActionTime}
             />
             <ToolbarTimeButton
-              busy={syncBusy}
+              disabled={syncBusy}
               icon={KeyRound}
               label="同步 API 账号"
+              loading={apiKeySyncBusy}
               onClick={runApiKeySync}
               time={apiKeySyncActionTime}
             />
@@ -583,7 +714,7 @@ function App() {
           <AccountsView
             accounts={accounts}
             accountJumpTarget={accountJumpTarget}
-            busy={busy}
+            busy={syncBusy}
             mailboxes={mailboxes}
             usageByAccountId={usageByAccountId}
             usageByEmail={usageByEmail}
@@ -630,10 +761,10 @@ function App() {
             cacheBaseUrl={settings.sub2api_base_url}
             cachedData={apiKeyAccountsCache}
             displayTimeZone={settings.display_timezone || defaultTimeZone}
-            globallyBusy={busy}
+            globallyBusy={busy || oauthSyncBusy || apiKeySyncBusy}
             key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
             onCacheChange={cacheApiKeyAccounts}
-            onBusyChange={setApiKeyViewBusy}
+            onOperationStart={beginApiKeyViewOperation}
             rateWritesEnabled={settings.upstream_rate_sync_enabled && !settings.automation_paused}
             refreshVersion={apiKeyRefreshVersion}
           />
@@ -663,7 +794,7 @@ function App() {
         {view === "mailboxes" ? (
           <MailboxView
             mailboxes={mailboxes}
-            busy={busy}
+            busy={syncBusy}
             onImport={(content, provider) => runAction(() => api.importMailboxes(content, provider), "导入完成")}
             onDelete={(id) => runAction(() => api.deleteMailbox(id), "已删除")}
           />
@@ -671,7 +802,7 @@ function App() {
         {view === "phones" ? (
           <PhoneView
             accounts={accounts}
-            busy={busy}
+            busy={syncBusy}
             phones={phones}
             onDelete={(id) => runAction(() => api.deletePhone(id), "已删除手机号")}
             onExport={async () => {
@@ -686,7 +817,7 @@ function App() {
         ) : null}
         {view === "history" ? (
           <HistoryView
-            busy={busy}
+            busy={syncBusy}
             exceptionRecords={exceptionRecords}
             jobs={jobs}
             events={events}
@@ -704,7 +835,7 @@ function App() {
         ) : null}
         {view === "settings" ? (
           <SettingsView
-            busy={busy}
+            busy={syncBusy}
             settings={settings}
             subscriptionTypes={[...new Set(accounts.map((account) => account.subscription_type).filter(Boolean))]}
             onScan={() => runAction(api.scanSub2Api, "扫描完成")}
@@ -795,16 +926,31 @@ function BootScreen() {
   );
 }
 
-function ThemeToggle({ theme, onToggleTheme, compact = false }: { theme: Theme; onToggleTheme: () => void; compact?: boolean }) {
+function ThemeToggle({
+  theme,
+  onToggleTheme,
+  compact = false,
+  sidebar = false,
+}: {
+  theme: Theme;
+  onToggleTheme: () => void;
+  compact?: boolean;
+  sidebar?: boolean;
+}) {
   const isDark = theme === "dark";
   const Icon = isDark ? Sun : Moon;
   const label = isDark ? "浅色" : "暗色";
   const title = isDark ? "切换到浅色模式" : "切换到暗色模式";
+  const className = sidebar
+    ? "ghost-button theme-toggle sidebar-theme-toggle"
+    : compact
+      ? "secondary-button theme-toggle compact"
+      : "secondary-button theme-toggle";
 
   return (
     <button
       aria-label={title}
-      className={compact ? "secondary-button theme-toggle compact" : "secondary-button theme-toggle"}
+      className={className}
       onClick={onToggleTheme}
       title={title}
       type="button"
@@ -1060,6 +1206,7 @@ function AccountsView({
   const [accountStatusFilter, setAccountStatusFilter] = useState<AccountStatusFilter>("all");
   const [accountSubscriptionFilter, setAccountSubscriptionFilter] = useState("");
   const [selectedAccountKeys, setSelectedAccountKeys] = useState<Record<string, boolean>>({});
+  const [livenessAccounts, setLivenessAccounts] = useState<Account[] | null>(null);
   const [sessionDeleteUnlocks, setSessionDeleteUnlocks] = useState<Record<string, boolean>>({});
   const [selectedMailbox, setSelectedMailbox] = useState<Mailbox | null>(null);
   const [folder, setFolder] = useState<"inbox" | "junk">("inbox");
@@ -1070,6 +1217,7 @@ function AccountsView({
   const [selectedErrorAccount, setSelectedErrorAccount] = useState<Account | null>(null);
   const [highlightedAccountKey, setHighlightedAccountKey] = useState<string | null>(null);
   const handledJumpRequestRef = useRef<number | null>(null);
+  const livenessTriggerRef = useRef<HTMLButtonElement | null>(null);
   const mailboxByEmail = useMemo(() => {
     const entries = mailboxes
       .filter((mailbox) => !mailbox.disabled)
@@ -1099,6 +1247,8 @@ function AccountsView({
               account.platform,
               account.account_type,
               account.status,
+              account.sub2api_error_code,
+              account.sub2api_error_message,
               account.schedulable === null ? "未知 unknown" : account.schedulable ? "可用 schedulable" : "暂停 unschedulable",
               accountShowsRateLimit(account, usage) ? `限流 rate limited ${accountRateLimitedWindowsLabel(account, usage)}` : "",
               usage?.seven_day_token_history.total_tokens,
@@ -1131,6 +1281,14 @@ function AccountsView({
   );
   const selectedAccounts = accounts.filter((account) => selectedAccountKeys[accountRowKey(account)]);
   const selectedAccountCount = selectedAccounts.length;
+  const selectedLivenessAccounts = selectedAccounts.filter(accountCanBeLivenessTested);
+  const selectedLivenessAccountCount = selectedLivenessAccounts.length;
+  const currentLivenessAccounts = filteredAccounts.filter(accountCanBeLivenessTested);
+  const selectableCurrentLivenessAccounts = currentLivenessAccounts.slice(0, MAX_LIVENESS_ACCOUNTS);
+  const allCurrentLivenessAccountsSelected = Boolean(
+    selectableCurrentLivenessAccounts.length
+    && selectableCurrentLivenessAccounts.every((account) => selectedAccountKeys[accountRowKey(account)]),
+  );
   const currentNoEmailAccountCount = filteredAccounts.filter(
     (account) => !account.mailbox_bound && accountCanBeSelectedForDeletion(account),
   ).length;
@@ -1283,6 +1441,30 @@ function AccountsView({
 
   const clearSelectedAccounts = () => setSelectedAccountKeys({});
 
+  const toggleCurrentLivenessAccounts = (selected: boolean) => {
+    setSelectedAccountKeys((current) => {
+      const next = { ...current };
+      let selectedEligibleCount = accounts.filter(
+        (account) => accountCanBeLivenessTested(account) && current[accountRowKey(account)],
+      ).length;
+      for (const account of currentLivenessAccounts) {
+        const key = accountRowKey(account);
+        if (!selected) {
+          delete next[key];
+        } else if (!next[key] && selectedEligibleCount < MAX_LIVENESS_ACCOUNTS) {
+          next[key] = true;
+          selectedEligibleCount += 1;
+        }
+      }
+      return next;
+    });
+  };
+
+  const closeLivenessDialog = useCallback(() => {
+    setLivenessAccounts(null);
+    window.requestAnimationFrame(() => livenessTriggerRef.current?.focus());
+  }, []);
+
   const deleteSelectedAccounts = () => {
     if (busy || !selectedAccounts.length) return;
     const noEmailCount = selectedAccounts.filter((account) => !account.mailbox_bound).length;
@@ -1325,6 +1507,38 @@ function AccountsView({
             </div>
           </div>
           <div className="toolbar-actions">
+            <button
+              className="primary-button"
+              disabled={
+                busy
+                || !selectedLivenessAccountCount
+                || selectedLivenessAccountCount > MAX_LIVENESS_ACCOUNTS
+              }
+              onClick={(event) => {
+                livenessTriggerRef.current = event.currentTarget;
+                setLivenessAccounts(selectedLivenessAccounts);
+              }}
+              title={
+                selectedLivenessAccountCount > MAX_LIVENESS_ACCOUNTS
+                  ? `单次最多测试 ${MAX_LIVENESS_ACCOUNTS} 个账号，请减少选择`
+                  : selectedLivenessAccountCount
+                    ? `测试 ${selectedLivenessAccountCount} 个所选 OAuth GPT 账号`
+                    : "请先勾选 OAuth GPT 账号"
+              }
+              type="button"
+            >
+              <Activity size={17} />
+              <span>测活 ({selectedLivenessAccountCount}/{MAX_LIVENESS_ACCOUNTS})</span>
+            </button>
+            <span
+              className={
+                "liveness-selection-count"
+                + (selectedLivenessAccountCount > MAX_LIVENESS_ACCOUNTS ? " is-over-limit" : "")
+              }
+              role="status"
+            >
+              已选 {selectedLivenessAccountCount} 个 OAuth GPT 账号
+            </span>
             <button className="secondary-button" disabled={busy || !currentNoEmailAccountCount} onClick={selectCurrentNoEmailAccounts} type="button">
               勾选当前无邮箱{currentNoEmailAccountCount ? ` (${currentNoEmailAccountCount})` : ""}
             </button>
@@ -1368,7 +1582,24 @@ function AccountsView({
             </colgroup>
             <thead>
               <tr>
-                <th className="accounts-select-header"><span className="sr-only">选择</span></th>
+                <th className="accounts-select-header">
+                  <label
+                    className="table-check account-select-check"
+                    title={
+                      currentLivenessAccounts.length > MAX_LIVENESS_ACCOUNTS
+                        ? `选择当前筛选结果中的前 ${MAX_LIVENESS_ACCOUNTS} 个 OAuth GPT 账号`
+                        : "选择当前筛选结果中的 OAuth GPT 账号"
+                    }
+                  >
+                    <input
+                      aria-label={`选择当前筛选结果中的 OAuth GPT 账号，单次最多 ${MAX_LIVENESS_ACCOUNTS} 个`}
+                      checked={allCurrentLivenessAccountsSelected}
+                      disabled={busy || !currentLivenessAccounts.length}
+                      onChange={(event) => toggleCurrentLivenessAccounts(event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                  </label>
+                </th>
                 <th>账号</th>
                 <th>sub2api ID</th>
                 <th>时间记录</th>
@@ -1426,7 +1657,251 @@ function AccountsView({
       ) : null}
       {currentSelectedPhoneAccount ? <AccountPhoneDialog account={currentSelectedPhoneAccount} onClose={() => setSelectedPhoneAccount(null)} /> : null}
       {selectedErrorAccount ? <AccountErrorDialog account={selectedErrorAccount} onClose={() => setSelectedErrorAccount(null)} /> : null}
+      {livenessAccounts ? <AccountLivenessDialog accounts={livenessAccounts} onClose={closeLivenessDialog} /> : null}
     </>
+  );
+}
+
+function AccountLivenessDialog({ accounts, onClose }: { accounts: Account[]; onClose: () => void }) {
+  const accountIds = useMemo(() => livenessAccountIds(accounts), [accounts]);
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const modelsAbortRef = useRef<AbortController | null>(null);
+  const testAbortRef = useRef<AbortController | null>(null);
+  const [models, setModels] = useState<AccountLivenessModel[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState("");
+  const [sourceAccountId, setSourceAccountId] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<AccountLivenessTestResult | null>(null);
+  const titleId = "account-liveness-dialog-title";
+  const sourceAccount = accounts.find(
+    (account) => String(account.sub2api_account_id || "") === sourceAccountId,
+  );
+
+  const abortRequests = useCallback(() => {
+    const modelsController = modelsAbortRef.current;
+    const testController = testAbortRef.current;
+    modelsAbortRef.current = null;
+    testAbortRef.current = null;
+    modelsController?.abort();
+    testController?.abort();
+  }, []);
+
+  const closeDialog = useCallback(() => {
+    abortRequests();
+    onClose();
+  }, [abortRequests, onClose]);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.requestAnimationFrame(() => closeButtonRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeDialog();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(
+        dialogRef.current.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+      abortRequests();
+    };
+  }, [abortRequests, closeDialog]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    modelsAbortRef.current?.abort();
+    modelsAbortRef.current = controller;
+    setModelsLoading(true);
+    setError("");
+    setSourceAccountId("");
+    api.accountLivenessModels(accountIds, controller.signal)
+      .then((response) => {
+        if (modelsAbortRef.current !== controller || controller.signal.aborted) return;
+        setModels(response.models);
+        setSourceAccountId(response.source_account_id);
+        setSelectedModelId((current) => response.models.some((model) => model.id === current) ? current : response.models[0]?.id || "");
+      })
+      .catch((reason) => {
+        if (modelsAbortRef.current === controller && !isAbortError(reason)) {
+          setError(reason instanceof Error ? reason.message : "模型列表读取失败");
+        }
+      })
+      .finally(() => {
+        if (modelsAbortRef.current === controller) {
+          modelsAbortRef.current = null;
+          setModelsLoading(false);
+        }
+      });
+    return () => {
+      controller.abort();
+      if (modelsAbortRef.current === controller) modelsAbortRef.current = null;
+    };
+  }, [accountIds]);
+
+  const startTest = async () => {
+    if (testing || !selectedModelId || !accountIds.length) return;
+    const controller = new AbortController();
+    testAbortRef.current?.abort();
+    testAbortRef.current = controller;
+    setTesting(true);
+    setError("");
+    setResult(null);
+    try {
+      const nextResult = await api.testAccountLiveness(accountIds, selectedModelId, controller.signal);
+      if (testAbortRef.current === controller && !controller.signal.aborted) setResult(nextResult);
+    } catch (reason) {
+      if (testAbortRef.current === controller && !isAbortError(reason)) {
+        setError(reason instanceof Error ? reason.message : "账号测活失败");
+      }
+    } finally {
+      if (testAbortRef.current === controller) {
+        testAbortRef.current = null;
+        setTesting(false);
+      }
+    }
+  };
+
+  const liveMessage = error
+    || (testing ? `正在测试 ${accountIds.length} 个账号` : "")
+    || (result ? `测活完成，成功 ${result.succeeded} 个，失败 ${result.failed} 个` : "");
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) closeDialog();
+      }}
+      role="presentation"
+    >
+      <section
+        aria-busy={testing}
+        aria-labelledby={titleId}
+        aria-modal="true"
+        className="mail-dialog liveness-dialog"
+        ref={dialogRef}
+        role="dialog"
+      >
+        <header className="mail-dialog-head">
+          <div>
+            <p className="eyebrow">{accountIds.length} 个 OAuth GPT 账号</p>
+            <h2 id={titleId}>批量账号测活</h2>
+          </div>
+          <button
+            aria-label="关闭账号测活"
+            className="icon-button"
+            onClick={closeDialog}
+            ref={closeButtonRef}
+            title="关闭"
+            type="button"
+          >
+            <X size={17} />
+          </button>
+        </header>
+
+        <span aria-atomic="true" aria-live="polite" className="sr-only">{liveMessage}</span>
+
+        <div className="liveness-controls">
+          <label className="liveness-model-field">
+            <span>测试模型</span>
+            <select
+              disabled={modelsLoading || testing || !models.length}
+              onChange={(event) => {
+                setSelectedModelId(event.currentTarget.value);
+                setResult(null);
+              }}
+              value={selectedModelId}
+            >
+              {modelsLoading ? <option value="">读取中...</option> : null}
+              {!modelsLoading && !models.length ? <option value="">无可用模型</option> : null}
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.display_name === model.id ? model.id : `${model.display_name} · ${model.id}`}
+                </option>
+              ))}
+            </select>
+            {sourceAccountId ? (
+              <small className="liveness-model-source">
+                模型来源：{sourceAccount?.account_name || sourceAccount?.email || "OAuth GPT 账号"} · #{sourceAccountId}
+              </small>
+            ) : null}
+          </label>
+          <button className="primary-button liveness-start-button" disabled={testing || modelsLoading || !selectedModelId} onClick={startTest} type="button">
+            {testing ? <RefreshCcw className="spin" size={17} /> : <Activity size={17} />}
+            <span>{testing ? `正在测试 ${accountIds.length} 个账号` : result ? "重新测试" : "开始测试"}</span>
+          </button>
+        </div>
+
+        {error ? <div className="mail-error" role="alert">{error}</div> : null}
+        {testing ? (
+          <div className="liveness-running" role="status">
+            <RefreshCcw className="spin" size={20} />
+            <span>sub2api 正在逐批测试连接...</span>
+          </div>
+        ) : null}
+
+        {result ? (
+          <>
+            <div className="liveness-summary" aria-label="测活结果汇总" aria-live="polite">
+              <div><span>总数</span><strong>{result.total}</strong></div>
+              <div><span>成功</span><strong className="liveness-success-text">{result.succeeded}</strong></div>
+              <div><span>失败</span><strong className="liveness-failure-text">{result.failed}</strong></div>
+              <div><span>模型</span><strong className="mono">{result.model_id}</strong></div>
+            </div>
+            <div className="table-wrap liveness-results">
+              <table>
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>sub2api ID</th>
+                    <th>结果</th>
+                    <th>耗时</th>
+                    <th>详情</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.results.map((item) => (
+                    <tr key={item.account_id}>
+                      <td>
+                        <div className="liveness-account-identity">
+                          <strong>{item.account_name || item.email || `账号 #${item.account_id}`}</strong>
+                          {item.email && item.email !== item.account_name ? <span className="mono">{item.email}</span> : null}
+                        </div>
+                      </td>
+                      <td className="mono muted">{item.account_id}</td>
+                      <td><Badge tone={item.success ? "ok" : "deactive"}>{item.success ? "可用" : "失败"}</Badge></td>
+                      <td className="mono muted">{item.duration_ms ? `${(item.duration_ms / 1000).toFixed(1)}s` : "-"}</td>
+                      <td className={item.success ? "muted" : "liveness-error-text"}>{item.success ? "连接成功" : item.error || "测试失败"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : null}
+      </section>
+    </div>
   );
 }
 
@@ -1522,7 +1997,7 @@ function AccountRow({
   return (
     <tr className={rowClass} id={id}>
       <td>
-        <label className="table-check account-select-check" title={canSelect ? "选中后可批量删除" : "此账号缺少可删除标识"}>
+        <label className="table-check account-select-check" title={canSelect ? "选中后可批量测活或删除" : "此账号缺少可选标识"}>
           <input
             aria-label={`选择 ${account.email}`}
             checked={selected}
@@ -2252,6 +2727,20 @@ function UsageLimitSamplesView({
       null,
     [selectedSubscriptionKey, selectedWindowGroup],
   );
+  const [sampleSortField, setSampleSortField] = useState<UsageSampleSortField>("quota");
+  const [sampleSortDirection, setSampleSortDirection] = useState<UsageSampleSortDirection>("asc");
+  const sortedSamples = useMemo(
+    () => sortUsageLimitSamples(selectedSubscription?.samples || [], sampleSortField, sampleSortDirection),
+    [sampleSortDirection, sampleSortField, selectedSubscription?.samples],
+  );
+  const toggleSampleSort = (field: UsageSampleSortField) => {
+    if (field === sampleSortField) {
+      setSampleSortDirection((current) => current === "asc" ? "desc" : "asc");
+      return;
+    }
+    setSampleSortField(field);
+    setSampleSortDirection(field === "recorded_at" ? "desc" : "asc");
+  };
 
   return (
     <div className="stack">
@@ -2348,16 +2837,38 @@ function UsageLimitSamplesView({
                       <th>#</th>
                       <th>套餐</th>
                       <th>邮箱</th>
-                      <th>窗口总额</th>
+                      <th aria-sort={sampleSortField === "quota" ? (sampleSortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                        <button
+                          aria-label={`按额度${sampleSortField === "quota" && sampleSortDirection === "asc" ? "降序" : "升序"}排列`}
+                          className={sampleSortField === "quota" ? "usage-sample-sort active" : "usage-sample-sort"}
+                          onClick={() => toggleSampleSort("quota")}
+                          title="切换额度排序"
+                          type="button"
+                        >
+                          <span>窗口总额</span>
+                          {sampleSortField !== "quota" ? <ArrowUpDown size={14} /> : sampleSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+                        </button>
+                      </th>
                       <th>限流已用</th>
                       <th>官方百分比</th>
                       <th>重置</th>
-                      <th>记录时间</th>
+                      <th aria-sort={sampleSortField === "recorded_at" ? (sampleSortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                        <button
+                          aria-label={`按记录时间${sampleSortField === "recorded_at" && sampleSortDirection === "desc" ? "升序" : "降序"}排列`}
+                          className={sampleSortField === "recorded_at" ? "usage-sample-sort active" : "usage-sample-sort"}
+                          onClick={() => toggleSampleSort("recorded_at")}
+                          title="切换记录时间排序"
+                          type="button"
+                        >
+                          <span>记录时间</span>
+                          {sampleSortField !== "recorded_at" ? <ArrowUpDown size={14} /> : sampleSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+                        </button>
+                      </th>
                       <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {selectedSubscription.samples.map((sample, index) => (
+                    {sortedSamples.map((sample, index) => (
                       <tr key={sample.id}>
                         <td className="mono muted">{index + 1}</td>
                         <td>{sample.plan_cohort}</td>
@@ -2777,6 +3288,9 @@ function PhoneSourceDetails({
 
 function AccountErrorDialog({ account, onClose }: { account: Account; onClose: () => void }) {
   const errorSummary = accountErrorSummary(account);
+  const remoteMessage = String(account.sub2api_error_message || "").trim();
+  const localMessage = String(account.last_error || "").trim();
+  const distinctLocalMessage = localMessage && localMessage !== remoteMessage ? localMessage : "";
   return (
     <div
       className="modal-backdrop"
@@ -2804,11 +3318,21 @@ function AccountErrorDialog({ account, onClose }: { account: Account; onClose: (
             <strong>当前状态</strong>
             <span>{account.status || "-"}</span>
           </div>
+          <div className="phone-dialog-card">
+            <strong>sub2api 状态码</strong>
+            <span>{account.sub2api_error_code || "-"}</span>
+          </div>
         </div>
         <div className="phone-dialog-card error-dialog-body">
-          <strong>完整报错</strong>
-          <pre>{account.last_error || (account.remote_error ? "sub2api 账号异常" : "无错误详情")}</pre>
+          <strong>{remoteMessage ? "sub2api 报错" : "完整报错"}</strong>
+          <pre>{remoteMessage || localMessage || (account.remote_error ? "sub2api 账号异常" : "无错误详情")}</pre>
         </div>
+        {distinctLocalMessage ? (
+          <div className="phone-dialog-card error-dialog-body">
+            <strong>插件报错</strong>
+            <pre>{distinctLocalMessage}</pre>
+          </div>
+        ) : null}
       </section>
     </div>
   );
@@ -4072,15 +4596,17 @@ function Empty({ label }: { label: string }) {
 }
 
 function ToolbarTimeButton({
-  busy,
+  disabled,
   icon: Icon,
   label,
+  loading,
   onClick,
   time,
 }: {
-  busy: boolean;
+  disabled: boolean;
   icon: LucideIcon;
   label: string;
+  loading: boolean;
   onClick: () => void;
   time: string | null;
 }) {
@@ -4088,8 +4614,8 @@ function ToolbarTimeButton({
   const shortTime = time ? formatClockTime(time, timeZone) : "--:--";
   const fullTime = time ? formatFullDate(time, timeZone) : "暂无刷新记录";
   return (
-    <button className="secondary-button toolbar-time-button" disabled={busy} onClick={onClick} title={`上次刷新时间 ${fullTime}`} type="button">
-      <Icon className={busy ? "spin" : ""} size={17} />
+    <button className="secondary-button toolbar-time-button" disabled={disabled} onClick={onClick} title={`上次刷新时间 ${fullTime}`} type="button">
+      <Icon className={loading ? "spin" : ""} size={17} />
       <span>{label}</span>
       <span className="toolbar-time">{shortTime}</span>
     </button>
@@ -4749,9 +5275,13 @@ function accountHasError(account: Pick<Account, "remote_error" | "last_error">) 
   return Boolean(account.remote_error || account.last_error || statusLooksError);
 }
 
-function accountErrorSummary(account: Pick<Account, "remote_error" | "last_error">) {
-  const detail = String(account.last_error || "").trim();
+function accountErrorSummary(account: Pick<Account, "remote_error" | "last_error" | "sub2api_error_code" | "sub2api_error_message">) {
+  const remoteCode = account.sub2api_error_code;
+  const detail = String(account.sub2api_error_message || account.last_error || "").trim();
   const text = detail.toLowerCase();
+  if (remoteCode) {
+    return { label: `sub2api ${remoteCode}`, tone: "error" };
+  }
   if (!detail && account.remote_error) {
     return { label: "远端异常", tone: "error" };
   }
@@ -4857,7 +5387,7 @@ function accountUsageEstimateToggleLabel(account: Account, usage?: AccountUsageE
   if (account.deactive) return "封禁排除";
   if (accountEstimateExcludedByError(account, usage)) return "错误排除";
   if (!account.usage_estimate_enabled) return "排除";
-  if (accountShowsRateLimit(account, usage)) return "限流排除";
+  if (accountShowsRateLimit(account, usage)) return "限流窗口排除";
   return "参与";
 }
 
@@ -4865,7 +5395,7 @@ function accountUsageEstimateToggleTitle(account: Account, usage?: AccountUsageE
   if (account.deactive) return "封禁账号不参与总额度估算";
   if (accountEstimateExcludedByError(account, usage)) return "错误状态账号不参与总额度估算";
   if (!account.usage_estimate_enabled) return "不参与总额度估算";
-  if (accountShowsRateLimit(account, usage)) return "账号当前限流，暂不参与总额度估算";
+  if (accountShowsRateLimit(account, usage)) return "账号当前限流，仅限流窗口不参与对应周期总额度估算";
   return "参与总额度估算";
 }
 
@@ -4876,7 +5406,7 @@ function usageEstimateParticipationLabel(
   if (account.deactive) return "封禁排除";
   if (account.error) return "错误排除";
   if (!account.usage_estimate_enabled) return "排除";
-  if (account.rate_limited) return "限流排除";
+  if (account.rate_limited) return "限流窗口排除";
   if (!includePausedAccounts && accountIsManuallyPaused(account)) return "主动暂停排除";
   return "参与";
 }
@@ -5117,8 +5647,8 @@ function aggregateUsageAccountsWindow(accounts: AccountUsageEstimate[], windowKe
   for (const account of accounts) {
     if (!usageDetailAccountVisible(account)) continue;
     if (!account.usage_estimate_enabled) continue;
-    if (usageDetailAccountRateLimited(account)) continue;
     const window = aggregateSourceWindow(account, windowKey);
+    if (window.rate_limited) continue;
     if (window.window_kind === "none") continue;
     enabledAccountCount += 1;
     if (window.estimate_spent !== null) {
@@ -5218,6 +5748,18 @@ function selectedAccountDeleteItem(account: Account): SelectedAccountDeleteItem 
 
 function latestEventByKinds(events: AppEvent[], kinds: string[]) {
   return events.find((event) => kinds.includes(event.kind)) || null;
+}
+
+function credentialBindingOrigin(value: string) {
+  try {
+    return new URL(toSub2ApiInstanceUrl(value)).origin.toLowerCase();
+  } catch {
+    return value.trim().toLowerCase();
+  }
+}
+
+function isAbortError(reason: unknown) {
+  return reason instanceof DOMException && reason.name === "AbortError";
 }
 
 function useDisplayTimeZone() {
