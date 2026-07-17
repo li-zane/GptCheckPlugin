@@ -15,7 +15,7 @@ from app.api.upstream_accounts import router
 from app.core.database import Base, get_db
 from app.core.security import require_admin
 from app.core.validation import sanitized_request_validation_handler
-from app.models import UpstreamAccountConfig
+from app.models import UpstreamAccountConfig, UpstreamRateChangeLog
 from app.schemas import UpstreamAccountOut, UpstreamAccountUpdate
 from app.services.sub2api import (
     MAX_SUB2API_ACCOUNT_PAGES,
@@ -30,7 +30,7 @@ from app.services.upstream_accounts import (
     get_upstream_account_service,
 )
 from app.services.upstream_channels import UpstreamChannelService
-from app.services.upstream_client import DiscoveryResult, GroupOption
+from app.services.upstream_client import AccountUpstreamState, DiscoveryResult, GroupOption
 
 
 class FakeSub2Api(Sub2ApiClient):
@@ -132,6 +132,7 @@ def discovery_result(
     group: float | None,
     recharge: float | None,
     status: str = "ok",
+    account_state: AccountUpstreamState | None = None,
 ) -> DiscoveryResult:
     option = GroupOption(id="gold", name="Gold", multiplier=group or 1.0, source="groups.available")
     return DiscoveryResult(
@@ -140,6 +141,7 @@ def discovery_result(
         status=status,
         groups=[option] if status == "ok" else [],
         matched_group=option if status == "ok" and group is not None else None,
+        matched_account_state=account_state,
         discovered_group_multiplier=group if status == "ok" else None,
         discovered_group_multiplier_source="groups.available" if group is not None else None,
         discovered_recharge_multiplier=recharge if status == "ok" else None,
@@ -209,6 +211,119 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accounts[0].base_url, "https://upstream.example.com")
         self.assertEqual(accounts[0].current_rate, 0.8)
         self.assertRegex(accounts[0].identity_fingerprint, r"^[0-9a-f]{64}$")
+
+    async def test_single_account_discovery_uses_two_confirmations_and_never_auto_recovers(self) -> None:
+        self.sub2api.accounts[0]["schedulable"] = True
+        await self._manage(api_key="sk-managed-health-key")
+        runtime = SimpleNamespace(
+            get_api_key_auto_disable_on_upstream_unavailable=AsyncMock(return_value=True),
+            get_automation_paused=AsyncMock(return_value=False),
+            get_upstream_priority_sync_enabled=AsyncMock(return_value=False),
+        )
+        disabled = discovery_result(
+            group=1.0,
+            recharge=1.0,
+            account_state=AccountUpstreamState(
+                key_status="disabled",
+                group_status="available",
+                group_id="gold",
+                group_name="Gold",
+            ),
+        )
+        with (
+            patch(
+                "app.services.upstream_accounts.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            patch(
+                "app.services.upstream_accounts.discover_upstream",
+                new=AsyncMock(return_value=disabled),
+            ),
+        ):
+            await self._discover()
+            first = await self._config()
+            self.assertEqual(first.upstream_health_invalid_count, 1)
+            self.assertTrue(self.sub2api.accounts[0]["schedulable"])
+            await self._discover()
+
+        config = await self._config()
+        self.assertEqual(config.upstream_health_invalid_count, 2)
+        self.assertEqual(config.auto_disabled_reason, "upstream_key_unavailable")
+        self.assertIsNotNone(config.last_auto_disabled_at)
+        self.assertFalse(self.sub2api.accounts[0]["schedulable"])
+        self.assertEqual(self.sub2api.schedulable_calls, [(7, False)])
+        disabled_log = await self.db.scalar(
+            select(UpstreamRateChangeLog).where(
+                UpstreamRateChangeLog.sub2api_account_id == 7,
+                UpstreamRateChangeLog.status == "account_disabled",
+            )
+        )
+        self.assertIsNotNone(disabled_log)
+
+        recovered = discovery_result(
+            group=1.0,
+            recharge=1.0,
+            account_state=AccountUpstreamState(
+                key_status="active",
+                group_status="available",
+                group_id="gold",
+                group_name="Gold",
+            ),
+        )
+        with (
+            patch(
+                "app.services.upstream_accounts.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            patch(
+                "app.services.upstream_accounts.discover_upstream",
+                new=AsyncMock(return_value=recovered),
+            ),
+        ):
+            await self._discover()
+
+        config = await self._config()
+        self.assertEqual(config.upstream_key_status, "active")
+        self.assertEqual(config.upstream_health_invalid_count, 0)
+        self.assertFalse(self.sub2api.accounts[0]["schedulable"])
+        self.assertEqual(self.sub2api.schedulable_calls, [(7, False)])
+
+        await self.service.set_account_enabled(
+            self.db,
+            7,
+            True,
+            await self._fingerprint(),
+        )
+        config = await self._config()
+        self.assertIsNone(config.auto_disabled_reason)
+        self.assertIsNone(config.last_auto_disabled_at)
+
+    async def test_discovery_priority_rebalance_respects_runtime_switch(self) -> None:
+        await self._manage(api_key="sk-priority-switch")
+        priority_service = self.service._priority_service()
+        runtime = SimpleNamespace(
+            get_api_key_auto_disable_on_upstream_unavailable=AsyncMock(return_value=False),
+            get_automation_paused=AsyncMock(return_value=False),
+            get_upstream_priority_sync_enabled=AsyncMock(return_value=False),
+        )
+        with (
+            patch(
+                "app.services.upstream_accounts.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            patch(
+                "app.services.upstream_accounts.discover_upstream",
+                new=AsyncMock(return_value=discovery_result(group=1.0, recharge=1.0)),
+            ),
+            patch.object(
+                priority_service,
+                "rebalance",
+                new=AsyncMock(),
+            ) as rebalance,
+        ):
+            await self._discover()
+
+        rebalance.assert_not_awaited()
 
     async def test_duplicate_valid_remote_ids_fail_closed_for_list_and_point_lookup(self) -> None:
         duplicate = dict(self.sub2api.accounts[0])

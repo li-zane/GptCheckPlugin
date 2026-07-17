@@ -1,4 +1,4 @@
-import type { UpstreamRateChangeLog } from "./types";
+import type { UpstreamChangeLog } from "./types";
 
 export type RateChangeDirection = "increase" | "decrease" | "unchanged" | "unknown";
 
@@ -7,6 +7,12 @@ export type UpstreamRateChange = {
   newValue: number | null;
   delta: number | null;
   direction: RateChangeDirection;
+};
+
+export type UpstreamStateChange = {
+  oldValue: string | null;
+  newValue: string | null;
+  direction: "changed" | "unchanged" | "unknown";
 };
 
 /** Converts an upstream group rate to the 1 CNY : 1 USD comparison basis. */
@@ -40,7 +46,7 @@ export function multiplierChange(oldValue: unknown, newValue: unknown): Upstream
  * New logs persist normalized values directly. Older logs are still useful, so
  * derive the same values from their group and recharge fields when necessary.
  */
-export function upstreamRateChange(log: UpstreamRateChangeLog): UpstreamRateChange {
+export function upstreamRateChange(log: UpstreamChangeLog): UpstreamRateChange {
   const oldRechargeMultiplier = finiteNumber(log.old_upstream_recharge_multiplier)
     ?? finiteNumber(log.upstream_recharge_multiplier);
   const newRechargeMultiplier = finiteNumber(log.new_upstream_recharge_multiplier)
@@ -53,11 +59,11 @@ export function upstreamRateChange(log: UpstreamRateChangeLog): UpstreamRateChan
   return multiplierChange(oldValue, newValue);
 }
 
-export function groupRateChange(log: UpstreamRateChangeLog) {
+export function groupRateChange(log: UpstreamChangeLog) {
   return multiplierChange(log.old_group_multiplier, log.new_group_multiplier);
 }
 
-export function accountBillingRateChange(log: UpstreamRateChangeLog) {
+export function accountBillingRateChange(log: UpstreamChangeLog) {
   const target = multiplierChange(log.old_target_rate, log.new_target_rate);
   if (target.direction === "increase" || target.direction === "decrease") return target;
   const current = multiplierChange(log.old_current_rate, log.new_current_rate);
@@ -65,15 +71,54 @@ export function accountBillingRateChange(log: UpstreamRateChangeLog) {
   return target.newValue !== null || target.oldValue !== null ? target : current;
 }
 
-export function upstreamRechargeRateChange(log: UpstreamRateChangeLog) {
+export function upstreamRechargeRateChange(log: UpstreamChangeLog) {
   return multiplierChange(
     log.old_upstream_recharge_multiplier,
     log.new_upstream_recharge_multiplier,
   );
 }
 
+export function upstreamKeyStatusChange(log: UpstreamChangeLog) {
+  return stateChange(log.old_upstream_key_status, log.new_upstream_key_status);
+}
+
+export function upstreamGroupStatusChange(log: UpstreamChangeLog) {
+  return stateChange(log.old_upstream_group_status, log.new_upstream_group_status);
+}
+
+export function remoteSchedulableChange(log: UpstreamChangeLog) {
+  return stateChange(
+    schedulableStatus(log.old_remote_schedulable),
+    schedulableStatus(log.new_remote_schedulable),
+  );
+}
+
+export function stateChange(oldValue: unknown, newValue: unknown): UpstreamStateChange {
+  const oldStatus = normalizedState(oldValue);
+  const newStatus = normalizedState(newValue);
+  if (oldStatus === null || newStatus === null) {
+    return { oldValue: oldStatus, newValue: newStatus, direction: "unknown" };
+  }
+  return {
+    oldValue: oldStatus,
+    newValue: newStatus,
+    direction: oldStatus === newStatus ? "unchanged" : "changed",
+  };
+}
+
 function finiteNumber(value: unknown) {
   if (value === null || value === undefined || value === "") return null;
   const number = typeof value === "number" ? value : Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function normalizedState(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized || null;
+}
+
+function schedulableStatus(value: boolean | null | undefined) {
+  if (value === null || value === undefined) return null;
+  return value ? "enabled" : "disabled";
 }

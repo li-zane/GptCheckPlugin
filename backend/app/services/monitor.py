@@ -1,13 +1,15 @@
 import asyncio
+from time import perf_counter
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.database import AsyncSessionLocal
 from app.models import AccountSnapshot, MailboxCredential, PhoneAccountBinding, PhoneNumber, utcnow
 from app.schemas import Sub2ApiSyncResult
 from app.services.account_exceptions import clear_account_exception, upsert_account_exception
-from app.services.events import record_event
+from app.services.events import elapsed_ms, record_event
 from app.services.phone_numbers import bind_phone_to_account, extract_phone_row_from_note, find_reconcilable_placeholder, note_marker
 from app.services.refresh import RefreshService, get_refresh_service
 from app.services.routed_mail_config import get_routed_mail_config_service
@@ -56,9 +58,13 @@ class MonitorService:
     async def _loop(self) -> None:
         await self._wait_for_startup_delay()
         while not self._stop.is_set():
-            if await self.runtime_config.get_automation_paused():
+            if (
+                await self.runtime_config.get_automation_paused()
+                or not await self.runtime_config.get_oauth_account_sync_enabled()
+            ):
                 await self._wait_for_next_run()
                 continue
+            started_at = perf_counter()
             try:
                 await self.sync_once(reason="scheduled")
             except Exception as exc:
@@ -67,6 +73,10 @@ class MonitorService:
                         db,
                         "monitor_failed",
                         f"Monitor failed: {self.sub2api.redact_error_text(exc)}",
+                        details={
+                            "reason": "scheduled",
+                            "duration_ms": elapsed_ms(started_at),
+                        },
                     )
             await self._wait_for_next_run()
 
@@ -101,8 +111,19 @@ class MonitorService:
             await asyncio.gather(stop_task, wake_task, return_exceptions=True)
             self._wake.clear()
 
-    async def sync_once(self, reason: str = "manual") -> Sub2ApiSyncResult:
-        raw_accounts = await self.sub2api.list_accounts()
+    async def sync_once(
+        self,
+        reason: str = "manual",
+        *,
+        raw_accounts: list[dict] | None = None,
+    ) -> Sub2ApiSyncResult:
+        started_at = perf_counter()
+        fetched_remote_accounts = raw_accounts is None
+        account_list_started_at = perf_counter()
+        raw_accounts = raw_accounts if raw_accounts is not None else await self.sub2api.list_accounts()
+        account_list_duration_ms = (
+            elapsed_ms(account_list_started_at) if fetched_remote_accounts else None
+        )
         present_remote_emails = {
             email.lower()
             for account in raw_accounts
@@ -120,49 +141,110 @@ class MonitorService:
         total_seen = 0
         error_seen = 0
         queued = 0
+        recovery_candidates: list[dict] = []
+        deferred_events: list[tuple[str, str, str]] = []
 
-        for account in accounts:
-            email = self.sub2api.account_email(account)
-            if not email:
-                continue
-            total_seen += 1
-            normalized = email.lower()
-            is_error = self.sub2api.is_error_account(account)
-            is_deactive = self.sub2api.is_deactive_account(account)
-            is_deactive, auto_refresh_locked = await self._upsert_snapshot(normalized, account, is_error, is_deactive)
-            await self._ensure_routed_mailbox(normalized)
-
-            if is_error or is_deactive:
-                await self._record_sync_exception(
+        async with AsyncSessionLocal() as inventory_db:
+            for account in accounts:
+                email = self.sub2api.account_email(account)
+                if not email:
+                    continue
+                total_seen += 1
+                normalized = email.lower()
+                is_error = self.sub2api.is_error_account(account)
+                is_deactive = self.sub2api.is_deactive_account(account)
+                is_deactive, auto_refresh_locked = await self._upsert_snapshot(
                     normalized,
                     account,
-                    "auto_refresh_locked" if auto_refresh_locked else None,
-                    effective_deactive=is_deactive,
+                    is_error,
+                    is_deactive,
+                    db=inventory_db,
                 )
-            elif self.sub2api.account_looks_healthy(account):
-                await self._clear_account_exceptions(normalized, self.sub2api.account_id(account))
+                await self._ensure_routed_mailbox(normalized, db=inventory_db)
 
-            if is_error:
-                error_seen += 1
-                if not is_deactive:
-                    if auto_refresh_locked:
-                        continue
-                    if not recovery_enabled:
-                        await self._mark_recovery_disabled(normalized)
-                        continue
-                    has_mailbox = await self._has_enabled_mailbox(normalized)
-                    if not has_mailbox and not self.refresh_service.can_try_protocol_refresh(account):
-                        await self._mark_missing_mailbox(normalized)
-                        continue
-                    job_id = await self.refresh_service.enqueue(account, reason=f"{reason}: sub2api reported error")
-                    if job_id is not None:
-                        queued += 1
+                if is_error or is_deactive:
+                    await self._record_sync_exception(
+                        normalized,
+                        account,
+                        "auto_refresh_locked" if auto_refresh_locked else None,
+                        effective_deactive=is_deactive,
+                        db=inventory_db,
+                    )
+                elif self.sub2api.account_looks_healthy(account):
+                    await self._clear_account_exceptions(
+                        normalized,
+                        self.sub2api.account_id(account),
+                        db=inventory_db,
+                    )
 
-        deleted_accounts, deleted_mailboxes = await self._delete_missing_remote_accounts(
-            present_remote_emails
-        )
+                if is_error:
+                    error_seen += 1
+                    if not is_deactive:
+                        if auto_refresh_locked:
+                            continue
+                        if not recovery_enabled:
+                            if await self._mark_recovery_disabled(normalized, db=inventory_db):
+                                deferred_events.append(
+                                    (
+                                        "refresh_skipped_recovery_disabled",
+                                        "Recovery is disabled in settings; account was checked only and refresh was not queued.",
+                                        normalized,
+                                    )
+                                )
+                            continue
+                        has_mailbox = await self._has_enabled_mailbox(
+                            normalized,
+                            db=inventory_db,
+                        )
+                        if not has_mailbox and not self.refresh_service.can_try_protocol_refresh(account):
+                            if await self._mark_missing_mailbox(normalized, db=inventory_db):
+                                deferred_events.append(
+                                    (
+                                        "refresh_skipped_missing_mailbox",
+                                        "No enabled mailbox credential exists for this GPT account; account was checked only and refresh was not queued.",
+                                        normalized,
+                                    )
+                                )
+                            continue
+                        recovery_candidates.append(account)
+
+            deleted_accounts, deleted_mailboxes = await self._delete_missing_remote_accounts(
+                present_remote_emails,
+                db=inventory_db,
+            )
+            await inventory_db.commit()
+
+        for event_kind, event_message, event_email in deferred_events:
+            async with AsyncSessionLocal() as event_db:
+                await _record_event_best_effort(
+                    event_db,
+                    event_kind,
+                    event_message,
+                    event_email,
+                )
+
+        for account in recovery_candidates:
+            job_id = await self.refresh_service.enqueue(
+                account,
+                reason=f"{reason}: sub2api reported error",
+            )
+            if job_id is not None:
+                queued += 1
 
         async with AsyncSessionLocal() as db:
+            details = {
+                "reason": reason,
+                "total_seen": total_seen,
+                "error_seen": error_seen,
+                "queued": queued,
+                "duplicate_accounts_ignored": len(duplicate_accounts),
+                "duplicates": duplicate_accounts[:50],
+                "deleted_accounts": deleted_accounts,
+                "deleted_mailboxes": deleted_mailboxes,
+                "duration_ms": elapsed_ms(started_at),
+            }
+            if account_list_duration_ms is not None:
+                details["account_list_duration_ms"] = account_list_duration_ms
             await _record_event_best_effort(
                 db,
                 "monitor_sync",
@@ -171,16 +253,7 @@ class MonitorService:
                     f"ignored {len(duplicate_accounts)} duplicate sub2api account(s); "
                     f"deleted {deleted_accounts} stale local account(s) and {deleted_mailboxes} mailbox credential(s)."
                 ),
-                details={
-                    "reason": reason,
-                    "total_seen": total_seen,
-                    "error_seen": error_seen,
-                    "queued": queued,
-                    "duplicate_accounts_ignored": len(duplicate_accounts),
-                    "duplicates": duplicate_accounts[:50],
-                    "deleted_accounts": deleted_accounts,
-                    "deleted_mailboxes": deleted_mailboxes,
-                },
+                details=details,
             )
         return Sub2ApiSyncResult(
             message=(
@@ -196,33 +269,51 @@ class MonitorService:
             deleted_mailboxes=deleted_mailboxes,
         )
 
-    async def _upsert_snapshot(self, email: str, account: dict, is_error: bool, is_deactive: bool) -> tuple[bool, bool]:
-        async with AsyncSessionLocal() as db:
-            snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
-            was_deactive = bool(snapshot.deactive or looks_deactive_text(snapshot.last_error)) if snapshot is not None else False
-            if snapshot is None:
-                snapshot = AccountSnapshot(email=email)
-                snapshot.usage_estimate_enabled = not is_deactive
-                db.add(snapshot)
-            remote_healthy = self._remote_looks_healthy(account, is_error, is_deactive)
-            effective_deactive = is_deactive or (was_deactive and not remote_healthy)
-            if effective_deactive and not was_deactive:
-                snapshot.usage_estimate_enabled = False
-            if remote_healthy or effective_deactive:
-                snapshot.auto_refresh_locked = False
-            snapshot.sub2api_account_id = self.sub2api.account_id(account)
-            snapshot.platform = self.sub2api.account_platform(account)
-            snapshot.account_type = self.sub2api.account_type(account)
-            snapshot.status = self.sub2api.account_status(account)
-            snapshot.schedulable = self.sub2api.account_schedulable(account)
-            snapshot.deactive = effective_deactive
-            if remote_healthy:
-                snapshot.last_error = None
-            snapshot.raw = sanitize_payload(account)
-            await self._sync_phone_from_account_note(db, snapshot, email, account)
-            snapshot.last_seen_at = utcnow()
-            await db.commit()
-            return effective_deactive, bool(snapshot.auto_refresh_locked)
+    async def _upsert_snapshot(
+        self,
+        email: str,
+        account: dict,
+        is_error: bool,
+        is_deactive: bool,
+        *,
+        db: AsyncSession | None = None,
+    ) -> tuple[bool, bool]:
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                result = await self._upsert_snapshot(
+                    email,
+                    account,
+                    is_error,
+                    is_deactive,
+                    db=owned_db,
+                )
+                await owned_db.commit()
+                return result
+
+        snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
+        was_deactive = bool(snapshot.deactive or looks_deactive_text(snapshot.last_error)) if snapshot is not None else False
+        if snapshot is None:
+            snapshot = AccountSnapshot(email=email)
+            snapshot.usage_estimate_enabled = not is_deactive
+            db.add(snapshot)
+        remote_healthy = self._remote_looks_healthy(account, is_error, is_deactive)
+        effective_deactive = is_deactive or (was_deactive and not remote_healthy)
+        if effective_deactive and not was_deactive:
+            snapshot.usage_estimate_enabled = False
+        if remote_healthy or effective_deactive:
+            snapshot.auto_refresh_locked = False
+        snapshot.sub2api_account_id = self.sub2api.account_id(account)
+        snapshot.platform = self.sub2api.account_platform(account)
+        snapshot.account_type = self.sub2api.account_type(account)
+        snapshot.status = self.sub2api.account_status(account)
+        snapshot.schedulable = self.sub2api.account_schedulable(account)
+        snapshot.deactive = effective_deactive
+        if remote_healthy:
+            snapshot.last_error = None
+        snapshot.raw = sanitize_payload(account)
+        await self._sync_phone_from_account_note(db, snapshot, email, account)
+        snapshot.last_seen_at = utcnow()
+        return effective_deactive, bool(snapshot.auto_refresh_locked)
 
     async def _sync_phone_from_account_note(
         self,
@@ -286,106 +377,148 @@ class MonitorService:
     async def _delete_missing_remote_accounts(
         self,
         present_remote_emails: set[str],
+        *,
+        db: AsyncSession | None = None,
     ) -> tuple[int, int]:
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(select(AccountSnapshot))
-            stale = [
-                snapshot
-                for snapshot in result.scalars().all()
-                if snapshot.email.lower() not in present_remote_emails
-            ]
-            if not stale:
-                return 0, 0
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                result = await self._delete_missing_remote_accounts(
+                    present_remote_emails,
+                    db=owned_db,
+                )
+                await owned_db.commit()
+                return result
 
-            stale_emails = [snapshot.email.lower() for snapshot in stale]
-            mailbox_result = await db.execute(
-                delete(MailboxCredential).where(func.lower(MailboxCredential.gpt_email).in_(stale_emails))
-            )
-            account_result = await db.execute(delete(AccountSnapshot).where(AccountSnapshot.id.in_([snapshot.id for snapshot in stale])))
-            await db.commit()
-            return account_result.rowcount or 0, mailbox_result.rowcount or 0
+        result = await db.execute(select(AccountSnapshot))
+        stale = [
+            snapshot
+            for snapshot in result.scalars().all()
+            if snapshot.email.lower() not in present_remote_emails
+        ]
+        if not stale:
+            return 0, 0
 
-    async def _has_enabled_mailbox(self, email: str) -> bool:
-        async with AsyncSessionLocal() as db:
-            credential = await db.scalar(select(MailboxCredential).where(MailboxCredential.gpt_email == email))
-            return credential is not None and not credential.disabled
+        stale_emails = [snapshot.email.lower() for snapshot in stale]
+        mailbox_result = await db.execute(
+            delete(MailboxCredential).where(func.lower(MailboxCredential.gpt_email).in_(stale_emails))
+        )
+        account_result = await db.execute(delete(AccountSnapshot).where(AccountSnapshot.id.in_([snapshot.id for snapshot in stale])))
+        return account_result.rowcount or 0, mailbox_result.rowcount or 0
 
-    async def _ensure_routed_mailbox(self, email: str) -> None:
+    async def _has_enabled_mailbox(
+        self,
+        email: str,
+        *,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                return await self._has_enabled_mailbox(email, db=owned_db)
+        credential = await db.scalar(select(MailboxCredential).where(MailboxCredential.gpt_email == email))
+        return credential is not None and not credential.disabled
+
+    async def _ensure_routed_mailbox(
+        self,
+        email: str,
+        *,
+        db: AsyncSession | None = None,
+    ) -> None:
         binding = self.routed_mail_config.binding_for_email(email)
         if binding is None:
             return
-        async with AsyncSessionLocal() as db:
-            credential = await db.scalar(select(MailboxCredential).where(MailboxCredential.gpt_email == email))
-            if credential is not None:
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                await self._ensure_routed_mailbox(email, db=owned_db)
+                await owned_db.commit()
                 return
-            db.add(
-                MailboxCredential(
-                    gpt_email=email,
-                    mailbox_email=binding.mailbox_email,
-                    provider="gmail",
-                    encrypted_password=encrypt_text(binding.password),
-                    proxy_url=binding.proxy_url,
-                    disabled=False,
-                    last_error=None,
-                )
+        credential = await db.scalar(select(MailboxCredential).where(MailboxCredential.gpt_email == email))
+        if credential is not None:
+            return
+        db.add(
+            MailboxCredential(
+                gpt_email=email,
+                mailbox_email=binding.mailbox_email,
+                provider="gmail",
+                encrypted_password=encrypt_text(binding.password),
+                proxy_url=binding.proxy_url,
+                disabled=False,
+                last_error=None,
             )
-            await db.commit()
+        )
 
-    async def _mark_missing_mailbox(self, email: str) -> None:
+    async def _mark_missing_mailbox(
+        self,
+        email: str,
+        *,
+        db: AsyncSession | None = None,
+    ) -> bool:
         reason = "No enabled mailbox credential exists for this GPT account; account was checked only and refresh was not queued."
-        async with AsyncSessionLocal() as db:
-            snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
-            should_record = snapshot is not None and snapshot.last_error != reason
-            if snapshot:
-                snapshot.refreshing = False
-                snapshot.last_error = reason
-            if snapshot:
-                await upsert_account_exception(
-                    db,
-                    source="sync",
-                    status="missing_mailbox",
-                    message=reason,
-                    email=email,
-                    sub2api_account_id=snapshot.sub2api_account_id,
-                    details={"reason": "missing_mailbox"},
-                    commit=False,
-                )
-            await db.commit()
-            if should_record:
-                await _record_event_best_effort(
-                    db,
-                    "refresh_skipped_missing_mailbox",
-                    reason,
-                    email,
-                )
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                should_record = await self._mark_missing_mailbox(email, db=owned_db)
+                await owned_db.commit()
+                if should_record:
+                    await _record_event_best_effort(
+                        owned_db,
+                        "refresh_skipped_missing_mailbox",
+                        reason,
+                        email,
+                    )
+            return should_record
 
-    async def _mark_recovery_disabled(self, email: str) -> None:
+        snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
+        should_record = snapshot is not None and snapshot.last_error != reason
+        if snapshot:
+            snapshot.refreshing = False
+            snapshot.last_error = reason
+            await upsert_account_exception(
+                db,
+                source="sync",
+                status="missing_mailbox",
+                message=reason,
+                email=email,
+                sub2api_account_id=snapshot.sub2api_account_id,
+                details={"reason": "missing_mailbox"},
+                commit=False,
+            )
+        return should_record
+
+    async def _mark_recovery_disabled(
+        self,
+        email: str,
+        *,
+        db: AsyncSession | None = None,
+    ) -> bool:
         reason = "Recovery is disabled in settings; account was checked only and refresh was not queued."
-        async with AsyncSessionLocal() as db:
-            snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
-            should_record = snapshot is not None and snapshot.last_error != reason
-            if snapshot:
-                snapshot.refreshing = False
-                snapshot.last_error = reason
-            if snapshot:
-                await upsert_account_exception(
-                    db,
-                    source="sync",
-                    status="recovery_disabled",
-                    message=reason,
-                    email=email,
-                    sub2api_account_id=snapshot.sub2api_account_id,
-                    details={"reason": "recovery_disabled"},
-                    commit=False,
-                )
-            await db.commit()
-            if should_record:
-                await _record_event_best_effort(
-                    db,
-                    "refresh_skipped_recovery_disabled",
-                    reason,
-                    email,
-                )
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                should_record = await self._mark_recovery_disabled(email, db=owned_db)
+                await owned_db.commit()
+                if should_record:
+                    await _record_event_best_effort(
+                        owned_db,
+                        "refresh_skipped_recovery_disabled",
+                        reason,
+                        email,
+                    )
+            return should_record
+
+        snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
+        should_record = snapshot is not None and snapshot.last_error != reason
+        if snapshot:
+            snapshot.refreshing = False
+            snapshot.last_error = reason
+            await upsert_account_exception(
+                db,
+                source="sync",
+                status="recovery_disabled",
+                message=reason,
+                email=email,
+                sub2api_account_id=snapshot.sub2api_account_id,
+                details={"reason": "recovery_disabled"},
+                commit=False,
+            )
+        return should_record
 
     async def _record_sync_exception(
         self,
@@ -393,7 +526,19 @@ class MonitorService:
         account: dict,
         reason: str | None = None,
         effective_deactive: bool = False,
+        db: AsyncSession | None = None,
     ) -> None:
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                await self._record_sync_exception(
+                    email,
+                    account,
+                    reason,
+                    effective_deactive,
+                    db=owned_db,
+                )
+                await owned_db.commit()
+                return
         account_id = self.sub2api.account_id(account)
         status = "deactive" if effective_deactive or self.sub2api.is_deactive_account(account) else "error"
         account_status = self.sub2api.account_status(account) or "unknown"
@@ -406,27 +551,46 @@ class MonitorService:
             message = f"sub2api reported this account in error state: status={account_status}."
         if error_message:
             message = f"{message} {error_message}"
-        async with AsyncSessionLocal() as db:
-            await upsert_account_exception(
-                db,
-                source="sync",
-                status=status if reason is None else reason,
-                message=message,
-                email=email,
-                sub2api_account_id=account_id,
-                details={
-                    "reason": reason,
-                    "status": account_status,
-                    "schedulable": self.sub2api.account_schedulable(account),
-                    "remote_error": self.sub2api.is_error_account(account),
-                    "deactive": self.sub2api.is_deactive_account(account),
-                },
-            )
+        await upsert_account_exception(
+            db,
+            source="sync",
+            status=status if reason is None else reason,
+            message=message,
+            email=email,
+            sub2api_account_id=account_id,
+            details={
+                "reason": reason,
+                "status": account_status,
+                "schedulable": self.sub2api.account_schedulable(account),
+                "remote_error": self.sub2api.is_error_account(account),
+                "deactive": self.sub2api.is_deactive_account(account),
+            },
+            commit=False,
+        )
 
-    async def _clear_account_exceptions(self, email: str, sub2api_account_id: str | None) -> None:
-        async with AsyncSessionLocal() as db:
-            await clear_account_exception(db, source="sync", email=email, sub2api_account_id=sub2api_account_id, commit=False)
-            await db.commit()
+    async def _clear_account_exceptions(
+        self,
+        email: str,
+        sub2api_account_id: str | None,
+        *,
+        db: AsyncSession | None = None,
+    ) -> None:
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                await self._clear_account_exceptions(
+                    email,
+                    sub2api_account_id,
+                    db=owned_db,
+                )
+                await owned_db.commit()
+                return
+        await clear_account_exception(
+            db,
+            source="sync",
+            email=email,
+            sub2api_account_id=sub2api_account_id,
+            commit=False,
+        )
 
 
 _monitor_service: MonitorService | None = None

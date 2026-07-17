@@ -405,7 +405,13 @@ async def _fetch_usages(
     sub2api: Sub2ApiClient,
     accounts: list[dict[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    semaphore = asyncio.Semaphore(5)
+    configured_concurrency = (
+        await get_runtime_config_service().get_usage_refresh_max_concurrency()
+    )
+    effective_concurrency = (
+        len(accounts) if configured_concurrency == 0 else configured_concurrency
+    )
+    semaphore = asyncio.Semaphore(max(1, effective_concurrency))
     usage_by_id: dict[str, dict[str, Any]] = {}
     errors_by_id: dict[str, str] = {}
 
@@ -1664,8 +1670,13 @@ def _window_estimate(
     usage_estimated_limit = _limit_from_usage(raw_spent, normalized_used_percent)
     raw_limit_value = _coerce_float(raw_limit)
     raw_estimated_limit = usage_estimated_limit or raw_limit_value
-    if raw_estimated_limit is None and (estimate_spent is None or estimate_spent <= 0):
+    used_zero_usage_fallback = False
+    if (
+        (raw_estimated_limit is None or raw_estimated_limit <= 0)
+        and (estimate_spent is None or estimate_spent <= 0)
+    ):
         raw_estimated_limit = _zero_usage_limit_estimate(calibration)
+        used_zero_usage_fallback = raw_estimated_limit is not None
     estimated_limit = (
         _trusted_full_window_limit(raw_estimated_limit, normalized_used_percent)
         or _calibrated_limit(
@@ -1682,6 +1693,8 @@ def _window_estimate(
         else:
             estimate_spent = 0.0
             estimate_basis = "sample_limit_zero_usage"
+    elif estimated_limit is not None and used_zero_usage_fallback:
+        estimate_basis = "sample_limit_zero_usage"
     rate_limited = _window_rate_limited(
         account,
         "seven_day" if window_kind == "monthly" else window_key,

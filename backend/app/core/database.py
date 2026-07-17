@@ -40,6 +40,7 @@ if is_sqlite:
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:
@@ -141,6 +142,13 @@ async def _ensure_upstream_channel_reference_guards(conn: AsyncConnection) -> No
 async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
     result = await conn.execute(text("PRAGMA table_info(upstream_channels)"))
     channel_columns = {str(row[1]) for row in result.fetchall()}
+    if channel_columns and "probe_enabled" not in channel_columns:
+        await conn.execute(
+            text(
+                "ALTER TABLE upstream_channels ADD COLUMN "
+                "probe_enabled BOOLEAN NOT NULL DEFAULT 1"
+            )
+        )
     if channel_columns and "management_base_url" not in channel_columns:
         await conn.execute(
             text("ALTER TABLE upstream_channels ADD COLUMN management_base_url VARCHAR(500)")
@@ -164,6 +172,11 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         columns.add("channel_id")
     optional_account_columns = {
         "channel_auto_assign_disabled": "BOOLEAN NOT NULL DEFAULT 0",
+        "priority_interval_id": "INTEGER",
+        "desired_priority": "INTEGER",
+        "priority_sync_status": "VARCHAR(32) NOT NULL DEFAULT 'unassigned'",
+        "priority_sync_error": "TEXT",
+        "last_priority_applied_at": "DATETIME",
         "remote_identity_fingerprint": "VARCHAR(64)",
         "api_key_origin_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "remote_name": "VARCHAR(200)",
@@ -175,6 +188,13 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "upstream_user_id": "VARCHAR(128)",
         "selected_group_id": "VARCHAR(128)",
         "selected_group_name": "VARCHAR(200)",
+        "upstream_key_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "upstream_group_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "upstream_health_invalid_count": "INTEGER NOT NULL DEFAULT 0",
+        "upstream_key_checked_at": "DATETIME",
+        "upstream_group_checked_at": "DATETIME",
+        "auto_disabled_reason": "VARCHAR(64)",
+        "last_auto_disabled_at": "DATETIME",
         "manual_group_multiplier": "FLOAT",
         "manual_recharge_multiplier": "FLOAT",
         "group_options": "JSON",
@@ -400,6 +420,150 @@ async def _migrate_upstream_rate_change_logs(conn: AsyncConnection) -> None:
             await conn.execute(
                 text(f"ALTER TABLE upstream_rate_change_logs ADD COLUMN {column} FLOAT")
             )
+    result = await conn.execute(text("PRAGMA table_info(upstream_rate_change_logs)"))
+    columns = {str(row[1]) for row in result.fetchall()}
+    extra_columns = {
+        "old_upstream_key_status": "VARCHAR(32)",
+        "new_upstream_key_status": "VARCHAR(32)",
+        "old_upstream_group_status": "VARCHAR(32)",
+        "new_upstream_group_status": "VARCHAR(32)",
+        "old_remote_schedulable": "BOOLEAN",
+        "new_remote_schedulable": "BOOLEAN",
+    }
+    for column, column_type in extra_columns.items():
+        if column not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE upstream_rate_change_logs ADD COLUMN {column} {column_type}")
+            )
+
+
+async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
+    await conn.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS upstream_priority_intervals ("
+            "id INTEGER NOT NULL PRIMARY KEY, "
+            "name VARCHAR(100) NOT NULL UNIQUE, "
+            "start_priority INTEGER NOT NULL, "
+            "end_priority INTEGER NOT NULL, "
+            "step INTEGER NOT NULL DEFAULT 1, "
+            "created_at DATETIME, "
+            "updated_at DATETIME, "
+            "CONSTRAINT ck_upstream_priority_interval_start CHECK (start_priority >= 0), "
+            "CONSTRAINT ck_upstream_priority_interval_end CHECK (end_priority > start_priority), "
+            "CONSTRAINT ck_upstream_priority_interval_step CHECK (step >= 1)"
+            ")"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_upstream_priority_intervals_name "
+            "ON upstream_priority_intervals (name)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_no_overlap_insert "
+            "BEFORE INSERT ON upstream_priority_intervals "
+            "WHEN EXISTS (SELECT 1 FROM upstream_priority_intervals "
+            "WHERE NEW.start_priority < end_priority AND NEW.end_priority > start_priority) "
+            "BEGIN SELECT RAISE(ABORT, 'overlapping upstream priority interval'); END"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_no_overlap_update "
+            "BEFORE UPDATE OF start_priority, end_priority ON upstream_priority_intervals "
+            "WHEN EXISTS (SELECT 1 FROM upstream_priority_intervals "
+            "WHERE id != OLD.id AND NEW.start_priority < end_priority "
+            "AND NEW.end_priority > start_priority) "
+            "BEGIN SELECT RAISE(ABORT, 'overlapping upstream priority interval'); END"
+        )
+    )
+
+    result = await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
+    columns = {str(row[1]) for row in result.fetchall()}
+    if not columns:
+        return
+    priority_columns = {
+        "priority_interval_id": "INTEGER",
+        "desired_priority": "INTEGER",
+        "priority_sync_status": "VARCHAR(32) NOT NULL DEFAULT 'unassigned'",
+        "priority_sync_error": "TEXT",
+        "last_priority_applied_at": "DATETIME",
+    }
+    for column, column_type in priority_columns.items():
+        if column not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE upstream_account_configs ADD COLUMN {column} {column_type}")
+            )
+            columns.add(column)
+    await conn.execute(
+        text(
+            "UPDATE upstream_account_configs SET priority_sync_status = 'unassigned' "
+            "WHERE priority_sync_status IS NULL OR TRIM(priority_sync_status) = ''"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_upstream_account_configs_priority_interval_id "
+            "ON upstream_account_configs (priority_interval_id)"
+        )
+    )
+
+    result = await conn.execute(text("PRAGMA foreign_key_list(upstream_account_configs)"))
+    has_interval_foreign_key = any(
+        str(row[2]) == "upstream_priority_intervals"
+        and str(row[3]) == "priority_interval_id"
+        for row in result.fetchall()
+    )
+    # A real ON DELETE SET NULL foreign key only clears the reference. Run the
+    # complete state cleanup before either the FK or the legacy AFTER trigger.
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_cleanup_delete "
+            "BEFORE DELETE ON upstream_priority_intervals "
+            "BEGIN UPDATE upstream_account_configs SET priority_interval_id = NULL, "
+            "desired_priority = NULL, priority_sync_status = 'unassigned', "
+            "priority_sync_error = NULL WHERE priority_interval_id = OLD.id; END"
+        )
+    )
+    if has_interval_foreign_key:
+        return
+    await conn.execute(
+        text(
+            "UPDATE upstream_account_configs SET priority_interval_id = NULL, "
+            "desired_priority = NULL, priority_sync_status = 'unassigned', "
+            "priority_sync_error = NULL WHERE priority_interval_id IS NOT NULL "
+            "AND priority_interval_id NOT IN (SELECT id FROM upstream_priority_intervals)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_account_priority_interval_insert "
+            "BEFORE INSERT ON upstream_account_configs "
+            "WHEN NEW.priority_interval_id IS NOT NULL AND NOT EXISTS "
+            "(SELECT 1 FROM upstream_priority_intervals WHERE id = NEW.priority_interval_id) "
+            "BEGIN SELECT RAISE(ABORT, 'invalid upstream priority interval reference'); END"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_account_priority_interval_update "
+            "BEFORE UPDATE OF priority_interval_id ON upstream_account_configs "
+            "WHEN NEW.priority_interval_id IS NOT NULL AND NOT EXISTS "
+            "(SELECT 1 FROM upstream_priority_intervals WHERE id = NEW.priority_interval_id) "
+            "BEGIN SELECT RAISE(ABORT, 'invalid upstream priority interval reference'); END"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_delete "
+            "AFTER DELETE ON upstream_priority_intervals "
+            "BEGIN UPDATE upstream_account_configs SET priority_interval_id = NULL, "
+            "desired_priority = NULL, priority_sync_status = 'unassigned', "
+            "priority_sync_error = NULL WHERE priority_interval_id = OLD.id; END"
+        )
+    )
 
 
 def _redact_migration_secrets(value: object, secrets: set[str], *, limit: int = 200) -> str | None:
@@ -503,6 +667,7 @@ async def init_db() -> None:
         if is_sqlite:
             await _migrate_upstream_channels(conn)
             await _migrate_upstream_rate_change_logs(conn)
+            await _migrate_upstream_priority_intervals(conn)
             await _scrub_upstream_plaintext_secret_copies(conn)
             result = await conn.execute(text("PRAGMA table_info(mailbox_credentials)"))
             columns = {str(row[1]) for row in result.fetchall()}

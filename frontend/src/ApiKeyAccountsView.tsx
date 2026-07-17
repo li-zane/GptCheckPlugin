@@ -11,7 +11,9 @@ import {
   History,
   KeyRound,
   LayoutGrid,
+  ListOrdered,
   Pencil,
+  Plus,
   Power,
   PowerOff,
   Radar,
@@ -28,47 +30,74 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
-import { api } from "./api";
+import { api, upstreamLegacyBindingCounts } from "./api";
 import {
   buildUpstreamAccountUpdatePayload,
   canSetManualMultiplier,
   expectedIdentityFingerprint,
 } from "./upstreamAccountForm";
 import { channelCredentialBindingChanged } from "./upstreamCredentialBinding";
-import { rateChangeReasonLabel, upstreamStatusLabel, upstreamStatusTone } from "./upstreamLabels";
+import {
+  upstreamChangeReasonLabel,
+  upstreamHealthStatusLabel,
+  upstreamStatusLabel,
+  upstreamStatusTone,
+  type UpstreamHealthKind,
+} from "./upstreamLabels";
 import {
   accountBillingRateChange,
   groupRateChange,
-  normalizedUpstreamMultiplier,
+  remoteSchedulableChange,
+  upstreamGroupStatusChange,
+  upstreamKeyStatusChange,
   upstreamRateChange,
   upstreamRechargeRateChange,
+  type UpstreamStateChange,
 } from "./upstreamRatePresentation";
 import {
   apiAccountSyncMessage,
+  apiAccountLegacyBindingConfirmationMessage,
   accountRateStatusLabel,
   channelDiscoveryErrorMessage,
   channelDiscoverySuccessMessage,
   upstreamDiscoveryCopy,
   upstreamMutationControlsDisabled,
 } from "./upstreamSyncPresentation";
+import {
+  accountCompositeMultiplier,
+  filterUpstreamAccountEntries,
+  flattenUpstreamAccounts,
+  priorityIntervalAssignmentBlocked,
+  priorityIntervalAssignmentNeedsConfirmation,
+  sortUpstreamAccountEntries,
+  upstreamAccountPlatforms,
+  upstreamAccountMatchesStatus,
+  type UpstreamAccountEntry,
+} from "./upstreamPriorityPresentation";
+import { upstreamOverviewHasLiveMutationData } from "./upstreamOverviewCache";
 import type {
+  PriorityInterval,
+  PriorityIntervalInput,
   UpstreamAccount,
   UpstreamChannel,
+  UpstreamChangeLog,
   UpstreamChannelsResponse,
   UpstreamChannelUpdate,
-  UpstreamRateChangeLog,
   UpstreamType,
 } from "./types";
 
 type StatusFilter = "all" | "pending" | "attention" | "undiscovered";
-type Subview = "manage" | "rate-log";
+type Subview = "accounts" | "channels" | "intervals" | "rate-log";
 type RateLogFilters = { startDate: string; endDate: string };
+type PriorityIntervalFilter = "all" | "unassigned" | string;
+type PlatformFilter = "all" | "__unknown__" | string;
 
 type ChannelForm = {
   displayName: string;
   baseUrl: string;
   managementBaseUrl: string;
   upstreamType: UpstreamType;
+  probeEnabled: boolean;
   accessToken: string;
   clearAccessToken: boolean;
   refreshToken: string;
@@ -84,6 +113,19 @@ type AccountForm = {
   remoteName: string;
 };
 
+type PriorityIntervalForm = {
+  name: string;
+  startPriority: string;
+  endPriority: string;
+  step: string;
+};
+
+type AccountCollectionDialog = {
+  accounts: UpstreamAccount[];
+  channel: UpstreamChannel | null;
+  title: string;
+};
+
 const emptyData: UpstreamChannelsResponse = {
   channels: [],
   unassigned_accounts: [],
@@ -94,6 +136,7 @@ const emptyChannelForm: ChannelForm = {
   baseUrl: "",
   managementBaseUrl: "",
   upstreamType: "auto",
+  probeEnabled: true,
   accessToken: "",
   clearAccessToken: false,
   refreshToken: "",
@@ -107,6 +150,13 @@ const emptyAccountForm: AccountForm = {
   apiKey: "",
   manualGroupMultiplier: "",
   remoteName: "",
+};
+
+const emptyPriorityIntervalForm: PriorityIntervalForm = {
+  name: "",
+  startPriority: "",
+  endPriority: "",
+  step: "1",
 };
 
 export function ApiKeyAccountsView({
@@ -134,12 +184,16 @@ export function ApiKeyAccountsView({
   const [bulkDiscovering, setBulkDiscovering] = useState(false);
   const [busyChannels, setBusyChannels] = useState<Record<string, string>>({});
   const [busyAccounts, setBusyAccounts] = useState<Record<string, string>>({});
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [channelSearch, setChannelSearch] = useState("");
+  const [channelStatusFilter, setChannelStatusFilter] = useState<StatusFilter>("all");
+  const [accountSearch, setAccountSearch] = useState("");
+  const [accountStatusFilter, setAccountStatusFilter] = useState<StatusFilter>("all");
+  const [priorityIntervalFilter, setPriorityIntervalFilter] = useState<PriorityIntervalFilter>("all");
+  const [platformFilter, setPlatformFilter] = useState<PlatformFilter>("all");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [subview, setSubview] = useState<Subview>("manage");
-  const [rateLogs, setRateLogs] = useState<UpstreamRateChangeLog[]>([]);
+  const [subview, setSubview] = useState<Subview>("accounts");
+  const [rateLogs, setRateLogs] = useState<UpstreamChangeLog[]>([]);
   const [rateLogsLoaded, setRateLogsLoaded] = useState(false);
   const [rateLogsLoading, setRateLogsLoading] = useState(false);
   const [rateLogsError, setRateLogsError] = useState("");
@@ -150,6 +204,12 @@ export function ApiKeyAccountsView({
   const [channelForm, setChannelForm] = useState<ChannelForm>(emptyChannelForm);
   const [editingAccount, setEditingAccount] = useState<UpstreamAccount | null>(null);
   const [accountForm, setAccountForm] = useState<AccountForm>(emptyAccountForm);
+  const [priorityIntervalDialogOpen, setPriorityIntervalDialogOpen] = useState(false);
+  const [editingPriorityInterval, setEditingPriorityInterval] = useState<PriorityInterval | null>(null);
+  const [priorityIntervalForm, setPriorityIntervalForm] = useState<PriorityIntervalForm>(emptyPriorityIntervalForm);
+  const [priorityIntervalsBusy, setPriorityIntervalsBusy] = useState(false);
+  const [accountCollectionDialog, setAccountCollectionDialog] = useState<AccountCollectionDialog | null>(null);
+  const [accountUpstreamDialog, setAccountUpstreamDialog] = useState<UpstreamChannel | null>(null);
   const [dialogError, setDialogError] = useState("");
   const [savingDialog, setSavingDialog] = useState(false);
   const [liveDataValidated, setLiveDataValidated] = useState(false);
@@ -161,6 +221,7 @@ export function ApiKeyAccountsView({
   const dialogRef = useRef<HTMLElement | null>(null);
   const lastFocusedElementRef = useRef<HTMLElement | null>(null);
   const localMutationBusy = savingDialog
+    || priorityIntervalsBusy
     || bulkDiscovering
     || Object.keys(busyChannels).length > 0
     || Object.keys(busyAccounts).length > 0;
@@ -184,6 +245,7 @@ export function ApiKeyAccountsView({
       const normalized = {
         ...response,
         channels: Array.isArray(response.channels) ? response.channels : [],
+        priority_intervals: Array.isArray(response.priority_intervals) ? response.priority_intervals : [],
         unassigned_accounts: Array.isArray(response.unassigned_accounts) ? response.unassigned_accounts : [],
       };
       hasDataRef.current = true;
@@ -232,7 +294,6 @@ export function ApiKeyAccountsView({
     hasDataRef.current = true;
     setData(cachedData);
     setLoading(false);
-    setRefreshing(true);
   }, [cachedData]);
 
   useEffect(() => {
@@ -242,6 +303,7 @@ export function ApiKeyAccountsView({
   useEffect(() => {
     if (refreshVersionRef.current === refreshVersion) return;
     refreshVersionRef.current = refreshVersion;
+    requestSequence.current += 1;
     setError("");
     setNotice("");
     rateLogsRequestSequence.current += 1;
@@ -250,8 +312,18 @@ export function ApiKeyAccountsView({
     setRateLogsHasMore(false);
     setRateLogsError("");
     setRateLogsLoaded(false);
-    void loadData();
-  }, [loadData, refreshVersion]);
+    if (cachedData) {
+      const hasLiveMutationData = upstreamOverviewHasLiveMutationData(cachedData);
+      hasDataRef.current = true;
+      setData(cachedData);
+      setLoading(false);
+      setRefreshing(false);
+      setLiveDataValidated(hasLiveMutationData);
+      if (!hasLiveMutationData) void loadData(true);
+    } else {
+      void loadData();
+    }
+  }, [cachedData, loadData, refreshVersion]);
 
   const loadRateLogs = useCallback(async (append = false) => {
     const sequence = ++rateLogsRequestSequence.current;
@@ -259,7 +331,7 @@ export function ApiKeyAccountsView({
     setRateLogsError("");
     try {
       const beforeId = append && rateLogs.length ? rateLogs[rateLogs.length - 1].id : null;
-      const next = await api.upstreamRateChangeLogs(50, beforeId, {
+      const next = await api.upstreamChangeLogs(50, beforeId, {
         startDate: rateLogFilters.startDate || undefined,
         endDate: rateLogFilters.endDate || undefined,
         timeZone: displayTimeZone,
@@ -270,7 +342,7 @@ export function ApiKeyAccountsView({
       setRateLogsLoaded(true);
     } catch (reason) {
       if (sequence === rateLogsRequestSequence.current) {
-        setRateLogsError(errorMessage(reason, "倍率变化记录读取失败"));
+        setRateLogsError(errorMessage(reason, "上游变化记录读取失败"));
         setRateLogsLoaded(true);
       }
     } finally {
@@ -315,34 +387,54 @@ export function ApiKeyAccountsView({
   }, [loadRateLogs, rateLogsLoaded, rateLogsLoading, subview]);
 
   const closeDialog = useCallback(() => {
+    const restoreTarget = lastFocusedElementRef.current;
+    lastFocusedElementRef.current = null;
     setEditingChannel(null);
     setEditingAccount(null);
+    setPriorityIntervalDialogOpen(false);
+    setEditingPriorityInterval(null);
+    setPriorityIntervalForm(emptyPriorityIntervalForm);
+    setAccountCollectionDialog(null);
+    setAccountUpstreamDialog(null);
     setChannelForm(emptyChannelForm);
     setAccountForm(emptyAccountForm);
     setDialogError("");
     setSavingDialog(false);
-    window.requestAnimationFrame(() => lastFocusedElementRef.current?.focus());
+    window.requestAnimationFrame(() => {
+      if (restoreTarget?.isConnected) restoreTarget.focus();
+    });
   }, []);
 
   useEffect(() => {
-    if (!editingChannel && !editingAccount) return;
+    if (
+      !editingChannel
+      && !editingAccount
+      && !priorityIntervalDialogOpen
+      && !accountCollectionDialog
+      && !accountUpstreamDialog
+    ) return;
     const previousOverflow = document.body.style.overflow;
+    const dialog = dialogRef.current;
     document.body.style.overflow = "hidden";
+    const focusableElements = () => Array.from(
+      dialog?.querySelectorAll<HTMLElement>(
+        'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ) || [],
+    );
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !savingDialog) {
         closeDialog();
         return;
       }
-      if (event.key !== "Tab" || !dialogRef.current) return;
-      const focusable = Array.from(
-        dialogRef.current.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
-        ),
-      );
+      if (event.key !== "Tab" || !dialog) return;
+      const focusable = focusableElements();
       if (!focusable.length) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
+      if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && document.activeElement === last) {
@@ -355,15 +447,28 @@ export function ApiKeyAccountsView({
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [closeDialog, editingAccount, editingChannel, savingDialog]);
+  }, [
+    accountCollectionDialog,
+    accountUpstreamDialog,
+    closeDialog,
+    editingAccount,
+    editingChannel,
+    priorityIntervalDialogOpen,
+    savingDialog,
+  ]);
 
-  const allAccounts = useMemo(
-    () => [
-      ...data.channels.flatMap((channel) => channel.accounts || []),
-      ...data.unassigned_accounts,
-    ],
-    [data.channels, data.unassigned_accounts],
-  );
+  const allAccountEntries = useMemo(() => flattenUpstreamAccounts(data), [data]);
+  const allAccounts = useMemo(() => allAccountEntries.map(({ account }) => account), [allAccountEntries]);
+  const priorityIntervals = data.priority_intervals || [];
+  const platformOptions = useMemo(() => upstreamAccountPlatforms(allAccountEntries), [allAccountEntries]);
+  const filteredAccountEntries = useMemo(() => {
+    const filtered = filterUpstreamAccountEntries(allAccountEntries, {
+      interval: priorityIntervalFilter,
+      platform: platformFilter,
+      query: accountSearch,
+    }).filter(({ account }) => upstreamAccountMatchesStatus(account, accountStatusFilter));
+    return sortUpstreamAccountEntries(filtered);
+  }, [accountSearch, accountStatusFilter, allAccountEntries, platformFilter, priorityIntervalFilter]);
 
   const summary = useMemo(
     () => ({
@@ -376,26 +481,26 @@ export function ApiKeyAccountsView({
   );
 
   const filteredChannels = useMemo(() => {
-    const query = search.trim().toLowerCase();
+    const query = channelSearch.trim().toLowerCase();
     return data.channels
       .map((channel) => {
         const channelMatches = !query || channelSearchText(channel).includes(query);
         const accounts = (channel.accounts || []).filter(
           (account) =>
-            matchesAccountStatus(account, statusFilter) &&
+            upstreamAccountMatchesStatus(account, channelStatusFilter) &&
             (channelMatches || accountSearchText(account).includes(query)),
         );
-        const channelStatusMatches = matchesChannelStatus(channel, statusFilter);
+        const channelStatusMatches = matchesChannelStatus(channel, channelStatusFilter);
         return { channel, accounts, visible: (channelMatches && channelStatusMatches) || accounts.length > 0 };
       })
       .filter((entry) => entry.visible);
-  }, [data.channels, search, statusFilter]);
+  }, [channelSearch, channelStatusFilter, data.channels]);
 
   const filteredUnassigned = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    if (statusFilter !== "all" && statusFilter !== "attention") return [];
+    const query = channelSearch.trim().toLowerCase();
+    if (channelStatusFilter !== "all" && channelStatusFilter !== "attention") return [];
     return data.unassigned_accounts.filter((account) => !query || accountSearchText(account).includes(query));
-  }, [data.unassigned_accounts, search, statusFilter]);
+  }, [channelSearch, channelStatusFilter, data.unassigned_accounts]);
 
   const setChannelBusy = (channel: UpstreamChannel, action: string | null) => {
     const key = channelKey(channel);
@@ -407,8 +512,20 @@ export function ApiKeyAccountsView({
     setBusyAccounts((current) => updateBusyMap(current, key, action));
   };
 
+  const rememberDialogTrigger = () => {
+    const activeElement = document.activeElement;
+    if (
+      activeElement instanceof HTMLElement
+      && !dialogRef.current?.contains(activeElement)
+    ) {
+      lastFocusedElementRef.current = activeElement;
+    }
+  };
+
   const openChannelConfig = (channel: UpstreamChannel) => {
-    lastFocusedElementRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    rememberDialogTrigger();
+    setAccountCollectionDialog(null);
+    setAccountUpstreamDialog(null);
     setEditingChannel(channel);
     setDialogError("");
     setChannelForm({
@@ -416,6 +533,7 @@ export function ApiKeyAccountsView({
       baseUrl: channelBaseUrl(channel),
       managementBaseUrl: channel.management_base_url || "",
       upstreamType: channel.upstream_type || "auto",
+      probeEnabled: channel.probe_enabled !== false,
       accessToken: "",
       clearAccessToken: false,
       refreshToken: "",
@@ -426,7 +544,9 @@ export function ApiKeyAccountsView({
   };
 
   const openAccountConfig = (account: UpstreamAccount, fallbackChannel?: UpstreamChannel) => {
-    lastFocusedElementRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    rememberDialogTrigger();
+    setAccountCollectionDialog(null);
+    setAccountUpstreamDialog(null);
     setEditingAccount(account);
     setDialogError("");
     setAccountForm({
@@ -435,6 +555,150 @@ export function ApiKeyAccountsView({
       manualGroupMultiplier: numberInputValue(account.manual_group_multiplier),
       remoteName: account.remote_name || "",
     });
+  };
+
+  const openChannelAccounts = (channel: UpstreamChannel) => {
+    rememberDialogTrigger();
+    setAccountUpstreamDialog(null);
+    setAccountCollectionDialog({
+      accounts: channel.accounts || [],
+      channel,
+      title: channelDisplayName(channel),
+    });
+  };
+
+  const openUnassignedAccounts = () => {
+    rememberDialogTrigger();
+    setAccountUpstreamDialog(null);
+    setAccountCollectionDialog({
+      accounts: data.unassigned_accounts,
+      channel: null,
+      title: "待分配账号",
+    });
+  };
+
+  const openAccountUpstream = (entry: UpstreamAccountEntry) => {
+    if (!entry.channel) return;
+    rememberDialogTrigger();
+    setAccountCollectionDialog(null);
+    setAccountUpstreamDialog(entry.channel);
+  };
+
+  const openPriorityIntervalConfig = (interval?: PriorityInterval) => {
+    rememberDialogTrigger();
+    setEditingPriorityInterval(interval || null);
+    setPriorityIntervalForm(interval ? {
+      name: interval.name,
+      startPriority: String(interval.start_priority),
+      endPriority: String(interval.end_priority),
+      step: String(interval.step),
+    } : emptyPriorityIntervalForm);
+    setDialogError("");
+    setPriorityIntervalDialogOpen(true);
+  };
+
+  const setAccountPriorityInterval = async (
+    account: UpstreamAccount,
+    priorityIntervalId: number | string | null,
+  ) => {
+    const confirmIdentityRebind = priorityIntervalAssignmentNeedsConfirmation(account);
+    if (
+      confirmIdentityRebind
+      && !window.confirm(
+        "这是升级前尚未绑定身份的本地配置。继续会先校验并认领当前 sub2api 账号，再分配优先级区间，是否确认？",
+      )
+    ) return;
+    const finishOperation = onOperationStart();
+    setAccountBusy(account, "priority");
+    setError("");
+    setNotice("");
+    try {
+      await api.setUpstreamAccountPriorityInterval(account.sub2api_account_id, {
+        priority_interval_id: priorityIntervalId,
+        expected_identity_fingerprint: expectedIdentityFingerprint(account),
+        confirm_identity_rebind: confirmIdentityRebind,
+      });
+      await loadData(true);
+      setNotice(
+        priorityIntervalId === null
+          ? `${accountDisplayName(account)} 已取消优先级区间，当前远端优先级保持不变。`
+          : `${accountDisplayName(account)} 的优先级区间已更新。`,
+      );
+    } catch (reason) {
+      setError(errorMessage(reason, "优先级区间分配失败"));
+    } finally {
+      setAccountBusy(account, null);
+      finishOperation();
+    }
+  };
+
+  const savePriorityInterval = async (event: FormEvent) => {
+    event.preventDefault();
+    const finishOperation = onOperationStart();
+    setSavingDialog(true);
+    setDialogError("");
+    try {
+      const payload = priorityIntervalPayload(priorityIntervalForm);
+      if (editingPriorityInterval) {
+        await api.updatePriorityInterval(editingPriorityInterval.id, payload);
+      } else {
+        await api.createPriorityInterval(payload);
+      }
+      closeDialog();
+      await loadData(true);
+      setError("");
+      setNotice(editingPriorityInterval ? "优先级区间已更新并重新计算。" : "优先级区间已创建。");
+    } catch (reason) {
+      setDialogError(errorMessage(reason, "优先级区间保存失败"));
+    } finally {
+      setSavingDialog(false);
+      finishOperation();
+    }
+  };
+
+  const deletePriorityInterval = async (interval: PriorityInterval) => {
+    const accountCount = priorityIntervalAccountCount(interval, allAccounts);
+    const detail = accountCount
+      ? `\n\n${accountCount} 个账号会变为“未选定区间”，它们当前的远端优先级不会被重置。`
+      : "";
+    if (!window.confirm(`确认删除优先级区间「${interval.name}」？${detail}`)) return;
+    const finishOperation = onOperationStart();
+    setPriorityIntervalsBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api.deletePriorityInterval(interval.id);
+      await loadData(true);
+      if (priorityIntervalFilter === String(interval.id)) setPriorityIntervalFilter("all");
+      setNotice("优先级区间已删除。");
+    } catch (reason) {
+      setError(errorMessage(reason, "优先级区间删除失败"));
+    } finally {
+      setPriorityIntervalsBusy(false);
+      finishOperation();
+    }
+  };
+
+  const rebalancePriorityIntervals = async () => {
+    const finishOperation = onOperationStart();
+    setPriorityIntervalsBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.rebalancePriorityIntervals();
+      await loadData(true);
+      const changed = finiteNumber(result.updated);
+      const failed = finiteNumber(result.failed);
+      setNotice(
+        result.message
+        || `优先级重排完成${changed === null ? "" : `，更新 ${changed} 个账号`}${failed ? `，失败 ${failed} 个` : ""}。`,
+      );
+    } catch (reason) {
+      setError(errorMessage(reason, "优先级重排失败"));
+    } finally {
+      setPriorityIntervalsBusy(false);
+      finishOperation();
+    }
   };
 
   const saveChannel = async (event: FormEvent) => {
@@ -467,6 +731,7 @@ export function ApiKeyAccountsView({
         base_url: baseUrl,
         management_base_url: nullableText(managementBaseUrl),
         upstream_type: channelForm.upstreamType,
+        probe_enabled: channelForm.probeEnabled,
         upstream_user_id: nullableText(channelForm.upstreamUserId),
         clear_access_token: channelForm.clearAccessToken,
         confirm_credential_rebind: credentialRebind,
@@ -589,8 +854,30 @@ export function ApiKeyAccountsView({
     setError("");
     setNotice("");
     try {
-      const result = await api.syncApiKeyAccounts(data, false);
-      await loadData(true);
+      const bindingCounts = upstreamLegacyBindingCounts(data);
+      const confirmationRequired = bindingCounts.unbound > 0 || bindingCounts.originRebind > 0;
+      if (
+        confirmationRequired
+        && !window.confirm(apiAccountLegacyBindingConfirmationMessage(bindingCounts))
+      ) {
+        setNotice("已取消 API 账号同步。");
+        return;
+      }
+      const result = await api.syncApiKeyAccounts(data, confirmationRequired);
+      if (result.overview) {
+        const normalized = {
+          ...result.overview,
+          channels: Array.isArray(result.overview.channels) ? result.overview.channels : [],
+          priority_intervals: Array.isArray(result.overview.priority_intervals) ? result.overview.priority_intervals : [],
+          unassigned_accounts: Array.isArray(result.overview.unassigned_accounts) ? result.overview.unassigned_accounts : [],
+        };
+        hasDataRef.current = true;
+        setData(normalized);
+        onCacheChange(normalized, cacheBaseUrl);
+        setLiveDataValidated(true);
+      } else {
+        await loadData(true);
+      }
       rateLogsRequestSequence.current += 1;
       setRateLogs([]);
       setRateLogsLoading(false);
@@ -675,14 +962,34 @@ export function ApiKeyAccountsView({
     <section className="api-key-view api-key-channel-view" aria-label="API Key 账号管理">
       <div className="api-key-subview-tabs" role="tablist" aria-label="API Key 子页面">
         <button
-          aria-selected={subview === "manage"}
-          className={subview === "manage" ? "active" : ""}
-          onClick={() => setSubview("manage")}
+          aria-selected={subview === "accounts"}
+          className={subview === "accounts" ? "active" : ""}
+          onClick={() => setSubview("accounts")}
           role="tab"
           type="button"
         >
           <LayoutGrid size={16} />
           <span>账号管理</span>
+        </button>
+        <button
+          aria-selected={subview === "channels"}
+          className={subview === "channels" ? "active" : ""}
+          onClick={() => setSubview("channels")}
+          role="tab"
+          type="button"
+        >
+          <Globe2 size={16} />
+          <span>上游渠道</span>
+        </button>
+        <button
+          aria-selected={subview === "intervals"}
+          className={subview === "intervals" ? "active" : ""}
+          onClick={() => setSubview("intervals")}
+          role="tab"
+          type="button"
+        >
+          <ListOrdered size={16} />
+          <span>优先级区间</span>
         </button>
         <button
           aria-selected={subview === "rate-log"}
@@ -692,15 +999,15 @@ export function ApiKeyAccountsView({
           type="button"
         >
           <History size={16} />
-          <span>倍率变化</span>
+          <span>上游变化</span>
         </button>
       </div>
 
-      {subview === "manage" ? <>
+      {subview !== "rate-log" ? <>
       <div className="api-key-summary" aria-label="上游渠道汇总">
         <SummaryItem label="上游渠道" value={summary.channels} tone="blue" />
         <SummaryItem label="API Key 账号" value={summary.accounts} tone="green" />
-        <SummaryItem label={rateWritesEnabled ? "待同步倍率" : "待应用倍率"} value={summary.pending} tone="amber" />
+        <SummaryItem label="倍率不一致" value={summary.pending} tone="amber" />
         <SummaryItem
           label="本地充值成本"
           value={"¥" + formatCostPerUsd(data.local_recharge_multiplier) + " / $1"}
@@ -716,6 +1023,98 @@ export function ApiKeyAccountsView({
         <Feedback tone="success" onClose={() => setNotice("")}>{notice}</Feedback>
       ) : null}
 
+      {subview === "accounts" ? (
+        <section className="api-key-panel api-key-accounts-panel" aria-label="API Key 账号">
+          <div className="api-key-panel-head">
+            <div>
+              <h2>API Key 账号</h2>
+              <p>按综合倍率从低到高排列；综合倍率不可用的账号显示在末尾。</p>
+            </div>
+          </div>
+
+          <div className="api-key-filters api-key-account-filters">
+            <label className="api-key-search">
+              <Search size={16} />
+              <span className="api-key-sr-only">搜索 API Key 账号</span>
+              <input
+                onChange={(event) => setAccountSearch(event.target.value)}
+                placeholder="搜索账号、渠道、ID 或分组"
+                type="search"
+                value={accountSearch}
+              />
+              <small>{filteredAccountEntries.length}/{allAccountEntries.length}</small>
+            </label>
+            <label className="api-key-filter-select">
+              <span>优先级区间</span>
+              <select
+                onChange={(event) => setPriorityIntervalFilter(event.target.value as PriorityIntervalFilter)}
+                value={priorityIntervalFilter}
+              >
+                <option value="all">全部区间</option>
+                <option value="unassigned">未选定区间</option>
+                {priorityIntervals.map((interval) => (
+                  <option key={String(interval.id)} value={String(interval.id)}>
+                    {interval.name} [{interval.start_priority}, {interval.end_priority})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="api-key-filter-select">
+              <span>平台</span>
+              <select onChange={(event) => setPlatformFilter(event.target.value as PlatformFilter)} value={platformFilter}>
+                <option value="all">全部平台</option>
+                {platformOptions.platforms.map((option) => (
+                  <option key={option.value} value={option.value}>{upstreamStatusLabel(option.label)}</option>
+                ))}
+                {platformOptions.hasUnknown ? <option value="__unknown__">未知平台</option> : null}
+              </select>
+            </label>
+            <label className="api-key-filter-select">
+              <span>状态</span>
+              <select onChange={(event) => setAccountStatusFilter(event.target.value as StatusFilter)} value={accountStatusFilter}>
+                <option value="all">全部状态</option>
+                <option value="pending">倍率不一致</option>
+                <option value="attention">需要处理</option>
+                <option value="undiscovered">尚未探测</option>
+              </select>
+            </label>
+          </div>
+
+          {loading && allAccountEntries.length === 0 ? (
+            <div className="api-key-empty">
+              <RefreshCcw className="spin" size={18} />
+              <span>正在读取 API Key 账号…</span>
+            </div>
+          ) : filteredAccountEntries.length ? (
+            <div className="api-key-account-grid api-key-account-management-grid">
+              {filteredAccountEntries.map((entry) => (
+                <AccountCard
+                  account={entry.account}
+                  busyAction={busyAccounts[accountKey(entry.account)]}
+                  channel={entry.channel}
+                  displayTimeZone={displayTimeZone}
+                  globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
+                  key={accountKey(entry.account)}
+                  onConfigure={() => openAccountConfig(entry.account, entry.channel || undefined)}
+                  onDelete={() => deleteRemoteAccount(entry.account)}
+                  onPriorityIntervalChange={(intervalId) => void setAccountPriorityInterval(entry.account, intervalId)}
+                  onShowChannel={() => openAccountUpstream(entry)}
+                  onToggle={() => toggleAccountEnabled(entry.account)}
+                  priorityIntervals={priorityIntervals}
+                  rateWritesEnabled={rateWritesEnabled}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="api-key-empty">
+              <KeyRound size={18} />
+              <span>{allAccountEntries.length ? "没有匹配的 API Key 账号" : "暂无可管理的 API Key 账号"}</span>
+            </div>
+          )}
+        </section>
+      ) : null}
+
+      {subview === "channels" ? (
       <section className="api-key-panel api-key-channel-panel">
         <div className="api-key-panel-head">
           <div>
@@ -732,16 +1131,6 @@ export function ApiKeyAccountsView({
               <Radar className={bulkDiscovering ? "spin" : ""} size={16} />
               <span>{bulkDiscovering ? discoveryCopy.bulkBusyLabel : discoveryCopy.bulkLabel}</span>
             </button>
-            <button
-              aria-label="刷新上游渠道"
-              className="api-key-icon-button"
-              disabled={loading || refreshing || anyBusy}
-              onClick={() => void loadData()}
-              title="刷新"
-              type="button"
-            >
-              <RefreshCcw className={loading || refreshing ? "spin" : ""} size={16} />
-            </button>
           </div>
         </div>
 
@@ -750,18 +1139,18 @@ export function ApiKeyAccountsView({
             <Search size={16} />
             <span className="api-key-sr-only">搜索渠道或账号</span>
             <input
-              onChange={(event) => setSearch(event.target.value)}
+              onChange={(event) => setChannelSearch(event.target.value)}
               placeholder="搜索渠道、URL、账号、ID 或分组"
               type="search"
-              value={search}
+              value={channelSearch}
             />
             <small>{filteredChannels.length}/{data.channels.length}</small>
           </label>
           <label className="api-key-filter-select">
             <span>状态</span>
-            <select onChange={(event) => setStatusFilter(event.target.value as StatusFilter)} value={statusFilter}>
+            <select onChange={(event) => setChannelStatusFilter(event.target.value as StatusFilter)} value={channelStatusFilter}>
               <option value="all">全部状态</option>
-              <option value="pending">{rateWritesEnabled ? "待同步倍率" : "待应用倍率"}</option>
+              <option value="pending">倍率不一致</option>
               <option value="attention">需要处理</option>
               <option value="undiscovered">尚未探测</option>
             </select>
@@ -780,37 +1169,177 @@ export function ApiKeyAccountsView({
           </div>
         ) : (
           <div className="api-key-channel-grid">
-            {filteredChannels.map(({ channel, accounts }) => (
+            {filteredChannels.map(({ channel }) => (
               <ChannelCard
-                accounts={accounts}
+                accountCount={channelAccountCount(channel)}
                 busyAction={busyChannels[channelKey(channel)]}
                 channel={channel}
                 displayTimeZone={displayTimeZone}
                 globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
                 key={channelKey(channel)}
-                onConfigureAccount={(account) => openAccountConfig(account, channel)}
                 onConfigureChannel={() => openChannelConfig(channel)}
-                onDeleteAccount={deleteRemoteAccount}
                 onDiscover={() => void discoverChannel(channel)}
-                onToggleAccount={toggleAccountEnabled}
+                onShowAccounts={() => openChannelAccounts(channel)}
                 rateWritesEnabled={rateWritesEnabled}
-                busyAccounts={busyAccounts}
               />
             ))}
             {filteredUnassigned.length ? (
               <UnassignedCard
-                accounts={filteredUnassigned}
-                busyAccounts={busyAccounts}
-                globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
-                onConfigure={openAccountConfig}
-                onDelete={deleteRemoteAccount}
-                onToggle={toggleAccountEnabled}
-                rateWritesEnabled={rateWritesEnabled}
+                accountCount={data.unassigned_accounts.length}
+                onShowAccounts={openUnassignedAccounts}
               />
             ) : null}
           </div>
         )}
       </section>
+      ) : null}
+
+      {subview === "intervals" ? (
+        <PriorityIntervalsView
+          accounts={allAccounts}
+          busy={anyBusy || mutationControlsDisabled}
+          intervals={priorityIntervals}
+          onCreate={() => openPriorityIntervalConfig()}
+          onDelete={(interval) => void deletePriorityInterval(interval)}
+          onEdit={openPriorityIntervalConfig}
+          onRebalance={() => void rebalancePriorityIntervals()}
+          rebalancing={priorityIntervalsBusy}
+        />
+      ) : null}
+
+      {accountCollectionDialog ? (
+        <Modal
+          dialogRef={dialogRef}
+          eyebrow={`${accountCollectionDialog.accounts.length} 个 API Key 账号`}
+          onClose={closeDialog}
+          saving={false}
+          title={accountCollectionDialog.title}
+        >
+          {accountCollectionDialog.accounts.length ? (
+            <div className="api-key-account-grid api-key-dialog-account-grid">
+              {sortUpstreamAccountEntries(accountCollectionDialog.accounts.map((account) => ({
+                account,
+                channel: accountCollectionDialog.channel,
+              }))).map((entry) => (
+                <AccountCard
+                  account={entry.account}
+                  busyAction={busyAccounts[accountKey(entry.account)]}
+                  channel={entry.channel}
+                  displayTimeZone={displayTimeZone}
+                  globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
+                  key={accountKey(entry.account)}
+                  onConfigure={() => openAccountConfig(entry.account, entry.channel || undefined)}
+                  onDelete={() => {
+                    closeDialog();
+                    void deleteRemoteAccount(entry.account);
+                  }}
+                  onPriorityIntervalChange={(intervalId) => {
+                    closeDialog();
+                    void setAccountPriorityInterval(entry.account, intervalId);
+                  }}
+                  onShowChannel={() => openAccountUpstream(entry)}
+                  onToggle={() => {
+                    closeDialog();
+                    void toggleAccountEnabled(entry.account);
+                  }}
+                  priorityIntervals={priorityIntervals}
+                  rateWritesEnabled={rateWritesEnabled}
+                />
+              ))}
+            </div>
+          ) : <div className="api-key-empty"><KeyRound size={18} /><span>当前没有 API Key 账号</span></div>}
+        </Modal>
+      ) : null}
+
+      {accountUpstreamDialog ? (
+        <Modal
+          dialogRef={dialogRef}
+          eyebrow="账号所属上游"
+          onClose={closeDialog}
+          saving={false}
+          title={channelDisplayName(accountUpstreamDialog)}
+        >
+          <div className="api-key-dialog-channel-card">
+            <ChannelCard
+              accountCount={channelAccountCount(accountUpstreamDialog)}
+              busyAction={busyChannels[channelKey(accountUpstreamDialog)]}
+              channel={accountUpstreamDialog}
+              displayTimeZone={displayTimeZone}
+              globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
+              onConfigureChannel={() => openChannelConfig(accountUpstreamDialog)}
+              onDiscover={() => {
+                closeDialog();
+                void discoverChannel(accountUpstreamDialog);
+              }}
+              onShowAccounts={() => openChannelAccounts(accountUpstreamDialog)}
+              rateWritesEnabled={rateWritesEnabled}
+            />
+          </div>
+        </Modal>
+      ) : null}
+
+      {priorityIntervalDialogOpen ? (
+        <Modal
+          dialogRef={dialogRef}
+          eyebrow="优先级区间"
+          onClose={closeDialog}
+          saving={savingDialog}
+          title={editingPriorityInterval ? `编辑 · ${editingPriorityInterval.name}` : "新建优先级区间"}
+        >
+          <form className="api-key-config-form" onSubmit={savePriorityInterval}>
+            <div className="api-key-config-fields">
+              <label className="api-key-field api-key-field--wide">
+                <span>区间名称</span>
+                <input
+                  autoFocus
+                  maxLength={100}
+                  onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, name: event.target.value }))}
+                  placeholder="例如：低成本优先"
+                  required
+                  value={priorityIntervalForm.name}
+                />
+              </label>
+              <label className="api-key-field">
+                <span>起始优先级</span>
+                <input
+                  inputMode="numeric"
+                  onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, startPriority: event.target.value }))}
+                  required
+                  step="1"
+                  type="number"
+                  value={priorityIntervalForm.startPriority}
+                />
+              </label>
+              <label className="api-key-field">
+                <span>结束优先级（不包含）</span>
+                <input
+                  inputMode="numeric"
+                  onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, endPriority: event.target.value }))}
+                  required
+                  step="1"
+                  type="number"
+                  value={priorityIntervalForm.endPriority}
+                />
+              </label>
+              <label className="api-key-field api-key-field--wide">
+                <span>优先级间隔</span>
+                <input
+                  inputMode="numeric"
+                  min="1"
+                  onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, step: event.target.value }))}
+                  required
+                  step="1"
+                  type="number"
+                  value={priorityIntervalForm.step}
+                />
+                <small>账号较多时会自动缩短间隔；间隔 1 仍放不下时，多出的账号使用区间最后一个优先级。</small>
+              </label>
+            </div>
+            <DialogError message={dialogError} />
+            <DialogActions onCancel={closeDialog} saving={savingDialog} />
+          </form>
+        </Modal>
+      ) : null}
 
       {editingChannel ? (
         <Modal title={"配置渠道 · " + channelDisplayName(editingChannel)} eyebrow="上游渠道" onClose={closeDialog} dialogRef={dialogRef} saving={savingDialog}>
@@ -864,6 +1393,21 @@ export function ApiKeyAccountsView({
                   ))}
                 </div>
               </fieldset>
+
+              <label className="api-key-field api-key-field--wide api-key-clear-token">
+                <input
+                  checked={channelForm.probeEnabled}
+                  onChange={(event) =>
+                    setChannelForm((current) => ({
+                      ...current,
+                      probeEnabled: event.target.checked,
+                    }))
+                  }
+                  type="checkbox"
+                />
+                <span>纳入自动上游探测</span>
+                <small>仅在全局“同步 API Key 账号上游”开启时生效；关闭后保留上次观测结果，也不会自动修改该渠道账号的倍率、优先级或启用状态。</small>
+              </label>
 
               <label className="api-key-field">
                 <span>Access Token</span>
@@ -1069,29 +1613,23 @@ export function ApiKeyAccountsView({
 
 function ChannelCard({
   channel,
-  accounts,
+  accountCount,
   displayTimeZone,
   busyAction,
-  busyAccounts,
   globallyDisabled,
   onConfigureChannel,
   onDiscover,
-  onConfigureAccount,
-  onDeleteAccount,
-  onToggleAccount,
+  onShowAccounts,
   rateWritesEnabled,
 }: {
   channel: UpstreamChannel;
-  accounts: UpstreamAccount[];
+  accountCount: number;
   displayTimeZone: string;
   busyAction?: string;
-  busyAccounts: Record<string, string>;
   globallyDisabled: boolean;
   onConfigureChannel: () => void;
   onDiscover: () => void;
-  onConfigureAccount: (account: UpstreamAccount) => void;
-  onDeleteAccount: (account: UpstreamAccount) => void;
-  onToggleAccount: (account: UpstreamAccount) => void;
+  onShowAccounts: () => void;
   rateWritesEnabled: boolean;
 }) {
   const [groupsExpanded, setGroupsExpanded] = useState(false);
@@ -1178,6 +1716,10 @@ function ChannelCard({
       </div>
 
       <div className="api-key-channel-credential-line">
+        <span className={channel.probe_enabled === false ? "needs-attention" : "is-ready"}>
+          <Radar size={13} />
+          {channel.probe_enabled === false ? "自动探测已关闭" : "自动探测已开启"}
+        </span>
         <span className={channel.access_token_set ? "is-ready" : "needs-attention"}>
           <KeyRound size={13} />
           {channel.access_token_set ? "Access Token 已配置" : "缺少 Access Token"}
@@ -1235,24 +1777,18 @@ function ChannelCard({
       <section className="api-key-channel-accounts" aria-label="渠道账号">
         <div className="api-key-channel-section-label api-key-channel-section-label--accounts">
           <span>API Key 账号</span>
-          <small>{accounts.length} 个</small>
+          <small>{accountCount} 个</small>
         </div>
-        {accounts.length ? (
-          <div className="api-key-account-grid">
-            {accounts.map((account) => (
-              <AccountCard
-                account={account}
-                busyAction={busyAccounts[accountKey(account)]}
-                globallyDisabled={globallyDisabled || Boolean(busyAction)}
-                key={accountKey(account)}
-                onConfigure={() => onConfigureAccount(account)}
-                onDelete={() => onDeleteAccount(account)}
-                onToggle={() => onToggleAccount(account)}
-                rateWritesEnabled={rateWritesEnabled}
-              />
-            ))}
-          </div>
-        ) : <div className="api-key-channel-no-accounts">当前筛选下没有匹配账号</div>}
+        <button
+          aria-label={`查看 ${channelDisplayName(channel)} 的 ${accountCount} 个 API Key 账号`}
+          className="api-key-channel-account-button"
+          onClick={onShowAccounts}
+          type="button"
+        >
+          <UsersRound size={16} />
+          <span>{accountCount ? `查看 ${accountCount} 个账号` : "查看账号"}</span>
+          <ArrowRight size={15} />
+        </button>
       </section>
 
       {error ? (
@@ -1266,21 +1802,11 @@ function ChannelCard({
 }
 
 function UnassignedCard({
-  accounts,
-  busyAccounts,
-  globallyDisabled,
-  onConfigure,
-  onDelete,
-  onToggle,
-  rateWritesEnabled,
+  accountCount,
+  onShowAccounts,
 }: {
-  accounts: UpstreamAccount[];
-  busyAccounts: Record<string, string>;
-  globallyDisabled: boolean;
-  onConfigure: (account: UpstreamAccount) => void;
-  onDelete: (account: UpstreamAccount) => void;
-  onToggle: (account: UpstreamAccount) => void;
-  rateWritesEnabled: boolean;
+  accountCount: number;
+  onShowAccounts: () => void;
 }) {
   return (
     <article className="api-key-channel-card api-key-channel-card--unassigned">
@@ -1297,22 +1823,18 @@ function UnassignedCard({
       <section className="api-key-channel-accounts">
         <div className="api-key-channel-section-label api-key-channel-section-label--accounts">
           <span>API Key 账号</span>
-          <small>{accounts.length} 个</small>
+          <small>{accountCount} 个</small>
         </div>
-        <div className="api-key-account-grid">
-          {accounts.map((account) => (
-            <AccountCard
-              account={account}
-              busyAction={busyAccounts[accountKey(account)]}
-              globallyDisabled={globallyDisabled}
-              key={accountKey(account)}
-              onConfigure={() => onConfigure(account)}
-              onDelete={() => onDelete(account)}
-              onToggle={() => onToggle(account)}
-              rateWritesEnabled={rateWritesEnabled}
-            />
-          ))}
-        </div>
+        <button
+          aria-label={`查看 ${accountCount} 个待分配 API Key 账号`}
+          className="api-key-channel-account-button"
+          onClick={onShowAccounts}
+          type="button"
+        >
+          <UsersRound size={16} />
+          <span>{accountCount ? `查看 ${accountCount} 个账号` : "查看账号"}</span>
+          <ArrowRight size={15} />
+        </button>
       </section>
     </article>
   );
@@ -1321,29 +1843,37 @@ function UnassignedCard({
 function AccountCard({
   account,
   busyAction,
+  channel,
+  displayTimeZone,
   globallyDisabled,
   onConfigure,
   onDelete,
+  onPriorityIntervalChange,
+  onShowChannel,
   onToggle,
+  priorityIntervals,
   rateWritesEnabled,
 }: {
   account: UpstreamAccount;
   busyAction?: string;
+  channel: UpstreamChannel | null;
+  displayTimeZone: string;
   globallyDisabled: boolean;
   onConfigure: () => void;
   onDelete: () => void;
+  onPriorityIntervalChange: (intervalId: number | string | null) => void;
+  onShowChannel: () => void;
   onToggle: () => void;
+  priorityIntervals: PriorityInterval[];
   rateWritesEnabled: boolean;
 }) {
   const busy = Boolean(busyAction) || globallyDisabled;
   const identityBlocked = Boolean(account.identity_rebind_required);
+  const priorityIdentityBlocked = priorityIntervalAssignmentBlocked(account);
   const current = finiteNumber(account.current_rate);
   const target = finiteNumber(account.target_rate);
   const groupMultiplier = finiteNumber(account.effective_group_multiplier);
-  const normalizedMultiplier = normalizedUpstreamMultiplier(
-    groupMultiplier,
-    account.effective_recharge_multiplier,
-  );
+  const normalizedMultiplier = accountCompositeMultiplier(account);
   const groupMultiplierTitle = groupMultiplier === null
     ? ""
     : normalizedMultiplier === null
@@ -1362,6 +1892,22 @@ function AccountCard({
     : `综合倍率为 ${combinedRateLabel}（上游充值倍率 ${rechargeMultiplierLabel} × 分组倍率 ${formatMultiplier(groupMultiplier)}）`;
   const currentRateTitle = `当前 sub2api 中账号计费倍率为 ${currentRateLabel}`;
   const targetRateTitle = `根据上游分组倍率和充值成本计算的目标计费倍率为 ${targetRateLabel}；${accountRateStatusLabel(target, account.would_change, rateWritesEnabled)}`;
+  const priority = finiteNumber(account.priority);
+  const desiredPriority = finiteNumber(account.desired_priority);
+  const hasPriorityInterval = account.priority_interval_id !== null && account.priority_interval_id !== undefined;
+  const multiplierUnavailable = hasPriorityInterval && (
+    account.priority_sync_status === "multiplier_unavailable" || normalizedMultiplier === null
+  );
+  const priorityPending = desiredPriority !== null && priority !== desiredPriority;
+  const priorityState = multiplierUnavailable
+    ? "等待综合倍率"
+    : account.priority_sync_error
+      ? "优先级同步失败"
+      : !hasPriorityInterval
+        ? "未选定区间"
+        : priorityPending
+          ? "等待写入"
+          : priorityStatusLabel(account.priority_sync_status);
   return (
     <article className={"api-key-account-card" + (enabled ? "" : " api-key-account-card--disabled")}>
       <header className="api-key-account-card-head">
@@ -1370,6 +1916,33 @@ function AccountCard({
         <div className="api-key-inline-chips api-key-account-meta-chips">
           <StatusChip status={effectiveStatus} />
           {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
+          <AccountUpstreamHealthChip
+            checkedAt={account.upstream_key_checked_at || account.upstream_health_checked_at}
+            displayTimeZone={displayTimeZone}
+            kind="key"
+            label="Key"
+            status={account.upstream_key_status}
+          />
+          <AccountUpstreamHealthChip
+            checkedAt={account.upstream_group_checked_at || account.upstream_health_checked_at}
+            displayTimeZone={displayTimeZone}
+            kind="group"
+            label="分组"
+            status={account.upstream_group_status}
+          />
+          {account.auto_disabled_reason ? (
+            <span
+              className="api-key-chip api-key-chip--danger"
+              title={
+                upstreamChangeReasonLabel(account.auto_disabled_reason)
+                + (account.last_auto_disabled_at
+                  ? ` · ${formatDate(account.last_auto_disabled_at, displayTimeZone)}`
+                  : "")
+              }
+            >
+              上游失效自动禁用
+            </span>
+          ) : null}
           {identityBlocked ? (
             <span className="api-key-chip api-key-chip--warn">
               {account.identity_binding_status === "mismatch" ? "身份已变化" : "身份待认领"}
@@ -1423,7 +1996,54 @@ function AccountCard({
           ) : null}
         </div>
       </div>
+      <div className="api-key-account-priority">
+        <label>
+          <span>优先级区间</span>
+          <select
+            aria-label={`设置 ${accountDisplayName(account)} 的优先级区间`}
+            disabled={busy || priorityIdentityBlocked}
+            onChange={(event) => onPriorityIntervalChange(
+              event.target.value
+                ? priorityIntervals.find((interval) => String(interval.id) === event.target.value)?.id ?? null
+                : null,
+            )}
+            value={String(account.priority_interval_id ?? "")}
+          >
+            <option value="">未选定区间</option>
+            {priorityIntervals.map((interval) => (
+              <option key={String(interval.id)} value={String(interval.id)}>
+                {interval.name} [{interval.start_priority}, {interval.end_priority})
+              </option>
+            ))}
+          </select>
+        </label>
+        <div
+          className={
+            "api-key-account-priority-value"
+            + (multiplierUnavailable ? " is-waiting" : "")
+            + (account.priority_sync_error ? " is-error" : "")
+          }
+          title={account.priority_sync_error || priorityState}
+        >
+          <span>调度优先级</span>
+          <div>
+            <strong>{formatPriority(priority)}</strong>
+            {priorityPending ? <><ArrowRight size={13} /><b>{formatPriority(desiredPriority)}</b></> : null}
+          </div>
+          <small>{account.priority_sync_error || priorityState}</small>
+        </div>
+      </div>
       <footer className="api-key-account-card-actions">
+        <button
+          aria-label={channel ? `查看 ${accountDisplayName(account)} 的上游渠道` : `${accountDisplayName(account)} 未分配上游渠道`}
+          className="api-key-icon-button"
+          disabled={!channel}
+          onClick={onShowChannel}
+          title={channel ? "查看上游渠道" : "未分配上游渠道"}
+          type="button"
+        >
+          <Globe2 size={15} />
+        </button>
         <button
           aria-label={"配置 " + accountDisplayName(account)}
           className="api-key-icon-button"
@@ -1460,6 +2080,154 @@ function AccountCard({
   );
 }
 
+function AccountUpstreamHealthChip({
+  checkedAt,
+  displayTimeZone,
+  kind,
+  label,
+  status,
+}: {
+  checkedAt?: string | null;
+  displayTimeZone: string;
+  kind: Extract<UpstreamHealthKind, "key" | "group">;
+  label: string;
+  status?: string | null;
+}) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (!normalized) return null;
+  return (
+    <span
+      className={`api-key-chip api-key-chip--${upstreamStatusTone(normalized)}`}
+      title={
+        `${label}：${upstreamHealthStatusLabel(kind, normalized)}`
+        + (checkedAt ? ` · ${formatDate(checkedAt, displayTimeZone)}` : "")
+      }
+    >
+      {label} {upstreamHealthStatusLabel(kind, normalized)}
+    </span>
+  );
+}
+
+function PriorityIntervalsView({
+  accounts,
+  busy,
+  intervals,
+  onCreate,
+  onDelete,
+  onEdit,
+  onRebalance,
+  rebalancing,
+}: {
+  accounts: UpstreamAccount[];
+  busy: boolean;
+  intervals: PriorityInterval[];
+  onCreate: () => void;
+  onDelete: (interval: PriorityInterval) => void;
+  onEdit: (interval: PriorityInterval) => void;
+  onRebalance: () => void;
+  rebalancing: boolean;
+}) {
+  const orderedIntervals = [...intervals].sort(
+    (left, right) => left.start_priority - right.start_priority || String(left.id).localeCompare(String(right.id)),
+  );
+  return (
+    <section className="api-key-panel api-key-priority-panel" aria-label="优先级区间">
+      <div className="api-key-panel-head">
+        <div>
+          <h2>优先级区间</h2>
+          <p>区间上界不包含；同一区间按综合倍率从低到高自动分配调度优先级。</p>
+        </div>
+        <div className="api-key-toolbar-actions">
+          <button
+            className="api-key-button api-key-button--secondary"
+            disabled={busy || !intervals.length}
+            onClick={onRebalance}
+            type="button"
+          >
+            <Radar className={rebalancing ? "spin" : ""} size={16} />
+            <span>{rebalancing ? "正在重排" : "重新计算"}</span>
+          </button>
+          <button className="api-key-button api-key-button--primary" disabled={busy} onClick={onCreate} type="button">
+            <Plus size={16} />
+            <span>新建区间</span>
+          </button>
+        </div>
+      </div>
+
+      {orderedIntervals.length ? (
+        <div className="api-key-priority-grid">
+          {orderedIntervals.map((interval) => {
+            const assignedAccounts = accounts.filter(
+              (account) => String(account.priority_interval_id ?? "") === String(interval.id),
+            );
+            const sortableCount = assignedAccounts.filter(
+              (account) => accountCompositeMultiplier(account) !== null,
+            ).length;
+            const waitingCount = assignedAccounts.length - sortableCount;
+            const capacity = Math.max(0, interval.end_priority - interval.start_priority);
+            const sharedLastPriorityCount = sortableCount > capacity
+              ? sortableCount - capacity + 1
+              : 0;
+            const effectiveStep = finiteNumber(interval.effective_step) ?? interval.step;
+            return (
+              <article className="api-key-priority-card" key={String(interval.id)}>
+                <header>
+                  <div>
+                    <strong>{interval.name}</strong>
+                    <span className="api-key-mono">[{interval.start_priority}, {interval.end_priority})</span>
+                  </div>
+                  <div className="api-key-row-actions">
+                    <button
+                      aria-label={`编辑优先级区间 ${interval.name}`}
+                      className="api-key-icon-button"
+                      disabled={busy}
+                      onClick={() => onEdit(interval)}
+                      title="编辑区间"
+                      type="button"
+                    >
+                      <Pencil size={15} />
+                    </button>
+                    <button
+                      aria-label={`删除优先级区间 ${interval.name}`}
+                      className="api-key-icon-button api-key-icon-button--danger"
+                      disabled={busy}
+                      onClick={() => onDelete(interval)}
+                      title="删除区间"
+                      type="button"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </header>
+                <div className="api-key-priority-card-stats">
+                  <div><span>设定间隔</span><strong>{interval.step}</strong></div>
+                  <div><span>实际间隔</span><strong>{effectiveStep}</strong></div>
+                  <div><span>已选账号</span><strong>{assignedAccounts.length}</strong></div>
+                  <div><span>参与排序</span><strong>{sortableCount}</strong></div>
+                </div>
+                {effectiveStep < interval.step ? (
+                  <p className="api-key-priority-note">账号数量较多，实际间隔已自动缩短为 {effectiveStep}。</p>
+                ) : null}
+                {sharedLastPriorityCount ? (
+                  <p className="api-key-priority-note is-warning">最后 {sharedLastPriorityCount} 个账号将共用优先级 {interval.end_priority - 1}。</p>
+                ) : null}
+                {waitingCount ? (
+                  <p className="api-key-priority-note is-waiting">{waitingCount} 个账号等待综合倍率，不参与容量和优先级计算。</p>
+                ) : null}
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="api-key-empty">
+          <ListOrdered size={18} />
+          <span>尚未设置优先级区间</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function RateChangeLogView({
   displayTimeZone,
   draftFilters,
@@ -1480,7 +2248,7 @@ function RateChangeLogView({
   filtersApplied: boolean;
   hasMore: boolean;
   loading: boolean;
-  logs: UpstreamRateChangeLog[];
+  logs: UpstreamChangeLog[];
   onApplyFilters: () => void;
   onClearFilters: () => void;
   onDraftFiltersChange: (filters: RateLogFilters) => void;
@@ -1488,14 +2256,14 @@ function RateChangeLogView({
   onRefresh: () => void;
 }) {
   return (
-    <section className="api-key-panel api-key-rate-log-panel" aria-label="倍率变化记录">
+    <section className="api-key-panel api-key-rate-log-panel" aria-label="上游变化记录">
       <div className="api-key-panel-head">
         <div>
-          <h2>倍率变化</h2>
-          <p>仅显示真实倍率变化；综合倍率按分组倍率 × 上游充值倍率折算。</p>
+          <h2>上游变化</h2>
+          <p>记录上游 Key、分组、账号调度与倍率信息；综合倍率按分组倍率 × 上游充值倍率折算。</p>
         </div>
         <button
-          aria-label="刷新倍率变化记录"
+          aria-label="刷新上游变化记录"
           className="api-key-icon-button"
           disabled={loading}
           onClick={onRefresh}
@@ -1562,12 +2330,12 @@ function RateChangeLogView({
       {loading && logs.length === 0 ? (
         <div className="api-key-empty">
           <RefreshCcw className="spin" size={18} />
-          <span>正在读取倍率变化…</span>
+          <span>正在读取上游变化…</span>
         </div>
       ) : logs.length === 0 ? (
         <div className="api-key-empty">
           <History size={18} />
-          <span>{filtersApplied ? "当前日期范围内没有倍率变化" : "暂无倍率变化记录"}</span>
+          <span>{filtersApplied ? "当前日期范围内没有上游变化" : "暂无上游变化记录"}</span>
         </div>
       ) : (
         <div className="api-key-rate-log-list">
@@ -1588,7 +2356,12 @@ function RateChangeLogView({
                   <div className="api-key-rate-log-meta">
                     <StatusChip status={log.status} />
                     <time dateTime={log.created_at}>{formatDate(log.created_at, displayTimeZone)}</time>
-                    <span>{rateChangeReasonLabel(log.reason)}</span>
+                    <span>{upstreamChangeReasonLabel(log.reason)}</span>
+                  </div>
+                  <div className="api-key-upstream-state-list" aria-label="上游状态变化">
+                    <UpstreamStateTransition change={upstreamKeyStatusChange(log)} kind="key" label="Key" />
+                    <UpstreamStateTransition change={upstreamGroupStatusChange(log)} kind="group" label="分组" />
+                    <UpstreamStateTransition change={remoteSchedulableChange(log)} kind="account" label="调度" />
                   </div>
                   {rechargeChanged ? (
                     <span className="api-key-rate-recharge-change">
@@ -1619,6 +2392,33 @@ function RateChangeLogView({
         </div>
       ) : null}
     </section>
+  );
+}
+
+function UpstreamStateTransition({
+  change,
+  kind,
+  label,
+}: {
+  change: UpstreamStateChange;
+  kind: UpstreamHealthKind;
+  label: string;
+}) {
+  const current = change.newValue ?? change.oldValue;
+  const tone = upstreamStatusTone(current || "unknown");
+  return (
+    <span className={`api-key-upstream-transition api-key-chip api-key-chip--${tone}`}>
+      <span>{label}</span>
+      {change.direction === "changed" ? (
+        <span className="api-key-upstream-transition-flow">
+          <b>{upstreamHealthStatusLabel(kind, change.oldValue)}</b>
+          <ArrowRight size={10} />
+          <strong>{upstreamHealthStatusLabel(kind, change.newValue)}</strong>
+        </span>
+      ) : (
+        <strong>{upstreamHealthStatusLabel(kind, current)}</strong>
+      )}
+    </span>
   );
 }
 
@@ -1712,6 +2512,15 @@ function Modal({
   children: React.ReactNode;
 }) {
   const titleId = useId();
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      if (!dialogRef.current?.contains(document.activeElement)) closeButtonRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [dialogRef]);
+
   return (
     <div
       className="api-key-modal-backdrop"
@@ -1719,10 +2528,10 @@ function Modal({
         if (event.target === event.currentTarget && !saving) onClose();
       }}
     >
-      <section aria-labelledby={titleId} aria-modal="true" className="api-key-dialog" ref={dialogRef} role="dialog">
+      <section aria-labelledby={titleId} aria-modal="true" className="api-key-dialog" ref={dialogRef} role="dialog" tabIndex={-1}>
         <div className="api-key-dialog-head">
           <div><p>{eyebrow}</p><h2 id={titleId}>{title}</h2></div>
-          <button aria-label="关闭配置" className="api-key-icon-button" disabled={saving} onClick={onClose} title="关闭" type="button">
+          <button aria-label="关闭弹窗" className="api-key-icon-button" disabled={saving} onClick={onClose} ref={closeButtonRef} title="关闭" type="button">
             <X size={17} />
           </button>
         </div>
@@ -1827,6 +2636,14 @@ function accountSearchText(account: UpstreamAccount) {
     account.selected_group_name,
     account.api_key_hint,
     account.group_multiplier_status,
+    account.upstream_key_status,
+    account.upstream_group_status,
+    account.auto_disabled_reason,
+    account.priority,
+    account.desired_priority,
+    account.priority_interval_name,
+    account.priority_sync_status,
+    account.priority_sync_error,
     account.last_error,
   ].filter(Boolean).join(" ").toLowerCase();
 }
@@ -1838,24 +2655,12 @@ function matchesChannelStatus(channel: UpstreamChannel, filter: StatusFilter) {
   return (channel.accounts || []).some((account) => account.would_change === true);
 }
 
-function matchesAccountStatus(account: UpstreamAccount, filter: StatusFilter) {
-  if (filter === "all") return true;
-  if (filter === "pending") return account.would_change === true;
-  if (filter === "undiscovered") return finiteNumber(account.target_rate) === null;
-  return accountHasAttention(account);
-}
-
 function channelHasAttention(channel: UpstreamChannel) {
   if (channel.last_error || !channel.access_token_set) return true;
   if (resolvedChannelType(channel) === "sub2api" && !channel.refresh_token_set) return true;
   return [channel.status, channel.balance_status, channel.recharge_multiplier_status]
     .filter(Boolean)
     .some((status) => isFailureStatus(status));
-}
-
-function accountHasAttention(account: UpstreamAccount) {
-  if (!account.managed || account.last_error || !account.api_key_set) return true;
-  return [account.group_multiplier_status].filter(Boolean).some((status) => isFailureStatus(status));
 }
 
 function channelStatus(channel: UpstreamChannel) {
@@ -1897,7 +2702,7 @@ function channelDisplayError(channel: UpstreamChannel) {
 function isFailureStatus(status?: string | null) {
   const value = String(status || "").trim().toLowerCase();
   if (value === "default_missing") return false;
-  return /(error|fail|invalid|unavailable|unsupported|missing|blocked|denied)/i.test(value);
+  return /(error|fail|invalid|unavailable|unsupported|missing|not[_-]?found|disabled|expired|exhausted|unassigned|blocked|denied)/i.test(value);
 }
 
 function updateBusyMap(current: Record<string, string>, key: string, action: string | null) {
@@ -1916,6 +2721,61 @@ function finiteNumber(value: unknown): number | null {
 function numberInputValue(value: unknown) {
   const number = finiteNumber(value);
   return number === null ? "" : String(number);
+}
+
+function formatPriority(value: unknown) {
+  const number = finiteNumber(value);
+  return number === null ? "—" : number.toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+}
+
+function priorityStatusLabel(status?: string | null) {
+  const value = String(status || "").trim().toLowerCase();
+  return ({
+    applied: "已同步",
+    apply_failed: "同步失败",
+    failed: "同步失败",
+    multiplier_unavailable: "等待综合倍率",
+    pending: "等待写入",
+    pending_apply: "等待写入",
+    skipped: "保持不变",
+    synced: "已同步",
+    in_sync: "已同步",
+    unchanged: "已同步",
+  } as Record<string, string>)[value] || (value ? statusLabel(value) : "已计算");
+}
+
+function priorityIntervalPayload(form: PriorityIntervalForm): PriorityIntervalInput {
+  const name = form.name.trim();
+  if (!name) throw new Error("请填写区间名称");
+  if (name.length > 100) throw new Error("区间名称不能超过 100 个字符");
+  const startPriority = Number(form.startPriority);
+  const endPriority = Number(form.endPriority);
+  const step = Number(form.step);
+  if (!Number.isSafeInteger(startPriority) || !Number.isSafeInteger(endPriority)) {
+    throw new Error("优先级范围必须使用整数");
+  }
+  if (startPriority < 0) throw new Error("起始优先级不能小于 0");
+  if (endPriority <= startPriority) throw new Error("结束优先级必须大于起始优先级");
+  if (!Number.isSafeInteger(step) || step < 1) throw new Error("优先级间隔必须是大于 0 的整数");
+  return {
+    name,
+    start_priority: startPriority,
+    end_priority: endPriority,
+    step,
+  };
+}
+
+function priorityIntervalAccountCount(interval: PriorityInterval, accounts: UpstreamAccount[]) {
+  const responseCount = finiteNumber(interval.account_count);
+  if (responseCount !== null) return responseCount;
+  return accounts.filter(
+    (account) => String(account.priority_interval_id ?? "") === String(interval.id),
+  ).length;
+}
+
+function channelAccountCount(channel: UpstreamChannel) {
+  const responseCount = finiteNumber(channel.account_count);
+  return responseCount === null ? (channel.accounts || []).length : Math.max(0, Math.trunc(responseCount));
 }
 
 function formatMultiplier(value: unknown) {

@@ -12,6 +12,10 @@ import type {
   MailMessage,
   PhoneImportResult,
   PhoneNumber,
+  PriorityInterval,
+  PriorityIntervalAssignment,
+  PriorityIntervalInput,
+  PriorityRebalanceResult,
   RefreshJob,
   SelectedAccountDeleteItem,
   Sub2ApiPortScanResult,
@@ -28,6 +32,7 @@ import type {
   UpstreamChannelDiscoverAllResult,
   UpstreamChannelsResponse,
   UpstreamChannelUpdate,
+  UpstreamChangeLog,
   UpstreamRateChangeLog,
 } from "./types";
 
@@ -102,17 +107,48 @@ async function request<T>(path: string, init: RequestInit = {}, timeoutMs: numbe
   return (await response.json()) as T;
 }
 
-export function upstreamRateChangeLogsPath(
+type UpstreamChangeLogFilters = { startDate?: string; endDate?: string; timeZone?: string };
+
+function upstreamChangeLogsQuery(
   limit = 50,
   beforeId?: number | null,
-  filters?: { startDate?: string; endDate?: string; timeZone?: string },
+  filters?: UpstreamChangeLogFilters,
 ) {
   const params = new URLSearchParams({ limit: String(limit) });
   if (beforeId) params.set("before_id", String(beforeId));
   if (filters?.startDate) params.set("start_date", filters.startDate);
   if (filters?.endDate) params.set("end_date", filters.endDate);
   if (filters?.timeZone) params.set("time_zone", filters.timeZone);
-  return `/api/upstream-accounts/rate-change-logs?${params.toString()}`;
+  return params.toString();
+}
+
+export function upstreamChangeLogsPath(
+  limit = 50,
+  beforeId?: number | null,
+  filters?: UpstreamChangeLogFilters,
+) {
+  return `/api/upstream-accounts/upstream-change-logs?${upstreamChangeLogsQuery(limit, beforeId, filters)}`;
+}
+
+export function upstreamRateChangeLogsPath(
+  limit = 50,
+  beforeId?: number | null,
+  filters?: UpstreamChangeLogFilters,
+) {
+  return `/api/upstream-accounts/rate-change-logs?${upstreamChangeLogsQuery(limit, beforeId, filters)}`;
+}
+
+async function requestUpstreamChangeLogs(
+  limit = 50,
+  beforeId?: number | null,
+  filters?: UpstreamChangeLogFilters,
+) {
+  try {
+    return await request<UpstreamChangeLog[]>(upstreamChangeLogsPath(limit, beforeId, filters));
+  } catch (error) {
+    if (!(error instanceof ApiError) || ![404, 405].includes(error.status)) throw error;
+    return request<UpstreamChangeLog[]>(upstreamRateChangeLogsPath(limit, beforeId, filters));
+  }
 }
 
 function fallbackHttpErrorMessage(response: Response) {
@@ -235,6 +271,37 @@ export const api = {
     }),
   deletePhone: (id: number) => request<{ message: string }>(`/api/phones/${id}`, { method: "DELETE" }),
   upstreamAccounts: () => request<UpstreamAccount[]>("/api/upstream-accounts"),
+  priorityIntervals: () => request<PriorityInterval[]>("/api/upstream-accounts/priority-intervals"),
+  createPriorityInterval: (payload: PriorityIntervalInput) =>
+    request<PriorityInterval>("/api/upstream-accounts/priority-intervals", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updatePriorityInterval: (intervalId: number | string, payload: PriorityIntervalInput) =>
+    request<PriorityInterval>(`/api/upstream-accounts/priority-intervals/${encodeURIComponent(String(intervalId))}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }, NO_FRONTEND_TIMEOUT),
+  deletePriorityInterval: (intervalId: number | string) =>
+    request<{ message: string }>(`/api/upstream-accounts/priority-intervals/${encodeURIComponent(String(intervalId))}`, {
+      method: "DELETE",
+    }),
+  setUpstreamAccountPriorityInterval: (
+    accountId: number | string,
+    payload: PriorityIntervalAssignment,
+  ) => request<UpstreamAccount>(
+    `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/priority-interval`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    NO_FRONTEND_TIMEOUT,
+  ),
+  rebalancePriorityIntervals: () => request<PriorityRebalanceResult>(
+    "/api/upstream-accounts/priority-intervals/rebalance",
+    { method: "POST" },
+    NO_FRONTEND_TIMEOUT,
+  ),
   updateUpstreamAccount: (accountId: number | string, payload: UpstreamAccountUpdate) =>
     request<UpstreamAccount>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}`, {
       method: "PUT",
@@ -253,10 +320,15 @@ export const api = {
         expected_identity_fingerprint: expectedIdentityFingerprint,
       }),
     }),
+  upstreamChangeLogs: (
+    limit = 50,
+    beforeId?: number | null,
+    filters?: UpstreamChangeLogFilters,
+  ) => requestUpstreamChangeLogs(limit, beforeId, filters),
   upstreamRateChangeLogs: (
     limit = 50,
     beforeId?: number | null,
-    filters?: { startDate?: string; endDate?: string; timeZone?: string },
+    filters?: UpstreamChangeLogFilters,
   ) => request<UpstreamRateChangeLog[]>(upstreamRateChangeLogsPath(limit, beforeId, filters)),
   deleteUpstreamAccount: (accountId: number | string, expectedIdentityFingerprint: string) =>
     request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}`, {
@@ -289,6 +361,12 @@ export const api = {
       90_000,
     ),
   upstreamChannels: () => request<UpstreamChannelsResponse>("/api/upstream-channels"),
+  syncApiKeyInventory: () =>
+    request<UpstreamChannelsResponse>(
+      "/api/upstream-channels/sync-inventory",
+      { method: "POST" },
+      90_000,
+    ),
   updateUpstreamChannel: (channelId: number | string, payload: UpstreamChannelUpdate) =>
     request<UpstreamChannel>(`/api/upstream-channels/${encodeURIComponent(String(channelId))}`, {
       method: "PUT",
@@ -361,4 +439,15 @@ export function upstreamLegacyIdentityBindings(overview: UpstreamChannelsRespons
       sub2api_account_id,
       expected_identity_fingerprint,
     }));
+}
+
+export function upstreamLegacyBindingCounts(overview: UpstreamChannelsResponse) {
+  const accounts = [
+    ...overview.channels.flatMap((channel) => channel.accounts || []),
+    ...overview.unassigned_accounts,
+  ];
+  return {
+    unbound: accounts.filter((account) => account.identity_binding_status === "unbound").length,
+    originRebind: accounts.filter((account) => account.api_key_origin_rebind_required === true).length,
+  };
 }

@@ -7,6 +7,8 @@ import json
 import math
 import re
 import socket
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence
@@ -22,16 +24,22 @@ Resolver = Callable[[str], ResolverResult | Awaitable[ResolverResult]]
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_PINNED_ADDRESSES = 8
 MAX_UPSTREAM_TOKEN_LENGTH = 8192
-DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_TIMEOUT_SECONDS = 3.5
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
+# Upstream key-list requests use page_size=200. Keep detail discovery capable
+# of covering the complete returned page while bounding the request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200
-KEY_REVEAL_CONCURRENCY = 4
+KEY_REVEAL_CONCURRENCY = 20
 NEWAPI_BALANCE_ENDPOINT = "/api/user/self"
 SUB2API_BALANCE_ENDPOINT = "/api/v1/auth/me"
 SUB2API_REFRESH_ENDPOINT = "/api/v1/auth/refresh"
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 DNS_OVER_HTTPS_URL = "https://cloudflare-dns.com/dns-query"
 MAX_DOH_RESPONSE_BYTES = 128 * 1024
+DNS_CACHE_TTL_SECONDS = 15 * 60
+MAX_DNS_CACHE_ENTRIES = 256
+_DNS_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
 
 # These are deliberately fixed.  Discovery never interpolates a user-provided
 # path or query string into an upstream request.
@@ -55,6 +63,22 @@ SUB2API_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/api-keys?page=1&page_size=200",
     "/api/v1/payment/checkout-info",
     "/api/v1/payment/config",
+    SUB2API_BALANCE_ENDPOINT,
+)
+
+NEWAPI_PRIMARY_ENDPOINTS: tuple[str, ...] = (
+    "/api/user/self/groups",
+    "/api/pricing",
+    "/api/user/self",
+    "/api/token/?p=1&page_size=200",
+    "/api/v1/payment/checkout-info",
+    "/api/status",
+)
+SUB2API_PRIMARY_ENDPOINTS: tuple[str, ...] = (
+    "/api/v1/groups/available",
+    "/api/v1/groups/rates",
+    "/api/v1/keys?page=1&page_size=200",
+    "/api/v1/payment/checkout-info",
     SUB2API_BALANCE_ENDPOINT,
 )
 
@@ -89,6 +113,16 @@ class AccountGroupMatch:
     source: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AccountUpstreamState:
+    """Authoritative API-key and group state discovered for one account."""
+
+    key_status: str | None = None
+    group_status: str | None = None
+    group_id: str | None = None
+    group_name: str | None = None
+
+
 @dataclass(slots=True)
 class DiscoveryResult:
     """Safe, presentation-ready result of upstream multiplier discovery."""
@@ -99,6 +133,8 @@ class DiscoveryResult:
     groups: list[GroupOption] = field(default_factory=list)
     matched_group: GroupOption | None = None
     account_group_matches: dict[int, AccountGroupMatch] = field(default_factory=dict)
+    matched_account_state: AccountUpstreamState | None = None
+    account_upstream_states: dict[int, AccountUpstreamState] = field(default_factory=dict)
     discovered_group_multiplier: float | None = None
     discovered_group_multiplier_source: str | None = None
     discovered_recharge_multiplier: float | None = None
@@ -137,6 +173,13 @@ class _BalanceDiscovery:
     unit: str | None = None
     status: str = "unknown"
     message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _AvailableGroupRefs:
+    ids: frozenset[str] = frozenset()
+    names: frozenset[str] = frozenset()
+    authoritative: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +260,7 @@ class UpstreamClient:
         self.timeout_seconds = timeout
         self.max_response_bytes = min(max_response_bytes, MAX_RESPONSE_BYTES)
         self.transport = transport
+        self.cache_dns = resolver is None and transport is None
         self.resolver = resolver or _default_resolver
 
     async def discover(
@@ -230,10 +274,15 @@ class UpstreamClient:
         selected_group_id: str | int | None = None,
         selected_group_name: str | None = None,
         account_api_keys: Mapping[int | str, str] | None = None,
+        optimized_endpoint_fallbacks: bool = False,
     ) -> DiscoveryResult:
         raw_account_api_keys = account_api_keys if isinstance(account_api_keys, Mapping) else {}
         secrets = (api_key, access_token, *raw_account_api_keys.values())
         normalized_account_api_keys = _normalize_account_api_keys(raw_account_api_keys)
+        normalized_api_key = _clean_secret(api_key)
+        target_api_keys = set(normalized_account_api_keys.values())
+        if normalized_api_key is not None:
+            target_api_keys.add(normalized_api_key)
 
         def safe(result: DiscoveryResult) -> DiscoveryResult:
             return _scrub_discovery_result(result, secrets)
@@ -270,7 +319,15 @@ class UpstreamClient:
         endpoints = (
             _ordered_union(NEWAPI_ENDPOINTS, SUB2API_ENDPOINTS)
             if requested_type == "auto"
-            else (NEWAPI_ENDPOINTS if requested_type == "newapi" else SUB2API_ENDPOINTS)
+            else (
+                NEWAPI_PRIMARY_ENDPOINTS
+                if optimized_endpoint_fallbacks and requested_type == "newapi"
+                else SUB2API_PRIMARY_ENDPOINTS
+                if optimized_endpoint_fallbacks and requested_type == "sub2api"
+                else NEWAPI_ENDPOINTS
+                if requested_type == "newapi"
+                else SUB2API_ENDPOINTS
+            )
         )
 
         timeout = httpx.Timeout(self.timeout_seconds)
@@ -314,13 +371,25 @@ class UpstreamClient:
                     fetched = await asyncio.gather(
                         *(fetch_endpoint(endpoint) for endpoint in endpoints)
                     )
+                    if optimized_endpoint_fallbacks and requested_type in {"newapi", "sub2api"}:
+                        primary_responses = dict(zip(endpoints, fetched))
+                        compatibility_endpoints = _missing_compatibility_endpoints(
+                            requested_type,
+                            primary_responses,
+                        )
+                        if compatibility_endpoints:
+                            compatibility_results = await asyncio.gather(
+                                *(fetch_endpoint(endpoint) for endpoint in compatibility_endpoints)
+                            )
+                            endpoints = (*endpoints, *compatibility_endpoints)
+                            fetched = [*fetched, *compatibility_results]
                     candidate_responses = dict(zip(endpoints, fetched))
                     candidate_type = (
                         _detect_upstream_type(candidate_responses)
                         if requested_type == "auto"
                         else requested_type
                     )
-                    if candidate_type in {"newapi", "sub2api"} and normalized_account_api_keys:
+                    if candidate_type in {"newapi", "sub2api"} and target_api_keys:
                         candidate_endpoints = (
                             NEWAPI_ENDPOINTS if candidate_type == "newapi" else SUB2API_ENDPOINTS
                         )
@@ -337,7 +406,7 @@ class UpstreamClient:
                                 normalized_url,
                                 upstream_type=candidate_type,
                                 payloads=candidate_payloads,
-                                target_keys=set(normalized_account_api_keys.values()),
+                                target_keys=target_api_keys,
                                 access_token=access_token,
                                 new_api_user=new_api_user,
                             )
@@ -351,6 +420,12 @@ class UpstreamClient:
                 # failure across the complete fixed endpoint set.
                 if any(result.status_code is not None for result in fetched):
                     break
+            if (
+                self.cache_dns
+                and fetched
+                and not any(result.status_code is not None for result in fetched)
+            ):
+                _invalidate_dns_cache(hostname)
         except Exception:
             return safe(_error_result(requested_type, "configured", "Could not reach upstream service."))
         finally:
@@ -386,7 +461,17 @@ class UpstreamClient:
 
         try:
             groups = _discover_groups(active_type, usable)
-            matched_record = _find_api_key_record(active_type, usable, _clean_secret(api_key))
+            masked_direct_records = _unique_masked_api_key_records(
+                active_type,
+                usable,
+                {normalized_api_key} if normalized_api_key is not None else set(),
+            )
+            matched_record = (
+                revealed_api_key_records.get(normalized_api_key or "")
+                or _find_unique_api_key_record(active_type, usable, normalized_api_key)
+                or masked_direct_records.get(normalized_api_key or "")
+            )
+            available_group_refs = _available_group_refs(active_type, usable)
             matched_group = _select_group(
                 groups,
                 matched_record,
@@ -399,6 +484,18 @@ class UpstreamClient:
                 groups,
                 normalized_account_api_keys,
                 revealed_api_key_records,
+            )
+            matched_account_state = _account_upstream_state_from_record(
+                active_type,
+                matched_record,
+                available_group_refs,
+            )
+            account_upstream_states = _match_account_upstream_states(
+                active_type,
+                usable,
+                normalized_account_api_keys,
+                revealed_api_key_records,
+                available_group_refs,
             )
             for account_group in account_group_matches.values():
                 if (
@@ -436,6 +533,8 @@ class UpstreamClient:
                 groups=groups,
                 matched_group=matched_group,
                 account_group_matches=account_group_matches,
+                matched_account_state=matched_account_state,
+                account_upstream_states=account_upstream_states,
                 discovered_group_multiplier=group_multiplier,
                 discovered_group_multiplier_source=group_source,
                 discovered_recharge_multiplier=recharge_multiplier,
@@ -485,8 +584,16 @@ class UpstreamClient:
         else:
             return {}
 
+        masked_records = _unique_masked_api_key_records(
+            upstream_type,
+            payloads,
+            target_keys,
+        )
         pending_keys = {
-            key for key in target_keys if _find_unique_api_key_record(upstream_type, payloads, key) is None
+            key
+            for key in target_keys
+            if _find_unique_api_key_record(upstream_type, payloads, key) is None
+            and key not in masked_records
         }
         if not pending_keys:
             return {}
@@ -664,6 +771,11 @@ class UpstreamClient:
                 raise ValueError("non-public address is not allowed")
             return (str(direct_ip),)
 
+        if self.cache_dns:
+            cached = _cached_dns_addresses(lowered)
+            if cached is not None:
+                return cached
+
         resolved = self.resolver(lowered)
         if inspect.isawaitable(resolved):
             resolved = await resolved
@@ -681,7 +793,10 @@ class UpstreamClient:
             normalized = str(address)
             if normalized not in validated:
                 validated.append(normalized)
-        return tuple(validated[:MAX_PINNED_ADDRESSES])
+        result = tuple(validated[:MAX_PINNED_ADDRESSES])
+        if self.cache_dns:
+            _store_dns_addresses(lowered, result)
+        return result
 
     async def _request_json(
         self,
@@ -747,6 +862,7 @@ async def discover_upstream(
     selected_group_id: str | int | None = None,
     selected_group_name: str | None = None,
     account_api_keys: Mapping[int | str, str] | None = None,
+    optimized_endpoint_fallbacks: bool = False,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     transport: httpx.AsyncBaseTransport | None = None,
     resolver: Resolver | None = None,
@@ -767,6 +883,7 @@ async def discover_upstream(
         selected_group_id=selected_group_id,
         selected_group_name=selected_group_name,
         account_api_keys=account_api_keys,
+        optimized_endpoint_fallbacks=optimized_endpoint_fallbacks,
     )
 
 
@@ -854,7 +971,6 @@ async def _default_resolver(hostname: str) -> Sequence[str]:
 async def _doh_resolver(hostname: str) -> list[str]:
     """Resolve proxy fake-IP answers through one fixed public DoH service."""
 
-    addresses: list[str] = []
     timeout = httpx.Timeout(DEFAULT_TIMEOUT_SECONDS)
     try:
         async with httpx.AsyncClient(
@@ -863,34 +979,34 @@ async def _doh_resolver(hostname: str) -> list[str]:
             trust_env=False,
             follow_redirects=False,
         ) as client:
-            for record_type in ("A", "AAAA"):
-                async with client.stream(
-                    "GET",
-                    DNS_OVER_HTTPS_URL,
-                    params={"name": hostname, "type": record_type},
-                ) as response:
-                    if response.status_code != 200:
-                        continue
-                    declared_length = _content_length(response.headers.get("content-length"))
-                    if declared_length is not None and declared_length > MAX_DOH_RESPONSE_BYTES:
-                        continue
-                    chunks: list[bytes] = []
-                    size = 0
-                    oversized = False
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > MAX_DOH_RESPONSE_BYTES:
-                            oversized = True
-                            break
-                        chunks.append(chunk)
-                if oversized:
-                    continue
-                payload = json.loads(b"".join(chunks))
+            async def query(record_type: str) -> list[str]:
+                try:
+                    async with client.stream(
+                        "GET",
+                        DNS_OVER_HTTPS_URL,
+                        params={"name": hostname, "type": record_type},
+                    ) as response:
+                        if response.status_code != 200:
+                            return []
+                        declared_length = _content_length(response.headers.get("content-length"))
+                        if declared_length is not None and declared_length > MAX_DOH_RESPONSE_BYTES:
+                            return []
+                        chunks: list[bytes] = []
+                        size = 0
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > MAX_DOH_RESPONSE_BYTES:
+                                return []
+                            chunks.append(chunk)
+                    payload = json.loads(b"".join(chunks))
+                except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+                    return []
                 if not isinstance(payload, dict) or payload.get("Status") not in (0, "0"):
-                    continue
+                    return []
                 answers = payload.get("Answer")
                 if not isinstance(answers, list):
-                    continue
+                    return []
+                addresses: list[str] = []
                 for answer in answers:
                     if not isinstance(answer, dict):
                         continue
@@ -901,9 +1017,43 @@ async def _doh_resolver(hostname: str) -> list[str]:
                         continue
                     if normalized not in addresses:
                         addresses.append(normalized)
+                return addresses
+
+            resolved = await asyncio.gather(query("A"), query("AAAA"))
     except (httpx.HTTPError, json.JSONDecodeError, ValueError):
         return []
-    return addresses
+    return list(dict.fromkeys(address for answers in resolved for address in answers))
+
+
+def _cached_dns_addresses(hostname: str) -> tuple[str, ...] | None:
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        cached = _DNS_CACHE.get(hostname)
+        if cached is None:
+            return None
+        expires_at, addresses = cached
+        if expires_at <= now:
+            _DNS_CACHE.pop(hostname, None)
+            return None
+        return addresses
+
+
+def _store_dns_addresses(hostname: str, addresses: tuple[str, ...]) -> None:
+    if not addresses:
+        return
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE.pop(hostname, None)
+        while len(_DNS_CACHE) >= MAX_DNS_CACHE_ENTRIES:
+            _DNS_CACHE.pop(next(iter(_DNS_CACHE)))
+        _DNS_CACHE[hostname] = (
+            time.monotonic() + DNS_CACHE_TTL_SECONDS,
+            addresses,
+        )
+
+
+def _invalidate_dns_cache(hostname: str) -> None:
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE.pop(hostname.rstrip(".").casefold(), None)
 
 
 def _build_headers(
@@ -1042,6 +1192,17 @@ def _scrub_account_group_match(
     )
 
 
+def _scrub_account_upstream_state(
+    state: AccountUpstreamState,
+    secrets: Iterable[str | None],
+) -> AccountUpstreamState:
+    return replace(
+        state,
+        group_id=_scrub_text(state.group_id, secrets, 160),
+        group_name=_scrub_text(state.group_name, secrets, 160),
+    )
+
+
 def _scrub_discovery_result(
     result: DiscoveryResult,
     secrets: Iterable[str | None],
@@ -1056,11 +1217,22 @@ def _scrub_discovery_result(
         account_id: _scrub_account_group_match(group, secrets)
         for account_id, group in result.account_group_matches.items()
     }
+    scrubbed_account_state = (
+        _scrub_account_upstream_state(result.matched_account_state, secrets)
+        if result.matched_account_state is not None
+        else None
+    )
+    scrubbed_account_states = {
+        account_id: _scrub_account_upstream_state(state, secrets)
+        for account_id, state in result.account_upstream_states.items()
+    }
     return replace(
         result,
         groups=scrubbed_groups,
         matched_group=scrubbed_match,
         account_group_matches=scrubbed_account_matches,
+        matched_account_state=scrubbed_account_state,
+        account_upstream_states=scrubbed_account_states,
         discovered_group_multiplier_source=_scrub_text(
             result.discovered_group_multiplier_source,
             secrets,
@@ -1085,6 +1257,52 @@ def _clean_upstream_type(value: str) -> str | None:
 
 def _ordered_union(*groups: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(item for group in groups for item in group))
+
+
+def _missing_compatibility_endpoints(
+    upstream_type: str,
+    responses: dict[str, _FetchResult],
+) -> tuple[str, ...]:
+    payloads = {
+        endpoint: result.payload
+        for endpoint, result in responses.items()
+        if result.ok and _payload_succeeded(result.payload)
+    }
+    fallbacks: list[str] = []
+    try:
+        groups_missing = not _discover_groups(upstream_type, payloads)
+    except Exception:
+        groups_missing = True
+    if upstream_type == "newapi" and groups_missing:
+        fallbacks.append("/api/v1/groups/available")
+
+    if not any(_iter_api_key_records(upstream_type, payloads)):
+        if upstream_type == "newapi":
+            fallbacks.extend(
+                (
+                    "/api/token/search?p=1&size=200",
+                    "/api/v1/keys?page=1&page_size=200",
+                )
+            )
+        else:
+            fallbacks.append("/api/v1/api-keys?page=1&page_size=200")
+
+    try:
+        _recharge, _source, recharge_status = _discover_recharge_multiplier(
+            upstream_type,
+            payloads,
+        )
+    except Exception:
+        recharge_status = "error"
+    if recharge_status != "ok":
+        fallbacks.append("/api/v1/payment/config")
+        if upstream_type == "newapi":
+            fallbacks.append("/api/status")
+    return tuple(
+        endpoint
+        for endpoint in _ordered_union(fallbacks)
+        if endpoint not in responses
+    )
 
 
 def _payload_succeeded(payload: Any) -> bool:
@@ -1472,6 +1690,181 @@ def _normalize_account_api_keys(
     return normalized
 
 
+def _available_group_refs(
+    upstream_type: str,
+    payloads: dict[str, Any],
+) -> _AvailableGroupRefs:
+    endpoints = (
+        ("/api/user/self/groups", "/api/v1/groups/available")
+        if upstream_type == "newapi"
+        else ("/api/v1/groups/available",)
+    )
+    authoritative = any(
+        endpoint in payloads and isinstance(_unwrap(payloads[endpoint]), (dict, list))
+        for endpoint in endpoints
+    )
+    ids: set[str] = set()
+    names: set[str] = set()
+    for endpoint in endpoints:
+        if endpoint not in payloads:
+            continue
+        for map_key, raw in _group_items(payloads[endpoint], allow_direct_map=True):
+            if isinstance(raw, dict):
+                raw_id = _first_value(raw, ("id", "group_id", "groupId"))
+                raw_name = _first_value(raw, ("name", "group_name", "groupName"))
+                if raw_name is None and map_key is not None and not str(map_key).isdigit():
+                    raw_name = map_key
+                if raw_id is None and map_key is not None:
+                    raw_id = map_key
+            else:
+                raw_id = map_key if map_key is not None and str(map_key).isdigit() else None
+                raw_name = map_key
+            group_id = _clean_identifier(raw_id)
+            group_name = _clean_text(raw_name, 160)
+            if group_id:
+                ids.add(group_id.casefold())
+            if group_name:
+                names.add(group_name.casefold())
+    return _AvailableGroupRefs(
+        ids=frozenset(ids),
+        names=frozenset(names),
+        authoritative=authoritative,
+    )
+
+
+def _normalize_api_key_status(upstream_type: str, record: dict[str, Any]) -> str | None:
+    for field_name in ("enabled", "is_enabled", "isEnabled", "active", "is_active", "isActive"):
+        if field_name in record and isinstance(record[field_name], bool):
+            return "active" if record[field_name] else "disabled"
+
+    raw_status = _first_value(record, ("status", "key_status", "keyStatus", "state"))
+    if isinstance(raw_status, bool):
+        return "active" if raw_status else "disabled"
+    if upstream_type == "newapi" and not isinstance(raw_status, bool):
+        numeric_status = _positive_int64(raw_status)
+        mapped = {
+            1: "active",
+            2: "disabled",
+            3: "quota_exhausted",
+            4: "expired",
+        }.get(numeric_status or 0)
+        if mapped is not None:
+            return mapped
+    if not isinstance(raw_status, str):
+        return None
+    normalized = raw_status.strip().casefold().replace("-", "_").replace(" ", "_")
+    if normalized in {"active", "enabled", "valid", "normal", "available"}:
+        return "active"
+    if normalized in {"disabled", "inactive", "blocked", "revoked", "deactivated"}:
+        return "disabled"
+    if normalized in {"expired", "key_expired"}:
+        return "expired"
+    if normalized in {"quota_exhausted", "exhausted", "quota_depleted"}:
+        return "quota_exhausted"
+    return None
+
+
+def _record_group_identity(record: dict[str, Any]) -> tuple[str | None, str | None, bool]:
+    raw_group = record.get("group")
+    group_present = "group" in record or any(
+        field_name in record
+        for field_name in ("group_id", "groupId", "group_name", "groupName")
+    )
+    if isinstance(raw_group, dict):
+        group_id = _clean_identifier(_first_value(raw_group, ("id", "group_id", "groupId")))
+        group_name = _clean_text(
+            _first_value(raw_group, ("name", "group_name", "groupName")),
+            160,
+        )
+    else:
+        group_id = _clean_identifier(_first_value(record, ("group_id", "groupId")))
+        group_name = _clean_text(_first_value(record, ("group_name", "groupName")), 160)
+        raw_group_text = _clean_text(raw_group, 160) if raw_group is not None else None
+        if raw_group_text:
+            if raw_group_text.isdigit():
+                group_id = group_id or raw_group_text
+            else:
+                group_name = group_name or raw_group_text
+    return group_id, group_name, group_present
+
+
+def _explicit_group_unavailable(record: dict[str, Any]) -> bool:
+    raw_group = record.get("group")
+    if isinstance(raw_group, dict):
+        raw_status = _first_value(
+            raw_group,
+            ("status", "group_status", "groupStatus", "state"),
+        )
+    else:
+        raw_status = _first_value(record, ("group_status", "groupStatus"))
+    if isinstance(raw_status, bool):
+        return not raw_status
+    if not isinstance(raw_status, str):
+        return False
+    normalized = raw_status.strip().casefold().replace("-", "_").replace(" ", "_")
+    return normalized in {"disabled", "inactive", "unavailable", "blocked", "expired"}
+
+
+def _account_upstream_state_from_record(
+    upstream_type: str,
+    record: dict[str, Any] | None,
+    available_groups: _AvailableGroupRefs,
+) -> AccountUpstreamState | None:
+    if record is None:
+        return None
+    key_status = _normalize_api_key_status(upstream_type, record)
+    group_id, group_name, group_present = _record_group_identity(record)
+    if _explicit_group_unavailable(record):
+        group_status: str | None = "unavailable"
+    elif group_present and group_id is None and group_name is None:
+        group_status = "unassigned"
+    elif available_groups.authoritative and (group_id is not None or group_name is not None):
+        matches = bool(
+            (group_id and group_id.casefold() in available_groups.ids)
+            or (group_name and group_name.casefold() in available_groups.names)
+        )
+        group_status = "available" if matches else "unavailable"
+    else:
+        group_status = None
+    if key_status is None and group_status is None and group_id is None and group_name is None:
+        return None
+    return AccountUpstreamState(
+        key_status=key_status,
+        group_status=group_status,
+        group_id=group_id,
+        group_name=group_name,
+    )
+
+
+def _match_account_upstream_states(
+    upstream_type: str,
+    payloads: dict[str, Any],
+    account_api_keys: Mapping[int, str],
+    revealed_records: Mapping[str, dict[str, Any]],
+    available_groups: _AvailableGroupRefs,
+) -> dict[int, AccountUpstreamState]:
+    matches: dict[int, AccountUpstreamState] = {}
+    masked_records = _unique_masked_api_key_records(
+        upstream_type,
+        payloads,
+        set(account_api_keys.values()),
+    )
+    for account_id, api_key in account_api_keys.items():
+        record = (
+            revealed_records.get(api_key)
+            or _find_unique_api_key_record(upstream_type, payloads, api_key)
+            or masked_records.get(api_key)
+        )
+        state = _account_upstream_state_from_record(
+            upstream_type,
+            record,
+            available_groups,
+        )
+        if state is not None:
+            matches[account_id] = state
+    return matches
+
+
 def _match_account_groups(
     upstream_type: str,
     payloads: dict[str, Any],
@@ -1539,7 +1932,7 @@ def _unique_masked_api_key_records(
     payloads: dict[str, Any],
     target_keys: set[str],
 ) -> dict[str, dict[str, Any]]:
-    if upstream_type != "newapi" or not target_keys:
+    if upstream_type not in {"newapi", "sub2api"} or not target_keys:
         return {}
     records = _deduplicated_api_key_records(upstream_type, payloads)
     candidates_by_key: dict[str, list[int]] = {key: [] for key in target_keys}
@@ -2100,6 +2493,7 @@ def _error_result(upstream_type: str, source: str, message: str) -> DiscoveryRes
 
 __all__ = [
     "AccountGroupMatch",
+    "AccountUpstreamState",
     "DEFAULT_TIMEOUT_SECONDS",
     "DiscoveryResult",
     "GroupOption",

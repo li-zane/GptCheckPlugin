@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+from contextlib import AsyncExitStack
 from decimal import Decimal, DecimalException
+from datetime import timezone
+from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
 
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
 from app.core.crypto import decrypt_text, encrypt_text
+from app.core.database import AsyncSessionLocal
 from app.core.upstream_urls import canonicalize_upstream_url, upstream_url_origin
 from app.models import UpstreamAccountConfig, UpstreamChannel, UpstreamRateChangeLog
 from app.schemas import (
@@ -22,11 +27,15 @@ from app.schemas import (
     UpstreamOverviewOut,
 )
 from app.services.sub2api import Sub2ApiClient
+from app.services.events import elapsed_ms
 from app.services.runtime_config import get_runtime_config_service
 from app.services.upstream_accounts import (
     DEFAULT_ENCRYPTION_KEY,
+    INVALID_UPSTREAM_GROUP_STATUSES,
+    INVALID_UPSTREAM_KEY_STATUSES,
     UpstreamAccountService,
     UpstreamAccountServiceError,
+    UpstreamHealthTransition,
     get_upstream_account_service,
     _calculate_target_rate,
     _balance_number,
@@ -43,9 +52,11 @@ from app.services.upstream_client import (
     discover_upstream,
     refresh_sub2api_tokens,
 )
+from app.services.workflow_coordination import get_workflow_coordinator
 
 
 API_KEY_EXPORT_BATCH_SIZE = 200
+logger = logging.getLogger(__name__)
 
 
 class UpstreamChannelService:
@@ -55,16 +66,75 @@ class UpstreamChannelService:
         self,
         sub2api: Sub2ApiClient | None = None,
         accounts: UpstreamAccountService | None = None,
+        priorities: Any | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self.accounts = accounts or UpstreamAccountService(sub2api or Sub2ApiClient())
         self.sub2api = self.accounts.sub2api
+        self._priorities = priorities
+        self._session_factory = session_factory
         self._locks: dict[int, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
         self._inventory_lock = asyncio.Lock()
+        self._discover_all_lock = asyncio.Lock()
+
+    def _priority_service(self):
+        if self._priorities is None:
+            from app.services.upstream_priorities import UpstreamPriorityService
+
+            self._priorities = UpstreamPriorityService(accounts=self.accounts)
+        return self._priorities
+
+    async def _rebalance_priorities_best_effort(
+        self,
+        db: AsyncSession,
+        *,
+        account_ids: set[int] | None = None,
+    ) -> None:
+        try:
+            runtime = get_runtime_config_service()
+            getter = getattr(runtime, "get_upstream_priority_sync_enabled", None)
+            if getter is not None and not bool(await getter()):
+                return
+            if account_ids is not None:
+                if not account_ids:
+                    return
+                await self._priority_service().rebalance(
+                    db,
+                    account_ids=account_ids,
+                )
+            else:
+                await self._priority_service().rebalance(db)
+        except Exception as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            await db.rollback()
+            logger.exception("Priority rebalance failed after an upstream channel mutation.")
 
     async def _lock_for(self, channel_id: int) -> asyncio.Lock:
         async with self._locks_guard:
             return self._locks.setdefault(channel_id, asyncio.Lock())
+
+    @staticmethod
+    def _channel_cache_is_fresh(
+        channel: UpstreamChannelOut,
+        max_age_seconds: int | None,
+    ) -> bool:
+        if (
+            channel.last_discovered_at is None
+            or channel.last_error == "Upstream channel discovery failed."
+        ):
+            return False
+        if max_age_seconds is not None:
+            if max_age_seconds <= 0:
+                return False
+            observed_at = channel.last_discovered_at
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            age_seconds = (_utcnow() - observed_at).total_seconds()
+            if age_seconds < 0 or age_seconds > max_age_seconds:
+                return False
+        return all(account.last_discovered_at is not None for account in channel.accounts)
 
     @staticmethod
     def _default_name(base_url: str) -> str:
@@ -79,6 +149,15 @@ class UpstreamChannelService:
         config.group_multiplier_status = "not_discovered"
         config.target_rate = None
         config.last_discovered_at = None
+        config.upstream_key_status = "not_checked"
+        config.upstream_group_status = "not_checked"
+        config.upstream_health_invalid_count = 0
+        config.upstream_key_checked_at = None
+        config.upstream_group_checked_at = None
+        if config.priority_interval_id is not None:
+            config.desired_priority = None
+            config.priority_sync_status = "multiplier_unavailable"
+            config.priority_sync_error = None
 
     @staticmethod
     def _invalidate_channel(channel: UpstreamChannel) -> None:
@@ -141,23 +220,34 @@ class UpstreamChannelService:
             raise UpstreamAccountServiceError("The upstream channel was not found.", status_code=404)
         return channel
 
-    async def _bound_configs(self, db: AsyncSession, channel_id: int) -> list[UpstreamAccountConfig]:
+    async def _bound_configs(
+        self,
+        db: AsyncSession,
+        channel_id: int,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
+    ) -> list[UpstreamAccountConfig]:
         result = await db.execute(
             select(UpstreamAccountConfig).where(UpstreamAccountConfig.channel_id == channel_id)
         )
-        return await self._filter_current_bindings(list(result.scalars().all()))
+        return await self._filter_current_bindings(
+            list(result.scalars().all()),
+            remote_by_id=remote_by_id,
+        )
 
     async def _filter_current_bindings(
         self,
         configs: list[UpstreamAccountConfig],
+        *,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
     ) -> list[UpstreamAccountConfig]:
         if not configs:
             return []
-        remote_by_id = {
-            account_id: account
-            for account in await self.accounts._remote_accounts()
-            if (account_id := self.accounts._numeric_remote_id(account)) is not None
-        }
+        if remote_by_id is None:
+            remote_by_id = {
+                account_id: account
+                for account in await self.accounts._remote_accounts()
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
+            }
         return [
             config
             for config in configs
@@ -172,6 +262,7 @@ class UpstreamChannelService:
         db: AsyncSession,
         configs: list[UpstreamAccountConfig],
         channel_id: int,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
     ) -> dict[int, str]:
         channel = await self._load_channel(db, channel_id)
         try:
@@ -183,14 +274,16 @@ class UpstreamChannelService:
         async def live_strict_fingerprints(
             candidates: list[UpstreamAccountConfig],
         ) -> dict[int, str]:
-            remote_by_id = {
-                account_id: account
-                for account in await self.accounts._remote_accounts()
-                if (account_id := self.accounts._numeric_remote_id(account)) is not None
-            }
+            live_remote_by_id = remote_by_id
+            if live_remote_by_id is None:
+                live_remote_by_id = {
+                    account_id: account
+                    for account in await self.accounts._remote_accounts()
+                    if (account_id := self.accounts._numeric_remote_id(account)) is not None
+                }
             fingerprints: dict[int, str] = {}
             for config in candidates:
-                remote = remote_by_id.get(config.sub2api_account_id)
+                remote = live_remote_by_id.get(config.sub2api_account_id)
                 if remote is None or self.accounts._config_binding_status(remote, config) != "bound":
                     continue
                 has_stored_key = bool(decrypt_text(config.encrypted_api_key))
@@ -386,25 +479,56 @@ class UpstreamChannelService:
     async def _sync_inventory(
         self,
         db: AsyncSession,
-    ) -> tuple[dict[int, dict[str, Any]], dict[int, UpstreamAccountConfig], dict[int, UpstreamChannel]]:
+    ) -> tuple[
+        dict[int, dict[str, Any]],
+        dict[int, UpstreamAccountConfig],
+        dict[int, UpstreamChannel],
+        bool,
+    ]:
         # Production runs one backend process. Serialize the read-create-commit
         # inventory transaction so overlapping page loads cannot race unique
         # channel/account inserts and escape as an unhandled IntegrityError.
         async with self._inventory_lock:
             return await self._sync_inventory_unlocked(db)
 
+    async def sync_inventory(
+        self,
+        db: AsyncSession,
+    ) -> tuple[
+        dict[int, dict[str, Any]],
+        dict[int, UpstreamAccountConfig],
+        dict[int, UpstreamChannel],
+        bool,
+    ]:
+        """Synchronize the local API-key/channel inventory without remote writes."""
+
+        return await self._sync_inventory(db)
+
     async def _sync_inventory_unlocked(
         self,
         db: AsyncSession,
-    ) -> tuple[dict[int, dict[str, Any]], dict[int, UpstreamAccountConfig], dict[int, UpstreamChannel]]:
+    ) -> tuple[
+        dict[int, dict[str, Any]],
+        dict[int, UpstreamAccountConfig],
+        dict[int, UpstreamChannel],
+        bool,
+    ]:
         remote_by_id = {
             account_id: account
             for account in await self.accounts._remote_accounts()
             if (account_id := self.accounts._numeric_remote_id(account)) is not None
         }
+        config_ids_result = await db.execute(
+            select(UpstreamAccountConfig.sub2api_account_id)
+        )
+        lock_account_ids = sorted(
+            set(remote_by_id).union(int(value) for value in config_ids_result.scalars().all())
+        )
+        await db.rollback()
+        db.expire_all()
         account_locks: list[asyncio.Lock] = []
         try:
-            for account_id in sorted(remote_by_id):
+            for account_id in lock_account_ids:
                 lock = await self.accounts._lock_for(account_id)
                 await lock.acquire()
                 account_locks.append(lock)
@@ -417,7 +541,12 @@ class UpstreamChannelService:
         self,
         db: AsyncSession,
         remote_by_id: dict[int, dict[str, Any]],
-    ) -> tuple[dict[int, dict[str, Any]], dict[int, UpstreamAccountConfig], dict[int, UpstreamChannel]]:
+    ) -> tuple[
+        dict[int, dict[str, Any]],
+        dict[int, UpstreamAccountConfig],
+        dict[int, UpstreamChannel],
+        bool,
+    ]:
         channel_result = await db.execute(select(UpstreamChannel))
         channels = list(channel_result.scalars().all())
         channels_by_url = {item.canonical_base_url: item for item in channels}
@@ -425,6 +554,16 @@ class UpstreamChannelService:
         config_result = await db.execute(select(UpstreamAccountConfig))
         configs = {item.sub2api_account_id: item for item in config_result.scalars().all()}
         changed = False
+        priority_membership_changed = False
+
+        for account_id, config in configs.items():
+            if account_id not in remote_by_id and config.priority_interval_id is not None:
+                config.priority_interval_id = None
+                config.desired_priority = None
+                config.priority_sync_status = "unassigned"
+                config.priority_sync_error = None
+                changed = True
+                priority_membership_changed = True
 
         for account_id in sorted(remote_by_id):
             remote = remote_by_id[account_id]
@@ -448,6 +587,13 @@ class UpstreamChannelService:
                 and self.accounts._config_binding_status(remote, config) != "bound"
                 and not name_only_binding_change
             ):
+                if config.priority_interval_id is not None:
+                    config.priority_interval_id = None
+                    config.desired_priority = None
+                    config.priority_sync_status = "unassigned"
+                    config.priority_sync_error = None
+                    changed = True
+                    priority_membership_changed = True
                 continue
             remote_url = _remote_base_url(remote)
             configured_url: str | None = None
@@ -525,6 +671,10 @@ class UpstreamChannelService:
                     config.remote_name = remote_name
                     changed = True
                 if endpoint_changed and channel is not None:
+                    priority_membership_changed = (
+                        priority_membership_changed
+                        or config.priority_interval_id is not None
+                    )
                     config.channel_id = channel.id
                     config.base_url = canonical_url
                     config.upstream_type = channel.upstream_type
@@ -561,7 +711,7 @@ class UpstreamChannelService:
         channels_by_id = {item.id: item for item in channel_result.scalars().all()}
         config_result = await db.execute(select(UpstreamAccountConfig))
         configs = {item.sub2api_account_id: item for item in config_result.scalars().all()}
-        return remote_by_id, configs, channels_by_id
+        return remote_by_id, configs, channels_by_id, priority_membership_changed
 
     async def _local_recharge(self) -> tuple[float | None, str | None, str]:
         try:
@@ -594,7 +744,9 @@ class UpstreamChannelService:
         local_recharge: float | None,
         local_source: str | None,
         local_status: str,
+        priority_interval_name: str | None = None,
     ) -> UpstreamAccountOut:
+        projected_target_rate = config.target_rate
         if channel is not None:
             group = _decimal_multiplier(config.effective_group_multiplier)
             recharge = _decimal_multiplier(channel.effective_recharge_multiplier)
@@ -604,15 +756,34 @@ class UpstreamChannelService:
                 if group and recharge and local
                 else None
             )
-            config.target_rate = float(target) if target is not None else None
+            projected_target_rate = float(target) if target is not None else None
         base = self.accounts._build_out(
             remote,
             config,
             extra_secrets=self._known_secrets(config, channel),
+            channel_name=channel.display_name if channel is not None else None,
+            priority_interval_name=priority_interval_name,
         )
+        projected_would_change: bool | None = None
+        if base.current_rate is not None and projected_target_rate is not None:
+            current = _decimal_multiplier(base.current_rate, allow_zero=True)
+            target = _decimal_multiplier(projected_target_rate, allow_zero=True)
+            if current is not None and target is not None:
+                projected_would_change = _quantize_rate(current) != _quantize_rate(target)
+        health_update = {
+            "upstream_key_status": config.upstream_key_status or "not_checked",
+            "upstream_group_status": config.upstream_group_status or "not_checked",
+            "upstream_health_invalid_count": min(
+                2,
+                max(0, int(config.upstream_health_invalid_count or 0)),
+            ),
+            "upstream_key_checked_at": config.upstream_key_checked_at,
+            "upstream_group_checked_at": config.upstream_group_checked_at,
+        }
         if channel is None:
             return base.model_copy(
                 update={
+                    **health_update,
                     "channel_id": None,
                     "channel_name": None,
                     "local_recharge_multiplier": local_recharge,
@@ -622,6 +793,7 @@ class UpstreamChannelService:
             )
         return base.model_copy(
             update={
+                **health_update,
                 "channel_id": channel.id,
                 "channel_name": channel.display_name,
                 "base_url": channel.canonical_base_url,
@@ -638,7 +810,8 @@ class UpstreamChannelService:
                 "local_recharge_multiplier": local_recharge,
                 "local_recharge_source": local_source,
                 "local_recharge_status": local_status,
-                "target_rate": config.target_rate,
+                "target_rate": projected_target_rate,
+                "would_change": projected_would_change,
                 "balance_remaining": channel.balance_remaining,
                 "balance_total": channel.balance_total,
                 "balance_used": channel.balance_used,
@@ -647,6 +820,39 @@ class UpstreamChannelService:
                 "balance_message": channel.balance_message,
                 "balance_checked_at": channel.balance_checked_at,
             }
+        )
+
+    async def _inventory_snapshot(
+        self,
+        db: AsyncSession,
+        *,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
+    ) -> tuple[
+        dict[int, dict[str, Any]],
+        dict[int, UpstreamAccountConfig],
+        dict[int, UpstreamChannel],
+    ]:
+        if remote_by_id is None:
+            remote_by_id = {
+                account_id: account
+                for account in await self.accounts._remote_accounts()
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
+            }
+        with db.no_autoflush:
+            config_result = await db.execute(select(UpstreamAccountConfig))
+            configs = {
+                item.sub2api_account_id: item for item in config_result.scalars().all()
+            }
+            channel_result = await db.execute(select(UpstreamChannel))
+            channels_by_id = {item.id: item for item in channel_result.scalars().all()}
+        return (
+            {
+                account_id: remote
+                for account_id, remote in remote_by_id.items()
+                if account_id in configs
+            },
+            configs,
+            channels_by_id,
         )
 
     @staticmethod
@@ -658,6 +864,14 @@ class UpstreamChannelService:
         channel: UpstreamChannel,
         accounts: list[UpstreamAccountOut],
     ) -> UpstreamChannelOut:
+        sorted_accounts = sorted(
+            accounts,
+            key=lambda item: (
+                item.composite_multiplier is None,
+                item.composite_multiplier or 0,
+                item.sub2api_account_id,
+            ),
+        )
         return UpstreamChannelOut(
             id=channel.id,
             display_name=channel.display_name,
@@ -665,6 +879,7 @@ class UpstreamChannelService:
             canonical_base_url=channel.canonical_base_url,
             management_base_url=channel.management_base_url,
             upstream_type=channel.upstream_type if channel.upstream_type in {"auto", "newapi", "sub2api"} else "auto",
+            probe_enabled=bool(channel.probe_enabled),
             resolved_upstream_type=(
                 channel.resolved_upstream_type
                 if channel.resolved_upstream_type in {"newapi", "sub2api"}
@@ -690,12 +905,32 @@ class UpstreamChannelService:
             last_discovered_at=channel.last_discovered_at,
             created_at=channel.created_at,
             updated_at=channel.updated_at,
-            accounts=accounts,
+            account_count=len(sorted_accounts),
+            accounts=sorted_accounts,
         )
 
-    async def overview(self, db: AsyncSession) -> UpstreamOverviewOut:
-        remote_by_id, configs, channels_by_id = await self._sync_inventory(db)
+    async def overview(
+        self,
+        db: AsyncSession,
+        *,
+        sync_inventory: bool = True,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
+    ) -> UpstreamOverviewOut:
+        if sync_inventory:
+            (
+                remote_by_id,
+                configs,
+                channels_by_id,
+                _priority_membership_changed,
+            ) = await self.sync_inventory(db)
+        else:
+            remote_by_id, configs, channels_by_id = await self._inventory_snapshot(
+                db,
+                remote_by_id=remote_by_id,
+            )
         local_recharge, local_source, local_status = await self._local_recharge()
+        priority_intervals = await self._priority_service().list_intervals(db)
+        priority_interval_names = {item.id: item.name for item in priority_intervals}
         grouped: dict[int, list[UpstreamAccountOut]] = {channel_id: [] for channel_id in channels_by_id}
         unassigned: list[UpstreamAccountOut] = []
         for account_id in sorted(remote_by_id):
@@ -706,6 +941,10 @@ class UpstreamChannelService:
                     remote_by_id[account_id],
                     config,
                     extra_secrets=self._known_secrets(config, channel),
+                    channel_name=channel.display_name if channel is not None else None,
+                    priority_interval_name=priority_interval_names.get(
+                        config.priority_interval_id or 0
+                    ),
                 )
                 if channel is None:
                     unassigned.append(account)
@@ -727,6 +966,9 @@ class UpstreamChannelService:
                 local_recharge=local_recharge,
                 local_source=local_source,
                 local_status=local_status,
+                priority_interval_name=priority_interval_names.get(
+                    config.priority_interval_id or 0
+                ),
             )
             if channel is None:
                 unassigned.append(account)
@@ -742,7 +984,15 @@ class UpstreamChannelService:
             local_recharge_source=local_source,
             local_recharge_status=local_status,
             channels=channels,
-            unassigned_accounts=unassigned,
+            unassigned_accounts=sorted(
+                unassigned,
+                key=lambda item: (
+                    item.composite_multiplier is None,
+                    item.composite_multiplier or 0,
+                    item.sub2api_account_id,
+                ),
+            ),
+            priority_intervals=priority_intervals,
         )
 
     async def update_channel(
@@ -756,6 +1006,19 @@ class UpstreamChannelService:
         # overlap.
         async with self._inventory_lock:
             await self._update_channel_locked(db, channel_id, payload)
+        rate_fields = {
+            "base_url",
+            "management_base_url",
+            "upstream_type",
+            "upstream_user_id",
+            "access_token",
+            "clear_access_token",
+            "refresh_token",
+            "clear_refresh_token",
+            "manual_recharge_multiplier",
+        }
+        if payload.model_fields_set & rate_fields:
+            await self._rebalance_priorities_best_effort(db)
         overview = await self.overview(db)
         result = next((item for item in overview.channels if item.id == channel_id), None)
         if result is None:
@@ -813,6 +1076,8 @@ class UpstreamChannelService:
             if "upstream_type" in fields:
                 identity_changed = identity_changed or payload.upstream_type != channel.upstream_type
                 channel.upstream_type = payload.upstream_type
+            if "probe_enabled" in fields and payload.probe_enabled is not None:
+                channel.probe_enabled = payload.probe_enabled
             if "upstream_user_id" in fields:
                 identity_changed = identity_changed or payload.upstream_user_id != channel.upstream_user_id
                 channel.upstream_user_id = payload.upstream_user_id
@@ -864,6 +1129,7 @@ class UpstreamChannelService:
                     group_multiplier_source=None,
                     group_multiplier_status="not_discovered",
                     target_rate=None,
+                    desired_priority=None,
                     last_discovered_at=None,
                 )
             if base_url_changed:
@@ -882,6 +1148,22 @@ class UpstreamChannelService:
                     .values(**account_values)
                     .execution_options(synchronize_session=False)
                 )
+                if identity_changed or "manual_recharge_multiplier" in fields:
+                    await db.execute(
+                        update(UpstreamAccountConfig)
+                        .where(
+                            UpstreamAccountConfig.id.in_(
+                                [config.id for config in bound_configs]
+                            ),
+                            UpstreamAccountConfig.priority_interval_id.is_not(None),
+                        )
+                        .values(
+                            desired_priority=None,
+                            priority_sync_status="multiplier_unavailable",
+                            priority_sync_error=None,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
 
             await db.commit()
             db.expire_all()
@@ -1112,6 +1394,14 @@ class UpstreamChannelService:
         except Exception:
             return False
 
+    @staticmethod
+    def _synchronized_upstream_state(result: Any, account_id: int) -> Any | None:
+        states = _value(result, "account_upstream_states")
+        if not isinstance(states, dict):
+            return None
+        state = states.get(account_id)
+        return state if state is not None else states.get(str(account_id))
+
     async def _reconcile_account_rate(
         self,
         db: AsyncSession,
@@ -1123,6 +1413,12 @@ class UpstreamChannelService:
         previous_local_recharge_multiplier: float | None,
         previous_target_rate: float | None,
         sync_enabled: bool,
+        health_transition: UpstreamHealthTransition,
+        old_remote_schedulable: bool | None,
+        new_remote_schedulable: bool | None,
+        health_action_status: str | None,
+        health_safe_error: str | None,
+        current_remote: dict[str, Any],
     ) -> None:
         group_changed = not self._same_multiplier(
             previous_group_multiplier,
@@ -1140,6 +1436,26 @@ class UpstreamChannelService:
         rate_inputs_changed = (
             group_changed or upstream_recharge_changed or local_recharge_changed
         )
+        key_status_changed = (
+            health_transition.old_key_status != health_transition.new_key_status
+        )
+        group_status_changed = (
+            health_transition.old_group_status != health_transition.new_group_status
+        )
+        schedulable_changed = old_remote_schedulable != new_remote_schedulable
+        upstream_health_invalid = bool(
+            health_transition.new_key_status in INVALID_UPSTREAM_KEY_STATUSES
+            or health_transition.new_group_status in INVALID_UPSTREAM_GROUP_STATUSES
+        )
+        initial_non_invalid_health = bool(
+            health_transition.old_key_status == "not_checked"
+            and health_transition.old_group_status == "not_checked"
+            and not upstream_health_invalid
+        )
+        health_change_should_log = bool(
+            (key_status_changed or group_status_changed)
+            and not initial_non_invalid_health
+        )
         old_upstream_multiplier = self._upstream_multiplier(
             previous_group_multiplier,
             previous_upstream_recharge_multiplier,
@@ -1150,10 +1466,24 @@ class UpstreamChannelService:
         )
         old_current = config.current_rate
         new_current = old_current
-        status = "observed"
-        safe_error: str | None = None
+        status = health_action_status or "observed"
+        safe_error: str | None = health_safe_error
         reason = (
-            "upstream_group_change"
+            "upstream_auto_disable"
+            if health_action_status is not None
+            else "upstream_key_recovered"
+            if key_status_changed
+            and health_transition.new_key_status == "active"
+            and health_transition.old_key_status in INVALID_UPSTREAM_KEY_STATUSES
+            else "upstream_key_status_change"
+            if key_status_changed
+            else "upstream_group_recovered"
+            if group_status_changed
+            and health_transition.new_group_status == "available"
+            and health_transition.old_group_status in INVALID_UPSTREAM_GROUP_STATUSES
+            else "upstream_group_status_change"
+            if group_status_changed
+            else "upstream_group_change"
             if group_changed
             else "upstream_recharge_change"
             if upstream_recharge_changed
@@ -1166,16 +1496,20 @@ class UpstreamChannelService:
 
         target = _decimal_multiplier(config.target_rate)
         source_is_safe = config.group_multiplier_source in {"upstream_key", "manual"}
-        attempted = sync_enabled and target is not None and source_is_safe
+        attempted = (
+            sync_enabled
+            and target is not None
+            and source_is_safe
+            and not upstream_health_invalid
+            and health_action_status is None
+        )
         if attempted:
             try:
                 if not await self._automatic_rate_write_allowed():
                     attempted = False
                     status = "skipped"
                 else:
-                    current = await self.sub2api.get_account_current_rate_multiplier(
-                        config.sub2api_account_id
-                    )
+                    current = self.accounts._remote_current_rate(current_remote)
                     config.current_rate = current
                     old_current = current
                     new_current = current
@@ -1186,9 +1520,6 @@ class UpstreamChannelService:
                         if not await self._automatic_rate_write_allowed():
                             status = "skipped"
                         else:
-                            current_remote = await self.accounts._remote_account(
-                                config.sub2api_account_id
-                            )
                             self.accounts._require_config_binding(current_remote, config)
                             await self.sub2api.update_account_rate_multiplier(
                                 config.sub2api_account_id,
@@ -1216,6 +1547,10 @@ class UpstreamChannelService:
         elif target is None and (rate_inputs_changed or target_changed):
             status = "skipped"
 
+        if health_action_status is not None:
+            status = health_action_status
+            safe_error = health_safe_error
+
         current_drift = (
             target is not None
             and _decimal_multiplier(old_current, allow_zero=True) is not None
@@ -1225,10 +1560,15 @@ class UpstreamChannelService:
             rate_inputs_changed
             or target_changed
             or (attempted and current_drift)
+            or health_change_should_log
+            or schedulable_changed
+            or health_action_status is not None
         ):
             return
-        if status != "apply_failed" and config.target_rate is not None:
+        if status not in {"apply_failed", "disable_failed"} and config.target_rate is not None and not upstream_health_invalid:
             config.last_error = None
+        elif health_safe_error is not None:
+            config.last_error = health_safe_error
         known_secrets = self._known_secrets(config, channel)
         db.add(
             UpstreamRateChangeLog(
@@ -1266,6 +1606,12 @@ class UpstreamChannelService:
                 new_target_rate=config.target_rate,
                 old_current_rate=old_current,
                 new_current_rate=new_current,
+                old_upstream_key_status=health_transition.old_key_status,
+                new_upstream_key_status=health_transition.new_key_status,
+                old_upstream_group_status=health_transition.old_group_status,
+                new_upstream_group_status=health_transition.new_group_status,
+                old_remote_schedulable=old_remote_schedulable,
+                new_remote_schedulable=new_remote_schedulable,
                 reason=reason,
                 status=status,
                 safe_error=safe_error,
@@ -1291,11 +1637,22 @@ class UpstreamChannelService:
             "multiplier": float(multiplier) if multiplier is not None else None,
         }
 
-    async def discover_channel(self, db: AsyncSession, channel_id: int) -> UpstreamChannelOut:
+    async def _discover_channel(
+        self,
+        db: AsyncSession,
+        channel_id: int,
+        *,
+        sync_inventory: bool = True,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
+    ) -> UpstreamChannelOut:
         lock = await self._lock_for(channel_id)
         async with lock:
             channel = await self._load_channel(db, channel_id)
-            configs = await self._bound_configs(db, channel_id)
+            configs = await self._bound_configs(
+                db,
+                channel_id,
+                remote_by_id=remote_by_id,
+            )
             if not configs:
                 raise UpstreamAccountServiceError(
                     "The upstream channel has no identity-bound API key accounts.",
@@ -1303,27 +1660,67 @@ class UpstreamChannelService:
                 )
             access_token = decrypt_text(channel.encrypted_access_token)
             refresh_token = decrypt_text(channel.encrypted_refresh_token)
-            account_api_keys = await self._account_api_keys(db, configs, channel.id)
+            account_api_keys = await self._account_api_keys(
+                db,
+                configs,
+                channel.id,
+                remote_by_id=remote_by_id,
+            )
             account_input_snapshots = {
                 config.sub2api_account_id: self._account_rate_input_snapshot(config)
                 for config in configs
             }
             discovery_base_url = channel.management_base_url or channel.canonical_base_url
-            discovery = discover_upstream(
-                base_url=discovery_base_url,
-                upstream_type=channel.upstream_type,
-                access_token=access_token,
-                new_api_user=channel.upstream_user_id,
-                account_api_keys=account_api_keys,
+            preferred_type = (
+                channel.resolved_upstream_type
+                if channel.upstream_type == "auto"
+                and channel.resolved_upstream_type in {"newapi", "sub2api"}
+                else channel.upstream_type
             )
-            result = await discovery if inspect.isawaitable(discovery) else discovery
-            result_type = str(_value(result, "upstream_type") or "").strip().lower()
-            should_refresh = bool(_value(result, "sub2api_auth_rejected")) and bool(refresh_token) and (
-                result_type == "sub2api"
-                or channel.upstream_type == "sub2api"
+
+            async def run_discovery(active_access_token: str | None, active_type: str) -> Any:
+                discovery = discover_upstream(
+                    base_url=discovery_base_url,
+                    upstream_type=active_type,
+                    access_token=active_access_token,
+                    new_api_user=channel.upstream_user_id,
+                    account_api_keys=account_api_keys,
+                    optimized_endpoint_fallbacks=True,
+                )
+                return await discovery if inspect.isawaitable(discovery) else discovery
+
+            configured_refresh_supported = bool(
+                channel.upstream_type == "sub2api"
                 or channel.resolved_upstream_type == "sub2api"
-                or (channel.upstream_type == "auto" and bool(channel.encrypted_refresh_token))
+                or (channel.upstream_type == "auto" and channel.encrypted_refresh_token)
             )
+            result: Any | None = None
+            # A refresh-only Sub2API channel has no credential with which to
+            # produce a 401. Rotate it before discovery instead of skipping the
+            # only credential that can restore management access.
+            should_refresh = bool(
+                refresh_token
+                and not access_token
+                and configured_refresh_supported
+            )
+            if not should_refresh:
+                result = await run_discovery(access_token, preferred_type)
+                if (
+                    channel.upstream_type == "auto"
+                    and preferred_type != "auto"
+                    and str(_value(result, "status") or "error").strip().lower() != "ok"
+                    and not bool(_value(result, "sub2api_auth_rejected"))
+                ):
+                    result = await run_discovery(access_token, "auto")
+                result_type = str(_value(result, "upstream_type") or "").strip().lower()
+                should_refresh = bool(
+                    _value(result, "sub2api_auth_rejected")
+                    and refresh_token
+                    and (
+                        configured_refresh_supported
+                        or result_type == "sub2api"
+                    )
+                )
             if should_refresh:
                 refreshed = refresh_sub2api_tokens(
                     discovery_base_url,
@@ -1365,22 +1762,34 @@ class UpstreamChannelService:
                         for config in current_configs.scalars().all()
                         if config.channel_id == channel.id
                     ]
-                    configs = await self._filter_current_bindings(configs)
+                    configs = await self._filter_current_bindings(
+                        configs,
+                        remote_by_id=remote_by_id,
+                    )
                     account_api_keys = await self._account_api_keys(
                         db,
                         configs,
                         channel.id,
+                        remote_by_id=remote_by_id,
                     )
 
                     access_token = token_pair.access_token
-                    retry = discover_upstream(
-                        base_url=discovery_base_url,
-                        upstream_type=channel.upstream_type,
-                        access_token=access_token,
-                        new_api_user=channel.upstream_user_id,
-                        account_api_keys=account_api_keys,
-                    )
-                    result = await retry if inspect.isawaitable(retry) else retry
+                    result = await run_discovery(access_token, preferred_type)
+                    if (
+                        channel.upstream_type == "auto"
+                        and preferred_type != "auto"
+                        and str(_value(result, "status") or "error").strip().lower() != "ok"
+                    ):
+                        result = await run_discovery(access_token, "auto")
+            if result is None:
+                result = await run_discovery(access_token, preferred_type)
+                if (
+                    channel.upstream_type == "auto"
+                    and preferred_type != "auto"
+                    and str(_value(result, "status") or "error").strip().lower() != "ok"
+                    and not bool(_value(result, "sub2api_auth_rejected"))
+                ):
+                    result = await run_discovery(access_token, "auto")
             previous_channel_recharge = channel.effective_recharge_multiplier
             discovery_succeeded = self._apply_discovery_to_channel(channel, result)
             await self._apply_api_key_balance_fallback(channel, configs)
@@ -1391,19 +1800,38 @@ class UpstreamChannelService:
                 # Discovery remains read-only if runtime settings are not yet
                 # available during startup or isolated service tests.
                 sync_enabled = False
-            for config in configs:
-                expected_inputs = account_input_snapshots.get(config.sub2api_account_id)
-                if expected_inputs is None:
-                    continue
-                account_lock = await self.accounts._lock_for(config.sub2api_account_id)
-                async with account_lock:
-                    with db.no_autoflush:
-                        current_config_result = await db.execute(
-                            select(UpstreamAccountConfig)
-                            .where(UpstreamAccountConfig.id == config.id)
-                            .execution_options(populate_existing=True)
+            auto_disable_allowed = await self.accounts.automatic_upstream_disable_allowed()
+            async with AsyncExitStack() as account_locks:
+                for config in sorted(
+                    configs,
+                    key=lambda item: item.sub2api_account_id,
+                ):
+                    account_lock = await self.accounts._lock_for(
+                        config.sub2api_account_id
+                    )
+                    await account_locks.enter_async_context(account_lock)
+
+                with db.no_autoflush:
+                    current_config_result = await db.execute(
+                        select(UpstreamAccountConfig)
+                        .where(
+                            UpstreamAccountConfig.id.in_(
+                                [config.id for config in configs]
+                            )
                         )
-                    config = current_config_result.scalar_one_or_none()
+                        .execution_options(populate_existing=True)
+                    )
+                current_configs = {
+                    config.id: config
+                    for config in current_config_result.scalars().all()
+                }
+                for pending_config in configs:
+                    expected_inputs = account_input_snapshots.get(
+                        pending_config.sub2api_account_id
+                    )
+                    if expected_inputs is None:
+                        continue
+                    config = current_configs.get(pending_config.id)
                     if (
                         config is None
                         or config.channel_id != channel.id
@@ -1411,13 +1839,20 @@ class UpstreamChannelService:
                     ):
                         continue
                     try:
-                        current_remote = await self.accounts._remote_account(
-                            config.sub2api_account_id
+                        current_remote = (
+                            remote_by_id.get(config.sub2api_account_id)
+                            if remote_by_id is not None
+                            else await self.accounts._remote_account(
+                                config.sub2api_account_id
+                            )
                         )
+                        if current_remote is None:
+                            continue
                         self.accounts._require_config_binding(current_remote, config)
                     except UpstreamAccountServiceError:
                         continue
                     if not discovery_succeeded:
+                        config.upstream_health_invalid_count = 0
                         config.target_rate = None
                         config.local_recharge_multiplier = local_recharge
                         config.local_recharge_source = local_source
@@ -1427,11 +1862,19 @@ class UpstreamChannelService:
                         config.last_error = (
                             "Upstream channel discovery failed; cached rates were not applied."
                         )
-                        await db.flush()
                         continue
                     previous_group_multiplier = config.effective_group_multiplier
                     previous_local_recharge_multiplier = config.local_recharge_multiplier
                     previous_target_rate = config.target_rate
+                    upstream_state = self._synchronized_upstream_state(
+                        result,
+                        config.sub2api_account_id,
+                    )
+                    health_transition = self.accounts.apply_authoritative_upstream_state(
+                        config,
+                        upstream_state,
+                        now=channel.last_discovered_at or _utcnow(),
+                    )
                     synchronized_group = self._synchronized_group(
                         result,
                         config.sub2api_account_id,
@@ -1439,6 +1882,12 @@ class UpstreamChannelService:
                     if synchronized_group is not None:
                         config.selected_group_id = str(synchronized_group["id"])
                         config.selected_group_name = str(synchronized_group["name"])
+                    elif (
+                        health_transition.observed_group_id is not None
+                        or health_transition.observed_group_name is not None
+                    ):
+                        config.selected_group_id = health_transition.observed_group_id
+                        config.selected_group_name = health_transition.observed_group_name
                     else:
                         # A successful channel response without an unambiguous key
                         # match must not reuse a historical group for billing.
@@ -1459,6 +1908,25 @@ class UpstreamChannelService:
                             config.last_error = (
                                 "The synchronized upstream group does not expose a billing multiplier."
                             )
+                    if health_transition.new_group_status in INVALID_UPSTREAM_GROUP_STATUSES:
+                        config.target_rate = None
+                        config.group_multiplier_status = "group_unavailable"
+                        config.last_error = "The synchronized upstream group is unavailable."
+                    elif health_transition.new_key_status in INVALID_UPSTREAM_KEY_STATUSES:
+                        config.target_rate = None
+                        config.last_error = "The synchronized upstream API key is unavailable."
+                    (
+                        current_remote,
+                        old_remote_schedulable,
+                        new_remote_schedulable,
+                        health_action_status,
+                        health_safe_error,
+                    ) = await self.accounts.maybe_disable_for_upstream_state(
+                        current_remote,
+                        config,
+                        health_transition,
+                        allowed=auto_disable_allowed,
+                    )
                     await self._reconcile_account_rate(
                         db,
                         config,
@@ -1468,27 +1936,96 @@ class UpstreamChannelService:
                         previous_local_recharge_multiplier=previous_local_recharge_multiplier,
                         previous_target_rate=previous_target_rate,
                         sync_enabled=sync_enabled,
+                        health_transition=health_transition,
+                        old_remote_schedulable=old_remote_schedulable,
+                        new_remote_schedulable=new_remote_schedulable,
+                        health_action_status=health_action_status,
+                        health_safe_error=health_safe_error,
+                        current_remote=current_remote,
                     )
-                    # Flush before releasing the shared account lock. SQLite then
-                    # keeps the write transaction ordered until the channel commit.
-                    await db.flush()
+                # Persist the complete channel batch before releasing account
+                # locks so concurrent account edits cannot be overwritten.
+                await db.flush()
             await db.commit()
             await db.refresh(channel)
-        overview = await self.overview(db)
+        if not sync_inventory:
+            return self._channel_out(channel, [])
+        overview = await self.overview(db, sync_inventory=True)
         found = next((item for item in overview.channels if item.id == channel_id), None)
         if found is None:
             raise UpstreamAccountServiceError("The upstream channel has no API key accounts.", status_code=409)
         return found
+
+    async def discover_channel(self, db: AsyncSession, channel_id: int) -> UpstreamChannelOut:
+        async with self._discover_all_lock:
+            result = await self._discover_channel(db, channel_id)
+            await self._rebalance_priorities_best_effort(db)
+            refreshed = await self.overview(db, sync_inventory=False)
+            return next(
+                (item for item in refreshed.channels if item.id == channel_id),
+                result,
+            )
 
     async def discover_all(
         self,
         db: AsyncSession,
         *,
         legacy_bindings: dict[int, str] | None = None,
+        max_concurrency: int = 1,
+        sync_inventory: bool = True,
+        require_management_credentials: bool = False,
+        force: bool = True,
+        cache_max_age_seconds: int | None = 900,
     ) -> UpstreamChannelDiscoverAllOut:
+        async with get_workflow_coordinator().upstream_batch():
+            async with self._discover_all_lock:
+                return await self._discover_all_locked(
+                    db,
+                    legacy_bindings=legacy_bindings,
+                    max_concurrency=max_concurrency,
+                    sync_inventory=sync_inventory,
+                    require_management_credentials=require_management_credentials,
+                    force=force,
+                    cache_max_age_seconds=cache_max_age_seconds,
+                )
+
+    async def _discover_all_locked(
+        self,
+        db: AsyncSession,
+        *,
+        legacy_bindings: dict[int, str] | None = None,
+        max_concurrency: int = 1,
+        sync_inventory: bool = True,
+        require_management_credentials: bool = False,
+        force: bool = True,
+        cache_max_age_seconds: int | None = 900,
+    ) -> UpstreamChannelDiscoverAllOut:
+        started_at = perf_counter()
+        if (
+            isinstance(max_concurrency, bool)
+            or not isinstance(max_concurrency, int)
+            or not 0 <= max_concurrency <= 50
+        ):
+            raise ValueError("max_concurrency must be between 0 and 50.")
         if legacy_bindings is not None:
             await self.accounts.bind_legacy_identities(db, legacy_bindings)
-        overview = await self.overview(db)
+        inventory_started_at = perf_counter()
+        if sync_inventory:
+            remote_by_id, _configs, _channels_by_id, _membership_changed = (
+                await self.sync_inventory(db)
+            )
+        else:
+            remote_by_id = {
+                account_id: account
+                for account in await self.accounts._remote_accounts()
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
+            }
+        inventory_duration_ms = elapsed_ms(inventory_started_at)
+        overview = await self.overview(
+            db,
+            sync_inventory=False,
+            remote_by_id=remote_by_id,
+        )
         if legacy_bindings is not None:
             # The first confirmation can bind a legacy row whose live endpoint
             # differs from its stored channel. Inventory sync then creates the
@@ -1498,12 +2035,95 @@ class UpstreamChannelService:
         channels: list[UpstreamChannelOut] = []
         succeeded = 0
         failed = 0
-        for channel in overview.channels:
-            try:
-                discovered = await self.discover_channel(db, channel.id)
-            except UpstreamAccountServiceError:
+        eligible_channels = [
+            channel
+            for channel in overview.channels
+            if channel.probe_enabled
+            and (
+                not require_management_credentials
+                or channel.access_token_set
+                or (
+                    channel.refresh_token_set
+                    and (
+                        channel.upstream_type in {"auto", "sub2api"}
+                        or channel.resolved_upstream_type == "sub2api"
+                    )
+                )
+            )
+        ]
+        cached_channels = (
+            []
+            if force
+            else [
+                channel
+                for channel in eligible_channels
+                if self._channel_cache_is_fresh(channel, cache_max_age_seconds)
+            ]
+        )
+        cached_channel_ids = {channel.id for channel in cached_channels}
+        channels_to_probe = [
+            channel for channel in eligible_channels if channel.id not in cached_channel_ids
+        ]
+        skipped = len(overview.channels) - len(eligible_channels)
+        effective_concurrency = (
+            len(channels_to_probe) if max_concurrency == 0 else max_concurrency
+        )
+        probe_started_at = perf_counter()
+        if effective_concurrency <= 1:
+            results: list[UpstreamChannelOut | BaseException] = []
+            for channel in channels_to_probe:
+                try:
+                    results.append(
+                        await self._discover_channel(
+                            db,
+                            channel.id,
+                            sync_inventory=False,
+                            remote_by_id=remote_by_id,
+                        )
+                    )
+                except UpstreamAccountServiceError as exc:
+                    results.append(exc)
+        else:
+            # The caller's session may have an active read transaction from the
+            # overview. Release it before worker sessions commit channel-local
+            # changes, then expire the identity map before the final readback.
+            await db.rollback()
+            db.expire_all()
+            session_factory = self._session_factory
+            if session_factory is None:
+                bind = db.bind
+                session_factory = (
+                    async_sessionmaker(bind, expire_on_commit=False)
+                    if bind is not None
+                    else AsyncSessionLocal
+                )
+            semaphore = asyncio.Semaphore(effective_concurrency)
+
+            async def discover_with_session(channel_id: int) -> UpstreamChannelOut:
+                async with semaphore:
+                    async with session_factory() as worker_db:
+                        return await self._discover_channel(
+                            worker_db,
+                            channel_id,
+                            sync_inventory=False,
+                            remote_by_id=remote_by_id,
+                        )
+
+            results = list(
+                await asyncio.gather(
+                    *(discover_with_session(channel.id) for channel in channels_to_probe),
+                    return_exceptions=True,
+                )
+            )
+        probe_duration_ms = elapsed_ms(probe_started_at)
+
+        for result in results:
+            if isinstance(result, UpstreamAccountServiceError):
                 failed += 1
                 continue
+            if isinstance(result, BaseException):
+                raise result
+            discovered = result
             channels.append(discovered)
             discovery_failed = discovered.last_error == "Upstream channel discovery failed."
             if (
@@ -1513,11 +2133,45 @@ class UpstreamChannelService:
                 succeeded += 1
             else:
                 failed += 1
+        eligible_account_ids = {
+            account.sub2api_account_id
+            for channel in eligible_channels
+            for account in channel.accounts
+        }
+        priority_started_at = perf_counter()
+        await self._rebalance_priorities_best_effort(
+            db,
+            account_ids=eligible_account_ids,
+        )
+        priority_duration_ms = elapsed_ms(priority_started_at)
+        try:
+            remote_by_id = {
+                account_id: account
+                for account in await self.accounts._remote_accounts()
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
+            }
+        except UpstreamAccountServiceError:
+            pass
+        db.expire_all()
+        refreshed = await self.overview(
+            db,
+            sync_inventory=False,
+            remote_by_id=remote_by_id,
+        )
         return UpstreamChannelDiscoverAllOut(
             total=len(overview.channels),
             succeeded=succeeded,
             failed=failed,
-            channels=channels,
+            cached=len(cached_channels),
+            skipped=skipped,
+            force=force,
+            cache_max_age_seconds=None if force else cache_max_age_seconds,
+            duration_ms=elapsed_ms(started_at),
+            inventory_duration_ms=inventory_duration_ms,
+            probe_duration_ms=probe_duration_ms,
+            priority_duration_ms=priority_duration_ms,
+            channels=refreshed.channels,
+            overview=refreshed,
         )
 
 
@@ -1527,5 +2181,10 @@ _service: UpstreamChannelService | None = None
 def get_upstream_channel_service() -> UpstreamChannelService:
     global _service
     if _service is None:
-        _service = UpstreamChannelService(accounts=get_upstream_account_service())
+        from app.services.upstream_priorities import get_upstream_priority_service
+
+        _service = UpstreamChannelService(
+            accounts=get_upstream_account_service(),
+            priorities=get_upstream_priority_service(),
+        )
     return _service

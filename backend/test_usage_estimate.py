@@ -279,6 +279,56 @@ class UsageEstimateTests(unittest.TestCase):
         self.assertAlmostEqual(window["remaining_percent"], 20.0)
         self.assertEqual(window["estimate_basis"], "official_window")
 
+    def test_zero_usage_ignores_zero_raw_limit_and_uses_sample_mean(self) -> None:
+        account = {"email": "unused@example.com", "status": "active", "schedulable": True}
+        expected_limits = {"five_hour": 21.0, "seven_day": 140.0}
+        calibrations = {
+            "five_hour": {
+                "plus": {"lower": 18.0, "upper": 24.0, "mean": 21.0, "sigma": 1.0},
+            },
+            "seven_day": {
+                "plus": {"lower": 120.0, "upper": 160.0, "mean": 140.0, "sigma": 5.0},
+            },
+        }
+        windows = {}
+
+        for window_key, expected_limit in expected_limits.items():
+            windows[window_key] = _window_estimate(
+                account=account,
+                usage={
+                    window_key: {
+                        "used_percent": 0.0,
+                        "remaining_seconds": 1_000,
+                        "window_stats": {"cost": 0.0, "limit": 0.0},
+                    }
+                },
+                window_key=window_key,
+                account_key="id:unused",
+                account_id="unused",
+                email="unused@example.com",
+                plan_cohort="plus",
+                usage_states={},
+                limit_calibrations=calibrations,
+            )
+
+            self.assertAlmostEqual(windows[window_key]["spent"], 0.0)
+            self.assertAlmostEqual(windows[window_key]["estimated_limit"], expected_limit)
+            self.assertAlmostEqual(windows[window_key]["remaining"], expected_limit)
+            self.assertEqual(windows[window_key]["estimate_basis"], "sample_limit_zero_usage")
+
+        row = {
+            "usage_estimate_enabled": True,
+            "deactive": False,
+            "error": None,
+            "usage_error": None,
+            "rate_limited": False,
+            **windows,
+        }
+        for window_key, expected_limit in expected_limits.items():
+            aggregate = _aggregate_window([row], window_key)
+            self.assertAlmostEqual(aggregate["estimated_limit"], expected_limit)
+            self.assertAlmostEqual(aggregate["remaining"], expected_limit)
+
     def test_remaining_seconds_without_reset_at_derives_reset_at(self) -> None:
         before = usage_estimate.utcnow()
         usage = usage_estimate.materialize_usage_reset_times(

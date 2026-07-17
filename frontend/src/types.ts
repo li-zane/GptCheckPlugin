@@ -181,6 +181,11 @@ export type SyncResult = {
   duplicate_accounts_ignored: number;
   deleted_accounts: number;
   deleted_mailboxes: number;
+  usage_total?: number;
+  usage_refreshed?: number;
+  usage_skipped?: number;
+  usage_failed?: number;
+  usage_pending?: number;
 };
 
 export type UsageRefreshResult = {
@@ -400,12 +405,20 @@ export type AppSettings = {
   sub2api_x_api_key_hint: string | null;
   sub2api_auto_recover_state: boolean;
   automation_paused: boolean;
+  oauth_account_sync_enabled: boolean;
   recovery_enabled: boolean;
   monitor_interval_seconds: number;
   usage_refresh_enabled: boolean;
   usage_refresh_interval_seconds: number;
   usage_refresh_max_concurrency: number;
+  api_key_account_sync_enabled: boolean;
+  api_key_account_sync_interval_seconds: number;
+  upstream_sync_enabled: boolean;
+  upstream_sync_interval_seconds: number;
+  upstream_sync_max_concurrency: number;
   upstream_rate_sync_enabled: boolean;
+  upstream_priority_sync_enabled: boolean;
+  api_key_auto_disable_on_upstream_unavailable: boolean;
   upstream_rate_log_retention_days: number;
   usage_limit_sample_five_hour_threshold_percent: number;
   usage_limit_sample_seven_day_threshold_percent: number;
@@ -416,6 +429,7 @@ export type AppSettings = {
   browser_min_available_memory_mb: number;
   subscription_refresh_batch_size: number;
   subscription_refresh_max_concurrency: number;
+  account_liveness_max_concurrency: number;
   last_scan_at: string | null;
   last_scan_status: string | null;
   last_scan_message: string | null;
@@ -431,12 +445,20 @@ export type AppSettingsUpdate = {
   confirm_sub2api_credential_rebind?: boolean;
   sub2api_auto_recover_state?: boolean;
   automation_paused?: boolean;
+  oauth_account_sync_enabled?: boolean;
   recovery_enabled?: boolean;
   monitor_interval_seconds?: number;
   usage_refresh_enabled?: boolean;
   usage_refresh_interval_seconds?: number;
   usage_refresh_max_concurrency?: number;
+  api_key_account_sync_enabled?: boolean;
+  api_key_account_sync_interval_seconds?: number;
+  upstream_sync_enabled?: boolean;
+  upstream_sync_interval_seconds?: number;
+  upstream_sync_max_concurrency?: number;
   upstream_rate_sync_enabled?: boolean;
+  upstream_priority_sync_enabled?: boolean;
+  api_key_auto_disable_on_upstream_unavailable?: boolean;
   upstream_rate_log_retention_days?: number;
   usage_limit_sample_five_hour_threshold_percent?: number;
   usage_limit_sample_seven_day_threshold_percent?: number;
@@ -447,6 +469,7 @@ export type AppSettingsUpdate = {
   browser_min_available_memory_mb?: number;
   subscription_refresh_batch_size?: number;
   subscription_refresh_max_concurrency?: number;
+  account_liveness_max_concurrency?: number;
   display_timezone?: string;
   site_name?: string;
 };
@@ -469,6 +492,41 @@ export type UpstreamGroupOption = {
   multiplier: number;
 };
 
+export type PriorityInterval = {
+  id: number | string;
+  name: string;
+  start_priority: number;
+  /** Exclusive upper bound. */
+  end_priority: number;
+  step: number;
+  account_count?: number;
+  effective_step?: number;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type PriorityIntervalInput = {
+  name: string;
+  start_priority: number;
+  end_priority: number;
+  step: number;
+};
+
+export type PriorityIntervalAssignment = {
+  priority_interval_id: number | string | null;
+  expected_identity_fingerprint: string;
+  confirm_identity_rebind?: boolean;
+};
+
+export type PriorityRebalanceResult = {
+  considered?: number;
+  message?: string;
+  total?: number;
+  updated?: number;
+  unchanged?: number;
+  failed?: number;
+};
+
 /**
  * A remote sub2api API-key account enriched with its optional local upstream
  * management state. Most enrichment fields are optional so an unmanaged or
@@ -487,6 +545,13 @@ export type UpstreamAccount = {
   remote_account_type?: string | null;
   remote_status?: string | null;
   remote_schedulable?: boolean | null;
+  priority?: number | null;
+  desired_priority?: number | null;
+  priority_interval_id?: number | string | null;
+  priority_interval_name?: string | null;
+  priority_sync_status?: string | null;
+  priority_sync_error?: string | null;
+  composite_multiplier?: number | null;
   managed?: boolean;
   base_url?: string | null;
   upstream_type?: UpstreamType | null;
@@ -507,6 +572,14 @@ export type UpstreamAccount = {
   effective_group_multiplier?: number | null;
   group_multiplier_source?: string | null;
   group_multiplier_status?: string | null;
+  upstream_key_status?: string | null;
+  upstream_group_status?: string | null;
+  upstream_health_invalid_count?: number;
+  upstream_health_checked_at?: string | null;
+  upstream_key_checked_at?: string | null;
+  upstream_group_checked_at?: string | null;
+  auto_disabled_reason?: string | null;
+  last_auto_disabled_at?: string | null;
   discovered_recharge_multiplier?: number | null;
   effective_recharge_multiplier?: number | null;
   recharge_multiplier_source?: string | null;
@@ -556,6 +629,7 @@ export type UpstreamChannel = {
   canonical_base_url?: string | null;
   management_base_url?: string | null;
   upstream_type?: UpstreamType | null;
+  probe_enabled?: boolean;
   resolved_upstream_type?: Exclude<UpstreamType, "auto"> | null;
   upstream_user_id?: string | null;
   access_token_set?: boolean;
@@ -580,6 +654,7 @@ export type UpstreamChannel = {
   last_discovered_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  account_count?: number;
   accounts?: UpstreamAccount[] | null;
 };
 
@@ -587,6 +662,7 @@ export type UpstreamChannelsResponse = {
   local_recharge_multiplier?: number | null;
   local_recharge_source?: string | null;
   local_recharge_status?: string | null;
+  priority_intervals?: PriorityInterval[];
   channels: UpstreamChannel[];
   unassigned_accounts: UpstreamAccount[];
 };
@@ -595,7 +671,17 @@ export type UpstreamChannelDiscoverAllResult = {
   total: number;
   succeeded: number;
   failed: number;
+  cached?: number;
+  skipped?: number;
+  probe_globally_enabled?: boolean;
+  force?: boolean;
+  cache_max_age_seconds?: number | null;
+  duration_ms?: number | null;
+  inventory_duration_ms?: number | null;
+  probe_duration_ms?: number | null;
+  priority_duration_ms?: number | null;
   channels: UpstreamChannel[];
+  overview?: UpstreamChannelsResponse | null;
 };
 
 export type UpstreamLegacyIdentityBinding = {
@@ -618,6 +704,7 @@ export type UpstreamChannelUpdate = {
   base_url?: string | null;
   management_base_url?: string | null;
   upstream_type?: UpstreamType;
+  probe_enabled?: boolean;
   access_token?: string;
   clear_access_token?: boolean;
   refresh_token?: string;
@@ -627,7 +714,7 @@ export type UpstreamChannelUpdate = {
   manual_recharge_multiplier?: number | null;
 };
 
-export type UpstreamRateChangeLog = {
+export type UpstreamChangeLog = {
   id: number;
   sub2api_account_id: number | string;
   account_name?: string | null;
@@ -649,8 +736,17 @@ export type UpstreamRateChangeLog = {
   new_target_rate?: number | null;
   old_current_rate?: number | null;
   new_current_rate?: number | null;
+  old_upstream_key_status?: string | null;
+  new_upstream_key_status?: string | null;
+  old_upstream_group_status?: string | null;
+  new_upstream_group_status?: string | null;
+  old_remote_schedulable?: boolean | null;
+  new_remote_schedulable?: boolean | null;
   reason?: string | null;
   status: string;
   safe_error?: string | null;
   created_at: string;
 };
+
+/** Compatibility alias for integrations compiled against the earlier name. */
+export type UpstreamRateChangeLog = UpstreamChangeLog;

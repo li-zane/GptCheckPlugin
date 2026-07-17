@@ -58,10 +58,15 @@ async def list_upstream_rate_change_logs(
         (UpstreamRateChangeLog.old_upstream_multiplier, UpstreamRateChangeLog.new_upstream_multiplier),
         (UpstreamRateChangeLog.old_target_rate, UpstreamRateChangeLog.new_target_rate),
         (UpstreamRateChangeLog.old_current_rate, UpstreamRateChangeLog.new_current_rate),
+        (UpstreamRateChangeLog.old_upstream_key_status, UpstreamRateChangeLog.new_upstream_key_status),
+        (UpstreamRateChangeLog.old_upstream_group_status, UpstreamRateChangeLog.new_upstream_group_status),
+        (UpstreamRateChangeLog.old_remote_schedulable, UpstreamRateChangeLog.new_remote_schedulable),
     )
     statement = select(UpstreamRateChangeLog).where(
         or_(
-            UpstreamRateChangeLog.status == "apply_failed",
+            UpstreamRateChangeLog.status.in_(
+                ("apply_failed", "disable_failed", "account_disabled", "already_disabled")
+            ),
             *(
                 and_(old.is_not(None), new.is_not(None), old != new)
                 for old, new in changed_fields

@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
   api,
   NO_FRONTEND_TIMEOUT,
+  upstreamLegacyBindingCounts,
+  upstreamChangeLogsPath,
   upstreamRateChangeLogsPath,
 } from "../src/api.ts";
 import {
@@ -17,26 +20,53 @@ import {
 } from "../src/upstreamAccountForm.ts";
 import { channelCredentialBindingChanged } from "../src/upstreamCredentialBinding.ts";
 import {
+  eventDurationBreakdown,
+  eventDurationMs,
+  formatElapsedDuration,
+  timestampDurationMs,
+} from "../src/durationPresentation.ts";
+import { oauthUsageBackgroundRefreshIntervals } from "../src/oauthUsageRefresh.ts";
+import {
   clearUpstreamOverviewCache,
   readUpstreamOverviewCache,
   sanitizeUpstreamOverview,
   upstreamOverviewCacheKey,
+  upstreamOverviewHasLiveMutationData,
   writeUpstreamOverviewCache,
 } from "../src/upstreamOverviewCache.ts";
-import { rateChangeReasonLabel, upstreamStatusLabel } from "../src/upstreamLabels.ts";
+import {
+  upstreamChangeReasonLabel,
+  upstreamHealthStatusLabel,
+  upstreamStatusLabel,
+} from "../src/upstreamLabels.ts";
 import {
   accountBillingRateChange,
   normalizedUpstreamMultiplier,
+  remoteSchedulableChange,
+  upstreamGroupStatusChange,
+  upstreamKeyStatusChange,
   upstreamRateChange,
   upstreamRechargeRateChange,
 } from "../src/upstreamRatePresentation.ts";
 import {
+  accountCompositeMultiplier,
+  filterUpstreamAccountEntries,
+  flattenUpstreamAccounts,
+  priorityIntervalAssignmentBlocked,
+  priorityIntervalAssignmentNeedsConfirmation,
+  sortUpstreamAccountEntries,
+  upstreamAccountMatchesStatus,
+  upstreamAccountPlatforms,
+} from "../src/upstreamPriorityPresentation.ts";
+import {
   apiAccountSyncMessage,
+  apiAccountLegacyBindingConfirmationMessage,
   accountRateStatusLabel,
   channelDiscoveryErrorMessage,
   channelDiscoverySuccessMessage,
   upstreamDiscoveryCopy,
   upstreamMutationControlsDisabled,
+  upstreamRateWritesAllowed,
 } from "../src/upstreamSyncPresentation.ts";
 import { sortUsageLimitSamples } from "../src/usageSampleSort.ts";
 import type { UpstreamChannelsResponse, UsageLimitSample } from "../src/types.ts";
@@ -75,6 +105,41 @@ const usageSamples: UsageLimitSample[] = [
     updated_at: "2026-07-15T04:00:00Z",
   },
 ];
+
+test("history duration helpers format totals, stages, and refresh jobs", () => {
+  const details = {
+    duration_ms: 1_904,
+    account_list_duration_ms: 420,
+    inventory_duration_ms: "1200",
+    probe_duration_ms: -5,
+  };
+  assert.equal(eventDurationMs(details), 1_904);
+  assert.equal(formatElapsedDuration(532), "532 ms");
+  assert.equal(formatElapsedDuration(1_904), "1.90 秒");
+  assert.equal(formatElapsedDuration(62_000), "1 分 02 秒");
+  assert.deepEqual(
+    eventDurationBreakdown(details).map(({ label, durationMs }) => [label, durationMs]),
+    [["获取账号清单", 420], ["同步本地清单", 1_200], ["探测上游", 0]],
+  );
+  assert.equal(
+    timestampDurationMs("2026-07-17T01:00:00Z", "2026-07-17T01:00:02.500Z"),
+    2_500,
+  );
+  assert.equal(timestampDurationMs(null, null), null);
+});
+
+test("API key dialogs move, trap, and restore keyboard focus", () => {
+  const source = readFileSync(
+    new URL("../src/ApiKeyAccountsView.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /closeButtonRef\.current\?\.focus\(\)/);
+  assert.match(source, /!dialog\.contains\(document\.activeElement\)/);
+  assert.match(source, /\(event\.shiftKey \? last : first\)\.focus\(\)/);
+  assert.match(source, /restoreTarget\?\.isConnected/);
+  assert.match(source, /tabIndex=\{-1\}/);
+});
 
 test("usage samples switch between quota and recorded-time directions", () => {
   assert.deepEqual(sortUsageLimitSamples(usageSamples, "quota", "asc").map((sample) => sample.id), [1, 2]);
@@ -193,6 +258,230 @@ test("stale-sensitive upstream mutations include the expected identity fingerpri
   }
 });
 
+test("API key inventory sync uses the lightweight inventory endpoint", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ path: string; method: string }> = [];
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({ path: String(input), method: String(init?.method || "GET") });
+    return new Response(JSON.stringify({ channels: [], unassigned_accounts: [], priority_intervals: [] }), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  try {
+    await api.syncApiKeyInventory();
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requests, [{
+    path: "/api/upstream-channels/sync-inventory",
+    method: "POST",
+  }]);
+});
+
+test("toolbar account syncs refresh only their affected data", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const syncBlock = source.slice(
+    source.indexOf("const runSyncAction"),
+    source.indexOf("if (authState === \"checking\")"),
+  );
+  assert.match(syncBlock, /api\.syncApiKeyAccounts/);
+  assert.match(syncBlock, /scheduleOAuthUsageBackgroundRefresh\(syncResult\.usage_pending\)/);
+  assert.doesNotMatch(syncBlock, /await loadAll\(\)/);
+  assert.doesNotMatch(syncBlock, /api\.syncApiKeyInventory\(\)/);
+  assert.match(syncBlock, /oauthSyncOperationRef/);
+  assert.match(syncBlock, /apiKeySyncOperationRef/);
+  assert.doesNotMatch(syncBlock, /syncOperationRef\.current/);
+  assert.match(syncBlock, /loadAllRequestSequenceRef\.current \+= 1/);
+  assert.match(syncBlock, /setApiKeyRefreshVersion\(\(current\) => current \+ 1\)/);
+});
+
+test("OAuth sync refreshes usage snapshots in bounded non-blocking retries", () => {
+  assert.deepEqual(oauthUsageBackgroundRefreshIntervals(0), [0]);
+  assert.deepEqual(oauthUsageBackgroundRefreshIntervals(3), [250, 1_000, 2_500, 4_000]);
+
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const syncBlock = source.slice(
+    source.indexOf("const runOAuthSync"),
+    source.indexOf("const runApiKeySync"),
+  );
+  assert.match(syncBlock, /scheduleOAuthUsageBackgroundRefresh\(syncResult\.usage_pending\)/);
+  assert.doesNotMatch(syncBlock, /await scheduleOAuthUsageBackgroundRefresh/);
+});
+
+test("validated API key data is never replaced by the sanitized display cache", () => {
+  const source = readFileSync(
+    new URL("../src/ApiKeyAccountsView.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /if \(!cachedData \|\| hasDataRef\.current\) return/);
+  assert.match(source, /requestSequence\.current \+= 1/);
+  assert.match(source, /upstreamOverviewHasLiveMutationData\(cachedData\)/);
+});
+
+test("sub2api credential changes invalidate the API key display cache", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /payload\.sub2api_x_api_key\?\.trim\(\) \|\| payload\.clear_sub2api_x_api_key/,
+  );
+  assert.match(
+    source,
+    /nextSettings\.sub2api_base_url !== previousSub2ApiBaseUrl\s+\|\| changesSub2ApiCredential/,
+  );
+});
+
+test("priority interval API requests use stable paths and identity-checked assignment", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ path: string; method: string; body: Record<string, unknown> }> = [];
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({
+      path: String(input),
+      method: String(init?.method || "GET"),
+      body: init?.body ? JSON.parse(String(init.body)) : {},
+    });
+    return new Response(JSON.stringify({}), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  const interval = { name: "低成本", start_priority: 40, end_priority: 70, step: 2 };
+  const fingerprint = "c".repeat(64);
+  try {
+    await api.createPriorityInterval(interval);
+    await api.updatePriorityInterval(3, interval);
+    await api.deletePriorityInterval(3);
+    await api.setUpstreamAccountPriorityInterval(9, {
+      priority_interval_id: 3,
+      expected_identity_fingerprint: fingerprint,
+      confirm_identity_rebind: true,
+    });
+    await api.rebalancePriorityIntervals();
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requests.map(({ path, method }) => ({ path, method })), [
+    { path: "/api/upstream-accounts/priority-intervals", method: "POST" },
+    { path: "/api/upstream-accounts/priority-intervals/3", method: "PUT" },
+    { path: "/api/upstream-accounts/priority-intervals/3", method: "DELETE" },
+    { path: "/api/upstream-accounts/9/priority-interval", method: "PUT" },
+    { path: "/api/upstream-accounts/priority-intervals/rebalance", method: "POST" },
+  ]);
+  assert.deepEqual(requests[3].body, {
+    priority_interval_id: 3,
+    expected_identity_fingerprint: fingerprint,
+    confirm_identity_rebind: true,
+  });
+});
+
+test("API key account presentation flattens once, sorts cheap multipliers first, and keeps unavailable last", () => {
+  const overview: UpstreamChannelsResponse = {
+    channels: [{
+      id: 5,
+      display_name: "渠道甲",
+      accounts: [
+        {
+          sub2api_account_id: 2,
+          remote_name: "未知倍率",
+          remote_platform: "anthropic",
+          composite_multiplier: null,
+          priority_interval_id: null,
+        },
+        {
+          sub2api_account_id: 1,
+          remote_name: "低倍率",
+          remote_platform: "OpenAI",
+          composite_multiplier: 0.2,
+          priority_interval_id: 7,
+        },
+        {
+          sub2api_account_id: 3,
+          remote_name: "更低倍率",
+          remote_platform: "openai",
+          effective_group_multiplier: 0.5,
+          effective_recharge_multiplier: 0.2,
+          priority_interval_id: 7,
+        },
+      ],
+    }],
+    unassigned_accounts: [
+      { sub2api_account_id: 1, remote_name: "重复快照", composite_multiplier: 9 },
+      { sub2api_account_id: 4, remote_name: "未分配渠道", remote_platform: null, composite_multiplier: 0.3 },
+    ],
+  };
+  const entries = flattenUpstreamAccounts(overview);
+  assert.deepEqual(sortUpstreamAccountEntries(entries).map(({ account }) => account.sub2api_account_id), [3, 1, 4, 2]);
+  assert.equal(accountCompositeMultiplier(entries.find(({ account }) => account.sub2api_account_id === 3)!.account), 0.1);
+  assert.deepEqual(
+    sortUpstreamAccountEntries(filterUpstreamAccountEntries(entries, {
+      interval: "7",
+      platform: "openai",
+      query: "渠道甲",
+    })).map(({ account }) => account.sub2api_account_id),
+    [3, 1],
+  );
+  assert.deepEqual(
+    filterUpstreamAccountEntries(entries, {
+      interval: "unassigned",
+      platform: "anthropic",
+      query: "",
+    }).map(({ account }) => account.sub2api_account_id),
+    [2],
+  );
+  assert.deepEqual(
+    filterUpstreamAccountEntries(entries, {
+      interval: "unassigned",
+      platform: "__unknown__",
+      query: "",
+    }).map(({ account }) => account.sub2api_account_id),
+    [4],
+  );
+  assert.deepEqual(upstreamAccountPlatforms(entries), {
+    hasUnknown: true,
+    platforms: [
+      { value: "anthropic", label: "anthropic" },
+      { value: "openai", label: "OpenAI" },
+    ],
+  });
+});
+
+test("priority interval assignment allows explicitly claiming legacy identities but blocks mismatches", () => {
+  const unbound = {
+    sub2api_account_id: 1,
+    identity_binding_status: "unbound" as const,
+    identity_rebind_required: true,
+  };
+  const mismatch = {
+    ...unbound,
+    identity_binding_status: "mismatch" as const,
+  };
+  const bound = {
+    ...unbound,
+    identity_binding_status: "bound" as const,
+    identity_rebind_required: false,
+  };
+
+  assert.equal(priorityIntervalAssignmentNeedsConfirmation(unbound), true);
+  assert.equal(priorityIntervalAssignmentBlocked(unbound), false);
+  assert.equal(priorityIntervalAssignmentNeedsConfirmation(mismatch), false);
+  assert.equal(priorityIntervalAssignmentBlocked(mismatch), true);
+  assert.equal(priorityIntervalAssignmentBlocked(bound), false);
+});
+
 async function apiKeySyncRequestBody(
   overview: UpstreamChannelsResponse,
   confirmLegacyBindings: boolean,
@@ -264,6 +553,17 @@ test("confirmed API account sync sends strict identity bindings", async () => {
       { sub2api_account_id: 2, expected_identity_fingerprint: "b".repeat(64) },
     ],
   });
+});
+
+test("legacy API account binding summary matches the confirmation payload", () => {
+  assert.deepEqual(upstreamLegacyBindingCounts(apiKeySyncOverview), {
+    unbound: 1,
+    originRebind: 1,
+  });
+  assert.match(
+    apiAccountLegacyBindingConfirmationMessage({ unbound: 1, originRebind: 1 }),
+    /身份待绑定：1 个[\s\S]*来源待重新绑定：1 个/,
+  );
 });
 
 test("unconfirmed API account sync omits binding confirmation payload", async () => {
@@ -449,9 +749,20 @@ test("session cache is scoped by the complete sub2api URL including API version"
 
 test("session cache strips credentials and credential hints", () => {
   const unsafe = {
+    priority_intervals: [{
+      id: 4,
+      name: "低成本",
+      start_priority: 40,
+      end_priority: 70,
+      step: 2,
+      account_count: 1,
+      effective_step: 2,
+    }],
     channels: [{
       id: 2,
       display_name: "上游",
+      account_count: 1,
+      probe_enabled: false,
       access_token: "secret-access",
       refresh_token: "secret-refresh",
       access_token_set: true,
@@ -463,6 +774,22 @@ test("session cache strips credentials and credential hints", () => {
         encrypted_api_key: "secret-ciphertext",
         api_key_hint: "key-tail",
         api_key_set: true,
+        identity_fingerprint: "a".repeat(64),
+        identity_binding_status: "bound",
+        priority: 40,
+        desired_priority: 42,
+        priority_interval_id: 4,
+        priority_interval_name: "低成本",
+        priority_sync_status: "pending",
+        composite_multiplier: 0.2,
+        upstream_key_status: "disabled",
+        upstream_group_status: "invalid",
+        upstream_health_invalid_count: 2,
+        upstream_health_checked_at: "2026-07-16T08:00:00Z",
+        upstream_key_checked_at: "2026-07-16T08:00:10Z",
+        upstream_group_checked_at: "2026-07-16T08:00:20Z",
+        auto_disabled_reason: "Upstream key is disabled.",
+        last_auto_disabled_at: "2026-07-16T08:01:00Z",
       }],
     }],
     unassigned_accounts: [],
@@ -470,13 +797,61 @@ test("session cache strips credentials and credential hints", () => {
   const safe = sanitizeUpstreamOverview(unsafe);
   assert.ok(safe);
   assert.equal(safe.channels[0].access_token_set, true);
+  assert.equal(safe.channels[0].account_count, 1);
+  assert.equal(safe.channels[0].probe_enabled, false);
   assert.equal(safe.channels[0].accounts?.[0].api_key_set, true);
   assert.equal(safe.channels[0].accounts?.[0].api_key_hint, undefined);
+  assert.equal(safe.channels[0].accounts?.[0].identity_fingerprint, undefined);
   assert.equal(safe.channels[0].accounts?.[0].remote_platform, "anthropic");
+  assert.equal(safe.channels[0].accounts?.[0].priority_interval_id, 4);
+  assert.equal(safe.channels[0].accounts?.[0].composite_multiplier, 0.2);
+  assert.equal(safe.channels[0].accounts?.[0].upstream_key_status, "disabled");
+  assert.equal(safe.channels[0].accounts?.[0].upstream_group_status, "invalid");
+  assert.equal(safe.channels[0].accounts?.[0].upstream_health_invalid_count, 2);
+  assert.equal(safe.channels[0].accounts?.[0].upstream_health_checked_at, "2026-07-16T08:00:00Z");
+  assert.equal(safe.channels[0].accounts?.[0].upstream_key_checked_at, "2026-07-16T08:00:10Z");
+  assert.equal(safe.channels[0].accounts?.[0].upstream_group_checked_at, "2026-07-16T08:00:20Z");
+  assert.equal(safe.channels[0].accounts?.[0].auto_disabled_reason, "Upstream key is disabled.");
+  assert.equal(safe.channels[0].accounts?.[0].last_auto_disabled_at, "2026-07-16T08:01:00Z");
+  assert.deepEqual(safe.priority_intervals, [{
+    id: 4,
+    name: "低成本",
+    start_priority: 40,
+    end_priority: 70,
+    step: 2,
+    account_count: 1,
+    effective_step: 2,
+  }]);
 
   const serialized = JSON.stringify(safe);
   assert.doesNotMatch(serialized, /secret-access|secret-refresh|secret-key|secret-ciphertext|key-tail/);
   assert.doesNotMatch(serialized, /"access_token"|"refresh_token"|"api_key"|"encrypted_api_key"|"api_key_hint"/);
+  assert.equal(upstreamOverviewHasLiveMutationData(safe), false);
+  assert.equal(
+    upstreamOverviewHasLiveMutationData(unsafe as unknown as UpstreamChannelsResponse),
+    true,
+  );
+});
+
+test("account status filters keep rate drift separate from priority and use discovery timestamps", () => {
+  const account = {
+    sub2api_account_id: 8,
+    managed: true,
+    api_key_set: true,
+    would_change: false,
+    priority: 40,
+    desired_priority: 42,
+    priority_sync_status: "pending",
+    last_discovered_at: "2026-07-17T00:00:00Z",
+  };
+  assert.equal(upstreamAccountMatchesStatus(account, "pending"), false);
+  assert.equal(upstreamAccountMatchesStatus({ ...account, would_change: true }, "pending"), true);
+  assert.equal(upstreamAccountMatchesStatus(account, "undiscovered"), false);
+  assert.equal(upstreamAccountMatchesStatus({ ...account, last_discovered_at: null }, "undiscovered"), true);
+  assert.equal(
+    upstreamAccountMatchesStatus({ ...account, identity_rebind_required: true }, "attention"),
+    true,
+  );
 });
 
 test("clearing the cache removes every sub2api scope only", () => {
@@ -532,6 +907,12 @@ test("discovery copy distinguishes read-only probing from rate application", () 
   assert.equal(channelDiscoveryErrorMessage(true, "渠道甲"), "渠道甲 探测并应用失败");
 });
 
+test("global automation pause disables upstream rate-write presentation", () => {
+  assert.equal(upstreamRateWritesAllowed(true, false), true);
+  assert.equal(upstreamRateWritesAllowed(true, true), false);
+  assert.equal(upstreamRateWritesAllowed(false, false), false);
+});
+
 test("API account sync summaries report empty, complete, and partial results", () => {
   assert.equal(
     apiAccountSyncMessage({ total: 0, succeeded: 0, failed: 0 }, false),
@@ -544,6 +925,10 @@ test("API account sync summaries report empty, complete, and partial results", (
   assert.match(
     apiAccountSyncMessage({ total: 3, succeeded: 2, failed: 1 }, true),
     /2\/3 个渠道探测并应用成功，1 个失败/,
+  );
+  assert.match(
+    apiAccountSyncMessage({ total: 3, succeeded: 0, failed: 0, cached: 2, skipped: 1 }, true),
+    /2 个渠道使用缓存，1 个按渠道设置跳过/,
   );
 });
 
@@ -573,12 +958,24 @@ test("cached upstream mutations stay disabled until a live response succeeds", (
   }), true);
 });
 
-test("rate change reasons and statuses use user-facing Chinese labels", () => {
-  assert.equal(rateChangeReasonLabel("upstream_group_change"), "上游分组变化");
-  assert.equal(rateChangeReasonLabel("upstream_recharge_change"), "上游充值成本变化");
-  assert.equal(rateChangeReasonLabel("local_recharge_change"), "本地充值成本变化");
-  assert.equal(rateChangeReasonLabel("target_recalculated"), "目标倍率重算");
-  assert.equal(rateChangeReasonLabel("rate_drift"), "账号倍率偏离目标");
+test("upstream change reasons and statuses use user-facing Chinese labels", () => {
+  assert.equal(upstreamChangeReasonLabel("upstream_group_change"), "上游分组变化");
+  assert.equal(upstreamChangeReasonLabel("upstream_recharge_change"), "上游充值成本变化");
+  assert.equal(upstreamChangeReasonLabel("local_recharge_change"), "本地充值成本变化");
+  assert.equal(upstreamChangeReasonLabel("target_recalculated"), "目标倍率重算");
+  assert.equal(upstreamChangeReasonLabel("rate_drift"), "账号倍率偏离目标");
+  assert.equal(upstreamChangeReasonLabel("upstream_key_disabled"), "上游 Key 已禁用");
+  assert.equal(upstreamChangeReasonLabel("upstream_group_invalid"), "上游分组已失效");
+  assert.equal(upstreamChangeReasonLabel("account_auto_disabled"), "账号已自动禁用");
+  assert.equal(upstreamChangeReasonLabel("upstream_auto_disable"), "上游失效后自动禁用");
+  assert.equal(upstreamChangeReasonLabel("upstream_key_recovered"), "上游 Key 恢复可用");
+  assert.equal(upstreamChangeReasonLabel("upstream_group_recovered"), "上游分组恢复可用");
+  assert.equal(upstreamHealthStatusLabel("key", "disabled"), "已禁用");
+  assert.equal(upstreamHealthStatusLabel("group", "invalid"), "已失效");
+  assert.equal(upstreamHealthStatusLabel("key", "expired"), "已过期");
+  assert.equal(upstreamHealthStatusLabel("key", "quota_exhausted"), "额度耗尽");
+  assert.equal(upstreamHealthStatusLabel("group", "unassigned"), "未分配");
+  assert.equal(upstreamHealthStatusLabel("key", "unknown"), "未确认");
   assert.equal(upstreamStatusLabel("observed"), "已观测");
   assert.equal(upstreamStatusLabel("applied"), "已应用");
   assert.equal(upstreamStatusLabel("apply_failed"), "应用失败");
@@ -661,6 +1058,47 @@ test("upstream recharge changes update the normalized upstream multiplier", () =
   assert.equal(normalized.direction, "increase");
 });
 
+test("upstream health transitions preserve unknown, invalid, and auto-disabled states", () => {
+  const log = {
+    id: 8,
+    sub2api_account_id: 48,
+    old_upstream_key_status: "available",
+    new_upstream_key_status: "disabled",
+    old_upstream_group_status: "available",
+    new_upstream_group_status: "invalid",
+    old_remote_schedulable: true,
+    new_remote_schedulable: false,
+    status: "observed",
+    created_at: "2026-07-16T00:00:00Z",
+  };
+  assert.deepEqual(upstreamKeyStatusChange(log), {
+    oldValue: "available",
+    newValue: "disabled",
+    direction: "changed",
+  });
+  assert.deepEqual(upstreamGroupStatusChange(log), {
+    oldValue: "available",
+    newValue: "invalid",
+    direction: "changed",
+  });
+  assert.deepEqual(remoteSchedulableChange(log), {
+    oldValue: "enabled",
+    newValue: "disabled",
+    direction: "changed",
+  });
+  assert.deepEqual(upstreamKeyStatusChange({
+    id: 9,
+    sub2api_account_id: 49,
+    new_upstream_key_status: "unknown",
+    status: "observed",
+    created_at: "2026-07-16T00:00:00Z",
+  }), {
+    oldValue: null,
+    newValue: "unknown",
+    direction: "unknown",
+  });
+});
+
 test("account billing presentation prefers a changed target over current readback", () => {
   const change = accountBillingRateChange({
     id: 5,
@@ -678,15 +1116,15 @@ test("account billing presentation prefers a changed target over current readbac
   assert.equal(change.direction, "increase");
 });
 
-test("rate log query includes cursor, inclusive date filters, and display time zone", () => {
-  const path = upstreamRateChangeLogsPath(25, 80, {
+test("upstream change log query includes cursor, inclusive date filters, and display time zone", () => {
+  const path = upstreamChangeLogsPath(25, 80, {
     startDate: "2026-07-01",
     endDate: "2026-07-14",
     timeZone: "Asia/Shanghai",
   });
 
   const url = new URL(path, "http://localhost");
-  assert.equal(url.pathname, "/api/upstream-accounts/rate-change-logs");
+  assert.equal(url.pathname, "/api/upstream-accounts/upstream-change-logs");
   assert.deepEqual(Object.fromEntries(url.searchParams), {
     limit: "25",
     before_id: "80",
@@ -694,6 +1132,47 @@ test("rate log query includes cursor, inclusive date filters, and display time z
     end_date: "2026-07-14",
     time_zone: "Asia/Shanghai",
   });
+  assert.equal(
+    new URL(upstreamRateChangeLogsPath(25, 80), "http://localhost").pathname,
+    "/api/upstream-accounts/rate-change-logs",
+  );
+});
+
+test("upstream change API prefers the new ledger and falls back only when unavailable", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  const paths: string[] = [];
+  let newEndpointAvailable = true;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const path = String(input);
+    paths.push(path);
+    if (path.includes("/upstream-change-logs") && !newEndpointAvailable) {
+      return new Response(JSON.stringify({ detail: "Not Found" }), {
+        headers: { "Content-Type": "application/json" },
+        status: 404,
+      });
+    }
+    return new Response("[]", { headers: { "Content-Type": "application/json" }, status: 200 });
+  }) as typeof fetch;
+  try {
+    await api.upstreamChangeLogs(6);
+    assert.match(paths[0], /\/upstream-change-logs\?/);
+    assert.equal(paths.length, 1);
+
+    newEndpointAvailable = false;
+    paths.length = 0;
+    await api.upstreamChangeLogs(6);
+    assert.match(paths[0], /\/upstream-change-logs\?/);
+    assert.match(paths[1], /\/rate-change-logs\?/);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
 });
 
 class MemoryStorage {

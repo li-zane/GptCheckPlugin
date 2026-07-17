@@ -39,7 +39,7 @@ SENSITIVE_ERROR_RE = re.compile(
     r"(?i)((?:access|refresh|id)_token|rt|api_key|password|client_secret|authorization)([\"'\s:=]+)[^\s,}\"']+"
 )
 BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
-RECOVERY_DISABLED_REASON = "Recovery is disabled in settings; refresh was not started."
+RECOVERY_DISABLED_REASON = "Automatic credential refresh is disabled in settings; refresh was not started."
 logger = logging.getLogger(__name__)
 _UNSET = object()
 
@@ -80,13 +80,21 @@ class RefreshService:
         self.account_status = ChatGptAccountStatusChecker(self.settings)
         self.runtime_config = get_runtime_config_service()
         self._running: set[str] = set()
+        self._manual_jobs: set[int] = set()
         self._active_protocol_refreshes = 0
         self._active_browser_refreshes = 0
         self._protocol_concurrency_condition = asyncio.Condition()
         self._browser_concurrency_condition = asyncio.Condition()
 
-    async def enqueue(self, account: dict, reason: str, allow_deactive: bool = False) -> int | None:
-        if not await self.runtime_config.get_recovery_enabled():
+    async def enqueue(
+        self,
+        account: dict,
+        reason: str,
+        allow_deactive: bool = False,
+        *,
+        manual: bool = False,
+    ) -> int | None:
+        if not manual and not await self.runtime_config.get_recovery_enabled():
             return None
         email = self.sub2api.account_email(account)
         if not email:
@@ -115,6 +123,8 @@ class RefreshService:
             await db.refresh(job)
             job_id = job.id
 
+        if manual:
+            self._manual_jobs.add(job_id)
         asyncio.create_task(self._run(job_id, account))
         return job_id
 
@@ -127,15 +137,18 @@ class RefreshService:
         return self._has_local_openai_token_cache(email)
 
     async def enqueue_by_email(self, email: str, reason: str = "manual") -> int | None:
-        if not await self.runtime_config.get_recovery_enabled():
-            return None
         normalized = email.lower()
         accounts, _ = self.sub2api.dedupe_accounts_by_email(
             [account for account in await self.sub2api.list_accounts() if self.sub2api.is_gpt_account(account)]
         )
         for account in accounts:
             if self.sub2api.account_email(account) == normalized:
-                return await self.enqueue(account, reason, allow_deactive=True)
+                return await self.enqueue(
+                    account,
+                    reason,
+                    allow_deactive=True,
+                    manual=True,
+                )
         return None
 
     async def _run(self, job_id: int, account: dict) -> None:
@@ -162,12 +175,13 @@ class RefreshService:
                     await self._safe_record_memory_peak(job_id, email, sampler.peak_rss_bytes)
         finally:
             self._running.discard(email)
+            self._manual_jobs.discard(job_id)
 
     async def _acquire_protocol_slot(self) -> None:
         async with self._protocol_concurrency_condition:
             while True:
                 limit = await self.runtime_config.get_protocol_refresh_max_concurrency()
-                if self._active_protocol_refreshes < limit:
+                if limit == 0 or self._active_protocol_refreshes < limit:
                     self._active_protocol_refreshes += 1
                     return
                 await self._protocol_concurrency_condition.wait()
@@ -181,7 +195,7 @@ class RefreshService:
         async with self._browser_concurrency_condition:
             while True:
                 limit = await self.runtime_config.get_browser_refresh_max_concurrency()
-                if self._active_browser_refreshes < limit:
+                if limit == 0 or self._active_browser_refreshes < limit:
                     self._active_browser_refreshes += 1
                     return
                 await self._browser_concurrency_condition.wait()
@@ -309,7 +323,7 @@ class RefreshService:
             await self._release_protocol_slot()
 
     async def _finish_if_recovery_disabled(self, job_id: int, email: str) -> bool:
-        if await self.runtime_config.get_recovery_enabled():
+        if job_id in self._manual_jobs or await self.runtime_config.get_recovery_enabled():
             return False
         await self._finish(job_id, email, "skipped", RECOVERY_DISABLED_REASON)
         return True

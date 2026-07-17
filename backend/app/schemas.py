@@ -474,6 +474,11 @@ class Sub2ApiSyncResult(MessageResponse):
     duplicate_accounts_ignored: int = 0
     deleted_accounts: int = 0
     deleted_mailboxes: int = 0
+    usage_total: int = 0
+    usage_refreshed: int = 0
+    usage_skipped: int = 0
+    usage_failed: int = 0
+    usage_pending: int = 0
 
 
 class UsageRefreshFailureOut(BaseModel):
@@ -522,12 +527,20 @@ class AppSettingsOut(BaseModel):
     sub2api_x_api_key_hint: str | None
     sub2api_auto_recover_state: bool
     automation_paused: bool
+    oauth_account_sync_enabled: bool
     recovery_enabled: bool
     monitor_interval_seconds: int
     usage_refresh_enabled: bool
     usage_refresh_interval_seconds: int
     usage_refresh_max_concurrency: int
+    api_key_account_sync_enabled: bool
+    api_key_account_sync_interval_seconds: int
+    upstream_sync_enabled: bool
+    upstream_sync_interval_seconds: int
+    upstream_sync_max_concurrency: int
     upstream_rate_sync_enabled: bool
+    upstream_priority_sync_enabled: bool
+    api_key_auto_disable_on_upstream_unavailable: bool
     upstream_rate_log_retention_days: int
     usage_limit_sample_five_hour_threshold_percent: float
     usage_limit_sample_seven_day_threshold_percent: float
@@ -538,6 +551,7 @@ class AppSettingsOut(BaseModel):
     browser_min_available_memory_mb: int
     subscription_refresh_batch_size: int
     subscription_refresh_max_concurrency: int
+    account_liveness_max_concurrency: int
     last_scan_at: datetime | None
     last_scan_status: str | None
     last_scan_message: str | None
@@ -553,22 +567,31 @@ class AppSettingsUpdate(BaseModel):
     confirm_sub2api_credential_rebind: bool = False
     sub2api_auto_recover_state: bool | None = None
     automation_paused: bool | None = None
+    oauth_account_sync_enabled: bool | None = None
     recovery_enabled: bool | None = None
     monitor_interval_seconds: int | None = Field(default=None, ge=30, le=86_400)
     usage_refresh_enabled: bool | None = None
     usage_refresh_interval_seconds: int | None = Field(default=None, ge=60, le=86_400)
-    usage_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=20)
+    usage_refresh_max_concurrency: int | None = Field(default=None, ge=0, le=100)
+    api_key_account_sync_enabled: bool | None = None
+    api_key_account_sync_interval_seconds: int | None = Field(default=None, ge=30, le=86_400)
+    upstream_sync_enabled: bool | None = None
+    upstream_sync_interval_seconds: int | None = Field(default=None, ge=60, le=86_400)
+    upstream_sync_max_concurrency: int | None = Field(default=None, ge=0, le=50)
     upstream_rate_sync_enabled: bool | None = None
+    upstream_priority_sync_enabled: bool | None = None
+    api_key_auto_disable_on_upstream_unavailable: bool | None = None
     upstream_rate_log_retention_days: int | None = Field(default=None, ge=1, le=3650)
     usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges] | None = None
-    refresh_max_concurrency: int | None = Field(default=None, ge=1, le=50)
-    protocol_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=50)
-    browser_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=50)
+    refresh_max_concurrency: int | None = Field(default=None, ge=0, le=50)
+    protocol_refresh_max_concurrency: int | None = Field(default=None, ge=0, le=50)
+    browser_refresh_max_concurrency: int | None = Field(default=None, ge=0, le=50)
     browser_min_available_memory_mb: int | None = Field(default=None, ge=0, le=1_048_576)
     subscription_refresh_batch_size: int | None = Field(default=None, ge=1, le=100)
-    subscription_refresh_max_concurrency: int | None = Field(default=None, ge=1, le=20)
+    subscription_refresh_max_concurrency: int | None = Field(default=None, ge=0, le=20)
+    account_liveness_max_concurrency: int | None = Field(default=None, ge=0, le=50)
     display_timezone: str | None = Field(default=None, min_length=1, max_length=80)
     site_name: str | None = Field(default=None, min_length=1, max_length=80)
 
@@ -614,6 +637,63 @@ class UpstreamGroupOptionOut(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=200)
     multiplier: float = Field(gt=0, le=1000, allow_inf_nan=False)
+
+
+class PriorityIntervalCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    start_priority: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX - 1)
+    end_priority: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    step: int = Field(default=1, ge=1, le=JS_SAFE_INTEGER_MAX)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def strip_name(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "PriorityIntervalCreate":
+        if self.end_priority <= self.start_priority:
+            raise ValueError("end_priority must be greater than start_priority")
+        return self
+
+
+class PriorityIntervalUpdate(PriorityIntervalCreate):
+    pass
+
+
+class PriorityIntervalAssignment(BaseModel):
+    expected_identity_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    priority_interval_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=JS_SAFE_INTEGER_MAX,
+    )
+    confirm_identity_rebind: bool = False
+
+
+class PriorityIntervalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    name: str
+    start_priority: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX - 1)
+    end_priority: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    step: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    account_count: int = Field(default=0, ge=0)
+    effective_step: int = Field(default=1, ge=1, le=JS_SAFE_INTEGER_MAX)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class PriorityRebalanceOut(BaseModel):
+    considered: int = Field(ge=0)
+    updated: int = Field(ge=0)
+    unchanged: int = Field(ge=0)
+    failed: int = Field(ge=0)
 
 
 class UpstreamAccountUpdate(BaseModel):
@@ -677,6 +757,7 @@ class UpstreamChannelUpdate(BaseModel):
     base_url: str | None = Field(default=None, max_length=500)
     management_base_url: str | None = Field(default=None, max_length=500)
     upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
+    probe_enabled: bool | None = None
     upstream_user_id: str | None = Field(default=None, max_length=128)
     access_token: str | None = None
     clear_access_token: bool = False
@@ -783,6 +864,12 @@ class UpstreamRateChangeLogOut(BaseModel):
     new_target_rate: float | None = None
     old_current_rate: float | None = None
     new_current_rate: float | None = None
+    old_upstream_key_status: str | None = None
+    new_upstream_key_status: str | None = None
+    old_upstream_group_status: str | None = None
+    new_upstream_group_status: str | None = None
+    old_remote_schedulable: bool | None = None
+    new_remote_schedulable: bool | None = None
     reason: str
     status: str
     safe_error: str | None = None
@@ -802,6 +889,13 @@ class UpstreamAccountOut(BaseModel):
     remote_account_type: str | None = None
     remote_status: str | None = None
     remote_schedulable: bool | None = None
+    priority: int | None = Field(default=None, ge=0, le=JS_SAFE_INTEGER_MAX)
+    desired_priority: int | None = Field(default=None, ge=0, le=JS_SAFE_INTEGER_MAX)
+    priority_interval_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    priority_interval_name: str | None = None
+    priority_sync_status: str = "unassigned"
+    priority_sync_error: str | None = None
+    composite_multiplier: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     managed: bool
     base_url: str | None = None
     upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
@@ -809,6 +903,13 @@ class UpstreamAccountOut(BaseModel):
     upstream_user_id: str | None = None
     selected_group_id: str | None = None
     selected_group_name: str | None = None
+    upstream_key_status: str = "not_checked"
+    upstream_group_status: str = "not_checked"
+    upstream_health_invalid_count: int = Field(default=0, ge=0, le=2)
+    upstream_key_checked_at: datetime | None = None
+    upstream_group_checked_at: datetime | None = None
+    auto_disabled_reason: str | None = None
+    last_auto_disabled_at: datetime | None = None
     api_key_set: bool = False
     api_key_hint: str | None = None
     access_token_set: bool = False
@@ -850,6 +951,7 @@ class UpstreamChannelOut(BaseModel):
     base_url: str
     management_base_url: str | None = None
     upstream_type: Literal["auto", "newapi", "sub2api"] = "auto"
+    probe_enabled: bool = True
     resolved_upstream_type: Literal["newapi", "sub2api"] | None = None
     access_token_set: bool = False
     refresh_token_set: bool = False
@@ -871,12 +973,14 @@ class UpstreamChannelOut(BaseModel):
     last_discovered_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    account_count: int = Field(default=0, ge=0)
     accounts: list["UpstreamAccountOut"] = Field(default_factory=list)
 
 
 class UpstreamOverviewOut(BaseModel):
     channels: list[UpstreamChannelOut] = Field(default_factory=list)
     unassigned_accounts: list[UpstreamAccountOut] = Field(default_factory=list)
+    priority_intervals: list[PriorityIntervalOut] = Field(default_factory=list)
     local_recharge_multiplier: float | None = None
     local_recharge_source: str | None = None
     local_recharge_status: str | None = None
@@ -886,7 +990,17 @@ class UpstreamChannelDiscoverAllOut(BaseModel):
     total: int = Field(ge=0)
     succeeded: int = Field(ge=0)
     failed: int = Field(ge=0)
+    cached: int = Field(default=0, ge=0)
+    skipped: int = Field(default=0, ge=0)
+    force: bool = True
+    cache_max_age_seconds: int | None = Field(default=None, ge=0)
+    probe_globally_enabled: bool = True
+    duration_ms: int | None = Field(default=None, ge=0)
+    inventory_duration_ms: int | None = Field(default=None, ge=0)
+    probe_duration_ms: int | None = Field(default=None, ge=0)
+    priority_duration_ms: int | None = Field(default=None, ge=0)
     channels: list[UpstreamChannelOut] = Field(default_factory=list)
+    overview: UpstreamOverviewOut | None = None
 
 
 class UpstreamDiscoverAllOut(BaseModel):

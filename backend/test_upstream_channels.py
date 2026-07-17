@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -16,17 +17,23 @@ from app.core.crypto import decrypt_text, encrypt_text
 from app.core.database import Base, get_db
 from app.core.security import require_admin
 from app.core.validation import sanitized_request_validation_handler
-from app.models import UpstreamAccountConfig, UpstreamChannel, UpstreamRateChangeLog
+from app.models import (
+    UpstreamAccountConfig,
+    UpstreamChannel,
+    UpstreamPriorityInterval,
+    UpstreamRateChangeLog,
+)
 from app.schemas import (
     UpstreamAccountUpdate,
     UpstreamChannelDiscoverAllRequest,
     UpstreamChannelDiscoverAllOut,
     UpstreamChannelUpdate,
+    UpstreamOverviewOut,
 )
 from app.services.sub2api import Sub2ApiClient
 from app.services.upstream_accounts import UpstreamAccountServiceError
 from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
-from app.services.upstream_client import Sub2ApiTokenPair
+from app.services.upstream_client import AccountUpstreamState, Sub2ApiTokenPair
 
 
 def nested_keys(value: object) -> set[str]:
@@ -47,6 +54,7 @@ class FakeSub2Api(Sub2ApiClient):
                 "platform": "openai",
                 "type": "apikey",
                 "status": "active",
+                "schedulable": True,
                 "created_at": "2026-07-01T00:00:07Z",
                 "rate_multiplier": 1.0,
                 "credentials": {"base_url": "https://UPSTREAM.example/v1"},
@@ -57,6 +65,7 @@ class FakeSub2Api(Sub2ApiClient):
                 "platform": "anthropic",
                 "type": "api_key",
                 "status": "active",
+                "schedulable": True,
                 "created_at": "2026-07-01T00:00:08Z",
                 "rate_multiplier": 0.5,
                 "credentials": {"base_url": "https://upstream.example/api/v1/"},
@@ -66,6 +75,7 @@ class FakeSub2Api(Sub2ApiClient):
         self.export_calls: list[list[int]] = []
         self.balance_results: dict[int, dict] = {}
         self.rate_update_calls: list[tuple[int, float]] = []
+        self.schedulable_calls: list[tuple[int, bool]] = []
         self.local_credit_per_cny = 10.0
 
     async def list_api_key_accounts(self) -> list[dict]:
@@ -97,6 +107,12 @@ class FakeSub2Api(Sub2ApiClient):
         account = next(item for item in self.accounts if int(item["id"]) == parsed_id)
         account["rate_multiplier"] = rate_multiplier
 
+    async def set_account_schedulable(self, account_id: str | int, schedulable: bool) -> None:
+        parsed_id = int(account_id)
+        self.schedulable_calls.append((parsed_id, schedulable))
+        account = next(item for item in self.accounts if int(item["id"]) == parsed_id)
+        account["schedulable"] = schedulable
+
 
 class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -110,6 +126,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.runtime_config = SimpleNamespace(
             get_upstream_rate_sync_enabled=AsyncMock(return_value=False),
             get_automation_paused=AsyncMock(return_value=False),
+            get_api_key_auto_disable_on_upstream_unavailable=AsyncMock(return_value=False),
+            get_upstream_priority_sync_enabled=AsyncMock(return_value=True),
         )
         self.runtime_config_patcher = patch(
             "app.services.upstream_channels.get_runtime_config_service",
@@ -117,6 +135,12 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.runtime_config_patcher.start()
         self.addCleanup(self.runtime_config_patcher.stop)
+        self.account_runtime_config_patcher = patch(
+            "app.services.upstream_accounts.get_runtime_config_service",
+            return_value=self.runtime_config,
+        )
+        self.account_runtime_config_patcher.start()
+        self.addCleanup(self.account_runtime_config_patcher.stop)
 
     async def asyncTearDown(self) -> None:
         await self.db.close()
@@ -153,6 +177,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         status: str = "ok",
         auth_rejected: bool = False,
         balance_remaining: float | None = 42.75,
+        account_upstream_states: dict[int, AccountUpstreamState] | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             upstream_type="sub2api",
@@ -168,6 +193,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             balance_unit="USD",
             balance_status="ok" if status == "ok" else "error",
             balance_message="Balance available." if status == "ok" else "Credentials rejected.",
+            account_upstream_states=account_upstream_states or {},
         )
 
     async def test_overview_groups_equivalent_v1_urls_into_one_channel(self) -> None:
@@ -187,6 +213,40 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(again.channels), 1)
         channels = await self.db.execute(select(UpstreamChannel))
         self.assertEqual(len(channels.scalars().all()), 1)
+
+    async def test_read_only_overview_does_not_flush_projected_target_rate(self) -> None:
+        overview = await self.service.overview(self.db)
+        channel_id = overview.channels[0].id
+        config = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        channel = await self.db.get(UpstreamChannel, channel_id)
+        self.assertIsNotNone(config)
+        self.assertIsNotNone(channel)
+        config.effective_group_multiplier = 1.0
+        config.target_rate = 9.0
+        channel.effective_recharge_multiplier = 1.0
+        await self.db.commit()
+
+        projected = await self.service.overview(self.db, sync_inventory=False)
+        account = next(
+            item
+            for item in projected.channels[0].accounts
+            if item.sub2api_account_id == 7
+        )
+        self.assertEqual(account.target_rate, 10.0)
+
+        await self.db.execute(select(UpstreamChannel.id))
+        await self.db.commit()
+        async with self.session_factory() as verifier:
+            stored_target = await verifier.scalar(
+                select(UpstreamAccountConfig.target_rate).where(
+                    UpstreamAccountConfig.sub2api_account_id == 7
+                )
+            )
+        self.assertEqual(stored_target, 9.0)
 
     async def test_concurrent_overview_serializes_inventory_creation(self) -> None:
         async with self.session_factory() as first_db, self.session_factory() as second_db:
@@ -1014,6 +1074,70 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         serialized = str(result.model_dump())
         for secret in self.sub2api.exported_api_keys.values():
             self.assertNotIn(secret, serialized)
+
+    async def test_automatic_discovery_does_not_sync_new_api_key_inventory(self) -> None:
+        initial = await self.service.overview(self.db)
+        initial_channel_ids = {channel.id for channel in initial.channels}
+        initial_config_rows = (
+            await self.db.execute(select(UpstreamAccountConfig))
+        ).scalars().all()
+        initial_bindings = {
+            row.sub2api_account_id: (row.channel_id, row.remote_identity_fingerprint)
+            for row in initial_config_rows
+        }
+        self.sub2api.accounts.append(
+            {
+                "id": 9,
+                "name": "gamma",
+                "platform": "openai",
+                "type": "apikey",
+                "status": "active",
+                "schedulable": True,
+                "created_at": "2026-07-01T00:00:09Z",
+                "rate_multiplier": 0.75,
+                "credentials": {"base_url": "https://new-upstream.example/v1"},
+            }
+        )
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=self._discovery_result()),
+        ):
+            automatic = await self.service.discover_all(
+                self.db,
+                sync_inventory=False,
+            )
+
+        self.assertEqual(automatic.total, 1)
+        after_automatic_configs = (
+            await self.db.execute(select(UpstreamAccountConfig))
+        ).scalars().all()
+        self.assertEqual(
+            {
+                row.sub2api_account_id: (row.channel_id, row.remote_identity_fingerprint)
+                for row in after_automatic_configs
+            },
+            initial_bindings,
+        )
+        after_automatic_channels = (
+            await self.db.execute(select(UpstreamChannel))
+        ).scalars().all()
+        self.assertEqual({channel.id for channel in after_automatic_channels}, initial_channel_ids)
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=self._discovery_result()),
+        ):
+            manual = await self.service.discover_all(self.db)
+
+        self.assertEqual(manual.total, 2)
+        added = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 9
+            )
+        )
+        self.assertIsNotNone(added)
+        self.assertIsNotNone(added.channel_id)
 
     async def test_missing_recharge_field_clears_stale_discovered_value(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
@@ -1995,6 +2119,47 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.balance_remaining, 46.226)
         self.assertTrue(channel.refresh_token_set)
 
+    async def test_refresh_only_sub2api_channel_is_eligible_for_batch_discovery(self) -> None:
+        channel_id = await self._configure_sub2api_credentials(
+            access_token="",
+            refresh_token="rt-refresh-only-private",
+        )
+        new_access_token = "at-restored-private"
+        new_refresh_token = "rt-rotated-private"
+
+        with (
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=self._discovery_result()),
+            ) as discover,
+            patch(
+                "app.services.upstream_channels.refresh_sub2api_tokens",
+                new=AsyncMock(
+                    return_value=Sub2ApiTokenPair(
+                        access_token=new_access_token,
+                        refresh_token=new_refresh_token,
+                    )
+                ),
+            ) as refresh,
+        ):
+            result = await self.service.discover_all(
+                self.db,
+                max_concurrency=1,
+                require_management_credentials=True,
+            )
+
+        self.assertEqual((result.succeeded, result.failed, result.skipped), (1, 0, 0))
+        refresh.assert_awaited_once_with(
+            "https://upstream.example",
+            "rt-refresh-only-private",
+        )
+        discover.assert_awaited_once()
+        self.assertEqual(discover.await_args.kwargs["access_token"], new_access_token)
+        stored = await self.db.get(UpstreamChannel, channel_id)
+        await self.db.refresh(stored)
+        self.assertEqual(decrypt_text(stored.encrypted_access_token), new_access_token)
+        self.assertEqual(decrypt_text(stored.encrypted_refresh_token), new_refresh_token)
+
     async def test_refresh_failure_preserves_old_credentials(self) -> None:
         channel_id = await self._configure_sub2api_credentials()
         before = await self.db.get(UpstreamChannel, channel_id)
@@ -2100,19 +2265,506 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
         refresh.assert_not_awaited()
 
+    async def test_priority_rebalance_failure_does_not_rollback_channel_discovery(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        priority_service = self.service._priority_service()
+        result = self._discovery_result()
+
+        with (
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=result),
+            ),
+            patch.object(
+                priority_service,
+                "rebalance",
+                new=AsyncMock(side_effect=RuntimeError("priority sync failed")),
+            ),
+        ):
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        stored = await self.db.get(UpstreamChannel, channel_id)
+        await self.db.refresh(stored)
+        self.assertIsNotNone(stored.last_discovered_at)
+        self.assertEqual(discovered.id, channel_id)
+
+    async def test_two_confirmed_disabled_key_probes_disable_once_and_recovery_does_not_enable(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+        self.runtime_config.get_api_key_auto_disable_on_upstream_unavailable.return_value = True
+        disabled = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="disabled",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                ),
+                8: AccountUpstreamState(
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                ),
+            }
+        )
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=disabled),
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+            first = await self.db.scalar(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == 7
+                )
+            )
+            self.assertEqual(first.upstream_health_invalid_count, 1)
+            self.assertTrue(self.sub2api.accounts[0]["schedulable"])
+
+            await self.service.discover_channel(self.db, channel_id)
+
+        await self.db.refresh(first)
+        self.assertEqual(first.upstream_key_status, "disabled")
+        self.assertEqual(first.upstream_group_status, "available")
+        self.assertEqual(first.upstream_health_invalid_count, 2)
+        self.assertEqual(first.auto_disabled_reason, "upstream_key_unavailable")
+        self.assertIsNotNone(first.last_auto_disabled_at)
+        self.assertFalse(self.sub2api.accounts[0]["schedulable"])
+        self.assertEqual(self.sub2api.schedulable_calls, [(7, False)])
+
+        recovered = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                ),
+                8: AccountUpstreamState(
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                ),
+            }
+        )
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=recovered),
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+
+        await self.db.refresh(first)
+        self.assertEqual(first.upstream_key_status, "active")
+        self.assertEqual(first.upstream_health_invalid_count, 0)
+        self.assertFalse(self.sub2api.accounts[0]["schedulable"])
+        self.assertEqual(self.sub2api.schedulable_calls, [(7, False)])
+        logs = list(
+            (
+                await self.db.execute(
+                    select(UpstreamRateChangeLog)
+                    .where(UpstreamRateChangeLog.sub2api_account_id == 7)
+                    .order_by(UpstreamRateChangeLog.id)
+                )
+            ).scalars()
+        )
+        self.assertTrue(any(item.status == "account_disabled" for item in logs))
+        self.assertTrue(any(item.reason == "upstream_key_recovered" for item in logs))
+        disabled_log = next(item for item in logs if item.status == "account_disabled")
+        self.assertTrue(disabled_log.old_remote_schedulable)
+        self.assertFalse(disabled_log.new_remote_schedulable)
+
+    async def test_inconclusive_probe_preserves_authoritative_state_and_breaks_invalid_sequence(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+        self.runtime_config.get_api_key_auto_disable_on_upstream_unavailable.return_value = True
+        invalid = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="disabled",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                )
+            }
+        )
+        inconclusive = self._discovery_result(account_upstream_states={})
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(side_effect=[invalid, inconclusive, invalid]),
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+            await self.service.discover_channel(self.db, channel_id)
+            await self.service.discover_channel(self.db, channel_id)
+
+        config = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        self.assertEqual(config.upstream_key_status, "disabled")
+        self.assertEqual(config.upstream_group_status, "available")
+        self.assertEqual(config.upstream_health_invalid_count, 1)
+        self.assertTrue(self.sub2api.accounts[0]["schedulable"])
+        self.assertEqual(self.sub2api.schedulable_calls, [])
+
+    async def test_two_confirmed_unavailable_group_probes_disable_account(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+        self.runtime_config.get_api_key_auto_disable_on_upstream_unavailable.return_value = True
+        invalid = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="active",
+                    group_status="unavailable",
+                    group_id="retired",
+                    group_name="Retired",
+                )
+            }
+        )
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=invalid),
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+            await self.service.discover_channel(self.db, channel_id)
+
+        config = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        self.assertEqual(config.upstream_group_status, "unavailable")
+        self.assertEqual(config.selected_group_id, "retired")
+        self.assertFalse(self.sub2api.accounts[0]["schedulable"])
+        self.assertEqual(self.sub2api.schedulable_calls, [(7, False)])
+
+    async def test_disable_readback_failure_is_logged_without_aborting_channel(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+        self.runtime_config.get_api_key_auto_disable_on_upstream_unavailable.return_value = True
+        invalid = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="disabled",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                )
+            }
+        )
+
+        with (
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=invalid),
+            ),
+            patch.object(
+                self.sub2api,
+                "set_account_schedulable",
+                new=AsyncMock(),
+            ),
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(discovered.id, channel_id)
+        self.assertTrue(self.sub2api.accounts[0]["schedulable"])
+        failure = await self.db.scalar(
+            select(UpstreamRateChangeLog)
+            .where(
+                UpstreamRateChangeLog.sub2api_account_id == 7,
+                UpstreamRateChangeLog.status == "disable_failed",
+            )
+            .order_by(UpstreamRateChangeLog.id.desc())
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("Unable to disable", failure.safe_error)
+
+    async def test_overview_inventory_cleanup_never_rebalances_priorities(self) -> None:
+        await self.service.overview(self.db)
+        interval = UpstreamPriorityInterval(
+            name="removed-account",
+            start_priority=80,
+            end_priority=90,
+            step=1,
+        )
+        self.db.add(interval)
+        await self.db.flush()
+        config = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 8
+            )
+        )
+        config.priority_interval_id = interval.id
+        await self.db.commit()
+        self.sub2api.accounts = [self.sub2api.accounts[0]]
+
+        with patch.object(
+            self.service,
+            "_rebalance_priorities_best_effort",
+            new=AsyncMock(),
+        ) as rebalance:
+            overview = await self.service.overview(self.db)
+
+        rebalance.assert_not_awaited()
+        self.assertEqual([item.sub2api_account_id for item in overview.channels[0].accounts], [7])
+        await self.db.refresh(config)
+        self.assertIsNone(config.priority_interval_id)
+
+    async def test_discover_all_max_concurrency_controls_parallel_channel_work(self) -> None:
+        base = await self.service.overview(self.db)
+        first = base.channels[0]
+        second = first.model_copy(update={"id": first.id + 1000})
+        synthetic = base.model_copy(update={"channels": [first, second]})
+
+        async def peak_for(limit: int) -> int:
+            active = 0
+            peak = 0
+
+            async def discover(
+                _db,
+                channel_id: int,
+                *,
+                sync_inventory: bool = True,
+                remote_by_id=None,
+            ):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.02)
+                active -= 1
+                return first if channel_id == first.id else second
+
+            with (
+                patch.object(
+                    self.service,
+                    "overview",
+                    new=AsyncMock(return_value=synthetic),
+                ),
+                patch.object(
+                    self.service,
+                    "_discover_channel",
+                    new=AsyncMock(side_effect=discover),
+                ),
+                patch.object(
+                    self.service,
+                    "_rebalance_priorities_best_effort",
+                    new=AsyncMock(),
+                ),
+            ):
+                await self.service.discover_all(self.db, max_concurrency=limit)
+            return peak
+
+        self.assertEqual(await peak_for(1), 1)
+        self.assertEqual(await peak_for(2), 2)
+        self.assertEqual(await peak_for(0), 2)
+        for invalid in (-1, 51, True):
+            with self.assertRaises(ValueError):
+                await self.service.discover_all(self.db, max_concurrency=invalid)
+
+    async def test_discover_all_skips_channels_with_automatic_probe_disabled(self) -> None:
+        overview = await self.service.overview(self.db)
+        channel = await self.db.get(UpstreamChannel, overview.channels[0].id)
+        self.assertIsNotNone(channel)
+        channel.probe_enabled = False
+        await self.db.commit()
+
+        with (
+            patch.object(
+                self.service,
+                "_discover_channel",
+                new=AsyncMock(),
+            ) as discover,
+            patch.object(
+                self.service,
+                "_rebalance_priorities_best_effort",
+                new=AsyncMock(),
+            ) as rebalance,
+        ):
+            result = await self.service.discover_all(self.db, max_concurrency=0)
+
+        self.assertEqual((result.total, result.succeeded, result.failed, result.skipped), (1, 0, 0, 1))
+        self.assertIsNotNone(result.overview)
+        self.assertFalse(result.channels[0].probe_enabled)
+        discover.assert_not_awaited()
+        rebalance.assert_awaited_once_with(self.db, account_ids=set())
+
+    async def test_manual_discover_all_reuses_complete_fresh_channel_cache(self) -> None:
+        overview = await self.service.overview(self.db)
+        observed_at = datetime.now(timezone.utc)
+        channel = overview.channels[0].model_copy(
+            update={
+                "last_discovered_at": observed_at,
+                "accounts": [
+                    account.model_copy(update={"last_discovered_at": observed_at})
+                    for account in overview.channels[0].accounts
+                ],
+            }
+        )
+        synthetic = overview.model_copy(update={"channels": [channel]})
+
+        with (
+            patch.object(
+                self.service,
+                "overview",
+                new=AsyncMock(return_value=synthetic),
+            ),
+            patch.object(
+                self.service,
+                "_discover_channel",
+                new=AsyncMock(),
+            ) as discover,
+            patch.object(
+                self.service,
+                "_rebalance_priorities_best_effort",
+                new=AsyncMock(),
+            ) as rebalance,
+        ):
+            result = await self.service.discover_all(
+                self.db,
+                max_concurrency=0,
+                force=False,
+                cache_max_age_seconds=900,
+            )
+
+        self.assertEqual((result.succeeded, result.failed, result.cached), (0, 0, 1))
+        self.assertFalse(result.force)
+        discover.assert_not_awaited()
+        rebalance.assert_awaited_once_with(
+            self.db,
+            account_ids={account.sub2api_account_id for account in channel.accounts},
+        )
+
+    async def test_manual_discover_all_reuses_complete_cache_without_ttl(self) -> None:
+        overview = await self.service.overview(self.db)
+        observed_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        channel = overview.channels[0].model_copy(
+            update={
+                "last_discovered_at": observed_at,
+                "accounts": [
+                    account.model_copy(update={"last_discovered_at": observed_at})
+                    for account in overview.channels[0].accounts
+                ],
+            }
+        )
+        synthetic = overview.model_copy(update={"channels": [channel]})
+
+        with (
+            patch.object(
+                self.service,
+                "overview",
+                new=AsyncMock(return_value=synthetic),
+            ),
+            patch.object(
+                self.service,
+                "_discover_channel",
+                new=AsyncMock(),
+            ) as discover,
+            patch.object(
+                self.service,
+                "_rebalance_priorities_best_effort",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await self.service.discover_all(
+                self.db,
+                max_concurrency=0,
+                force=False,
+                cache_max_age_seconds=None,
+            )
+
+        self.assertEqual(result.cached, 1)
+        self.assertIsNone(result.cache_max_age_seconds)
+        discover.assert_not_awaited()
+
+    async def test_discover_all_syncs_inventory_once_and_reuses_the_batch_snapshot(self) -> None:
+        overview = await self.service.overview(self.db)
+        overview_mock = AsyncMock(side_effect=[overview, overview])
+        discover_mock = AsyncMock(return_value=overview.channels[0])
+        with (
+            patch.object(self.service, "overview", new=overview_mock),
+            patch.object(self.service, "_discover_channel", new=discover_mock),
+            patch.object(
+                self.service,
+                "_rebalance_priorities_best_effort",
+                new=AsyncMock(),
+            ),
+        ):
+            await self.service.discover_all(self.db, max_concurrency=1)
+
+        self.assertEqual(
+            [call.kwargs["sync_inventory"] for call in overview_mock.await_args_list],
+            [False, False],
+        )
+        self.assertEqual(discover_mock.await_count, 1)
+        self.assertEqual(discover_mock.await_args.args, (self.db, overview.channels[0].id))
+        self.assertFalse(discover_mock.await_args.kwargs["sync_inventory"])
+        self.assertIn(7, discover_mock.await_args.kwargs["remote_by_id"])
+
+    async def test_overlapping_discover_all_batches_share_one_service_lock(self) -> None:
+        synthetic = await self.service.overview(self.db)
+        active = 0
+        peak = 0
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def discover(
+            _db,
+            _channel_id: int,
+            *,
+            sync_inventory: bool = True,
+            remote_by_id=None,
+        ):
+            nonlocal active, peak, calls
+            calls += 1
+            active += 1
+            peak = max(peak, active)
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+            active -= 1
+            return synthetic.channels[0]
+
+        with (
+            patch.object(
+                self.service,
+                "overview",
+                new=AsyncMock(return_value=synthetic),
+            ),
+            patch.object(
+                self.service,
+                "_discover_channel",
+                new=AsyncMock(side_effect=discover),
+            ),
+            patch.object(
+                self.service,
+                "_rebalance_priorities_best_effort",
+                new=AsyncMock(),
+            ),
+        ):
+            first = asyncio.create_task(
+                self.service.discover_all(self.db, max_concurrency=1)
+            )
+            await first_started.wait()
+            second = asyncio.create_task(
+                self.service.discover_all(self.db, max_concurrency=1)
+            )
+            await asyncio.sleep(0.02)
+            self.assertEqual(active, 1)
+            release_first.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(peak, 1)
+
 
 class UpstreamChannelAuthenticationTests(unittest.TestCase):
-    def test_discover_all_records_only_summary_counts(self) -> None:
+    def test_sync_inventory_returns_overview_without_running_discovery(self) -> None:
         app = FastAPI()
         app.include_router(router, prefix="/api/upstream-channels")
         db = AsyncMock()
-        result = UpstreamChannelDiscoverAllOut(
-            total=2,
-            succeeded=1,
-            failed=1,
-            channels=[],
-        )
-        service = SimpleNamespace(discover_all=AsyncMock(return_value=result))
+        result = UpstreamOverviewOut()
+        service = SimpleNamespace(overview=AsyncMock(return_value=result))
 
         async def fake_db():
             yield db
@@ -2124,6 +2776,57 @@ class UpstreamChannelAuthenticationTests(unittest.TestCase):
             patch("app.api.upstream_channels.record_event", new=AsyncMock()) as record,
             TestClient(app) as client,
         ):
+            response = client.post("/api/upstream-channels/sync-inventory")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["channels"], [])
+        service.overview.assert_awaited_once_with(db)
+        record.assert_awaited_once_with(
+            db,
+            "manual_api_key_inventory_sync",
+            "Synchronized 0 API key account(s) across 0 upstream channel(s).",
+            details={
+                "reason": "manual",
+                "accounts": 0,
+                "channels": 0,
+                "unassigned_accounts": 0,
+                "duration_ms": ANY,
+            },
+        )
+
+    def test_discover_all_records_only_summary_counts(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-channels")
+        db = AsyncMock()
+        result = UpstreamChannelDiscoverAllOut(
+            total=2,
+            succeeded=1,
+            failed=1,
+            force=True,
+            cache_max_age_seconds=None,
+            channels=[],
+        )
+        service = SimpleNamespace(discover_all=AsyncMock(return_value=result))
+        runtime = SimpleNamespace(
+            get_upstream_sync_max_concurrency=AsyncMock(return_value=2),
+            get_upstream_sync_interval_seconds=AsyncMock(return_value=900),
+            get_upstream_sync_enabled=AsyncMock(return_value=True),
+        )
+
+        async def fake_db():
+            yield db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = fake_db
+        app.dependency_overrides[get_upstream_channel_service] = lambda: service
+        with (
+            patch("app.api.upstream_channels.record_event", new=AsyncMock()) as record,
+            patch(
+                "app.api.upstream_channels.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            TestClient(app) as client,
+        ):
             response = client.post("/api/upstream-channels/discover-all")
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -2131,9 +2834,73 @@ class UpstreamChannelAuthenticationTests(unittest.TestCase):
         record.assert_awaited_once_with(
             db,
             "manual_upstream_sync",
-            "Synchronized 2 API key channel(s); 1 succeeded and 1 failed.",
-            details={"total": 2, "succeeded": 1, "failed": 1},
+            "Synchronized 2 API key channel(s); 1 probed successfully, 0 reused cached state, 1 failed, and 0 skipped.",
+            details={
+                "reason": "manual",
+                "total": 2,
+                "succeeded": 1,
+                "failed": 1,
+                "cached": 0,
+                "skipped": 0,
+                "force": True,
+                "cache_max_age_seconds": None,
+                "probe_globally_enabled": True,
+                "duration_ms": ANY,
+            },
         )
+        service.discover_all.assert_awaited_once_with(
+            db,
+            max_concurrency=2,
+            require_management_credentials=True,
+            force=True,
+        )
+
+    def test_discover_all_only_syncs_inventory_when_global_probe_is_disabled(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-channels")
+        db = AsyncMock()
+        overview = UpstreamOverviewOut(
+            channels=[
+                {
+                    "id": 1,
+                    "display_name": "disabled-global-probe",
+                    "canonical_base_url": "https://upstream.example",
+                    "base_url": "https://upstream.example",
+                    "account_count": 0,
+                }
+            ]
+        )
+        service = SimpleNamespace(
+            overview=AsyncMock(return_value=overview),
+            discover_all=AsyncMock(),
+        )
+        runtime = SimpleNamespace(
+            get_upstream_sync_max_concurrency=AsyncMock(return_value=0),
+            get_upstream_sync_interval_seconds=AsyncMock(return_value=900),
+            get_upstream_sync_enabled=AsyncMock(return_value=False),
+        )
+
+        async def fake_db():
+            yield db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = fake_db
+        app.dependency_overrides[get_upstream_channel_service] = lambda: service
+        with (
+            patch("app.api.upstream_channels.record_event", new=AsyncMock()),
+            patch(
+                "app.api.upstream_channels.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            TestClient(app) as client,
+        ):
+            response = client.post("/api/upstream-channels/discover-all")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["probe_globally_enabled"])
+        self.assertEqual(response.json()["skipped"], 1)
+        service.overview.assert_awaited_once_with(db)
+        service.discover_all.assert_not_awaited()
 
     def test_discover_all_returns_success_when_summary_event_cannot_be_saved(self) -> None:
         app = FastAPI()
@@ -2143,9 +2910,16 @@ class UpstreamChannelAuthenticationTests(unittest.TestCase):
             total=1,
             succeeded=1,
             failed=0,
+            force=False,
+            cache_max_age_seconds=900,
             channels=[],
         )
         service = SimpleNamespace(discover_all=AsyncMock(return_value=result))
+        runtime = SimpleNamespace(
+            get_upstream_sync_max_concurrency=AsyncMock(return_value=1),
+            get_upstream_sync_interval_seconds=AsyncMock(return_value=900),
+            get_upstream_sync_enabled=AsyncMock(return_value=True),
+        )
 
         async def fake_db():
             yield db
@@ -2157,6 +2931,10 @@ class UpstreamChannelAuthenticationTests(unittest.TestCase):
             patch(
                 "app.api.upstream_channels.record_event",
                 new=AsyncMock(side_effect=RuntimeError("synthetic audit failure")),
+            ),
+            patch(
+                "app.api.upstream_channels.get_runtime_config_service",
+                return_value=runtime,
             ),
             TestClient(app) as client,
         ):
@@ -2176,6 +2954,7 @@ class UpstreamChannelAuthenticationTests(unittest.TestCase):
         app.dependency_overrides[get_db] = fake_db
         requests = [
             ("GET", "/api/upstream-channels", None),
+            ("POST", "/api/upstream-channels/sync-inventory", None),
             ("POST", "/api/upstream-channels/discover-all", None),
             ("PUT", "/api/upstream-channels/1", {"display_name": "test"}),
             ("POST", "/api/upstream-channels/1/discover", None),

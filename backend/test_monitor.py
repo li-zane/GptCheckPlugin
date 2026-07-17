@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from app.services.monitor import MonitorService
 from app.services.sub2api import Sub2ApiClient
@@ -67,9 +67,15 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
         service._upsert_snapshot.assert_awaited_once()  # type: ignore[attr-defined]
         self.assertEqual(service._upsert_snapshot.await_args.args[0], "oauth@example.com")  # type: ignore[attr-defined]
         service._delete_missing_remote_accounts.assert_awaited_once_with(  # type: ignore[attr-defined]
-            {"oauth@example.com", "api-key@example.com"}
+            {"oauth@example.com", "api-key@example.com"},
+            db=ANY,
         )
+        db.commit.assert_awaited_once()
         record.assert_awaited_once()
+        details = record.await_args.kwargs["details"]
+        self.assertEqual(details["reason"], "manual")
+        self.assertIsInstance(details["duration_ms"], int)
+        self.assertIsInstance(details["account_list_duration_ms"], int)
 
     async def test_sync_once_returns_result_when_post_commit_audit_fails(self) -> None:
         account = {
@@ -110,7 +116,10 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
         service._stop = asyncio.Event()
         service._wake = asyncio.Event()
         service.sub2api = Sub2ApiClient()
-        service.runtime_config = SimpleNamespace(get_automation_paused=AsyncMock(return_value=False))
+        service.runtime_config = SimpleNamespace(
+            get_automation_paused=AsyncMock(return_value=False),
+            get_oauth_account_sync_enabled=AsyncMock(return_value=True),
+        )
         service.sync_once = AsyncMock(side_effect=RuntimeError("sync unavailable"))  # type: ignore[method-assign]
         service._wait_for_startup_delay = AsyncMock()  # type: ignore[method-assign]
 
@@ -130,6 +139,27 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
 
         service._wait_for_next_run.assert_awaited_once()  # type: ignore[attr-defined]
         db.rollback.assert_awaited_once()
+
+    async def test_monitor_loop_skips_scheduled_sync_when_oauth_inventory_is_disabled(self) -> None:
+        service = object.__new__(MonitorService)
+        service._stop = asyncio.Event()
+        service._wake = asyncio.Event()
+        service.runtime_config = SimpleNamespace(
+            get_automation_paused=AsyncMock(return_value=False),
+            get_oauth_account_sync_enabled=AsyncMock(return_value=False),
+        )
+        service.sync_once = AsyncMock()  # type: ignore[method-assign]
+        service._wait_for_startup_delay = AsyncMock()  # type: ignore[method-assign]
+
+        async def stop_after_iteration() -> None:
+            service._stop.set()
+
+        service._wait_for_next_run = AsyncMock(side_effect=stop_after_iteration)  # type: ignore[method-assign]
+
+        await service._loop()
+
+        service.sync_once.assert_not_awaited()  # type: ignore[attr-defined]
+        service._wait_for_next_run.assert_awaited_once()  # type: ignore[attr-defined]
 
     async def test_upsert_snapshot_never_persists_api_key_aliases(self) -> None:
         account = {

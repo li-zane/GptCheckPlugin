@@ -156,6 +156,37 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.sub2api_account_id for row in rows], [5])
         self.assertEqual(rows[0].safe_error, failure.safe_error)
 
+    async def test_list_returns_health_only_changes_and_disable_failures(self) -> None:
+        health_change = _log(account_id=7, status="observed")
+        health_change.new_group_multiplier = health_change.old_group_multiplier
+        health_change.new_upstream_multiplier = health_change.old_upstream_multiplier
+        health_change.new_target_rate = health_change.old_target_rate
+        health_change.new_current_rate = health_change.old_current_rate
+        health_change.old_upstream_key_status = "active"
+        health_change.new_upstream_key_status = "disabled"
+        health_change.old_upstream_group_status = "available"
+        health_change.new_upstream_group_status = "available"
+        health_change.old_remote_schedulable = True
+        health_change.new_remote_schedulable = True
+        disable_failure = _log(account_id=8, status="disable_failed")
+        disable_failure.new_group_multiplier = disable_failure.old_group_multiplier
+        disable_failure.new_upstream_multiplier = disable_failure.old_upstream_multiplier
+        disable_failure.new_target_rate = disable_failure.old_target_rate
+        disable_failure.new_current_rate = disable_failure.old_current_rate
+        disable_failure.safe_error = "Unable to disable and verify the sub2api account."
+        self.db.add_all([health_change, disable_failure])
+        await self.db.commit()
+
+        rows = await list_upstream_rate_change_logs(
+            self.db,
+            retention_days=30,
+        )
+
+        self.assertEqual(
+            [row.sub2api_account_id for row in rows],
+            [8, 7],
+        )
+
     async def test_prune_commits_at_most_once_and_only_when_rows_are_deleted(self) -> None:
         db = AsyncMock()
         db.execute.return_value = Mock(rowcount=0)
@@ -186,6 +217,9 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
         serialized = UpstreamRateChangeLogOut.model_validate(row).model_dump()
         self.assertEqual(serialized["old_upstream_multiplier"], 0.1)
         self.assertEqual(serialized["new_upstream_multiplier"], 0.125)
+        self.assertIn("old_upstream_key_status", serialized)
+        self.assertIn("new_upstream_group_status", serialized)
+        self.assertIn("new_remote_schedulable", serialized)
 
 
 class UpstreamRateChangeLogApiTests(unittest.TestCase):
@@ -248,6 +282,36 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
             response = client.get("/api/upstream-accounts/rate-change-logs?limit=201")
 
         self.assertEqual(response.status_code, 422)
+
+    def test_upstream_change_log_alias_preserves_the_old_contract(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-accounts")
+        fake_db = AsyncMock()
+
+        async def db_override():
+            yield fake_db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = db_override
+        runtime = SimpleNamespace(
+            get_upstream_rate_log_retention_days=AsyncMock(return_value=30)
+        )
+        list_logs = AsyncMock(return_value=[])
+        with (
+            patch(
+                "app.api.upstream_accounts.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            patch(
+                "app.api.upstream_accounts.list_upstream_rate_change_logs",
+                new=list_logs,
+            ),
+            TestClient(app) as client,
+        ):
+            response = client.get("/api/upstream-accounts/upstream-change-logs")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        list_logs.assert_awaited_once()
 
     def test_route_converts_inclusive_local_dates_to_utc_bounds(self) -> None:
         app = FastAPI()

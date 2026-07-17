@@ -13,6 +13,7 @@ from app.api.accounts import (
     test_selected_account_liveness as account_liveness_endpoint,
 )
 from app.schemas import AccountLivenessModelsRequest, AccountLivenessTestRequest
+from app.services.account_liveness import AccountLivenessLimiter
 from app.services.runtime_config import EffectiveSub2ApiConfig
 from app.services.sub2api import Sub2ApiClient, Sub2ApiRequestError
 
@@ -190,6 +191,29 @@ class Sub2ApiLivenessClientTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+
+class AccountLivenessLimiterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limit_is_shared_across_concurrent_batches(self) -> None:
+        runtime = SimpleNamespace(
+            get_account_liveness_max_concurrency=AsyncMock(return_value=2)
+        )
+        limiter = AccountLivenessLimiter(runtime)
+        active = 0
+        peak = 0
+
+        async def worker() -> None:
+            nonlocal active, peak
+            async with limiter.slot():
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.01)
+                active -= 1
+
+        await asyncio.gather(*(worker() for _ in range(8)))
+
+        self.assertEqual(peak, 2)
+        self.assertEqual(limiter.active, 0)
 
 
 class AccountLivenessBatchTests(unittest.IsolatedAsyncioTestCase):

@@ -67,10 +67,12 @@ MAX_SUB2API_ERROR_PREVIEW_BYTES = 500
 MAX_SUB2API_TEST_STREAM_BYTES = 64 * 1024
 MAX_SUB2API_TEST_LINE_BYTES = 16 * 1024
 SUB2API_REQUEST_TOTAL_TIMEOUT_SECONDS = 90.0
+SUB2API_USAGE_REFRESH_TIMEOUT_SECONDS = 10.0
 SUB2API_TEST_TOTAL_TIMEOUT_SECONDS = 70.0
 MAX_REMOTE_ACCOUNT_ERROR_CHARS = 500
 MAX_SUB2API_ACCOUNT_PAGES = 100
 MAX_SUB2API_ACCOUNTS = 10_000
+MAX_SUB2API_PRIORITY = 9_007_199_254_740_991
 SUB2API_MUTATION_READBACK_ATTEMPTS = 3
 SUB2API_MUTATION_READBACK_DELAY_SECONDS = 0.1
 SUB2API_MUTATION_READBACK_TIMEOUT_SECONDS = 10.0
@@ -245,6 +247,18 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _nonnegative_int(value: Any, *, maximum: int = MAX_SUB2API_PRIORITY) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if 0 <= parsed <= maximum else None
 
 
 def _find_nested_field(value: Any, field: str) -> tuple[bool, Any]:
@@ -567,17 +581,23 @@ class Sub2ApiClient:
         method: str,
         path: str,
         config: EffectiveSub2ApiConfig | None = None,
+        total_timeout_seconds: float | None = None,
         **kwargs: Any,
     ) -> Any:
+        request_timeout = (
+            SUB2API_REQUEST_TOTAL_TIMEOUT_SECONDS
+            if total_timeout_seconds is None
+            else max(0.1, float(total_timeout_seconds))
+        )
         deadline = (
             asyncio.get_running_loop().time()
-            + SUB2API_REQUEST_TOTAL_TIMEOUT_SECONDS
+            + request_timeout
         )
         try:
             async with asyncio.timeout_at(deadline):
                 active_config = config or await get_runtime_config_service().get_sub2api_config()
                 async with httpx.AsyncClient(
-                    timeout=30.0,
+                    timeout=min(30.0, request_timeout),
                     headers=self._headers(active_config),
                     trust_env=False,
                     transport=self.transport,
@@ -946,7 +966,7 @@ class Sub2ApiClient:
         numeric_id = _positive_int(account_id)
         if numeric_id is None:
             raise ValueError("A positive numeric sub2api account id is required.")
-        account = await self.get_account(str(numeric_id))
+        account = await self.get_account_by_id(numeric_id)
         if account is None:
             raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
         value = _bounded_number(account.get("rate_multiplier"), minimum=0, maximum=1000)
@@ -967,6 +987,35 @@ class Sub2ApiClient:
             f"{config.accounts_path}/bulk-update",
             config=config,
             json={"account_ids": [numeric_id], "rate_multiplier": parsed_rate},
+        )
+
+    async def update_account_priorities(
+        self,
+        account_ids: list[int],
+        priority: int,
+    ) -> None:
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for account_id in account_ids:
+            parsed_id = _positive_int(account_id)
+            if parsed_id is None:
+                raise ValueError("Account ids must be positive integers.")
+            if parsed_id not in seen:
+                normalized_ids.append(parsed_id)
+                seen.add(parsed_id)
+        if not normalized_ids:
+            raise ValueError("At least one account id is required.")
+        if len(normalized_ids) > MAX_SUB2API_ACCOUNTS:
+            raise ValueError("Too many account ids were provided.")
+        parsed_priority = _nonnegative_int(priority)
+        if parsed_priority is None:
+            raise ValueError("priority must be a non-negative safe integer.")
+        config = await get_runtime_config_service().get_sub2api_config()
+        await self._request(
+            "POST",
+            f"{config.accounts_path}/bulk-update",
+            config=config,
+            json={"account_ids": normalized_ids, "priority": parsed_priority},
         )
 
     async def update_account_name(
@@ -1151,18 +1200,28 @@ class Sub2ApiClient:
     async def refresh_account_usage(self, account: dict[str, Any] | str) -> bool:
         return await self.refresh_account_usage_data(account) is not None
 
-    async def refresh_account_usage_data(self, account: dict[str, Any] | str) -> dict[str, Any] | None:
+    async def refresh_account_usage_data(
+        self,
+        account: dict[str, Any] | str,
+        *,
+        config: EffectiveSub2ApiConfig | None = None,
+        force: bool = True,
+    ) -> dict[str, Any] | None:
         account_id = account if isinstance(account, str) else self.account_id(account)
         if not account_id:
             raise ValueError("Cannot refresh sub2api account usage without id.")
 
-        config = await get_runtime_config_service().get_sub2api_config()
+        config = config or await get_runtime_config_service().get_sub2api_config()
         try:
+            params = {"source": "active"}
+            if force:
+                params["force"] = "true"
             payload = await self._request(
                 "GET",
                 f"{config.accounts_path}/{account_id}/usage",
                 config=config,
-                params={"source": "active", "force": "true"},
+                params=params,
+                total_timeout_seconds=SUB2API_USAGE_REFRESH_TIMEOUT_SECONDS,
             )
         except Sub2ApiRequestError as exc:
             if exc.status_code in {404, 405}:
@@ -2021,6 +2080,9 @@ class Sub2ApiClient:
                     limit=MAX_REMOTE_ACCOUNT_ERROR_CHARS,
                 ) or None
         return None
+
+    def account_priority(self, account: dict[str, Any]) -> int | None:
+        return _nonnegative_int(account.get("priority"))
 
     def account_error_status_code(self, account: dict[str, Any]) -> int | None:
         explicit = _first_value(

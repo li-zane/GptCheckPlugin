@@ -11,10 +11,11 @@ from sqlalchemy import select
 from app.core.config import Settings, get_settings
 from app.core.database import AsyncSessionLocal
 from app.models import AccountSnapshot
-from app.services.events import record_event
+from app.services.events import elapsed_ms, record_event
 from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient, looks_deactive_text
 from app.services.usage_estimate import account_rate_limited_windows, materialize_usage_reset_times, record_usage_limit_samples
+from app.services.workflow_coordination import get_workflow_coordinator
 
 
 SENSITIVE_ERROR_RE = re.compile(
@@ -37,6 +38,11 @@ class UsageRefreshSummary:
     skipped: int = 0
     failed: int = 0
     max_concurrency: int = 1
+    duration_ms: int = 0
+    workflow_wait_duration_ms: int | None = None
+    queue_wait_duration_ms: int = 0
+    query_duration_ms: int = 0
+    force: bool = False
     failures: list[UsageRefreshFailure] = field(default_factory=list)
 
     @property
@@ -45,6 +51,27 @@ class UsageRefreshSummary:
             f"Usage window refresh finished: {self.refreshed}/{self.total} refreshed, "
             f"{self.skipped} skipped, {self.failed} failed."
         )
+
+
+def resolve_usage_refresh_force(reason: str, force: bool | None) -> bool:
+    if force is not None:
+        return force
+    return reason == "scheduled"
+
+
+def cached_usage_from_account(account: dict[str, Any]) -> dict[str, Any] | None:
+    extra = account.get("extra")
+    if not isinstance(extra, dict):
+        return None
+    if not any(
+        extra.get(key) is not None
+        for key in ("codex_5h_used_percent", "codex_7d_used_percent")
+    ):
+        return None
+    return {
+        "source": "account_snapshot",
+        "updated_at": extra.get("codex_usage_updated_at"),
+    }
 
 
 class UsageRefreshService:
@@ -89,6 +116,7 @@ class UsageRefreshService:
                 continue
             if not await self.runtime_config.get_usage_refresh_enabled():
                 continue
+            started_at = time.perf_counter()
             try:
                 await self.refresh_all(reason="scheduled")
             except Exception as exc:
@@ -97,7 +125,11 @@ class UsageRefreshService:
                         db,
                         "usage_refresh_failed",
                         "Scheduled usage window refresh failed.",
-                        details={"error": _redact_error_text(str(exc))},
+                        details={
+                            "error": _redact_error_text(str(exc)),
+                            "reason": "scheduled",
+                            "duration_ms": elapsed_ms(started_at),
+                        },
                     )
 
     async def _wait_for_next_run(self, interval: int) -> None:
@@ -115,9 +147,35 @@ class UsageRefreshService:
             await asyncio.gather(stop_task, wake_task, return_exceptions=True)
             self._wake.clear()
 
-    async def refresh_all(self, reason: str = "manual") -> UsageRefreshSummary:
+    async def refresh_all(
+        self,
+        reason: str = "manual",
+        *,
+        accounts: list[dict[str, Any]] | None = None,
+        skip_account_ids: set[str] | None = None,
+        force: bool | None = None,
+    ) -> UsageRefreshSummary:
+        started_at = time.perf_counter()
+        resolved_force = resolve_usage_refresh_force(reason, force)
+        workflow_wait_duration_ms: int | None = None
+        if reason == "oauth_sync" and resolved_force:
+            workflow_wait_started_at = time.perf_counter()
+            await get_workflow_coordinator().wait_for_upstream_idle()
+            workflow_wait_duration_ms = elapsed_ms(workflow_wait_started_at)
+        queue_wait_started_at = time.perf_counter()
         async with self._lock:
-            summary = await self._refresh_all_inner()
+            queue_wait_duration_ms = elapsed_ms(queue_wait_started_at)
+            query_started_at = time.perf_counter()
+            summary = await self._refresh_all_inner(
+                accounts=accounts,
+                skip_account_ids=skip_account_ids,
+                force=resolved_force,
+            )
+            summary.force = resolved_force
+            summary.query_duration_ms = elapsed_ms(query_started_at)
+            summary.workflow_wait_duration_ms = workflow_wait_duration_ms
+            summary.queue_wait_duration_ms = queue_wait_duration_ms
+            summary.duration_ms = elapsed_ms(started_at)
             async with AsyncSessionLocal() as db:
                 await record_event(
                     db,
@@ -125,11 +183,20 @@ class UsageRefreshService:
                     summary.message,
                     details={
                         "reason": reason,
+                        "force": summary.force,
                         "total": summary.total,
                         "refreshed": summary.refreshed,
                         "skipped": summary.skipped,
                         "failed": summary.failed,
                         "max_concurrency": summary.max_concurrency,
+                        "duration_ms": summary.duration_ms,
+                        "queue_wait_duration_ms": summary.queue_wait_duration_ms,
+                        "query_duration_ms": summary.query_duration_ms,
+                        **(
+                            {"workflow_wait_duration_ms": summary.workflow_wait_duration_ms}
+                            if summary.workflow_wait_duration_ms is not None
+                            else {}
+                        ),
                         "failures": [
                             {
                                 "email": failure.email,
@@ -142,31 +209,57 @@ class UsageRefreshService:
                 )
             return summary
 
-    async def _refresh_all_inner(self) -> UsageRefreshSummary:
+    async def _refresh_all_inner(
+        self,
+        *,
+        accounts: list[dict[str, Any]] | None = None,
+        skip_account_ids: set[str] | None = None,
+        force: bool = False,
+    ) -> UsageRefreshSummary:
+        source_accounts = accounts if accounts is not None else await self.sub2api.list_accounts()
         accounts, _ = self.sub2api.dedupe_accounts_by_email(
             [
                 account
-                for account in await self.sub2api.list_accounts()
+                for account in source_accounts
                 if self.sub2api.is_gpt_account(account) and self.sub2api.is_oauth_account(account)
             ]
         )
         summary = UsageRefreshSummary()
         summary.max_concurrency = await self.runtime_config.get_usage_refresh_max_concurrency()
         sample_thresholds = await self.runtime_config.get_usage_limit_sample_thresholds()
-        semaphore = asyncio.Semaphore(summary.max_concurrency)
+        sub2api_config = await self.runtime_config.get_sub2api_config()
+        semaphore = (
+            None
+            if summary.max_concurrency == 0
+            else asyncio.Semaphore(summary.max_concurrency)
+        )
         tasks = []
         usage_by_id: dict[str, dict[str, Any]] = {}
+        skipped_ids = skip_account_ids or set()
 
         for account in accounts:
             account_id = self.sub2api.account_id(account)
             if not account_id:
                 summary.skipped += 1
                 continue
+            if account_id in skipped_ids:
+                summary.skipped += 1
+                continue
             if self.sub2api.is_deactive_account(account):
                 summary.skipped += 1
                 continue
             summary.total += 1
-            tasks.append(asyncio.create_task(self._refresh_one(account, semaphore, sample_thresholds)))
+            tasks.append(
+                asyncio.create_task(
+                    self._refresh_one(
+                        account,
+                        semaphore,
+                        sample_thresholds,
+                        sub2api_config,
+                        force,
+                    )
+                )
+            )
 
         for task in asyncio.as_completed(tasks):
             account_id, email, result, error, usage = await task
@@ -188,25 +281,61 @@ class UsageRefreshService:
     async def _refresh_one(
         self,
         account: dict[str, Any],
-        semaphore: asyncio.Semaphore,
+        semaphore: asyncio.Semaphore | None,
         sample_thresholds: dict[str, float],
+        sub2api_config: Any,
+        force: bool,
     ) -> tuple[str | None, str | None, bool | None, str | None, dict[str, Any] | None]:
         account_id = self.sub2api.account_id(account)
         email = self.sub2api.account_email(account)
-        async with semaphore:
-            try:
-                usage = await self.sub2api.refresh_account_usage_data(account)
-                if usage is not None:
-                    usage = materialize_usage_reset_times(usage)
-                    await self._recover_cleared_rate_limits(account, usage, sample_thresholds)
-                    await self._mark_deactivated_stale_rate_limit(account, usage, sample_thresholds)
+        if semaphore is not None:
+            async with semaphore:
+                return await self._refresh_one_unlimited(
+                    account,
+                    account_id,
+                    email,
+                    sample_thresholds,
+                    sub2api_config,
+                    force,
+                )
+        return await self._refresh_one_unlimited(
+            account,
+            account_id,
+            email,
+            sample_thresholds,
+            sub2api_config,
+            force,
+        )
+
+    async def _refresh_one_unlimited(
+        self,
+        account: dict[str, Any],
+        account_id: str | None,
+        email: str | None,
+        sample_thresholds: dict[str, float],
+        sub2api_config: Any,
+        force: bool,
+    ) -> tuple[str | None, str | None, bool | None, str | None, dict[str, Any] | None]:
+        try:
+            if not force:
+                usage = cached_usage_from_account(account)
                 return account_id, email, usage is not None, None, usage
-            except Exception as exc:
-                error = _redact_error_text(str(exc))
-                if looks_deactive_text(error):
-                    await self._mark_account_deactive(email, f"sub2api usage refresh reported account_deactivated: {error}")
-                    error = f"account_deactivated: {error}"
-                return account_id, email, None, error, None
+            usage = await self.sub2api.refresh_account_usage_data(
+                account,
+                config=sub2api_config,
+                force=force,
+            )
+            if usage is not None:
+                usage = materialize_usage_reset_times(usage)
+                await self._recover_cleared_rate_limits(account, usage, sample_thresholds)
+                await self._mark_deactivated_stale_rate_limit(account, usage, sample_thresholds)
+            return account_id, email, usage is not None, None, usage
+        except Exception as exc:
+            error = _redact_error_text(str(exc))
+            if looks_deactive_text(error):
+                await self._mark_account_deactive(email, f"sub2api usage refresh reported account_deactivated: {error}")
+                error = f"account_deactivated: {error}"
+            return account_id, email, None, error, None
 
     async def _recover_cleared_rate_limits(
         self,

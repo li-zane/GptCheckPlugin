@@ -55,23 +55,32 @@ class Settings(BaseSettings):
 
     monitor_enabled: bool = True
     automation_paused: bool = False
+    oauth_account_sync_enabled: bool = True
     recovery_enabled: bool = False
     monitor_interval_seconds: int = 300
     monitor_page_size: int = 100
     usage_refresh_enabled: bool = False
     usage_refresh_interval_seconds: int = 3600
-    usage_refresh_max_concurrency: int = 5
+    usage_refresh_max_concurrency: int = 20
+    api_key_account_sync_enabled: bool = True
+    api_key_account_sync_interval_seconds: int = 300
+    upstream_sync_enabled: bool | None = None
+    upstream_sync_interval_seconds: int = 900
+    upstream_sync_max_concurrency: int = 10
     upstream_rate_sync_enabled: bool = False
+    upstream_priority_sync_enabled: bool = True
+    api_key_auto_disable_on_upstream_unavailable: bool = False
     upstream_rate_log_retention_days: int = Field(default=90, ge=1, le=3650)
     usage_limit_sample_five_hour_threshold_percent: float = 0.0
     usage_limit_sample_seven_day_threshold_percent: float = 0.0
     usage_limit_default_ranges_json: str = ""
-    refresh_max_concurrency: int = 1
+    refresh_max_concurrency: int = 2
     protocol_refresh_max_concurrency: int | None = None
     browser_refresh_max_concurrency: int = 1
     browser_min_available_memory_mb: int = 500
     subscription_refresh_batch_size: int = 3
     subscription_refresh_max_concurrency: int = 3
+    account_liveness_max_concurrency: int = 3
 
     playwright_headless: bool = True
     playwright_slow_mo_ms: int = 0

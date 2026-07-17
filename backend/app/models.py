@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -212,6 +212,12 @@ class UpstreamChannel(Base):
     canonical_base_url: Mapped[str] = mapped_column(String(500), unique=True, index=True, nullable=False)
     management_base_url: Mapped[str | None] = mapped_column(String(500))
     upstream_type: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
+    probe_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="1",
+        nullable=False,
+    )
     resolved_upstream_type: Mapped[str | None] = mapped_column(String(32))
     encrypted_access_token: Mapped[str | None] = mapped_column(Text)
     encrypted_refresh_token: Mapped[str | None] = mapped_column(Text)
@@ -231,6 +237,23 @@ class UpstreamChannel(Base):
     balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UpstreamPriorityInterval(Base):
+    __tablename__ = "upstream_priority_intervals"
+    __table_args__ = (
+        CheckConstraint("start_priority >= 0", name="ck_upstream_priority_interval_start"),
+        CheckConstraint("end_priority > start_priority", name="ck_upstream_priority_interval_end"),
+        CheckConstraint("step >= 1", name="ck_upstream_priority_interval_step"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    start_priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    step: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -255,6 +278,19 @@ class UpstreamAccountConfig(Base):
         default=False,
         nullable=False,
     )
+    priority_interval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstream_priority_intervals.id", ondelete="SET NULL"),
+        index=True,
+    )
+    desired_priority: Mapped[int | None] = mapped_column(Integer)
+    priority_sync_status: Mapped[str] = mapped_column(
+        String(32),
+        default="unassigned",
+        server_default="unassigned",
+        nullable=False,
+    )
+    priority_sync_error: Mapped[str | None] = mapped_column(Text)
+    last_priority_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     remote_name: Mapped[str | None] = mapped_column(String(200))
     remote_platform: Mapped[str | None] = mapped_column(String(64))
     remote_account_type: Mapped[str | None] = mapped_column(String(32))
@@ -266,6 +302,28 @@ class UpstreamAccountConfig(Base):
     upstream_user_id: Mapped[str | None] = mapped_column(String(128))
     selected_group_id: Mapped[str | None] = mapped_column(String(128))
     selected_group_name: Mapped[str | None] = mapped_column(String(200))
+    upstream_key_status: Mapped[str] = mapped_column(
+        String(32),
+        default="not_checked",
+        server_default="not_checked",
+        nullable=False,
+    )
+    upstream_group_status: Mapped[str] = mapped_column(
+        String(32),
+        default="not_checked",
+        server_default="not_checked",
+        nullable=False,
+    )
+    upstream_health_invalid_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    upstream_key_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    upstream_group_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    auto_disabled_reason: Mapped[str | None] = mapped_column(String(64))
+    last_auto_disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     manual_group_multiplier: Mapped[float | None] = mapped_column(Float)
     manual_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     group_options: Mapped[list[dict] | None] = mapped_column(JSON)
@@ -318,6 +376,12 @@ class UpstreamRateChangeLog(Base):
     new_target_rate: Mapped[float | None] = mapped_column(Float)
     old_current_rate: Mapped[float | None] = mapped_column(Float)
     new_current_rate: Mapped[float | None] = mapped_column(Float)
+    old_upstream_key_status: Mapped[str | None] = mapped_column(String(32))
+    new_upstream_key_status: Mapped[str | None] = mapped_column(String(32))
+    old_upstream_group_status: Mapped[str | None] = mapped_column(String(32))
+    new_upstream_group_status: Mapped[str | None] = mapped_column(String(32))
+    old_remote_schedulable: Mapped[bool | None] = mapped_column(Boolean)
+    new_remote_schedulable: Mapped[bool | None] = mapped_column(Boolean)
     reason: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     safe_error: Mapped[str | None] = mapped_column(Text)

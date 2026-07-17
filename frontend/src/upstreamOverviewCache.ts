@@ -4,9 +4,10 @@ import type {
   UpstreamChannelsResponse,
   UpstreamGroupOption,
   UpstreamType,
+  PriorityInterval,
 } from "./types";
 
-export const upstreamOverviewCacheVersion = 1;
+export const upstreamOverviewCacheVersion = 2;
 const cacheKeyPrefix = "sub2api-at-upstream-overview:";
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem" | "key" | "length">;
@@ -102,9 +103,20 @@ export function sanitizeUpstreamOverview(value: unknown): UpstreamChannelsRespon
     local_recharge_multiplier: nullableNumber(source.local_recharge_multiplier),
     local_recharge_source: nullableString(source.local_recharge_source),
     local_recharge_status: nullableString(source.local_recharge_status),
+    priority_intervals: sanitizePriorityIntervals(source.priority_intervals),
     channels: source.channels.map(sanitizeChannel).filter(isPresent),
     unassigned_accounts: source.unassigned_accounts.map(sanitizeAccount).filter(isPresent),
   };
+}
+
+export function upstreamOverviewHasLiveMutationData(value: UpstreamChannelsResponse | null | undefined) {
+  if (!value) return false;
+  const accounts = [
+    ...value.channels.flatMap((channel) => channel.accounts || []),
+    ...value.unassigned_accounts,
+  ];
+  return value.channels.every((channel) => typeof channel.probe_enabled === "boolean")
+    && accounts.every((account) => /^[a-f0-9]{64}$/.test(String(account.identity_fingerprint || "")));
 }
 
 function sanitizeChannel(value: unknown): UpstreamChannel | null {
@@ -118,6 +130,7 @@ function sanitizeChannel(value: unknown): UpstreamChannel | null {
     canonical_base_url: nullableString(source.canonical_base_url),
     management_base_url: nullableString(source.management_base_url),
     upstream_type: upstreamType(source.upstream_type),
+    probe_enabled: optionalBoolean(source.probe_enabled),
     resolved_upstream_type: resolvedUpstreamType(source.resolved_upstream_type),
     upstream_user_id: nullableString(source.upstream_user_id),
     access_token_set: optionalBoolean(source.access_token_set),
@@ -142,6 +155,7 @@ function sanitizeChannel(value: unknown): UpstreamChannel | null {
     last_discovered_at: nullableString(source.last_discovered_at),
     created_at: nullableString(source.created_at),
     updated_at: nullableString(source.updated_at),
+    account_count: nullableNumber(source.account_count) ?? undefined,
     accounts: Array.isArray(source.accounts) ? source.accounts.map(sanitizeAccount).filter(isPresent) : [],
   };
 }
@@ -158,6 +172,13 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
     remote_account_type: nullableString(source.remote_account_type),
     remote_status: nullableString(source.remote_status),
     remote_schedulable: optionalBoolean(source.remote_schedulable),
+    priority: nullableNumber(source.priority),
+    desired_priority: nullableNumber(source.desired_priority),
+    priority_interval_id: nullableId(source.priority_interval_id),
+    priority_interval_name: nullableString(source.priority_interval_name),
+    priority_sync_status: nullableString(source.priority_sync_status),
+    priority_sync_error: nullableString(source.priority_sync_error),
+    composite_multiplier: nullableNumber(source.composite_multiplier),
     managed: optionalBoolean(source.managed),
     base_url: nullableString(source.base_url),
     upstream_type: upstreamType(source.upstream_type),
@@ -175,6 +196,14 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
     effective_group_multiplier: nullableNumber(source.effective_group_multiplier),
     group_multiplier_source: nullableString(source.group_multiplier_source),
     group_multiplier_status: nullableString(source.group_multiplier_status),
+    upstream_key_status: nullableString(source.upstream_key_status),
+    upstream_group_status: nullableString(source.upstream_group_status),
+    upstream_health_invalid_count: nullableNumber(source.upstream_health_invalid_count) ?? undefined,
+    upstream_health_checked_at: nullableString(source.upstream_health_checked_at),
+    upstream_key_checked_at: nullableString(source.upstream_key_checked_at),
+    upstream_group_checked_at: nullableString(source.upstream_group_checked_at),
+    auto_disabled_reason: nullableString(source.auto_disabled_reason),
+    last_auto_disabled_at: nullableString(source.last_auto_disabled_at),
     discovered_recharge_multiplier: nullableNumber(source.discovered_recharge_multiplier),
     effective_recharge_multiplier: nullableNumber(source.effective_recharge_multiplier),
     recharge_multiplier_source: nullableString(source.recharge_multiplier_source),
@@ -198,6 +227,35 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
     created_at: nullableString(source.created_at),
     updated_at: nullableString(source.updated_at),
   };
+}
+
+function sanitizePriorityIntervals(value: unknown): PriorityInterval[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => {
+    const source = asRecord(entry);
+    const id = source ? nullableId(source.id) : undefined;
+    const name = source ? nullableString(source.name) : undefined;
+    const startPriority = source ? nullableNumber(source.start_priority) : undefined;
+    const endPriority = source ? nullableNumber(source.end_priority) : undefined;
+    const step = source ? nullableNumber(source.step) : undefined;
+    if (
+      !source
+      || id === null || id === undefined
+      || !name
+      || startPriority === null || startPriority === undefined
+      || endPriority === null || endPriority === undefined
+      || step === null || step === undefined
+    ) return null;
+    return {
+      id,
+      name,
+      start_priority: startPriority,
+      end_priority: endPriority,
+      step,
+      account_count: nullableNumber(source.account_count) ?? undefined,
+      effective_step: nullableNumber(source.effective_step) ?? undefined,
+    };
+  }).filter(isPresent);
 }
 
 function sanitizeGroupOptions(value: unknown): UpstreamGroupOption[] {

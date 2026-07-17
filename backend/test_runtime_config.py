@@ -33,6 +33,7 @@ class RuntimeConfigTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(settings_router, prefix="/api/settings")
         service = SimpleNamespace(
+            get_public_settings=AsyncMock(return_value=_route_public_settings_fixture()),
             update_public_settings=AsyncMock(
                 side_effect=RuntimeConfigServiceError("credential rebind confirmation required", status_code=409)
             )
@@ -49,6 +50,59 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"detail": "credential rebind confirmation required"})
+
+    def test_settings_route_does_not_wake_tasks_for_unchanged_automation_fields(self) -> None:
+        before = _route_public_settings_fixture()
+        after = {**before, "site_name": "Renamed App"}
+        payload = {
+            field_name: before[field_name]
+            for field_name in AppSettingsUpdate.model_fields
+            if field_name in before
+        }
+        payload["site_name"] = after["site_name"]
+        response, services = _put_settings_route(before, after, payload)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["site_name"], "Renamed App")
+        services.monitor.wake.assert_not_called()
+        services.upstream.wake.assert_not_called()
+        services.upstream.wake_inventory.assert_not_called()
+        services.upstream.wake_upstream.assert_not_called()
+        services.usage.wake.assert_not_called()
+        services.refresh.wake_concurrency.assert_not_awaited()
+        services.liveness.wake.assert_not_awaited()
+
+    def test_settings_route_wakes_only_api_key_inventory_loop_for_inventory_change(self) -> None:
+        before = _route_public_settings_fixture()
+        after = {**before, "api_key_account_sync_enabled": False}
+        response, services = _put_settings_route(
+            before,
+            after,
+            {"api_key_account_sync_enabled": False},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        services.upstream.wake_inventory.assert_called_once_with()
+        services.upstream.wake.assert_not_called()
+        services.upstream.wake_upstream.assert_not_called()
+        services.monitor.wake.assert_not_called()
+        services.usage.wake.assert_not_called()
+
+    def test_settings_route_wakes_only_upstream_loop_for_upstream_change(self) -> None:
+        before = _route_public_settings_fixture()
+        after = {**before, "upstream_sync_interval_seconds": 1200}
+        response, services = _put_settings_route(
+            before,
+            after,
+            {"upstream_sync_interval_seconds": 1200},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        services.upstream.wake_upstream.assert_called_once_with()
+        services.upstream.wake.assert_not_called()
+        services.upstream.wake_inventory.assert_not_called()
+        services.monitor.wake.assert_not_called()
+        services.usage.wake.assert_not_called()
 
     def test_test_environment_never_persists_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -394,11 +448,14 @@ class RuntimeConfigTests(unittest.TestCase):
 
             with patch.object(service, "_load_values", new=AsyncMock(return_value={})):
                 enabled = asyncio.run(service.get_upstream_rate_sync_enabled())
+                upstream_enabled = asyncio.run(service.get_upstream_sync_enabled())
                 retention_days = asyncio.run(service.get_upstream_rate_log_retention_days())
                 public = asyncio.run(service.get_public_settings())
 
         self.assertTrue(enabled)
+        self.assertTrue(upstream_enabled)
         self.assertEqual(retention_days, 180)
+        self.assertTrue(public["upstream_sync_enabled"])
         self.assertTrue(public["upstream_rate_sync_enabled"])
         self.assertEqual(public["upstream_rate_log_retention_days"], 180)
 
@@ -423,14 +480,35 @@ class RuntimeConfigTests(unittest.TestCase):
 
                 settings = await service.update_public_settings(
                     {
+                        "oauth_account_sync_enabled": False,
+                        "api_key_account_sync_enabled": False,
+                        "api_key_account_sync_interval_seconds": 600,
+                        "upstream_sync_enabled": True,
+                        "upstream_sync_interval_seconds": 1200,
+                        "upstream_sync_max_concurrency": 2,
                         "upstream_rate_sync_enabled": True,
+                        "upstream_priority_sync_enabled": False,
+                        "api_key_auto_disable_on_upstream_unavailable": True,
                         "upstream_rate_log_retention_days": 180,
+                        "account_liveness_max_concurrency": 4,
                     }
                 )
 
+                self.assertFalse(settings["oauth_account_sync_enabled"])
+                self.assertFalse(settings["api_key_account_sync_enabled"])
+                self.assertEqual(settings["api_key_account_sync_interval_seconds"], 600)
+                self.assertTrue(settings["upstream_sync_enabled"])
+                self.assertEqual(settings["upstream_sync_interval_seconds"], 1200)
+                self.assertEqual(settings["upstream_sync_max_concurrency"], 2)
                 self.assertTrue(settings["upstream_rate_sync_enabled"])
+                self.assertFalse(settings["upstream_priority_sync_enabled"])
+                self.assertTrue(settings["api_key_auto_disable_on_upstream_unavailable"])
+                self.assertEqual(settings["account_liveness_max_concurrency"], 4)
                 self.assertEqual(settings["upstream_rate_log_retention_days"], 180)
+                self.assertTrue(await service.get_upstream_sync_enabled())
                 self.assertTrue(await service.get_upstream_rate_sync_enabled())
+                self.assertFalse(await service.get_upstream_priority_sync_enabled())
+                self.assertTrue(await service.get_api_key_auto_disable_on_upstream_unavailable())
                 self.assertEqual(await service.get_upstream_rate_log_retention_days(), 180)
 
                 async with runtime_config.AsyncSessionLocal() as db:
@@ -438,18 +516,36 @@ class RuntimeConfigTests(unittest.TestCase):
                         select(AppSetting).where(
                             AppSetting.key.in_(
                                 [
+                                    "oauth_account_sync_enabled",
+                                    "api_key_account_sync_enabled",
+                                    "api_key_account_sync_interval_seconds",
+                                    "upstream_sync_enabled",
+                                    "upstream_sync_interval_seconds",
+                                    "upstream_sync_max_concurrency",
                                     "upstream_rate_sync_enabled",
+                                    "upstream_priority_sync_enabled",
+                                    "api_key_auto_disable_on_upstream_unavailable",
                                     "upstream_rate_log_retention_days",
+                                    "account_liveness_max_concurrency",
                                 ]
                             )
                         )
                     )
                     values = {row.key: row.value for row in result.scalars().all()}
 
+                self.assertEqual(values["oauth_account_sync_enabled"], "false")
+                self.assertEqual(values["api_key_account_sync_enabled"], "false")
+                self.assertEqual(values["upstream_sync_enabled"], "true")
                 self.assertEqual(values["upstream_rate_sync_enabled"], "true")
+                self.assertEqual(values["upstream_priority_sync_enabled"], "false")
+                self.assertEqual(values["api_key_auto_disable_on_upstream_unavailable"], "true")
                 self.assertEqual(values["upstream_rate_log_retention_days"], "180")
                 env_text = (project_root / ".env").read_text(encoding="utf-8")
+                self.assertIn("UPSTREAM_SYNC_ENABLED=true", env_text)
                 self.assertIn("UPSTREAM_RATE_SYNC_ENABLED=true", env_text)
+                self.assertIn("UPSTREAM_PRIORITY_SYNC_ENABLED=false", env_text)
+                self.assertIn("API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE=true", env_text)
+                self.assertIn("ACCOUNT_LIVENESS_MAX_CONCURRENCY=4", env_text)
                 self.assertIn("UPSTREAM_RATE_LOG_RETENTION_DAYS=180", env_text)
             finally:
                 runtime_config.AsyncSessionLocal = original_sessionmaker
@@ -625,22 +721,31 @@ class _FakeSettings:
         self.sub2api_scan_timeout_seconds = 0.5
         self.sub2api_scan_ports = [8080, 18080]
         self.automation_paused = False
+        self.oauth_account_sync_enabled = True
         self.recovery_enabled = False
         self.monitor_interval_seconds = 300
         self.usage_refresh_enabled = False
         self.usage_refresh_interval_seconds = 3600
         self.usage_refresh_max_concurrency = 5
+        self.api_key_account_sync_enabled = True
+        self.api_key_account_sync_interval_seconds = 300
+        self.upstream_sync_enabled = None
+        self.upstream_sync_interval_seconds = 900
+        self.upstream_sync_max_concurrency = 1
         self.upstream_rate_sync_enabled = False
+        self.upstream_priority_sync_enabled = True
+        self.api_key_auto_disable_on_upstream_unavailable = False
         self.upstream_rate_log_retention_days = 90
         self.usage_limit_sample_five_hour_threshold_percent = 0.0
         self.usage_limit_sample_seven_day_threshold_percent = 0.0
         self.usage_limit_default_ranges_json = ""
-        self.refresh_max_concurrency = 1
-        self.protocol_refresh_max_concurrency = 1
+        self.refresh_max_concurrency = 2
+        self.protocol_refresh_max_concurrency = 2
         self.browser_refresh_max_concurrency = 1
         self.browser_min_available_memory_mb = 500
         self.subscription_refresh_batch_size = 3
         self.subscription_refresh_max_concurrency = 3
+        self.account_liveness_max_concurrency = 3
         self.display_timezone = "Asia/Shanghai"
 
 
@@ -661,24 +766,78 @@ def _public_settings_fixture() -> dict:
         "sub2api_base_url": "http://localhost:8080/api/v1",
         "sub2api_auto_recover_state": True,
         "automation_paused": False,
+        "oauth_account_sync_enabled": True,
         "recovery_enabled": False,
         "monitor_interval_seconds": 300,
         "usage_refresh_enabled": False,
         "usage_refresh_interval_seconds": 3600,
         "usage_refresh_max_concurrency": 5,
+        "api_key_account_sync_enabled": True,
+        "api_key_account_sync_interval_seconds": 300,
+        "upstream_sync_enabled": False,
+        "upstream_sync_interval_seconds": 900,
+        "upstream_sync_max_concurrency": 1,
         "upstream_rate_sync_enabled": False,
+        "upstream_priority_sync_enabled": True,
+        "api_key_auto_disable_on_upstream_unavailable": False,
         "upstream_rate_log_retention_days": 90,
         "usage_limit_sample_five_hour_threshold_percent": 0.0,
         "usage_limit_sample_seven_day_threshold_percent": 0.0,
         "usage_limit_default_ranges": {},
-        "refresh_max_concurrency": 1,
-        "protocol_refresh_max_concurrency": 1,
+        "refresh_max_concurrency": 2,
+        "protocol_refresh_max_concurrency": 2,
         "browser_refresh_max_concurrency": 1,
         "browser_min_available_memory_mb": 500,
         "subscription_refresh_batch_size": 3,
         "subscription_refresh_max_concurrency": 3,
+        "account_liveness_max_concurrency": 3,
         "display_timezone": "Asia/Shanghai",
     }
+
+
+def _route_public_settings_fixture() -> dict:
+    return {
+        **_public_settings_fixture(),
+        "sub2api_port": 8080,
+        "sub2api_base_url_source": "manual",
+        "sub2api_x_api_key_set": True,
+        "sub2api_x_api_key_hint": "***configured***",
+        "last_scan_at": None,
+        "last_scan_status": None,
+        "last_scan_message": None,
+    }
+
+
+def _put_settings_route(
+    before: dict,
+    after: dict,
+    payload: dict,
+) -> tuple[object, SimpleNamespace]:
+    app = FastAPI()
+    app.include_router(settings_router, prefix="/api/settings")
+    runtime_service = SimpleNamespace(
+        get_public_settings=AsyncMock(return_value=before),
+        update_public_settings=AsyncMock(return_value=after),
+    )
+    services = SimpleNamespace(
+        monitor=Mock(),
+        upstream=Mock(),
+        usage=Mock(),
+        refresh=SimpleNamespace(wake_concurrency=AsyncMock()),
+        liveness=SimpleNamespace(wake=AsyncMock()),
+    )
+    app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+    with (
+        patch("app.api.settings.get_runtime_config_service", return_value=runtime_service),
+        patch("app.api.settings.get_monitor_service", return_value=services.monitor),
+        patch("app.api.settings.get_upstream_rate_sync_service", return_value=services.upstream),
+        patch("app.api.settings.get_usage_refresh_service", return_value=services.usage),
+        patch("app.api.settings.get_refresh_service", return_value=services.refresh),
+        patch("app.api.settings.get_account_liveness_limiter", return_value=services.liveness),
+        TestClient(app) as client,
+    ):
+        response = client.put("/api/settings", json=payload)
+    return response, services
 
 
 if __name__ == "__main__":

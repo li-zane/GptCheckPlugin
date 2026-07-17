@@ -185,7 +185,7 @@ gpt@example.com----mail@example.com----password----client_id----refresh_token---
 
 OAuth 写回会标准保存 `credentials.refresh_token`。如果原账号使用 `rt` 字段，或 sub2api 的隐藏敏感字段状态表明现有 RT 可能不是标准 `refresh_token` 字段，也会同步写入 `credentials.rt` 兼容旧数据。
 
-用量查询、订阅查询和账号刷新并发可以分开设置：`USAGE_REFRESH_MAX_CONCURRENCY` 控制额度窗口查询并发，默认 `5`；`SUBSCRIPTION_REFRESH_MAX_CONCURRENCY` 控制订阅状态检查并发，默认 `3`；`PROTOCOL_REFRESH_MAX_CONCURRENCY` 控制协议路径，`BROWSER_REFRESH_MAX_CONCURRENCY` 控制 Playwright 回退，旧的 `REFRESH_MAX_CONCURRENCY` 会作为协议并发的兼容默认值。
+自动任务分别配置 OAuth 账号清单、OAuth 凭证恢复、OAuth 用量窗口、API Key 账号清单、API Key 上游探测、计费倍率和优先级写入。账号清单同步是单次分页读取；`USAGE_REFRESH_MAX_CONCURRENCY` 控制额度窗口查询并发，默认 `20`；`PROTOCOL_REFRESH_MAX_CONCURRENCY` 控制协议刷新，默认 `2`；`BROWSER_REFRESH_MAX_CONCURRENCY` 控制 Playwright 回退，默认 `1`；`UPSTREAM_SYNC_MAX_CONCURRENCY` 控制上游渠道并发，默认 `10`。所有并发上限设为 `0` 时表示本批不限，即拿到本批账号或渠道清单后同时发起。账号测活会发出真实模型请求并消耗额度，因此仍建议为 `ACCOUNT_LIVENESS_MAX_CONCURRENCY` 保留一个较小的正数。手动操作与自动任务共用这些限制，关闭自动开关不会阻止显式的单账号或单渠道操作。
 
 OAuth 订阅类型会统一规范化后用于账号标注、订阅筛选和额度样本。内置识别 Plus、Team、Pro、Free 与 K12；新的非空订阅类型会保留为稳定类型键，而不会被直接丢到 `unknown`。设置页的“订阅默认额度区间”可分别配置每种类型的 5h、7d 和月窗口上下界，也可新增未来订阅类型；`unknown` 是未返回套餐时的回退区间。对应环境变量为 `USAGE_LIMIT_DEFAULT_RANGES_JSON`，通常直接通过设置页维护即可。
 

@@ -31,11 +31,21 @@ KEY_SUB2API_BASE_URL = "sub2api_base_url"
 KEY_SUB2API_BASE_URL_SOURCE = "sub2api_base_url_source"
 KEY_SUB2API_X_API_KEY = "sub2api_x_api_key"
 KEY_SUB2API_AUTO_RECOVER_STATE = "sub2api_auto_recover_state"
+KEY_OAUTH_ACCOUNT_SYNC_ENABLED = "oauth_account_sync_enabled"
 KEY_MONITOR_INTERVAL_SECONDS = "monitor_interval_seconds"
 KEY_USAGE_REFRESH_ENABLED = "usage_refresh_enabled"
 KEY_USAGE_REFRESH_INTERVAL_SECONDS = "usage_refresh_interval_seconds"
 KEY_USAGE_REFRESH_MAX_CONCURRENCY = "usage_refresh_max_concurrency"
+KEY_API_KEY_ACCOUNT_SYNC_ENABLED = "api_key_account_sync_enabled"
+KEY_API_KEY_ACCOUNT_SYNC_INTERVAL_SECONDS = "api_key_account_sync_interval_seconds"
+KEY_UPSTREAM_SYNC_ENABLED = "upstream_sync_enabled"
+KEY_UPSTREAM_SYNC_INTERVAL_SECONDS = "upstream_sync_interval_seconds"
+KEY_UPSTREAM_SYNC_MAX_CONCURRENCY = "upstream_sync_max_concurrency"
 KEY_UPSTREAM_RATE_SYNC_ENABLED = "upstream_rate_sync_enabled"
+KEY_UPSTREAM_PRIORITY_SYNC_ENABLED = "upstream_priority_sync_enabled"
+KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE = (
+    "api_key_auto_disable_on_upstream_unavailable"
+)
 KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS = "upstream_rate_log_retention_days"
 KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
@@ -47,6 +57,7 @@ KEY_BROWSER_REFRESH_MAX_CONCURRENCY = "browser_refresh_max_concurrency"
 KEY_BROWSER_MIN_AVAILABLE_MEMORY_MB = "browser_min_available_memory_mb"
 KEY_SUBSCRIPTION_REFRESH_BATCH_SIZE = "subscription_refresh_batch_size"
 KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY = "subscription_refresh_max_concurrency"
+KEY_ACCOUNT_LIVENESS_MAX_CONCURRENCY = "account_liveness_max_concurrency"
 KEY_LAST_SCAN_AT = "sub2api_last_scan_at"
 KEY_LAST_SCAN_STATUS = "sub2api_last_scan_status"
 KEY_LAST_SCAN_MESSAGE = "sub2api_last_scan_message"
@@ -123,6 +134,13 @@ class RuntimeConfigService:
         values = await self._load_values()
         return _int_or_default(values.get(KEY_MONITOR_INTERVAL_SECONDS), self.settings.monitor_interval_seconds)
 
+    async def get_oauth_account_sync_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_OAUTH_ACCOUNT_SYNC_ENABLED),
+            self.settings.oauth_account_sync_enabled,
+        )
+
     async def get_automation_paused(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(values.get(KEY_AUTOMATION_PAUSED), self.settings.automation_paused)
@@ -147,8 +165,52 @@ class RuntimeConfigService:
         return _bounded_int_or_default(
             values.get(KEY_USAGE_REFRESH_MAX_CONCURRENCY),
             self.settings.usage_refresh_max_concurrency,
-            1,
-            20,
+            0,
+            100,
+        )
+
+    async def get_api_key_account_sync_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_API_KEY_ACCOUNT_SYNC_ENABLED),
+            self.settings.api_key_account_sync_enabled,
+        )
+
+    async def get_api_key_account_sync_interval_seconds(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_API_KEY_ACCOUNT_SYNC_INTERVAL_SECONDS),
+            self.settings.api_key_account_sync_interval_seconds,
+            30,
+            86_400,
+        )
+
+    async def get_upstream_sync_enabled(self) -> bool:
+        values = await self._load_values()
+        configured_default = self.settings.upstream_sync_enabled
+        if configured_default is None:
+            configured_default = _bool_or_default(
+                values.get(KEY_UPSTREAM_RATE_SYNC_ENABLED),
+                self.settings.upstream_rate_sync_enabled,
+            )
+        return _bool_or_default(values.get(KEY_UPSTREAM_SYNC_ENABLED), configured_default)
+
+    async def get_upstream_sync_interval_seconds(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_UPSTREAM_SYNC_INTERVAL_SECONDS),
+            self.settings.upstream_sync_interval_seconds,
+            60,
+            86_400,
+        )
+
+    async def get_upstream_sync_max_concurrency(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_UPSTREAM_SYNC_MAX_CONCURRENCY),
+            self.settings.upstream_sync_max_concurrency,
+            0,
+            50,
         )
 
     async def get_upstream_rate_sync_enabled(self) -> bool:
@@ -156,6 +218,20 @@ class RuntimeConfigService:
         return _bool_or_default(
             values.get(KEY_UPSTREAM_RATE_SYNC_ENABLED),
             self.settings.upstream_rate_sync_enabled,
+        )
+
+    async def get_upstream_priority_sync_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_UPSTREAM_PRIORITY_SYNC_ENABLED),
+            self.settings.upstream_priority_sync_enabled,
+        )
+
+    async def get_api_key_auto_disable_on_upstream_unavailable(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE),
+            self.settings.api_key_auto_disable_on_upstream_unavailable,
         )
 
     async def get_upstream_rate_log_retention_days(self) -> int:
@@ -193,7 +269,7 @@ class RuntimeConfigService:
         return _bounded_int_or_default(
             values.get(KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY) or values.get(KEY_REFRESH_MAX_CONCURRENCY),
             self._default_protocol_refresh_max_concurrency(),
-            1,
+            0,
             50,
         )
 
@@ -202,7 +278,7 @@ class RuntimeConfigService:
         return _bounded_int_or_default(
             values.get(KEY_BROWSER_REFRESH_MAX_CONCURRENCY),
             self.settings.browser_refresh_max_concurrency,
-            1,
+            0,
             50,
         )
 
@@ -229,8 +305,17 @@ class RuntimeConfigService:
         return _bounded_int_or_default(
             values.get(KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY),
             self.settings.subscription_refresh_max_concurrency,
-            1,
+            0,
             20,
+        )
+
+    async def get_account_liveness_max_concurrency(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_ACCOUNT_LIVENESS_MAX_CONCURRENCY),
+            self.settings.account_liveness_max_concurrency,
+            0,
+            50,
         )
 
     async def get_public_settings(self) -> dict:
@@ -253,6 +338,10 @@ class RuntimeConfigService:
                 values.get(KEY_AUTOMATION_PAUSED),
                 self.settings.automation_paused,
             ),
+            "oauth_account_sync_enabled": _bool_or_default(
+                values.get(KEY_OAUTH_ACCOUNT_SYNC_ENABLED),
+                self.settings.oauth_account_sync_enabled,
+            ),
             "recovery_enabled": _bool_or_default(
                 values.get(KEY_RECOVERY_ENABLED),
                 self.settings.recovery_enabled,
@@ -272,12 +361,51 @@ class RuntimeConfigService:
             "usage_refresh_max_concurrency": _bounded_int_or_default(
                 values.get(KEY_USAGE_REFRESH_MAX_CONCURRENCY),
                 self.settings.usage_refresh_max_concurrency,
-                1,
-                20,
+                0,
+                100,
+            ),
+            "api_key_account_sync_enabled": _bool_or_default(
+                values.get(KEY_API_KEY_ACCOUNT_SYNC_ENABLED),
+                self.settings.api_key_account_sync_enabled,
+            ),
+            "api_key_account_sync_interval_seconds": _bounded_int_or_default(
+                values.get(KEY_API_KEY_ACCOUNT_SYNC_INTERVAL_SECONDS),
+                self.settings.api_key_account_sync_interval_seconds,
+                30,
+                86_400,
+            ),
+            "upstream_sync_enabled": _bool_or_default(
+                values.get(KEY_UPSTREAM_SYNC_ENABLED),
+                self.settings.upstream_sync_enabled
+                if self.settings.upstream_sync_enabled is not None
+                else _bool_or_default(
+                    values.get(KEY_UPSTREAM_RATE_SYNC_ENABLED),
+                    self.settings.upstream_rate_sync_enabled,
+                ),
+            ),
+            "upstream_sync_interval_seconds": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_SYNC_INTERVAL_SECONDS),
+                self.settings.upstream_sync_interval_seconds,
+                60,
+                86_400,
+            ),
+            "upstream_sync_max_concurrency": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_SYNC_MAX_CONCURRENCY),
+                self.settings.upstream_sync_max_concurrency,
+                0,
+                50,
             ),
             "upstream_rate_sync_enabled": _bool_or_default(
                 values.get(KEY_UPSTREAM_RATE_SYNC_ENABLED),
                 self.settings.upstream_rate_sync_enabled,
+            ),
+            "upstream_priority_sync_enabled": _bool_or_default(
+                values.get(KEY_UPSTREAM_PRIORITY_SYNC_ENABLED),
+                self.settings.upstream_priority_sync_enabled,
+            ),
+            "api_key_auto_disable_on_upstream_unavailable": _bool_or_default(
+                values.get(KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE),
+                self.settings.api_key_auto_disable_on_upstream_unavailable,
             ),
             "upstream_rate_log_retention_days": _bounded_int_or_default(
                 values.get(KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS),
@@ -299,19 +427,19 @@ class RuntimeConfigService:
             "refresh_max_concurrency": _bounded_int_or_default(
                 values.get(KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY) or values.get(KEY_REFRESH_MAX_CONCURRENCY),
                 self._default_protocol_refresh_max_concurrency(),
-                1,
+                0,
                 50,
             ),
             "protocol_refresh_max_concurrency": _bounded_int_or_default(
                 values.get(KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY) or values.get(KEY_REFRESH_MAX_CONCURRENCY),
                 self._default_protocol_refresh_max_concurrency(),
-                1,
+                0,
                 50,
             ),
             "browser_refresh_max_concurrency": _bounded_int_or_default(
                 values.get(KEY_BROWSER_REFRESH_MAX_CONCURRENCY),
                 self.settings.browser_refresh_max_concurrency,
-                1,
+                0,
                 50,
             ),
             "browser_min_available_memory_mb": _bounded_int_or_default(
@@ -329,8 +457,14 @@ class RuntimeConfigService:
             "subscription_refresh_max_concurrency": _bounded_int_or_default(
                 values.get(KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY),
                 self.settings.subscription_refresh_max_concurrency,
-                1,
+                0,
                 20,
+            ),
+            "account_liveness_max_concurrency": _bounded_int_or_default(
+                values.get(KEY_ACCOUNT_LIVENESS_MAX_CONCURRENCY),
+                self.settings.account_liveness_max_concurrency,
+                0,
+                50,
             ),
             "last_scan_at": _datetime_or_none(values.get(KEY_LAST_SCAN_AT)),
             "last_scan_status": values.get(KEY_LAST_SCAN_STATUS),
@@ -383,6 +517,13 @@ class RuntimeConfigService:
             if payload.get("monitor_interval_seconds") is not None:
                 await self._put(db, KEY_MONITOR_INTERVAL_SECONDS, str(int(payload["monitor_interval_seconds"])))
 
+            if payload.get("oauth_account_sync_enabled") is not None:
+                await self._put(
+                    db,
+                    KEY_OAUTH_ACCOUNT_SYNC_ENABLED,
+                    "true" if payload["oauth_account_sync_enabled"] else "false",
+                )
+
             if payload.get("automation_paused") is not None:
                 await self._put(db, KEY_AUTOMATION_PAUSED, "true" if payload["automation_paused"] else "false")
 
@@ -406,11 +547,62 @@ class RuntimeConfigService:
                     str(int(payload["usage_refresh_max_concurrency"])),
                 )
 
+            if payload.get("api_key_account_sync_enabled") is not None:
+                await self._put(
+                    db,
+                    KEY_API_KEY_ACCOUNT_SYNC_ENABLED,
+                    "true" if payload["api_key_account_sync_enabled"] else "false",
+                )
+
+            if payload.get("api_key_account_sync_interval_seconds") is not None:
+                await self._put(
+                    db,
+                    KEY_API_KEY_ACCOUNT_SYNC_INTERVAL_SECONDS,
+                    str(int(payload["api_key_account_sync_interval_seconds"])),
+                )
+
+            if payload.get("upstream_sync_enabled") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_SYNC_ENABLED,
+                    "true" if payload["upstream_sync_enabled"] else "false",
+                )
+
+            if payload.get("upstream_sync_interval_seconds") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_SYNC_INTERVAL_SECONDS,
+                    str(int(payload["upstream_sync_interval_seconds"])),
+                )
+
+            if payload.get("upstream_sync_max_concurrency") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_SYNC_MAX_CONCURRENCY,
+                    str(int(payload["upstream_sync_max_concurrency"])),
+                )
+
             if payload.get("upstream_rate_sync_enabled") is not None:
                 await self._put(
                     db,
                     KEY_UPSTREAM_RATE_SYNC_ENABLED,
                     "true" if payload["upstream_rate_sync_enabled"] else "false",
+                )
+
+            if payload.get("upstream_priority_sync_enabled") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_PRIORITY_SYNC_ENABLED,
+                    "true" if payload["upstream_priority_sync_enabled"] else "false",
+                )
+
+            if payload.get("api_key_auto_disable_on_upstream_unavailable") is not None:
+                await self._put(
+                    db,
+                    KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE,
+                    "true"
+                    if payload["api_key_auto_disable_on_upstream_unavailable"]
+                    else "false",
                 )
 
             if payload.get("upstream_rate_log_retention_days") is not None:
@@ -488,6 +680,13 @@ class RuntimeConfigService:
                     db,
                     KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY,
                     str(int(payload["subscription_refresh_max_concurrency"])),
+                )
+
+            if payload.get("account_liveness_max_concurrency") is not None:
+                await self._put(
+                    db,
+                    KEY_ACCOUNT_LIVENESS_MAX_CONCURRENCY,
+                    str(int(payload["account_liveness_max_concurrency"])),
                 )
 
             if payload.get("display_timezone") is not None:
@@ -755,12 +954,26 @@ class RuntimeConfigService:
             "SUB2API_BASE_URL": str(settings["sub2api_base_url"]),
             "SUB2API_AUTO_RECOVER_STATE": _env_bool(bool(settings["sub2api_auto_recover_state"])),
             "AUTOMATION_PAUSED": _env_bool(bool(settings["automation_paused"])),
+            "OAUTH_ACCOUNT_SYNC_ENABLED": _env_bool(bool(settings["oauth_account_sync_enabled"])),
             "RECOVERY_ENABLED": _env_bool(bool(settings["recovery_enabled"])),
             "MONITOR_INTERVAL_SECONDS": str(int(settings["monitor_interval_seconds"])),
             "USAGE_REFRESH_ENABLED": _env_bool(bool(settings["usage_refresh_enabled"])),
             "USAGE_REFRESH_INTERVAL_SECONDS": str(int(settings["usage_refresh_interval_seconds"])),
             "USAGE_REFRESH_MAX_CONCURRENCY": str(int(settings["usage_refresh_max_concurrency"])),
+            "API_KEY_ACCOUNT_SYNC_ENABLED": _env_bool(bool(settings["api_key_account_sync_enabled"])),
+            "API_KEY_ACCOUNT_SYNC_INTERVAL_SECONDS": str(
+                int(settings["api_key_account_sync_interval_seconds"])
+            ),
+            "UPSTREAM_SYNC_ENABLED": _env_bool(bool(settings["upstream_sync_enabled"])),
+            "UPSTREAM_SYNC_INTERVAL_SECONDS": str(int(settings["upstream_sync_interval_seconds"])),
+            "UPSTREAM_SYNC_MAX_CONCURRENCY": str(int(settings["upstream_sync_max_concurrency"])),
             "UPSTREAM_RATE_SYNC_ENABLED": _env_bool(bool(settings["upstream_rate_sync_enabled"])),
+            "UPSTREAM_PRIORITY_SYNC_ENABLED": _env_bool(
+                bool(settings["upstream_priority_sync_enabled"])
+            ),
+            "API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE": _env_bool(
+                bool(settings["api_key_auto_disable_on_upstream_unavailable"])
+            ),
             "UPSTREAM_RATE_LOG_RETENTION_DAYS": str(int(settings["upstream_rate_log_retention_days"])),
             "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(
                 float(settings["usage_limit_sample_five_hour_threshold_percent"])
@@ -780,6 +993,9 @@ class RuntimeConfigService:
             "BROWSER_MIN_AVAILABLE_MEMORY_MB": str(int(settings["browser_min_available_memory_mb"])),
             "SUBSCRIPTION_REFRESH_BATCH_SIZE": str(int(settings["subscription_refresh_batch_size"])),
             "SUBSCRIPTION_REFRESH_MAX_CONCURRENCY": str(int(settings["subscription_refresh_max_concurrency"])),
+            "ACCOUNT_LIVENESS_MAX_CONCURRENCY": str(
+                int(settings["account_liveness_max_concurrency"])
+            ),
             "DISPLAY_TIMEZONE": str(settings["display_timezone"]),
         }
         if remove_legacy_x_api_key or x_api_key == "":
@@ -806,7 +1022,9 @@ class RuntimeConfigService:
         return ""
 
     def _default_protocol_refresh_max_concurrency(self) -> int:
-        return self.settings.protocol_refresh_max_concurrency or self.settings.refresh_max_concurrency
+        if self.settings.protocol_refresh_max_concurrency is not None:
+            return self.settings.protocol_refresh_max_concurrency
+        return self.settings.refresh_max_concurrency
 
 
 def _headers_for_probe(config: EffectiveSub2ApiConfig) -> dict[str, str]:

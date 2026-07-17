@@ -150,11 +150,20 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
                     await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
                 ).fetchall()
             }
+            channel_columns = {
+                row[1]: row
+                for row in (
+                    await conn.execute(text("PRAGMA table_info(upstream_channels)"))
+                ).fetchall()
+            }
 
         self.assertEqual(channel_count, 2)
         self.assertEqual(index_count, 1)
         self.assertEqual(columns["upstream_type"][3], 1)
         self.assertIn("channel_id", columns)
+        self.assertIn("probe_enabled", channel_columns)
+        self.assertEqual(channel_columns["probe_enabled"][3], 1)
+        self.assertEqual(str(channel_columns["probe_enabled"][4]).strip("'\""), "1")
         self.assertIn("balance_status", columns)
         self.assertIn("remote_identity_fingerprint", columns)
         self.assertEqual(columns["remote_identity_fingerprint"][3], 0)
@@ -175,6 +184,9 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row.remote_identity_fingerprint is None for row in migrated_rows))
         self.assertTrue(all(not row.api_key_origin_rebind_required for row in migrated_rows))
         self.assertTrue(all(row.balance_status is None for row in migrated_rows))
+        self.assertTrue(all(row.upstream_key_status == "not_checked" for row in migrated_rows))
+        self.assertTrue(all(row.upstream_group_status == "not_checked" for row in migrated_rows))
+        self.assertTrue(all(row.upstream_health_invalid_count == 0 for row in migrated_rows))
 
     async def test_explicitly_unassigned_account_stays_unassigned_on_migration_rerun(self) -> None:
         async with self.engine.begin() as conn:
@@ -331,7 +343,10 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
                     await conn.execute(
                         text(
                             "SELECT old_upstream_multiplier, new_upstream_multiplier, "
-                            "old_upstream_recharge_multiplier, new_upstream_recharge_multiplier "
+                            "old_upstream_recharge_multiplier, new_upstream_recharge_multiplier, "
+                            "old_upstream_key_status, new_upstream_key_status, "
+                            "old_upstream_group_status, new_upstream_group_status, "
+                            "old_remote_schedulable, new_remote_schedulable "
                             "FROM upstream_rate_change_logs WHERE id = 1"
                         )
                     )
@@ -343,11 +358,17 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("new_upstream_multiplier", columns)
         self.assertIn("old_upstream_recharge_multiplier", columns)
         self.assertIn("new_upstream_recharge_multiplier", columns)
+        self.assertIn("old_upstream_key_status", columns)
+        self.assertIn("new_upstream_key_status", columns)
+        self.assertIn("old_upstream_group_status", columns)
+        self.assertIn("new_upstream_group_status", columns)
+        self.assertIn("old_remote_schedulable", columns)
+        self.assertIn("new_remote_schedulable", columns)
         self.assertEqual(columns["old_upstream_multiplier"][3], 0)
         self.assertEqual(columns["new_upstream_multiplier"][3], 0)
         self.assertEqual(columns["old_upstream_recharge_multiplier"][3], 0)
         self.assertEqual(columns["new_upstream_recharge_multiplier"][3], 0)
-        self.assertEqual(tuple(row), (None, None, None, None))
+        self.assertEqual(tuple(row), (None,) * 10)
 
     async def test_scrubs_plaintext_secret_copies_from_names_and_rate_logs(self) -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

@@ -2,6 +2,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowDown,
+  ArrowRight,
   ArrowUp,
   ArrowUpDown,
   ChevronDown,
@@ -38,16 +39,42 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { createContext, FormEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, FormEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { api, AUTH_EXPIRED_EVENT } from "./api";
+import { api, AUTH_EXPIRED_EVENT, upstreamLegacyBindingCounts } from "./api";
 import { ApiKeyAccountsView } from "./ApiKeyAccountsView";
+import { oauthUsageBackgroundRefreshIntervals } from "./oauthUsageRefresh";
+import {
+  eventDurationBreakdown,
+  eventDurationMs,
+  formatElapsedDuration,
+  timestampDurationMs,
+} from "./durationPresentation";
 import {
   accountCanBeLivenessTested,
   livenessAccountIds,
   MAX_LIVENESS_ACCOUNTS,
 } from "./accountLiveness";
-import { apiAccountSyncMessage } from "./upstreamSyncPresentation";
+import {
+  apiAccountLegacyBindingConfirmationMessage,
+  apiAccountSyncMessage,
+  upstreamRateWritesAllowed,
+} from "./upstreamSyncPresentation";
+import {
+  accountBillingRateChange,
+  groupRateChange,
+  remoteSchedulableChange,
+  upstreamGroupStatusChange,
+  upstreamKeyStatusChange,
+  upstreamRateChange,
+  type UpstreamStateChange,
+} from "./upstreamRatePresentation";
+import {
+  upstreamChangeReasonLabel,
+  upstreamHealthStatusLabel,
+  upstreamStatusTone,
+  type UpstreamHealthKind,
+} from "./upstreamLabels";
 import {
   sortUsageLimitSamples,
   type UsageSampleSortDirection,
@@ -83,6 +110,7 @@ import type {
   UsageTokenHistory,
   UsageWindowAggregate,
   UsageWindowEstimate,
+  UpstreamChangeLog,
   UpstreamChannelsResponse,
 } from "./types";
 
@@ -160,22 +188,31 @@ const emptySettings: AppSettings = {
   sub2api_x_api_key_hint: null,
   sub2api_auto_recover_state: true,
   automation_paused: false,
+  oauth_account_sync_enabled: true,
   recovery_enabled: false,
   monitor_interval_seconds: 300,
   usage_refresh_enabled: false,
   usage_refresh_interval_seconds: 3600,
-  usage_refresh_max_concurrency: 5,
+  usage_refresh_max_concurrency: 20,
+  api_key_account_sync_enabled: true,
+  api_key_account_sync_interval_seconds: 300,
+  upstream_sync_enabled: false,
+  upstream_sync_interval_seconds: 900,
+  upstream_sync_max_concurrency: 10,
   upstream_rate_sync_enabled: false,
+  upstream_priority_sync_enabled: true,
+  api_key_auto_disable_on_upstream_unavailable: false,
   upstream_rate_log_retention_days: 90,
   usage_limit_sample_five_hour_threshold_percent: 0,
   usage_limit_sample_seven_day_threshold_percent: 0,
   usage_limit_default_ranges: defaultUsageLimitRanges,
-  refresh_max_concurrency: 1,
-  protocol_refresh_max_concurrency: 1,
+  refresh_max_concurrency: 2,
+  protocol_refresh_max_concurrency: 2,
   browser_refresh_max_concurrency: 1,
   browser_min_available_memory_mb: 500,
   subscription_refresh_batch_size: 3,
   subscription_refresh_max_concurrency: 3,
+  account_liveness_max_concurrency: 3,
   last_scan_at: null,
   last_scan_status: null,
   last_scan_message: null,
@@ -204,7 +241,10 @@ function App() {
   const loadAllRequestSequenceRef = useRef(0);
   const settingsMutationGenerationRef = useRef(0);
   const settingsMutationPendingRef = useRef(false);
-  const syncOperationRef = useRef(false);
+  const oauthSyncOperationRef = useRef(false);
+  const apiKeySyncOperationRef = useRef(false);
+  const oauthUsageRefreshGenerationRef = useRef(0);
+  const oauthUsageRefreshTimersRef = useRef(new Set<number>());
   const [usageEstimate, setUsageEstimate] = useState<UsageEstimate | null>(null);
   const [usageLimitSamples, setUsageLimitSamples] = useState<UsageLimitSamples | null>(null);
   const [usageLimitSamplesLoading, setUsageLimitSamplesLoading] = useState(false);
@@ -219,7 +259,10 @@ function App() {
   const siteName = settings.site_name?.trim() || defaultSiteName;
   const now = useRefreshClock();
   const lastOAuthSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
-  const lastApiKeySyncEvent = useMemo(() => latestEventByKinds(events, ["manual_upstream_sync"]), [events]);
+  const lastApiKeySyncEvent = useMemo(
+    () => latestEventByKinds(events, ["manual_api_key_inventory_sync", "manual_upstream_sync"]),
+    [events],
+  );
   const oauthSyncActionTime = lastOAuthSyncEvent?.created_at ?? null;
   const apiKeySyncActionTime = lastApiKeySyncEvent?.created_at ?? null;
   const syncBusy = busy || oauthSyncBusy || apiKeySyncBusy || apiKeyViewBusy;
@@ -242,7 +285,7 @@ function App() {
     const activeBaseUrl = apiKeyAccountsCacheBaseUrlRef.current;
     if (!activeBaseUrl || upstreamOverviewCacheScope(activeBaseUrl) !== upstreamOverviewCacheScope(responseBaseUrl)) return;
     const safeResponse = writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), responseBaseUrl, response);
-    if (safeResponse) setApiKeyAccountsCache(safeResponse);
+    if (safeResponse) setApiKeyAccountsCache(response);
   }, []);
 
   const loadAll = useCallback(async ({ includePhones = true }: { includePhones?: boolean } = {}) => {
@@ -336,6 +379,44 @@ function App() {
       setUsageLoading(false);
     }
   }, []);
+
+  const cancelOAuthUsageBackgroundRefresh = useCallback(() => {
+    oauthUsageRefreshGenerationRef.current += 1;
+    for (const timer of oauthUsageRefreshTimersRef.current) window.clearTimeout(timer);
+    oauthUsageRefreshTimersRef.current.clear();
+  }, []);
+
+  const scheduleOAuthUsageBackgroundRefresh = useCallback((usagePending?: number) => {
+    cancelOAuthUsageBackgroundRefresh();
+    const generation = oauthUsageRefreshGenerationRef.current;
+    const intervals = oauthUsageBackgroundRefreshIntervals(usagePending);
+
+    const scheduleNext = (index: number) => {
+      if (index >= intervals.length || generation !== oauthUsageRefreshGenerationRef.current) return;
+      const timer = window.setTimeout(async () => {
+        oauthUsageRefreshTimersRef.current.delete(timer);
+        if (generation !== oauthUsageRefreshGenerationRef.current) return;
+        try {
+          const nextEstimate = await api.usageEstimate(false);
+          if (generation !== oauthUsageRefreshGenerationRef.current) return;
+          setUsageEstimate(nextEstimate);
+          setUsageEstimateRefreshed(true);
+          setUsageError("");
+        } catch {
+          // A later bounded retry can still pick up the completed background snapshot.
+        }
+        scheduleNext(index + 1);
+      }, intervals[index]);
+      oauthUsageRefreshTimersRef.current.add(timer);
+    };
+
+    scheduleNext(0);
+  }, [cancelOAuthUsageBackgroundRefresh]);
+
+  useEffect(() => {
+    if (authState !== "in") cancelOAuthUsageBackgroundRefresh();
+    return cancelOAuthUsageBackgroundRefresh;
+  }, [authState, cancelOAuthUsageBackgroundRefresh]);
 
   const loadUsageLimitSamples = useCallback(async () => {
     setUsageLimitSamplesLoading(true);
@@ -446,6 +527,9 @@ function App() {
   const saveSettings = async (payload: AppSettingsUpdate) => {
     const previousSub2ApiBaseUrl = settings.sub2api_base_url;
     const nextSub2ApiBaseUrl = payload.sub2api_base_url || previousSub2ApiBaseUrl;
+    const changesSub2ApiCredential = Boolean(
+      payload.sub2api_x_api_key?.trim() || payload.clear_sub2api_x_api_key,
+    );
     const reusesExistingCredential = settings.sub2api_x_api_key_set
       && !payload.clear_sub2api_x_api_key
       && !payload.sub2api_x_api_key?.trim();
@@ -473,7 +557,10 @@ function App() {
       loadAllRequestSequenceRef.current += 1;
       settingsMutationPendingRef.current = false;
       setSettings(nextSettings);
-      if (nextSettings.sub2api_base_url !== previousSub2ApiBaseUrl) {
+      if (
+        nextSettings.sub2api_base_url !== previousSub2ApiBaseUrl
+        || changesSub2ApiCredential
+      ) {
         clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
         apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
         setApiKeyAccountsCache(null);
@@ -490,17 +577,19 @@ function App() {
     }
   };
 
-  const runSyncAction = async (
+  const runSyncAction = async <T,>(
     kind: "oauth" | "api-key",
-    action: () => Promise<unknown>,
+    action: () => Promise<T>,
     success: string,
+    refreshAffectedData: (result: T) => Promise<void>,
   ) => {
+    const operationRef = kind === "oauth" ? oauthSyncOperationRef : apiKeySyncOperationRef;
     if (
-      syncOperationRef.current
+      operationRef.current
       || busy
-      || apiKeyViewOperationTokensRef.current.size > 0
+      || (kind === "api-key" && apiKeyViewOperationTokensRef.current.size > 0)
     ) return;
-    syncOperationRef.current = true;
+    operationRef.current = true;
     if (kind === "oauth") setOAuthSyncBusy(true);
     else setApiKeySyncBusy(true);
     setNotice("");
@@ -511,68 +600,77 @@ function App() {
           ? result.message
           : success,
       );
-      await loadAll();
+      await refreshAffectedData(result);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "同步失败");
     } finally {
       if (kind === "oauth") setOAuthSyncBusy(false);
       else setApiKeySyncBusy(false);
-      syncOperationRef.current = false;
+      operationRef.current = false;
     }
   };
 
-  const runOAuthSync = () => void runSyncAction(
-    "oauth",
-    async () => {
-      const result = await api.sync();
-      const estimate = await loadUsageEstimate(false).catch(() => null);
-      if (estimate) setUsageEstimateRefreshed(true);
-      return result;
-    },
-    "OAuth 账号同步完成",
-  );
+  const runOAuthSync = () => {
+    cancelOAuthUsageBackgroundRefresh();
+    void runSyncAction(
+      "oauth",
+      () => api.sync(),
+      "OAuth 账号同步完成",
+      async (syncResult) => {
+        const [nextSummary, nextAccounts, nextJobs, nextEvents, nextExceptionRecords] = await Promise.all([
+          api.summary(),
+          api.accounts(),
+          api.jobs(),
+          api.events(),
+          api.exceptionRecords().catch(() => null),
+        ]);
+        loadAllRequestSequenceRef.current += 1;
+        setSummary(nextSummary);
+        setAccounts(nextAccounts);
+        setJobs(nextJobs);
+        setEvents(nextEvents);
+        if (nextExceptionRecords) setExceptionRecords(nextExceptionRecords);
+        scheduleOAuthUsageBackgroundRefresh(syncResult.usage_pending);
+      },
+    );
+  };
 
   const runApiKeySync = () => void runSyncAction(
     "api-key",
     async () => {
-      const overview = await api.upstreamChannels();
-      const upstreamAccounts = [
-        ...overview.channels.flatMap((channel) => channel.accounts || []),
-        ...overview.unassigned_accounts,
-      ];
-      const unboundCount = upstreamAccounts.filter(
-        (account) => account.identity_binding_status === "unbound",
-      ).length;
-      const originRebindCount = upstreamAccounts.filter(
-        (account) => account.api_key_origin_rebind_required === true,
-      ).length;
-      const confirmationRequired = unboundCount > 0 || originRebindCount > 0;
+      const liveOverview = await api.upstreamChannels();
+      const bindingCounts = upstreamLegacyBindingCounts(liveOverview);
+      const confirmationRequired = bindingCounts.unbound > 0 || bindingCounts.originRebind > 0;
       if (
         confirmationRequired
-        && !window.confirm(
-          "本次同步发现需要显式确认的 API Key 账号：\n"
-            + `- 升级前身份待绑定：${unboundCount} 个\n`
-            + `- 上游端点变化、API Key 来源待重新绑定：${originRebindCount} 个\n\n`
-            + "同一账号可能同时计入两项。继续会将已保存的加密 API Key 绑定到当前账号身份和当前上游端点，并探测分组与倍率。请确认你已核对这些账号和端点，是否继续？",
-        )
+        && !window.confirm(apiAccountLegacyBindingConfirmationMessage(bindingCounts))
       ) {
-        return { message: "已取消 API 账号同步。" };
+        return { message: "已取消 API 账号同步。", cancelled: true };
       }
-      try {
-        const result = await api.syncApiKeyAccounts(overview, confirmationRequired);
-        return {
-          message: apiAccountSyncMessage(
-            result,
-            settings.upstream_rate_sync_enabled && !settings.automation_paused,
-          ),
-        };
-      } finally {
-        clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
-        setApiKeyAccountsCache(null);
-        setApiKeyRefreshVersion((current) => current + 1);
-      }
+      const result = await api.syncApiKeyAccounts(liveOverview, confirmationRequired);
+      const overview = result.overview || {
+        ...liveOverview,
+        channels: result.channels || [],
+        unassigned_accounts: liveOverview.unassigned_accounts,
+      };
+      cacheApiKeyAccounts(overview, settings.sub2api_base_url);
+      setApiKeyRefreshVersion((current) => current + 1);
+      const accountCount = overview.channels.reduce(
+        (total, channel) => total + (channel.account_count || channel.accounts?.length || 0),
+        overview.unassigned_accounts.length,
+      );
+      return {
+        message: `已同步 ${accountCount} 个 API Key 账号；${apiAccountSyncMessage(
+          result,
+          upstreamRateWritesAllowed(settings.upstream_rate_sync_enabled, settings.automation_paused),
+        )}`,
+        cancelled: false,
+      };
     },
     "API 账号同步完成",
+    async () => {
+      setEvents(await api.events());
+    },
   );
 
   if (authState === "checking") {
@@ -680,7 +778,7 @@ function App() {
           <div className="topbar-actions">
             {notice ? <span className="notice">{notice}</span> : null}
             <ToolbarTimeButton
-              disabled={syncBusy}
+              disabled={busy || oauthSyncBusy}
               icon={RefreshCcw}
               label="同步 OAuth 账号"
               loading={oauthSyncBusy}
@@ -688,7 +786,7 @@ function App() {
               time={oauthSyncActionTime}
             />
             <ToolbarTimeButton
-              disabled={syncBusy}
+              disabled={busy || apiKeySyncBusy || apiKeyViewBusy}
               icon={KeyRound}
               label="同步 API 账号"
               loading={apiKeySyncBusy}
@@ -703,6 +801,7 @@ function App() {
             summary={summary}
             accounts={accounts}
             accountCounts={accountCounts}
+            apiKeyRefreshVersion={apiKeyRefreshVersion}
             jobs={jobs}
             events={events}
             problemUnusedQuota={problemUnusedQuota}
@@ -761,11 +860,14 @@ function App() {
             cacheBaseUrl={settings.sub2api_base_url}
             cachedData={apiKeyAccountsCache}
             displayTimeZone={settings.display_timezone || defaultTimeZone}
-            globallyBusy={busy || oauthSyncBusy || apiKeySyncBusy}
+            globallyBusy={busy || apiKeySyncBusy}
             key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
             onCacheChange={cacheApiKeyAccounts}
             onOperationStart={beginApiKeyViewOperation}
-            rateWritesEnabled={settings.upstream_rate_sync_enabled && !settings.automation_paused}
+            rateWritesEnabled={upstreamRateWritesAllowed(
+              settings.upstream_rate_sync_enabled,
+              settings.automation_paused,
+            )}
             refreshVersion={apiKeyRefreshVersion}
           />
         ) : null}
@@ -981,6 +1083,7 @@ function Overview({
   summary,
   accounts,
   accountCounts,
+  apiKeyRefreshVersion,
   jobs,
   events,
   problemUnusedQuota,
@@ -990,6 +1093,7 @@ function Overview({
   summary: Summary;
   accounts: Account[];
   accountCounts: AccountCounts;
+  apiKeyRefreshVersion: number;
   jobs: RefreshJob[];
   events: AppEvent[];
   problemUnusedQuota: ProblemUnusedQuotaSummary | null;
@@ -1094,6 +1198,8 @@ function Overview({
         )}
       </section>
 
+      <RecentApiKeyUpstreamChanges refreshVersion={apiKeyRefreshVersion} />
+
       <section className="split-grid">
         <div className="panel">
           <PanelTitle title="最近账号" icon={UsersRound} />
@@ -1117,6 +1223,160 @@ function Overview({
       </section>
     </div>
   );
+}
+
+function RecentApiKeyUpstreamChanges({ refreshVersion }: { refreshVersion: number }) {
+  const timeZone = useDisplayTimeZone();
+  const [logs, setLogs] = useState<UpstreamChangeLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const requestSequence = useRef(0);
+
+  const load = useCallback(async () => {
+    const sequence = ++requestSequence.current;
+    setLoading(true);
+    setError("");
+    try {
+      const next = await api.upstreamChangeLogs(6);
+      if (sequence === requestSequence.current) setLogs(next);
+    } catch (reason) {
+      if (sequence === requestSequence.current) {
+        setError(reason instanceof Error ? reason.message : "上游变化读取失败");
+      }
+    } finally {
+      if (sequence === requestSequence.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    return () => {
+      requestSequence.current += 1;
+    };
+  }, [load, refreshVersion]);
+
+  return (
+    <section className="panel api-key-rate-log-panel" aria-label="最近 API Key 上游变化">
+      <div className="panel-toolbar">
+        <div>
+          <PanelTitle title="最近 API Key 上游变化" icon={KeyRound} />
+          <p className="panel-subtitle">按发生时间展示上游 Key、分组、综合倍率与账号调度状态。</p>
+        </div>
+        <button
+          aria-label="刷新最近 API Key 上游变化"
+          className="api-key-icon-button"
+          disabled={loading}
+          onClick={() => void load()}
+          title="刷新"
+          type="button"
+        >
+          <RefreshCcw className={loading ? "spin" : ""} size={16} />
+        </button>
+      </div>
+
+      {error ? (
+        <div className="api-key-rate-log-error" role="alert">
+          <AlertTriangle size={15} />
+          <span>{error}</span>
+        </div>
+      ) : loading && logs.length === 0 ? (
+        <div className="api-key-empty">
+          <RefreshCcw className="spin" size={18} />
+          <span>正在读取上游变化…</span>
+        </div>
+      ) : logs.length === 0 ? (
+        <div className="api-key-empty">
+          <KeyRound size={18} />
+          <span>暂无 API Key 上游变化</span>
+        </div>
+      ) : (
+        <div className="api-key-rate-log-list">
+          {logs.map((log) => (
+            <article className="api-key-rate-log-row" key={log.id}>
+              <div className="api-key-rate-log-identity">
+                <strong>{log.account_name || `API Key 账号 #${log.sub2api_account_id}`}</strong>
+                <span>
+                  {log.channel_name || "未分配渠道"}
+                  {log.group_name ? ` · ${log.group_name}` : ""}
+                </span>
+                <div className="api-key-rate-log-meta">
+                  <time dateTime={log.created_at}>{formatDate(log.created_at, timeZone)}</time>
+                  <span>{upstreamChangeReasonLabel(log.reason)}</span>
+                </div>
+                <div className="api-key-upstream-state-list" aria-label="上游状态变化">
+                  <OverviewUpstreamStateTransition change={upstreamKeyStatusChange(log)} kind="key" label="Key" />
+                  <OverviewUpstreamStateTransition change={upstreamGroupStatusChange(log)} kind="group" label="分组" />
+                  <OverviewUpstreamStateTransition change={remoteSchedulableChange(log)} kind="account" label="调度" />
+                </div>
+              </div>
+              <OverviewRateChangeCell change={groupRateChange(log)} label="分组倍率" />
+              <OverviewRateChangeCell change={upstreamRateChange(log)} emphasize label="综合倍率" />
+              <OverviewRateChangeCell change={accountBillingRateChange(log)} label="账号计费倍率" />
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function OverviewUpstreamStateTransition({
+  change,
+  kind,
+  label,
+}: {
+  change: UpstreamStateChange;
+  kind: UpstreamHealthKind;
+  label: string;
+}) {
+  const current = change.newValue ?? change.oldValue;
+  const tone = upstreamStatusTone(current || "unknown");
+  return (
+    <span className={`api-key-upstream-transition api-key-chip api-key-chip--${tone}`}>
+      <span>{label}</span>
+      {change.direction === "changed" ? (
+        <span className="api-key-upstream-transition-flow">
+          <b>{upstreamHealthStatusLabel(kind, change.oldValue)}</b>
+          <ArrowRight size={10} />
+          <strong>{upstreamHealthStatusLabel(kind, change.newValue)}</strong>
+        </span>
+      ) : (
+        <strong>{upstreamHealthStatusLabel(kind, current)}</strong>
+      )}
+    </span>
+  );
+}
+
+function OverviewRateChangeCell({
+  change,
+  emphasize = false,
+  label,
+}: {
+  change: ReturnType<typeof groupRateChange>;
+  emphasize?: boolean;
+  label: string;
+}) {
+  const changed = change.direction === "increase" || change.direction === "decrease";
+  const value = change.newValue ?? change.oldValue;
+  return (
+    <div className={"api-key-rate-log-cell" + (emphasize ? " api-key-rate-log-cell--primary" : "")}>
+      <span>{label}</span>
+      {changed ? (
+        <div className="api-key-rate-log-flow">
+          <b>{formatOverviewMultiplier(change.oldValue)}</b>
+          <ArrowRight size={13} />
+          <strong>{formatOverviewMultiplier(change.newValue)}</strong>
+        </div>
+      ) : (
+        <strong className="api-key-rate-log-static">{formatOverviewMultiplier(value)}</strong>
+      )}
+    </div>
+  );
+}
+
+function formatOverviewMultiplier(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return "--";
+  return value.toFixed(4).replace(/\.?0+$/, "");
 }
 
 function RateLimitedAccountColumn({
@@ -3576,6 +3836,75 @@ function PhoneBindingDialog({
   );
 }
 
+function AutomationSettingRow({
+  checked,
+  interval,
+  label,
+  onChange,
+  threads,
+}: {
+  checked: boolean;
+  interval: ReactNode;
+  label: string;
+  onChange: (checked: boolean) => void;
+  threads: ReactNode;
+}) {
+  return (
+    <div className="automation-setting-row" role="group" aria-label={label}>
+      <label className="automation-setting-toggle">
+        <input checked={checked} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
+        <strong>{label}</strong>
+      </label>
+      <div className="automation-setting-cell">
+        <span className="automation-setting-mobile-label">线程数</span>
+        {threads}
+      </div>
+      <div className="automation-setting-cell">
+        <span className="automation-setting-mobile-label">自动执行间隔</span>
+        {interval}
+      </div>
+    </div>
+  );
+}
+
+function AutomationSettingNumber({
+  ariaLabel,
+  max,
+  min,
+  onChange,
+  suffix,
+  value,
+}: {
+  ariaLabel: string;
+  max: number;
+  min: number;
+  onChange: (value: string) => void;
+  suffix?: string;
+  value: string;
+}) {
+  return (
+    <div className="automation-setting-number">
+      <input
+        aria-label={ariaLabel}
+        max={max}
+        min={min}
+        onChange={(event) => onChange(event.target.value)}
+        type="number"
+        value={value}
+      />
+      {suffix ? <span>{suffix}</span> : null}
+    </div>
+  );
+}
+
+function AutomationSettingInherited({ children }: { children: ReactNode }) {
+  return (
+    <div aria-disabled="true" className="automation-setting-inherited">
+      {children}
+    </div>
+  );
+}
+
 function SettingsView({
   settings,
   subscriptionTypes,
@@ -3594,13 +3923,31 @@ function SettingsView({
   const [recoveryEnabled, setRecoveryEnabled] = useState(settings.recovery_enabled);
   const [autoRecoverState, setAutoRecoverState] = useState(settings.sub2api_auto_recover_state);
   const [automationPaused, setAutomationPaused] = useState(settings.automation_paused);
+  const [oauthAccountSyncEnabled, setOauthAccountSyncEnabled] = useState(settings.oauth_account_sync_enabled ?? true);
   const [interval, setInterval] = useState(String(settings.monitor_interval_seconds));
   const [usageRefreshEnabled, setUsageRefreshEnabled] = useState(settings.usage_refresh_enabled);
   const [usageRefreshInterval, setUsageRefreshInterval] = useState(String(settings.usage_refresh_interval_seconds));
   const [usageRefreshMaxConcurrency, setUsageRefreshMaxConcurrency] = useState(
-    String(settings.usage_refresh_max_concurrency || 5),
+    String(settings.usage_refresh_max_concurrency ?? 20),
+  );
+  const [apiKeyAccountSyncEnabled, setApiKeyAccountSyncEnabled] = useState(settings.api_key_account_sync_enabled ?? true);
+  const [apiKeyAccountSyncInterval, setApiKeyAccountSyncInterval] = useState(
+    String(settings.api_key_account_sync_interval_seconds ?? 300),
+  );
+  const [upstreamSyncEnabled, setUpstreamSyncEnabled] = useState(settings.upstream_sync_enabled ?? false);
+  const [upstreamSyncInterval, setUpstreamSyncInterval] = useState(
+    String(settings.upstream_sync_interval_seconds ?? 900),
+  );
+  const [upstreamSyncMaxConcurrency, setUpstreamSyncMaxConcurrency] = useState(
+    String(settings.upstream_sync_max_concurrency ?? 10),
   );
   const [upstreamRateSyncEnabled, setUpstreamRateSyncEnabled] = useState(settings.upstream_rate_sync_enabled ?? false);
+  const [upstreamPrioritySyncEnabled, setUpstreamPrioritySyncEnabled] = useState(
+    settings.upstream_priority_sync_enabled ?? true,
+  );
+  const [apiKeyAutoDisableEnabled, setApiKeyAutoDisableEnabled] = useState(
+    settings.api_key_auto_disable_on_upstream_unavailable ?? false,
+  );
   const [upstreamRateLogRetentionDays, setUpstreamRateLogRetentionDays] = useState(
     String(settings.upstream_rate_log_retention_days || 90),
   );
@@ -3616,10 +3963,10 @@ function SettingsView({
   );
   const [newSubscriptionType, setNewSubscriptionType] = useState("");
   const [protocolRefreshMaxConcurrency, setProtocolRefreshMaxConcurrency] = useState(
-    String(settings.protocol_refresh_max_concurrency || settings.refresh_max_concurrency || 1),
+    String(settings.protocol_refresh_max_concurrency ?? 2),
   );
   const [browserRefreshMaxConcurrency, setBrowserRefreshMaxConcurrency] = useState(
-    String(settings.browser_refresh_max_concurrency || 1),
+    String(settings.browser_refresh_max_concurrency ?? 1),
   );
   const [browserMinAvailableMemoryMb, setBrowserMinAvailableMemoryMb] = useState(
     String(settings.browser_min_available_memory_mb ?? 500),
@@ -3628,7 +3975,10 @@ function SettingsView({
     String(settings.subscription_refresh_batch_size || 3),
   );
   const [subscriptionRefreshMaxConcurrency, setSubscriptionRefreshMaxConcurrency] = useState(
-    String(settings.subscription_refresh_max_concurrency || 3),
+    String(settings.subscription_refresh_max_concurrency ?? 3),
+  );
+  const [accountLivenessMaxConcurrency, setAccountLivenessMaxConcurrency] = useState(
+    String(settings.account_liveness_max_concurrency ?? 3),
   );
   const [displayTimeZone, setDisplayTimeZone] = useState(settings.display_timezone || defaultTimeZone);
   const [xApiKey, setXApiKey] = useState("");
@@ -3640,34 +3990,47 @@ function SettingsView({
     setRecoveryEnabled(settings.recovery_enabled);
     setAutoRecoverState(settings.sub2api_auto_recover_state);
     setAutomationPaused(settings.automation_paused);
+    setOauthAccountSyncEnabled(settings.oauth_account_sync_enabled ?? true);
     setInterval(String(settings.monitor_interval_seconds));
     setUsageRefreshEnabled(settings.usage_refresh_enabled);
     setUsageRefreshInterval(String(settings.usage_refresh_interval_seconds));
-    setUsageRefreshMaxConcurrency(String(settings.usage_refresh_max_concurrency || 5));
+    setUsageRefreshMaxConcurrency(String(settings.usage_refresh_max_concurrency ?? 20));
+    setApiKeyAccountSyncEnabled(settings.api_key_account_sync_enabled ?? true);
+    setApiKeyAccountSyncInterval(String(settings.api_key_account_sync_interval_seconds ?? 300));
+    setUpstreamSyncEnabled(settings.upstream_sync_enabled ?? false);
+    setUpstreamSyncInterval(String(settings.upstream_sync_interval_seconds ?? 900));
+    setUpstreamSyncMaxConcurrency(String(settings.upstream_sync_max_concurrency ?? 10));
     setUpstreamRateSyncEnabled(settings.upstream_rate_sync_enabled ?? false);
+    setUpstreamPrioritySyncEnabled(settings.upstream_priority_sync_enabled ?? true);
+    setApiKeyAutoDisableEnabled(settings.api_key_auto_disable_on_upstream_unavailable ?? false);
     setUpstreamRateLogRetentionDays(String(settings.upstream_rate_log_retention_days || 90));
     setUsageLimitSampleFiveHourThreshold(String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0));
     setUsageLimitSampleSevenDayThreshold(String(settings.usage_limit_sample_seven_day_threshold_percent ?? 0));
     setUsageLimitDefaultRanges(mergeUsageLimitDefaultRanges(settings.usage_limit_default_ranges, subscriptionTypes));
     setNewSubscriptionType("");
     setProtocolRefreshMaxConcurrency(
-      String(settings.protocol_refresh_max_concurrency || settings.refresh_max_concurrency || 1),
+      String(settings.protocol_refresh_max_concurrency ?? 2),
     );
-    setBrowserRefreshMaxConcurrency(String(settings.browser_refresh_max_concurrency || 1));
+    setBrowserRefreshMaxConcurrency(String(settings.browser_refresh_max_concurrency ?? 1));
     setBrowserMinAvailableMemoryMb(String(settings.browser_min_available_memory_mb ?? 500));
     setSubscriptionRefreshBatchSize(String(settings.subscription_refresh_batch_size || 3));
-    setSubscriptionRefreshMaxConcurrency(String(settings.subscription_refresh_max_concurrency || 3));
+    setSubscriptionRefreshMaxConcurrency(String(settings.subscription_refresh_max_concurrency ?? 3));
+    setAccountLivenessMaxConcurrency(String(settings.account_liveness_max_concurrency ?? 3));
     setDisplayTimeZone(settings.display_timezone || defaultTimeZone);
     setXApiKey("");
     setClearXApiKey(false);
   }, [
     settings.automation_paused,
+    settings.account_liveness_max_concurrency,
+    settings.api_key_account_sync_enabled,
+    settings.api_key_account_sync_interval_seconds,
+    settings.api_key_auto_disable_on_upstream_unavailable,
     settings.browser_min_available_memory_mb,
     settings.browser_refresh_max_concurrency,
     settings.display_timezone,
     settings.monitor_interval_seconds,
+    settings.oauth_account_sync_enabled,
     settings.protocol_refresh_max_concurrency,
-    settings.refresh_max_concurrency,
     settings.recovery_enabled,
     settings.site_name,
     settings.subscription_refresh_batch_size,
@@ -3681,6 +4044,10 @@ function SettingsView({
     settings.usage_refresh_max_concurrency,
     settings.upstream_rate_log_retention_days,
     settings.upstream_rate_sync_enabled,
+    settings.upstream_priority_sync_enabled ?? true,
+    settings.upstream_sync_enabled,
+    settings.upstream_sync_interval_seconds,
+    settings.upstream_sync_max_concurrency,
     settings.usage_limit_sample_five_hour_threshold_percent,
     settings.usage_limit_sample_seven_day_threshold_percent,
     settings.usage_limit_default_ranges,
@@ -3690,6 +4057,9 @@ function SettingsView({
   const intervalNumber = Number(interval);
   const usageRefreshIntervalNumber = Number(usageRefreshInterval);
   const usageRefreshMaxConcurrencyNumber = Number(usageRefreshMaxConcurrency);
+  const apiKeyAccountSyncIntervalNumber = Number(apiKeyAccountSyncInterval);
+  const upstreamSyncIntervalNumber = Number(upstreamSyncInterval);
+  const upstreamSyncMaxConcurrencyNumber = Number(upstreamSyncMaxConcurrency);
   const upstreamRateLogRetentionDaysNumber = Number(upstreamRateLogRetentionDays);
   const usageLimitSampleFiveHourThresholdNumber = Number(usageLimitSampleFiveHourThreshold);
   const usageLimitSampleSevenDayThresholdNumber = Number(usageLimitSampleSevenDayThreshold);
@@ -3698,6 +4068,7 @@ function SettingsView({
   const browserMinAvailableMemoryMbNumber = Number(browserMinAvailableMemoryMb);
   const subscriptionRefreshBatchSizeNumber = Number(subscriptionRefreshBatchSize);
   const subscriptionRefreshMaxConcurrencyNumber = Number(subscriptionRefreshMaxConcurrency);
+  const accountLivenessMaxConcurrencyNumber = Number(accountLivenessMaxConcurrency);
   const cleanSiteName = siteName.trim();
   const usageLimitDefaultRangesInvalid =
     !usageLimitDefaultRanges.unknown ||
@@ -3714,12 +4085,22 @@ function SettingsView({
     !isSub2ApiInstanceUrl(instanceUrl) ||
     !Number.isInteger(intervalNumber) ||
     intervalNumber < 30 ||
+    intervalNumber > 86_400 ||
     !Number.isInteger(usageRefreshIntervalNumber) ||
     usageRefreshIntervalNumber < 60 ||
     usageRefreshIntervalNumber > 86_400 ||
     !Number.isInteger(usageRefreshMaxConcurrencyNumber) ||
-    usageRefreshMaxConcurrencyNumber < 1 ||
-    usageRefreshMaxConcurrencyNumber > 20 ||
+    usageRefreshMaxConcurrencyNumber < 0 ||
+    usageRefreshMaxConcurrencyNumber > 100 ||
+    !Number.isInteger(apiKeyAccountSyncIntervalNumber) ||
+    apiKeyAccountSyncIntervalNumber < 30 ||
+    apiKeyAccountSyncIntervalNumber > 86_400 ||
+    !Number.isInteger(upstreamSyncIntervalNumber) ||
+    upstreamSyncIntervalNumber < 60 ||
+    upstreamSyncIntervalNumber > 86_400 ||
+    !Number.isInteger(upstreamSyncMaxConcurrencyNumber) ||
+    upstreamSyncMaxConcurrencyNumber < 0 ||
+    upstreamSyncMaxConcurrencyNumber > 50 ||
     !Number.isInteger(upstreamRateLogRetentionDaysNumber) ||
     upstreamRateLogRetentionDaysNumber < 1 ||
     upstreamRateLogRetentionDaysNumber > 3650 ||
@@ -3730,10 +4111,10 @@ function SettingsView({
     usageLimitSampleSevenDayThresholdNumber < 0 ||
     usageLimitSampleSevenDayThresholdNumber > 100 ||
     !Number.isInteger(protocolRefreshMaxConcurrencyNumber) ||
-    protocolRefreshMaxConcurrencyNumber < 1 ||
+    protocolRefreshMaxConcurrencyNumber < 0 ||
     protocolRefreshMaxConcurrencyNumber > 50 ||
     !Number.isInteger(browserRefreshMaxConcurrencyNumber) ||
-    browserRefreshMaxConcurrencyNumber < 1 ||
+    browserRefreshMaxConcurrencyNumber < 0 ||
     browserRefreshMaxConcurrencyNumber > 50 ||
     !Number.isInteger(browserMinAvailableMemoryMbNumber) ||
     browserMinAvailableMemoryMbNumber < 0 ||
@@ -3742,8 +4123,11 @@ function SettingsView({
     subscriptionRefreshBatchSizeNumber < 1 ||
     subscriptionRefreshBatchSizeNumber > 100 ||
     !Number.isInteger(subscriptionRefreshMaxConcurrencyNumber) ||
-    subscriptionRefreshMaxConcurrencyNumber < 1 ||
+    subscriptionRefreshMaxConcurrencyNumber < 0 ||
     subscriptionRefreshMaxConcurrencyNumber > 20 ||
+    !Number.isInteger(accountLivenessMaxConcurrencyNumber) ||
+    accountLivenessMaxConcurrencyNumber < 0 ||
+    accountLivenessMaxConcurrencyNumber > 50 ||
     usageLimitDefaultRangesInvalid;
 
   const addSubscriptionType = () => {
@@ -3786,11 +4170,19 @@ function SettingsView({
       recovery_enabled: recoveryEnabled,
       sub2api_auto_recover_state: autoRecoverState,
       automation_paused: automationPaused,
+      oauth_account_sync_enabled: oauthAccountSyncEnabled,
       monitor_interval_seconds: intervalNumber,
       usage_refresh_enabled: usageRefreshEnabled,
       usage_refresh_interval_seconds: usageRefreshIntervalNumber,
       usage_refresh_max_concurrency: usageRefreshMaxConcurrencyNumber,
+      api_key_account_sync_enabled: apiKeyAccountSyncEnabled,
+      api_key_account_sync_interval_seconds: apiKeyAccountSyncIntervalNumber,
+      upstream_sync_enabled: upstreamSyncEnabled,
+      upstream_sync_interval_seconds: upstreamSyncIntervalNumber,
+      upstream_sync_max_concurrency: upstreamSyncMaxConcurrencyNumber,
       upstream_rate_sync_enabled: upstreamRateSyncEnabled,
+      upstream_priority_sync_enabled: upstreamPrioritySyncEnabled,
+      api_key_auto_disable_on_upstream_unavailable: apiKeyAutoDisableEnabled,
       upstream_rate_log_retention_days: upstreamRateLogRetentionDaysNumber,
       usage_limit_sample_five_hour_threshold_percent: usageLimitSampleFiveHourThresholdNumber,
       usage_limit_sample_seven_day_threshold_percent: usageLimitSampleSevenDayThresholdNumber,
@@ -3800,6 +4192,7 @@ function SettingsView({
       browser_min_available_memory_mb: browserMinAvailableMemoryMbNumber,
       subscription_refresh_batch_size: subscriptionRefreshBatchSizeNumber,
       subscription_refresh_max_concurrency: subscriptionRefreshMaxConcurrencyNumber,
+      account_liveness_max_concurrency: accountLivenessMaxConcurrencyNumber,
       display_timezone: displayTimeZone,
     };
     if (xApiKey.trim()) {
@@ -3810,11 +4203,21 @@ function SettingsView({
     }
     await onSave(payload);
   };
+  const enabledAutomationCount = [
+    settings.oauth_account_sync_enabled ?? true,
+    settings.api_key_account_sync_enabled ?? true,
+    settings.recovery_enabled,
+    settings.upstream_sync_enabled,
+    settings.upstream_rate_sync_enabled,
+    settings.upstream_priority_sync_enabled,
+    settings.api_key_auto_disable_on_upstream_unavailable,
+    settings.usage_refresh_enabled,
+  ].filter(Boolean).length;
 
   return (
     <div className="stack">
       <section className="panel">
-        <PanelTitle title="sub2api 连接" icon={Link2} />
+        <PanelTitle title="运行设置" icon={Link2} />
         <form className="settings-form" onSubmit={submit}>
           <div className="settings-grid settings-main-grid settings-connection-grid">
             <label className="site-name-label">
@@ -3846,105 +4249,192 @@ function SettingsView({
               onChange={(event) => setAutomationPaused(event.target.checked)}
               type="checkbox"
             />
-            <span>暂停自动巡检与自动用量查询</span>
+            <span>暂停全部自动任务</span>
           </label>
 
-          <fieldset className="settings-section">
-            <legend>OAuth 账号巡检</legend>
-            <div className="settings-grid settings-section-grid">
-            <label>
-              巡检间隔（秒）
-              <input
-                min={30}
-                onChange={(event) => setInterval(event.target.value)}
-                type="number"
-                value={interval}
+          <fieldset className="settings-section settings-section--automation">
+            <legend>自动任务</legend>
+            <p className="settings-section-note">线程数填 0 表示本批任务不限并发，拿到账号或渠道清单后会同时发起。</p>
+            <div className="automation-settings-table">
+              <div aria-hidden="true" className="automation-settings-head">
+                <span>功能开关</span>
+                <span>线程数</span>
+                <span>自动执行间隔</span>
+              </div>
+              <AutomationSettingRow
+                checked={oauthAccountSyncEnabled}
+                interval={(
+                  <AutomationSettingNumber
+                    ariaLabel="OAuth 账号同步间隔"
+                    max={86_400}
+                    min={30}
+                    onChange={setInterval}
+                    suffix="秒"
+                    value={interval}
+                  />
+                )}
+                label="同步 sub2api OAuth 账号"
+                onChange={setOauthAccountSyncEnabled}
+                threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
               />
-            </label>
-            <label>
-              协议最大同时数
-              <input
-                max={50}
-                min={1}
-                onChange={(event) => setProtocolRefreshMaxConcurrency(event.target.value)}
-                type="number"
-                value={protocolRefreshMaxConcurrency}
+              <AutomationSettingRow
+                checked={apiKeyAccountSyncEnabled}
+                interval={(
+                  <AutomationSettingNumber
+                    ariaLabel="API Key 账号同步间隔"
+                    max={86_400}
+                    min={30}
+                    onChange={setApiKeyAccountSyncInterval}
+                    suffix="秒"
+                    value={apiKeyAccountSyncInterval}
+                  />
+                )}
+                label="同步 sub2api API Key 账号"
+                onChange={setApiKeyAccountSyncEnabled}
+                threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
               />
-            </label>
-            <label>
-              浏览器最大同时登录数
-              <input
-                max={50}
-                min={1}
-                onChange={(event) => setBrowserRefreshMaxConcurrency(event.target.value)}
-                type="number"
-                value={browserRefreshMaxConcurrency}
+              <AutomationSettingRow
+                checked={recoveryEnabled}
+                interval={<AutomationSettingInherited>跟随 OAuth 同步</AutomationSettingInherited>}
+                label="刷新 OAuth 账号凭证"
+                onChange={setRecoveryEnabled}
+                threads={(
+                  <div className="automation-setting-split">
+                    <label>
+                      <span>协议</span>
+                      <input
+                        aria-label="OAuth 协议刷新线程数"
+                        max={50}
+                        min={0}
+                        onChange={(event) => setProtocolRefreshMaxConcurrency(event.target.value)}
+                        type="number"
+                        value={protocolRefreshMaxConcurrency}
+                      />
+                    </label>
+                    <label>
+                      <span>浏览器</span>
+                      <input
+                        aria-label="OAuth 浏览器刷新线程数"
+                        max={50}
+                        min={0}
+                        onChange={(event) => setBrowserRefreshMaxConcurrency(event.target.value)}
+                        type="number"
+                        value={browserRefreshMaxConcurrency}
+                      />
+                    </label>
+                  </div>
+                )}
               />
-            </label>
-            <label>
-              浏览器最低可用内存（MB）
-              <input
-                max={1048576}
-                min={0}
-                onChange={(event) => setBrowserMinAvailableMemoryMb(event.target.value)}
-                type="number"
-                value={browserMinAvailableMemoryMb}
+              <AutomationSettingRow
+                checked={upstreamSyncEnabled}
+                interval={(
+                  <AutomationSettingNumber
+                    ariaLabel="API Key 上游同步间隔"
+                    max={86_400}
+                    min={60}
+                    onChange={setUpstreamSyncInterval}
+                    suffix="秒"
+                    value={upstreamSyncInterval}
+                  />
+                )}
+                label="同步 API Key 账号上游"
+                onChange={setUpstreamSyncEnabled}
+                threads={(
+                  <AutomationSettingNumber
+                    ariaLabel="API Key 上游同步线程数"
+                    max={50}
+                    min={0}
+                    onChange={setUpstreamSyncMaxConcurrency}
+                    value={upstreamSyncMaxConcurrency}
+                  />
+                )}
               />
-            </label>
+              <AutomationSettingRow
+                checked={upstreamRateSyncEnabled}
+                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+                label="修改 API Key 账号计费倍率"
+                onChange={setUpstreamRateSyncEnabled}
+                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={upstreamPrioritySyncEnabled}
+                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+                label="修改 API Key 账号优先级"
+                onChange={setUpstreamPrioritySyncEnabled}
+                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={apiKeyAutoDisableEnabled}
+                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+                label="上游失效时禁用 API Key 账号"
+                onChange={setApiKeyAutoDisableEnabled}
+                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={usageRefreshEnabled}
+                interval={(
+                  <AutomationSettingNumber
+                    ariaLabel="OAuth 用量窗口同步间隔"
+                    max={86_400}
+                    min={60}
+                    onChange={setUsageRefreshInterval}
+                    suffix="秒"
+                    value={usageRefreshInterval}
+                  />
+                )}
+                label="同步 OAuth 账号用量窗口"
+                onChange={setUsageRefreshEnabled}
+                threads={(
+                  <AutomationSettingNumber
+                    ariaLabel="OAuth 用量窗口同步线程数"
+                    max={100}
+                    min={0}
+                    onChange={setUsageRefreshMaxConcurrency}
+                    value={usageRefreshMaxConcurrency}
+                  />
+                )}
+              />
             </div>
-            <div className="settings-toggle-list settings-toggle-list--compact">
-              <label className="checkbox-line settings-toggle">
+            <label className="checkbox-line settings-toggle settings-automation-policy">
+              <input
+                checked={autoRecoverState}
+                onChange={(event) => setAutoRecoverState(event.target.checked)}
+                type="checkbox"
+              />
+              <span>凭证刷新成功后恢复 sub2api 调度状态</span>
+            </label>
+          </fieldset>
+
+          <fieldset className="settings-section">
+            <legend>手动任务资源限制</legend>
+            <div className="settings-grid settings-section-grid settings-resource-grid">
+              <label>
+                账号测活最大线程数
                 <input
-                  checked={recoveryEnabled}
-                  onChange={(event) => setRecoveryEnabled(event.target.checked)}
-                  type="checkbox"
+                  max={50}
+                  min={0}
+                  onChange={(event) => setAccountLivenessMaxConcurrency(event.target.value)}
+                  title="账号页手动测活使用此线程数"
+                  type="number"
+                  value={accountLivenessMaxConcurrency}
                 />
-                <span>开启账号恢复任务</span>
               </label>
-              <label className="checkbox-line settings-toggle">
+              <label>
+                浏览器最低可用内存（MB）
                 <input
-                  checked={autoRecoverState}
-                  onChange={(event) => setAutoRecoverState(event.target.checked)}
-                  type="checkbox"
+                  max={1048576}
+                  min={0}
+                  onChange={(event) => setBrowserMinAvailableMemoryMb(event.target.value)}
+                  type="number"
+                  value={browserMinAvailableMemoryMb}
                 />
-                <span>刷新成功后自动恢复 sub2api 调度状态</span>
               </label>
             </div>
           </fieldset>
 
           <fieldset className="settings-section">
-            <legend>OAuth 用量窗口查询</legend>
-            <div className="settings-toggle-list settings-toggle-list--compact">
-              <label className="checkbox-line settings-toggle">
-                <input
-                  checked={usageRefreshEnabled}
-                  onChange={(event) => setUsageRefreshEnabled(event.target.checked)}
-                  type="checkbox"
-                />
-                <span>自动查询账号用量窗口</span>
-              </label>
-            </div>
+            <legend>用量与订阅规则</legend>
             <div className="settings-grid settings-section-grid">
-            <label>
-              查询周期（秒）
-              <input
-                max={86400}
-                min={60}
-                onChange={(event) => setUsageRefreshInterval(event.target.value)}
-                type="number"
-                value={usageRefreshInterval}
-              />
-            </label>
-            <label>
-              查询最大同时数
-              <input
-                max={20}
-                min={1}
-                onChange={(event) => setUsageRefreshMaxConcurrency(event.target.value)}
-                type="number"
-                value={usageRefreshMaxConcurrency}
-              />
-            </label>
             <label>
               默认 5h 用量阈值 (%)
               <input
@@ -3983,13 +4473,13 @@ function SettingsView({
               订阅查询最大同时数
               <input
                 max={20}
-                min={1}
+                min={0}
                 onChange={(event) => setSubscriptionRefreshMaxConcurrency(event.target.value)}
                 type="number"
                 value={subscriptionRefreshMaxConcurrency}
               />
             </label>
-          </div>
+            </div>
           </fieldset>
 
           <fieldset className="quota-range-settings">
@@ -4079,20 +4569,10 @@ function SettingsView({
           </fieldset>
 
           <fieldset className="settings-section settings-section--api-key">
-            <legend>API Key 上游倍率同步</legend>
-            <div className="settings-toggle-list settings-toggle-list--compact">
-              <label className="checkbox-line settings-toggle">
-                <input
-                  checked={upstreamRateSyncEnabled}
-                  onChange={(event) => setUpstreamRateSyncEnabled(event.target.checked)}
-                  type="checkbox"
-                />
-                <span>自动同步上游分组与账号计费倍率</span>
-              </label>
-            </div>
+            <legend>上游变化记录</legend>
             <div className="settings-grid settings-section-grid">
               <label>
-                倍率日志保留天数
+                上游变化保留天数
                 <input
                   max={3650}
                   min={1}
@@ -4167,17 +4647,9 @@ function SettingsView({
           <div className="key-state">
             <TimerReset size={16} />
             <span>
-              {settings.automation_paused ? "已暂停自动任务 · " : ""}巡检 {settings.monitor_interval_seconds} 秒 · 用量{" "}
-              {settings.usage_refresh_enabled ? `${settings.usage_refresh_interval_seconds} 秒` : "关闭"} · 用量并发{" "}
-              {settings.usage_refresh_max_concurrency} · 协议并发{" "}
-              {settings.protocol_refresh_max_concurrency || settings.refresh_max_concurrency} · 浏览器并发{" "}
-              {settings.browser_refresh_max_concurrency} · 样本阈值 5h{" "}
-              {sampleThresholdSettingLabel(settings.usage_limit_sample_five_hour_threshold_percent)} / 7d{" "}
-              {sampleThresholdSettingLabel(settings.usage_limit_sample_seven_day_threshold_percent)} · 订阅单次{" "}
-              {settings.subscription_refresh_batch_size} · 订阅并发{" "}
-              {settings.subscription_refresh_max_concurrency} · 浏览器内存阈值 {settings.browser_min_available_memory_mb} MB · 恢复任务{" "}
-              {settings.recovery_enabled ? "开启" : "关闭"} · 状态恢复 {settings.sub2api_auto_recover_state ? "开启" : "关闭"} · API Key 倍率同步{" "}
-              {settings.upstream_rate_sync_enabled ? "开启" : "关闭"} · 倍率日志 {settings.upstream_rate_log_retention_days} 天
+              {settings.automation_paused ? "自动任务已暂停" : "自动任务运行中"} · 已开启 {enabledAutomationCount}/8 ·
+              上游线程 {settings.upstream_sync_max_concurrency ?? 2} · 测活线程 {settings.account_liveness_max_concurrency ?? 3} ·
+              上游变化保留 {settings.upstream_rate_log_retention_days} 天
             </span>
           </div>
           <button className="secondary-button" disabled={busy} onClick={onScan} type="button">
@@ -4208,6 +4680,7 @@ function HistoryView({
   onLocateAccount: (record: AccountExceptionRecord) => void;
 }) {
   const timeZone = useDisplayTimeZone();
+  const now = useRefreshClock();
   const [subview, setSubview] = useState<"exceptions" | "jobs" | "events">("exceptions");
   const hasHistory = jobs.length > 0 || events.length > 0;
   const clearHistory = () => {
@@ -4282,6 +4755,9 @@ function HistoryView({
           <div className="history-list">
             {exceptionRecords.map((record) => {
               const relatedJob = latestErrorRefreshJobForRecord(record, jobs);
+              const relatedJobDurationMs = relatedJob
+                ? timestampDurationMs(relatedJob.started_at, relatedJob.finished_at, now)
+                : null;
               const displayMessage = relatedJob?.reason || record.message || "-";
               const displayTime = relatedJob?.created_at ?? record.updated_at;
               const protocolSummary = relatedJob ? refreshJobProtocolSummary(relatedJob, events) : null;
@@ -4293,6 +4769,9 @@ function HistoryView({
                       <Badge tone="ink">{exceptionSourceLabel(record.source)}</Badge>
                       <strong className="mono history-email">{record.email || "unknown"}</strong>
                       {record.sub2api_account_id ? <span className="memory-pill mono">{record.sub2api_account_id}</span> : null}
+                      {relatedJobDurationMs !== null ? (
+                        <span className="memory-pill">耗时 {formatElapsedDuration(relatedJobDurationMs)}</span>
+                      ) : null}
                     </div>
                     <div className="history-record-actions">
                       <time>{formatDate(displayTime, timeZone)}</time>
@@ -4334,6 +4813,7 @@ function HistoryView({
           <div className="history-list">
             {jobs.map((job) => {
               const protocolSummary = refreshJobProtocolSummary(job, events);
+              const durationMs = timestampDurationMs(job.started_at, job.finished_at, now);
               return (
                 <article className="history-item" key={job.id}>
                   <div className="history-item-head">
@@ -4344,6 +4824,9 @@ function HistoryView({
                       <strong className="mono history-email">{job.email}</strong>
                       {job.memory_peak_rss_bytes ? (
                         <span className="memory-pill">内存峰值 {formatBytes(job.memory_peak_rss_bytes)}</span>
+                      ) : null}
+                      {durationMs !== null ? (
+                        <span className="memory-pill">耗时 {formatElapsedDuration(durationMs)}</span>
                       ) : null}
                     </div>
                     <time>{formatDate(job.created_at, timeZone)}</time>
@@ -4364,21 +4847,33 @@ function HistoryView({
           <div className="history-list">
             {events.map((event) => {
               const reasonLabel = eventReasonLabel(event);
+              const modeLabel = eventModeLabel(event);
               const syncErrorCount = eventSyncErrorCount(event);
+              const durationMs = eventDurationMs(event.details);
+              const durationBreakdown = eventDurationBreakdown(event.details);
               return (
                 <article className="history-item event-history-item" key={event.id}>
                   <div className="history-item-head">
                     <div className="history-meta">
                       <Badge tone={eventTone(event.kind)}>{eventKindLabel(event.kind)}</Badge>
                       {reasonLabel ? <Badge tone="ink">{reasonLabel}</Badge> : null}
+                      {modeLabel ? <Badge tone="ink">{modeLabel}</Badge> : null}
                       {syncErrorCount !== null ? (
                         <Badge tone={syncErrorCount > 0 ? "error" : "ok"}>{`错误账号 ${syncErrorCount}`}</Badge>
+                      ) : null}
+                      {durationMs !== null ? (
+                        <Badge tone="ink">{`耗时 ${formatElapsedDuration(durationMs)}`}</Badge>
                       ) : null}
                       <strong className="history-email">{event.email || "system"}</strong>
                     </div>
                     <time>{formatDate(event.created_at, timeZone)}</time>
                   </div>
                   <p className="history-message">{event.message}</p>
+                  {durationBreakdown.length ? (
+                    <p className="history-message">
+                      阶段耗时：{durationBreakdown.map((item) => `${item.label} ${formatElapsedDuration(item.durationMs)}`).join(" · ")}
+                    </p>
+                  ) : null}
                 </article>
               );
             })}
@@ -5930,6 +6425,13 @@ function eventReasonLabel(event: AppEvent) {
   return null;
 }
 
+function eventModeLabel(event: AppEvent) {
+  const force = event.details?.force;
+  if (force === true) return "强制刷新";
+  if (force === false) return "缓存优先";
+  return null;
+}
+
 function eventKindLabel(kind: string) {
   return (
     {
@@ -5944,7 +6446,19 @@ function eventKindLabel(kind: string) {
       refresh_succeeded: "刷新成功",
       refresh_deactive: "刷新封禁",
       refresh_skipped_missing_mailbox: "缺少邮箱",
+      manual_sync: "OAuth 账号同步",
+      monitor_sync: "OAuth 账号清单同步",
+      monitor_failed: "OAuth 账号清单同步失败",
+      usage_refresh: "OAuth 用量窗口",
+      usage_refresh_failed: "OAuth 用量窗口失败",
+      usage_statistics_refresh: "用量窗口手动刷新",
+      subscription_refresh: "订阅信息刷新",
       manual_upstream_sync: "API 账号同步",
+      manual_api_key_inventory_sync: "API Key 账号清单同步",
+      api_key_inventory_sync: "API Key 账号清单自动同步",
+      api_key_inventory_sync_failed: "API Key 账号清单自动同步失败",
+      upstream_sync: "上游自动探测",
+      upstream_rate_sync_failed: "上游自动探测失败",
     }[kind] || kind
   );
 }

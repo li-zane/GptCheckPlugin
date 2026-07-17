@@ -9,6 +9,11 @@ from app.core.database import get_db
 from app.core.security import require_admin
 from app.schemas import (
     MessageResponse,
+    PriorityIntervalAssignment,
+    PriorityIntervalCreate,
+    PriorityIntervalOut,
+    PriorityIntervalUpdate,
+    PriorityRebalanceOut,
     UpstreamAccountEnabledUpdate,
     UpstreamAccountOut,
     UpstreamAccountUpdate,
@@ -26,10 +31,15 @@ from app.services.upstream_accounts import (
 )
 from app.services.upstream_rate_logs import list_upstream_rate_change_logs
 from app.services.upstream_channels import get_upstream_channel_service
+from app.services.upstream_priorities import (
+    UpstreamPriorityService,
+    get_upstream_priority_service,
+)
 
 
 router = APIRouter()
 AccountId = Annotated[int, Path(ge=1, le=9_007_199_254_740_991)]
+IntervalId = Annotated[int, Path(ge=1, le=9_007_199_254_740_991)]
 
 
 def _http_error(exc: UpstreamAccountServiceError) -> HTTPException:
@@ -88,6 +98,7 @@ async def discover_all_upstream_accounts(
         raise _http_error(exc) from None
 
 
+@router.get("/upstream-change-logs", response_model=list[UpstreamRateChangeLogOut])
 @router.get("/rate-change-logs", response_model=list[UpstreamRateChangeLogOut])
 async def list_upstream_rate_logs(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
@@ -111,6 +122,65 @@ async def list_upstream_rate_logs(
     return [UpstreamRateChangeLogOut.model_validate(item) for item in logs]
 
 
+@router.get("/priority-intervals", response_model=list[PriorityIntervalOut])
+async def list_priority_intervals(
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamPriorityService = Depends(get_upstream_priority_service),
+) -> list[PriorityIntervalOut]:
+    return await service.list_intervals(db)
+
+
+@router.post("/priority-intervals", response_model=PriorityIntervalOut, status_code=201)
+async def create_priority_interval(
+    payload: PriorityIntervalCreate,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamPriorityService = Depends(get_upstream_priority_service),
+) -> PriorityIntervalOut:
+    try:
+        return await service.create_interval(db, payload)
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+
+@router.post("/priority-intervals/rebalance", response_model=PriorityRebalanceOut)
+async def rebalance_priority_intervals(
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamPriorityService = Depends(get_upstream_priority_service),
+) -> PriorityRebalanceOut:
+    return await service.rebalance(db)
+
+
+@router.put("/priority-intervals/{interval_id}", response_model=PriorityIntervalOut)
+async def update_priority_interval(
+    interval_id: IntervalId,
+    payload: PriorityIntervalUpdate,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamPriorityService = Depends(get_upstream_priority_service),
+) -> PriorityIntervalOut:
+    try:
+        return await service.update_interval(db, interval_id, payload)
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+
+@router.delete("/priority-intervals/{interval_id}", response_model=MessageResponse)
+async def delete_priority_interval(
+    interval_id: IntervalId,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamPriorityService = Depends(get_upstream_priority_service),
+) -> MessageResponse:
+    if not await service.delete_interval(db, interval_id):
+        raise HTTPException(status_code=404, detail="The priority interval was not found.")
+    return MessageResponse(
+        message="Deleted the priority interval without changing remote account priorities."
+    )
+
+
 @router.put("/{sub2api_account_id}", response_model=UpstreamAccountOut)
 async def upsert_upstream_account(
     sub2api_account_id: AccountId,
@@ -120,11 +190,17 @@ async def upsert_upstream_account(
     service: UpstreamAccountService = Depends(get_upstream_account_service),
 ) -> UpstreamAccountOut:
     try:
-        account = await service.upsert_account(db, sub2api_account_id, payload)
+        reconcile_fields = {"channel_id", "api_key", "manual_group_multiplier"}
+        reconcile_requested = bool(payload.model_fields_set & reconcile_fields)
+        account = await service.upsert_account(
+            db,
+            sub2api_account_id,
+            payload,
+            defer_priority_rebalance=reconcile_requested,
+        )
         should_reconcile = bool(
             account.channel_id
-            and payload.model_fields_set
-            & {"channel_id", "api_key", "manual_group_multiplier"}
+            and reconcile_requested
         )
         if should_reconcile and account.channel_id is not None:
             try:
@@ -133,6 +209,17 @@ async def upsert_upstream_account(
                     account.channel_id,
                 )
             except UpstreamAccountServiceError:
+                if isinstance(service, UpstreamAccountService):
+                    await service._rebalance_priorities_best_effort(db)
+                    refreshed = await service.list_accounts(db)
+                    return next(
+                        (
+                            item
+                            for item in refreshed
+                            if item.sub2api_account_id == sub2api_account_id
+                        ),
+                        account,
+                    )
                 return account
             return next(
                 (
@@ -142,7 +229,32 @@ async def upsert_upstream_account(
                 ),
                 account,
             )
+        if reconcile_requested and isinstance(service, UpstreamAccountService):
+            await service._rebalance_priorities_best_effort(db)
+            refreshed = await service.list_accounts(db)
+            return next(
+                (
+                    item
+                    for item in refreshed
+                    if item.sub2api_account_id == sub2api_account_id
+                ),
+                account,
+            )
         return account
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+
+@router.put("/{sub2api_account_id}/priority-interval", response_model=UpstreamAccountOut)
+async def assign_priority_interval(
+    sub2api_account_id: AccountId,
+    payload: PriorityIntervalAssignment,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamPriorityService = Depends(get_upstream_priority_service),
+) -> UpstreamAccountOut:
+    try:
+        return await service.assign_interval(db, sub2api_account_id, payload)
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
 

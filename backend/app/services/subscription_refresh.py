@@ -51,7 +51,8 @@ async def refresh_subscriptions(protocol_limit: int = 3, max_concurrency: int = 
     )
     snapshots = await _load_snapshots()
     mailboxes = await _load_mailboxes()
-    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    effective_concurrency = len(accounts) if max_concurrency == 0 else max_concurrency
+    semaphore = asyncio.Semaphore(max(1, effective_concurrency))
     failures: list[dict[str, str | None]] = []
     refreshed = 0
     skipped = 0

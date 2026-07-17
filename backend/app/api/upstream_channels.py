@@ -1,4 +1,5 @@
 import logging
+from time import perf_counter
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path
@@ -15,7 +16,8 @@ from app.schemas import (
 )
 from app.services.upstream_accounts import UpstreamAccountServiceError
 from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
-from app.services.events import record_event
+from app.services.events import elapsed_ms, record_event
+from app.services.runtime_config import get_runtime_config_service
 
 
 router = APIRouter()
@@ -39,6 +41,47 @@ async def upstream_channel_overview(
         raise _http_error(exc) from None
 
 
+@router.post("/sync-inventory", response_model=UpstreamOverviewOut)
+async def sync_upstream_channel_inventory(
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+) -> UpstreamOverviewOut:
+    started_at = perf_counter()
+    try:
+        result = await service.overview(db)
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+    channel_count = len(result.channels)
+    account_count = sum(item.account_count for item in result.channels) + len(
+        result.unassigned_accounts
+    )
+    try:
+        await record_event(
+            db,
+            "manual_api_key_inventory_sync",
+            (
+                f"Synchronized {account_count} API key account(s) across "
+                f"{channel_count} upstream channel(s)."
+            ),
+            details={
+                "reason": "manual",
+                "accounts": account_count,
+                "channels": channel_count,
+                "unassigned_accounts": len(result.unassigned_accounts),
+                "duration_ms": elapsed_ms(started_at),
+            },
+        )
+    except Exception:
+        await db.rollback()
+        logger.warning(
+            "Could not persist the manual API key inventory sync event.",
+            exc_info=True,
+        )
+    return result
+
+
 @router.post("/discover-all", response_model=UpstreamChannelDiscoverAllOut)
 async def discover_all_upstream_channels(
     payload: UpstreamChannelDiscoverAllRequest | None = None,
@@ -46,6 +89,7 @@ async def discover_all_upstream_channels(
     db: AsyncSession = Depends(get_db),
     service: UpstreamChannelService = Depends(get_upstream_channel_service),
 ) -> UpstreamChannelDiscoverAllOut:
+    started_at = perf_counter()
     try:
         legacy_bindings = None
         if payload is not None and payload.confirm_legacy_bindings:
@@ -53,26 +97,77 @@ async def discover_all_upstream_channels(
                 item.sub2api_account_id: item.expected_identity_fingerprint
                 for item in payload.account_bindings
             }
-        result = (
-            await service.discover_all(db, legacy_bindings=legacy_bindings)
-            if legacy_bindings is not None
-            else await service.discover_all(db)
-        )
+        runtime = get_runtime_config_service()
+        max_concurrency = await runtime.get_upstream_sync_max_concurrency()
+        probe_globally_enabled = await runtime.get_upstream_sync_enabled()
+        if not probe_globally_enabled:
+            inventory_started_at = perf_counter()
+            overview = await service.overview(db)
+            inventory_duration_ms = elapsed_ms(inventory_started_at)
+            result = UpstreamChannelDiscoverAllOut(
+                total=len(overview.channels),
+                succeeded=0,
+                failed=0,
+                cached=0,
+                skipped=len(overview.channels),
+                force=True,
+                cache_max_age_seconds=None,
+                probe_globally_enabled=False,
+                inventory_duration_ms=inventory_duration_ms,
+                probe_duration_ms=0,
+                priority_duration_ms=0,
+                channels=overview.channels,
+                overview=overview,
+            )
+        else:
+            result = (
+                await service.discover_all(
+                    db,
+                    legacy_bindings=legacy_bindings,
+                    max_concurrency=max_concurrency,
+                    require_management_credentials=True,
+                    force=True,
+                )
+                if legacy_bindings is not None
+                else await service.discover_all(
+                    db,
+                    max_concurrency=max_concurrency,
+                    require_management_credentials=True,
+                    force=True,
+                )
+            )
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
     try:
+        details = {
+            "reason": "manual",
+            "total": result.total,
+            "succeeded": result.succeeded,
+            "failed": result.failed,
+            "cached": result.cached,
+            "skipped": result.skipped,
+            "force": result.force,
+            "cache_max_age_seconds": result.cache_max_age_seconds,
+            "probe_globally_enabled": result.probe_globally_enabled,
+            "duration_ms": elapsed_ms(started_at),
+        }
+        for field_name in (
+            "inventory_duration_ms",
+            "probe_duration_ms",
+            "priority_duration_ms",
+        ):
+            value = getattr(result, field_name)
+            if value is not None:
+                details[field_name] = value
         await record_event(
             db,
             "manual_upstream_sync",
             (
                 f"Synchronized {result.total} API key channel(s); "
-                f"{result.succeeded} succeeded and {result.failed} failed."
+                f"{result.succeeded} probed successfully, {result.cached} reused cached state, "
+                f"{result.failed} failed, and {result.skipped} skipped."
             ),
-            details={
-                "total": result.total,
-                "succeeded": result.succeeded,
-                "failed": result.failed,
-            },
+            details=details,
         )
     except Exception:
         await db.rollback()

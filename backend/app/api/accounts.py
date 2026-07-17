@@ -56,7 +56,8 @@ from app.services.account_exceptions import (
     clear_account_exception,
     prune_account_exception_records_to_current_accounts,
 )
-from app.services.events import record_event
+from app.services.account_liveness import get_account_liveness_limiter
+from app.services.events import elapsed_ms, record_event
 from app.services.monitor import get_monitor_service
 from app.services.refresh import get_refresh_service
 from app.services.runtime_config import get_runtime_config_service
@@ -83,9 +84,16 @@ from app.services.usage_estimate import (
 from app.services.usage_refresh import get_usage_refresh_service
 
 router = APIRouter()
-_ACCOUNT_DELETE_UNLOCK_PREFIX = "account_delete_unlock."
-_ACCOUNT_LIVENESS_MAX_CONCURRENCY = 5
+_oauth_sync_background_tasks: set[asyncio.Task] = set()
 
+
+def _consume_background_task_result(task: asyncio.Task) -> None:
+    _oauth_sync_background_tasks.discard(task)
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        return
+_ACCOUNT_DELETE_UNLOCK_PREFIX = "account_delete_unlock."
 _SUBSCRIPTION_KEYS = (
     "subscription_starts_at",
     "subscription_expires_at",
@@ -753,8 +761,14 @@ async def usage_estimate(
     _: dict = Depends(require_admin),
 ) -> UsageEstimateOut:
     try:
-        cached_usage = None if refresh else get_usage_refresh_service().latest_usage_snapshot()
-        return await build_usage_estimate(refresh=refresh, usage_by_account_id=cached_usage)
+        usage_service = get_usage_refresh_service()
+        if refresh:
+            await usage_service.refresh_all(reason="usage_estimate")
+        cached_usage = usage_service.latest_usage_snapshot()
+        return await build_usage_estimate(
+            refresh=False,
+            usage_by_account_id=cached_usage,
+        )
     except Sub2ApiRequestError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
@@ -954,7 +968,7 @@ async def test_selected_account_liveness(
         for account in remote_accounts
         if (account_id := sub2api.account_id(account))
     }
-    semaphore = asyncio.Semaphore(_ACCOUNT_LIVENESS_MAX_CONCURRENCY)
+    limiter = get_account_liveness_limiter()
 
     async def test_one(account_id: str) -> AccountLivenessTestItemOut:
         account = remote_by_id.get(account_id)
@@ -981,7 +995,7 @@ async def test_selected_account_liveness(
 
         started_at = perf_counter()
         try:
-            async with semaphore:
+            async with limiter.slot():
                 success, error = await sub2api.test_account_connection(account, payload.model_id)
         except (Sub2ApiRequestError, ValueError) as exc:
             success = False
@@ -1013,7 +1027,7 @@ async def test_selected_account_liveness(
                 "total": len(results),
                 "succeeded": succeeded,
                 "failed": failed,
-                "max_concurrency": _ACCOUNT_LIVENESS_MAX_CONCURRENCY,
+                "max_concurrency": await get_runtime_config_service().get_account_liveness_max_concurrency(),
             },
         )
     except Exception:
@@ -1036,24 +1050,87 @@ async def sync_accounts(
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> Sub2ApiSyncResult:
-    runtime_config = get_runtime_config_service()
+    started_at = perf_counter()
+    sub2api = Sub2ApiClient()
     try:
-        result = await get_monitor_service().sync_once(reason="manual")
-        subscription_protocol_limit = await runtime_config.get_subscription_refresh_batch_size()
-        subscription_max_concurrency = await runtime_config.get_subscription_refresh_max_concurrency()
-        subscription_result = await refresh_subscriptions(
-            protocol_limit=subscription_protocol_limit,
-            max_concurrency=subscription_max_concurrency,
+        account_list_started_at = perf_counter()
+        raw_accounts = await sub2api.list_accounts()
+        account_list_duration_ms = elapsed_ms(account_list_started_at)
+        recovery_enabled = await get_runtime_config_service().get_recovery_enabled()
+        recovery_account_ids = {
+            account_id
+            for account in raw_accounts
+            if sub2api.is_gpt_account(account)
+            and sub2api.is_oauth_account(account)
+            and sub2api.is_error_account(account)
+            and (account_id := sub2api.account_id(account))
+        } if recovery_enabled else set()
+        inventory_started_at = perf_counter()
+        result = await get_monitor_service().sync_once(
+            reason="manual",
+            raw_accounts=raw_accounts,
         )
-        usage_result = await get_usage_refresh_service().refresh_all(reason="sync")
+        inventory_duration_ms = elapsed_ms(inventory_started_at)
+        usage_dispatch_started_at = perf_counter()
+        usage_task = asyncio.create_task(
+            get_usage_refresh_service().refresh_all(
+                reason="oauth_sync",
+                accounts=raw_accounts,
+                skip_account_ids=recovery_account_ids,
+            )
+        )
+        await asyncio.sleep(0)
+        usage_dispatch_duration_ms = elapsed_ms(usage_dispatch_started_at)
+        if usage_task.done():
+            usage_result = usage_task.result()
+        else:
+            usage_result = None
+            _oauth_sync_background_tasks.add(usage_task)
+            usage_task.add_done_callback(_consume_background_task_result)
     except Sub2ApiRequestError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    sync_message = result.message
-    result.message = f"{sync_message} {subscription_result['message']} {usage_result.message}"
+    oauth_accounts, _duplicates = sub2api.dedupe_accounts_by_email(
+        [
+            account
+            for account in raw_accounts
+            if sub2api.is_gpt_account(account)
+            and sub2api.is_oauth_account(account)
+        ]
+    )
+    pending_usage_count = (
+        sum(
+            1
+            for account in oauth_accounts
+            if (account_id := sub2api.account_id(account))
+            and account_id not in recovery_account_ids
+            and not sub2api.is_deactive_account(account)
+        )
+        if usage_result is None
+        else 0
+    )
+    result = result.model_copy(
+        update={
+            "message": (
+                f"{result.message} "
+                + (
+                    f"Usage windows continue in the background for {pending_usage_count} account(s); "
+                    if usage_result is None
+                    else f"Usage windows: {usage_result.refreshed}/{usage_result.total} refreshed, "
+                    f"{usage_result.failed} failed; "
+                )
+                + f"{len(recovery_account_ids)} recovery account(s) continue after credential refresh."
+            ),
+            "usage_total": pending_usage_count if usage_result is None else usage_result.total,
+            "usage_refreshed": 0 if usage_result is None else usage_result.refreshed,
+            "usage_skipped": 0 if usage_result is None else usage_result.skipped,
+            "usage_failed": 0 if usage_result is None else usage_result.failed,
+            "usage_pending": pending_usage_count,
+        }
+    )
     await record_event(
         db,
         "manual_sync",
-        sync_message,
+        result.message,
         details={
             "reason": "manual",
             "total_seen": result.total_seen,
@@ -1062,19 +1139,15 @@ async def sync_accounts(
             "duplicate_accounts_ignored": result.duplicate_accounts_ignored,
             "deleted_accounts": result.deleted_accounts,
             "deleted_mailboxes": result.deleted_mailboxes,
-            "subscription_total": subscription_result["total"],
-            "subscription_refreshed": subscription_result["refreshed"],
-            "subscription_skipped": subscription_result["skipped"],
-            "subscription_no_subscription_fields": subscription_result["no_subscription_fields"],
-            "subscription_protocol_attempts": subscription_result.get("protocol_attempts", 0),
-            "subscription_protocol_limit": subscription_protocol_limit,
-            "subscription_max_concurrency": subscription_max_concurrency,
-            "subscription_failed": subscription_result["failed"],
-            "usage_total": usage_result.total,
-            "usage_refreshed": usage_result.refreshed,
-            "usage_skipped": usage_result.skipped,
-            "usage_failed": usage_result.failed,
-            "usage_max_concurrency": usage_result.max_concurrency,
+            "usage_total": result.usage_total,
+            "usage_refreshed": result.usage_refreshed,
+            "usage_skipped": result.usage_skipped,
+            "usage_failed": result.usage_failed,
+            "usage_pending": result.usage_pending,
+            "duration_ms": elapsed_ms(started_at),
+            "account_list_duration_ms": account_list_duration_ms,
+            "inventory_duration_ms": inventory_duration_ms,
+            "usage_dispatch_duration_ms": usage_dispatch_duration_ms,
         },
     )
     return result
@@ -1311,6 +1384,15 @@ async def refresh_usage_windows(
             "usage_skipped": result.skipped,
             "usage_failed": result.failed,
             "usage_max_concurrency": result.max_concurrency,
+            "force": result.force,
+            "duration_ms": result.duration_ms,
+            "queue_wait_duration_ms": result.queue_wait_duration_ms,
+            "query_duration_ms": result.query_duration_ms,
+            **(
+                {"workflow_wait_duration_ms": result.workflow_wait_duration_ms}
+                if result.workflow_wait_duration_ms is not None
+                else {}
+            ),
         },
     )
     return UsageRefreshResult(
@@ -1329,13 +1411,18 @@ async def refresh_usage_windows(
 @router.post("/subscription-refresh", response_model=SubscriptionRefreshResult)
 async def refresh_account_subscriptions(
     protocol_limit: int | None = Query(default=None, ge=1, le=100),
-    max_concurrency: int | None = Query(default=None, ge=1, le=20),
+    max_concurrency: int | None = Query(default=None, ge=0, le=20),
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> SubscriptionRefreshResult:
+    started_at = perf_counter()
     runtime_config = get_runtime_config_service()
     resolved_protocol_limit = protocol_limit or await runtime_config.get_subscription_refresh_batch_size()
-    resolved_max_concurrency = max_concurrency or await runtime_config.get_subscription_refresh_max_concurrency()
+    resolved_max_concurrency = (
+        max_concurrency
+        if max_concurrency is not None
+        else await runtime_config.get_subscription_refresh_max_concurrency()
+    )
     try:
         result = await refresh_subscriptions(
             protocol_limit=resolved_protocol_limit,
@@ -1356,6 +1443,7 @@ async def refresh_account_subscriptions(
             "protocol_limit": resolved_protocol_limit,
             "max_concurrency": resolved_max_concurrency,
             "failed": result["failed"],
+            "duration_ms": elapsed_ms(started_at),
         },
     )
     return SubscriptionRefreshResult(
@@ -1384,8 +1472,6 @@ async def refresh_account(
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> RefreshJobOut:
-    if not await get_runtime_config_service().get_recovery_enabled():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Recovery is disabled in settings.")
     try:
         job_id = await get_refresh_service().enqueue_by_email(str(payload.email), reason="manual")
     except Sub2ApiRequestError as exc:
