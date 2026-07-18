@@ -683,6 +683,19 @@ h2 {
   box-sizing: content-box;
 }
 
+.settings-save-header {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.settings-save-header .panel-title {
+  margin-bottom: 0;
+}
+
 .panel-toolbar {
   align-items: center;
   display: flex;
@@ -3231,20 +3244,12 @@ select:focus {
 
 .liveness-account-identity {
   display: grid;
-  gap: 4px;
+  gap: 2px;
   min-width: 0;
 }
 
-.liveness-account-identity strong,
-.liveness-account-identity span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.liveness-account-identity span {
-  color: var(--muted);
-  font-size: 11px;
+.liveness-account-identity .copy-text-button {
+  width: 100%;
 }
 
 .phone-dialog-grid {
@@ -4818,6 +4823,7 @@ fieldset.api-key-field {
 }
 
 .api-key-rate-log-row .api-key-rate-log-identity {
+  align-content: start;
   align-items: start;
   display: grid;
   gap: 4px;
@@ -4862,11 +4868,20 @@ fieldset.api-key-field {
   min-width: 0;
 }
 
+.api-key-rate-log-row .api-key-upstream-state-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 1px;
+  width: 100%;
+}
+
 .api-key-upstream-transition {
   gap: 4px;
+  justify-content: center;
   max-width: 100%;
-  overflow: visible;
-  text-overflow: clip;
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: 4px;
 }
 
 .api-key-upstream-transition > span:first-child {
@@ -4887,11 +4902,20 @@ fieldset.api-key-field {
   display: inline-flex;
   gap: 3px;
   min-width: 0;
+  overflow: hidden;
 }
 
 .api-key-upstream-transition-flow b {
   font-weight: 600;
   opacity: 0.72;
+}
+
+.api-key-upstream-transition > strong,
+.api-key-upstream-transition-flow b,
+.api-key-upstream-transition-flow strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .api-key-upstream-transition-flow svg {
@@ -5017,7 +5041,7 @@ fieldset.api-key-field {
 
   .api-key-rate-log-row {
     align-items: stretch;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .api-key-rate-log-row .api-key-rate-log-identity {
@@ -5031,8 +5055,8 @@ fieldset.api-key-field {
   }
 
   .api-key-rate-log-cell--primary {
-    grid-column: 1 / -1;
-    grid-row: 2;
+    grid-column: auto;
+    grid-row: auto;
   }
 }
 
@@ -5345,18 +5369,37 @@ button.api-key-group-chip--more {
   align-content: start;
   display: grid;
   gap: 4px;
-  min-height: 94px;
+  min-height: 42px;
   min-width: 0;
   padding: 10px 10px 8px;
 }
 
-.api-key-account-card-head > strong {
+.api-key-account-card-head > strong,
+.api-key-account-title-line > strong {
   color: var(--ink);
   font-size: 12px;
   line-height: 1.35;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.api-key-account-title-line {
+  align-items: center;
+  display: flex;
+  gap: 5px;
+  min-width: 0;
+}
+
+.api-key-account-title-line > strong {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.api-key-account-title-line > .api-key-mono {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 9px;
 }
 
 .api-key-account-card-head > .api-key-mono {
@@ -5384,6 +5427,20 @@ button.api-key-group-chip--more {
   gap: 5px;
   min-width: 0;
   padding: 9px 10px 10px;
+}
+
+.api-key-account-group-label {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.api-key-account-group-label > span:first-child {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  margin-right: auto;
 }
 
 .api-key-account-card-group > span {
@@ -5422,6 +5479,32 @@ button.api-key-group-chip--more {
   line-height: 1;
   min-height: 20px;
   padding: 3px 6px;
+}
+
+.api-key-account-usage {
+  align-items: baseline;
+  border-top: 1px dashed var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 6px;
+  margin-top: 2px;
+  padding-top: 6px;
+}
+
+.api-key-account-usage > span,
+.api-key-account-usage > small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.api-key-account-usage > strong {
+  color: var(--ink);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.api-key-account-usage > small {
+  margin-left: auto;
 }
 
 .api-key-account-rate-chip {
@@ -6492,6 +6575,41 @@ button.api-key-group-chip--more {
   min-width: 0;
 }
 
+.api-key-account-priority-heading {
+  align-items: center;
+  display: flex;
+  gap: 5px;
+}
+
+.api-key-account-priority-heading > small {
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  padding-left: 5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-key-account-priority-value .api-key-account-rate-chips {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.api-key-account-priority-value .api-key-account-rate-chip {
+  flex: 1 1 0;
+  justify-content: center;
+  min-width: 0;
+  padding-inline: 4px;
+}
+
+.api-key-channel-today-usage {
+  color: var(--ink) !important;
+  font-weight: 700;
+}
+
 .api-key-account-priority label > span,
 .api-key-account-priority-value > span,
 .api-key-account-priority-value small {
@@ -6513,6 +6631,7 @@ button.api-key-group-chip--more {
 .api-key-account-priority-value {
   align-content: start;
   border-left: 1px solid var(--line);
+  grid-template-columns: minmax(0, 1fr);
   padding-left: 9px;
 }
 
@@ -6723,7 +6842,7 @@ button.api-key-group-chip--more {
   }
 }
 
-@media (max-width: 390px) {
+@media (max-width: 480px) {
   .api-key-account-priority {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -6733,6 +6852,16 @@ button.api-key-group-chip--more {
     border-top: 1px solid var(--line);
     padding-left: 0;
     padding-top: 7px;
+  }
+
+  .api-key-account-priority-value .api-key-account-rate-chips {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .api-key-account-usage > small {
+    flex-basis: 100%;
+    margin-left: 0;
   }
 
   .api-key-priority-card-stats {

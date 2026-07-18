@@ -75,6 +75,8 @@ import {
   type UpstreamAccountEntry,
 } from "./upstreamPriorityPresentation";
 import { upstreamOverviewHasLiveMutationData } from "./upstreamOverviewCache";
+import { rechargeAdjustedUsage } from "./upstreamUsagePresentation";
+import type { ApiKeySubview } from "./viewRouting";
 import type {
   PriorityInterval,
   PriorityIntervalInput,
@@ -87,7 +89,6 @@ import type {
 } from "./types";
 
 type StatusFilter = "all" | "pending" | "attention" | "undiscovered";
-type Subview = "accounts" | "channels" | "intervals" | "rate-log";
 type RateLogFilters = { startDate: string; endDate: string };
 type PriorityIntervalFilter = "all" | "unassigned" | string;
 type PlatformFilter = "all" | "__unknown__" | string;
@@ -166,8 +167,10 @@ export function ApiKeyAccountsView({
   globallyBusy,
   onCacheChange,
   onOperationStart,
+  onSubviewChange,
   rateWritesEnabled,
   refreshVersion,
+  subview,
 }: {
   cacheBaseUrl: string;
   cachedData: UpstreamChannelsResponse | null;
@@ -175,8 +178,10 @@ export function ApiKeyAccountsView({
   globallyBusy: boolean;
   onCacheChange: (data: UpstreamChannelsResponse, baseUrl: string) => void;
   onOperationStart: () => () => void;
+  onSubviewChange: (subview: ApiKeySubview) => void;
   rateWritesEnabled: boolean;
   refreshVersion: number;
+  subview: ApiKeySubview;
 }) {
   const [data, setData] = useState<UpstreamChannelsResponse>(cachedData || emptyData);
   const [loading, setLoading] = useState(!cachedData);
@@ -192,7 +197,6 @@ export function ApiKeyAccountsView({
   const [platformFilter, setPlatformFilter] = useState<PlatformFilter>("all");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [subview, setSubview] = useState<Subview>("accounts");
   const [rateLogs, setRateLogs] = useState<UpstreamChangeLog[]>([]);
   const [rateLogsLoaded, setRateLogsLoaded] = useState(false);
   const [rateLogsLoading, setRateLogsLoading] = useState(false);
@@ -964,7 +968,7 @@ export function ApiKeyAccountsView({
         <button
           aria-selected={subview === "accounts"}
           className={subview === "accounts" ? "active" : ""}
-          onClick={() => setSubview("accounts")}
+          onClick={() => onSubviewChange("accounts")}
           role="tab"
           type="button"
         >
@@ -974,7 +978,7 @@ export function ApiKeyAccountsView({
         <button
           aria-selected={subview === "channels"}
           className={subview === "channels" ? "active" : ""}
-          onClick={() => setSubview("channels")}
+          onClick={() => onSubviewChange("channels")}
           role="tab"
           type="button"
         >
@@ -984,7 +988,7 @@ export function ApiKeyAccountsView({
         <button
           aria-selected={subview === "intervals"}
           className={subview === "intervals" ? "active" : ""}
-          onClick={() => setSubview("intervals")}
+          onClick={() => onSubviewChange("intervals")}
           role="tab"
           type="button"
         >
@@ -994,7 +998,7 @@ export function ApiKeyAccountsView({
         <button
           aria-selected={subview === "rate-log"}
           className={subview === "rate-log" ? "active" : ""}
-          onClick={() => setSubview("rate-log")}
+          onClick={() => onSubviewChange("rate-log")}
           role="tab"
           type="button"
         >
@@ -1704,6 +1708,9 @@ function ChannelCard({
         <ChannelStat icon={<WalletCards size={16} />} label="上游余额">
           <strong>{formatBalance(channel.balance_remaining, channel.balance_unit)}</strong>
           <span>{balanceDetail(channel)}</span>
+          <span className="api-key-channel-today-usage">
+            {formatTodayBalanceUsed(channel, displayTimeZone)}
+          </span>
         </ChannelStat>
         <ChannelStat icon={<BadgeDollarSign size={16} />} label="充值成本">
           <strong>{"¥" + formatCostPerUsd(channel.effective_recharge_multiplier) + " / $1"}</strong>
@@ -1908,28 +1915,24 @@ function AccountCard({
         : priorityPending
           ? "等待写入"
           : priorityStatusLabel(account.priority_sync_status);
+  const usageAmount = finiteNumber(account.upstream_usage_amount);
+  const usageCost = rechargeAdjustedUsage(usageAmount, account.effective_recharge_multiplier);
+  const usageDetail = usageAmount === null
+    ? "使用额待同步"
+    : usageCost === null
+      ? "充值倍率待同步"
+      : `× 充值倍率 = ¥${formatMoney(usageCost)}`;
+  const hasAccountMeta = Boolean(account.auto_disabled_reason || identityBlocked);
   return (
     <article className={"api-key-account-card" + (enabled ? "" : " api-key-account-card--disabled")}>
       <header className="api-key-account-card-head">
-        <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
-        <span className="api-key-mono">#{account.sub2api_account_id}</span>
-        <div className="api-key-inline-chips api-key-account-meta-chips">
+        <div className="api-key-account-title-line">
+          <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
           <StatusChip status={effectiveStatus} />
           {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
-          <AccountUpstreamHealthChip
-            checkedAt={account.upstream_key_checked_at || account.upstream_health_checked_at}
-            displayTimeZone={displayTimeZone}
-            kind="key"
-            label="Key"
-            status={account.upstream_key_status}
-          />
-          <AccountUpstreamHealthChip
-            checkedAt={account.upstream_group_checked_at || account.upstream_health_checked_at}
-            displayTimeZone={displayTimeZone}
-            kind="group"
-            label="分组"
-            status={account.upstream_group_status}
-          />
+          <span className="api-key-mono">#{account.sub2api_account_id}</span>
+        </div>
+        {hasAccountMeta ? <div className="api-key-inline-chips api-key-account-meta-chips">
           {account.auto_disabled_reason ? (
             <span
               className="api-key-chip api-key-chip--danger"
@@ -1948,39 +1951,26 @@ function AccountCard({
               {account.identity_binding_status === "mismatch" ? "身份已变化" : "身份待认领"}
             </span>
           ) : null}
-        </div>
-        <div className="api-key-inline-chips api-key-account-rate-chips">
-          <span
-            aria-label={combinedRateTitle}
-            className="api-key-chip api-key-account-rate-chip api-key-account-rate-chip--combined"
-            title={combinedRateTitle}
-          >
-            <span>综合</span>
-            <strong>{combinedRateLabel}</strong>
-          </span>
-          <span
-            aria-label={currentRateTitle}
-            className="api-key-chip api-key-account-rate-chip api-key-account-rate-chip--current"
-            title={currentRateTitle}
-          >
-            <span>当前</span>
-            <strong>{currentRateLabel}</strong>
-          </span>
-          <span
-            aria-label={targetRateTitle}
-            className={
-              "api-key-chip api-key-account-rate-chip api-key-account-rate-chip--target"
-              + (account.would_change === true ? " is-pending" : "")
-            }
-            title={targetRateTitle}
-          >
-            <span>目标</span>
-            <strong>{targetRateLabel}</strong>
-          </span>
-        </div>
+        </div> : null}
       </header>
       <div className="api-key-account-card-group">
-        <span>上游分组</span>
+        <div className="api-key-account-group-label">
+          <span>上游分组</span>
+          <AccountUpstreamHealthChip
+            checkedAt={account.upstream_key_checked_at || account.upstream_health_checked_at}
+            displayTimeZone={displayTimeZone}
+            kind="key"
+            label="Key"
+            status={account.upstream_key_status}
+          />
+          <AccountUpstreamHealthChip
+            checkedAt={account.upstream_group_checked_at || account.upstream_health_checked_at}
+            displayTimeZone={displayTimeZone}
+            kind="group"
+            label="分组"
+            status={account.upstream_group_status}
+          />
+        </div>
         <div className="api-key-account-group-line">
           <strong title={account.selected_group_name || account.selected_group_id || "未识别"}>
             {account.selected_group_name || account.selected_group_id || "未识别"}
@@ -1994,6 +1984,11 @@ function AccountCard({
               {formatMultiplier(groupMultiplier)}
             </span>
           ) : null}
+        </div>
+        <div className="api-key-account-usage">
+          <span>累计使用</span>
+          <strong>{formatBalance(usageAmount, account.upstream_usage_unit)}</strong>
+          <small>{usageDetail}</small>
         </div>
       </div>
       <div className="api-key-account-priority">
@@ -2025,12 +2020,19 @@ function AccountCard({
           }
           title={account.priority_sync_error || priorityState}
         >
-          <span>调度优先级</span>
+          <span className="api-key-account-priority-heading">
+            <span>调度优先级</span>
+            <small>{account.priority_sync_error || priorityState}</small>
+          </span>
           <div>
             <strong>{formatPriority(priority)}</strong>
             {priorityPending ? <><ArrowRight size={13} /><b>{formatPriority(desiredPriority)}</b></> : null}
           </div>
-          <small>{account.priority_sync_error || priorityState}</small>
+          <div className="api-key-inline-chips api-key-account-rate-chips">
+            <RateChip label="综合" value={combinedRateLabel} title={combinedRateTitle} tone="combined" />
+            <RateChip label="当前" value={currentRateLabel} title={currentRateTitle} tone="current" />
+            <RateChip label="目标" pending={account.would_change === true} value={targetRateLabel} title={targetRateTitle} tone="target" />
+          </div>
         </div>
       </div>
       <footer className="api-key-account-card-actions">
@@ -2077,6 +2079,24 @@ function AccountCard({
         </button>
       </footer>
     </article>
+  );
+}
+
+function RateChip({ label, pending = false, value, title, tone }: {
+  label: string;
+  pending?: boolean;
+  value: string;
+  title: string;
+  tone: "combined" | "current" | "target";
+}) {
+  return (
+    <span
+      aria-label={title}
+      className={`api-key-chip api-key-account-rate-chip api-key-account-rate-chip--${tone}${pending ? " is-pending" : ""}`}
+      title={title}
+    >
+      <span>{label}</span><strong>{value}</strong>
+    </span>
   );
 }
 
@@ -2406,8 +2426,11 @@ function UpstreamStateTransition({
 }) {
   const current = change.newValue ?? change.oldValue;
   const tone = upstreamStatusTone(current || "unknown");
+  const title = change.direction === "changed"
+    ? `${label}：${upstreamHealthStatusLabel(kind, change.oldValue)} -> ${upstreamHealthStatusLabel(kind, change.newValue)}`
+    : `${label}：${upstreamHealthStatusLabel(kind, current)}`;
   return (
-    <span className={`api-key-upstream-transition api-key-chip api-key-chip--${tone}`}>
+    <span className={`api-key-upstream-transition api-key-chip api-key-chip--${tone}`} title={title}>
       <span>{label}</span>
       {change.direction === "changed" ? (
         <span className="api-key-upstream-transition-flow">
@@ -2819,6 +2842,34 @@ function balanceDetail(channel: UpstreamChannel) {
   if (finiteNumber(channel.balance_total) !== null) details.push("总额 " + formatBalance(channel.balance_total, channel.balance_unit));
   if (finiteNumber(channel.balance_used) !== null) details.push("上游累计已用 " + formatBalance(channel.balance_used, channel.balance_unit));
   return details.join(" · ") || statusLabel(channel.balance_status || channel.status || "not_checked");
+}
+
+function formatTodayBalanceUsed(channel: UpstreamChannel, timeZone: string) {
+  if (String(channel.today_balance_status || "").toLowerCase() !== "ok") {
+    return channel.resolved_upstream_type === "newapi" ? "今日消耗 上游未提供" : "今日消耗 待同步";
+  }
+  const amount = formatBalance(channel.today_balance_used, channel.today_balance_unit || channel.balance_unit);
+  return isToday(channel.today_balance_checked_at, timeZone) ? `今日消耗 ${amount}` : `上次同步 ${amount}`;
+}
+
+function formatMoney(value: unknown) {
+  const number = finiteNumber(value);
+  if (number === null) return "—";
+  return number.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+}
+
+function isToday(value: string | null | undefined, timeZone: string) {
+  if (!value) return false;
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : value + "Z";
+  const checkedAt = new Date(normalized);
+  if (Number.isNaN(checkedAt.getTime())) return false;
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    day: "2-digit",
+    month: "2-digit",
+    timeZone,
+    year: "numeric",
+  });
+  return formatter.format(checkedAt) === formatter.format(new Date());
 }
 
 function formatDate(value?: string | null, timeZone?: string) {

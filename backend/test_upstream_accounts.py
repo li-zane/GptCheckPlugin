@@ -325,6 +325,32 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
 
         rebalance.assert_not_awaited()
 
+    async def test_successful_discovery_clears_stale_usage_when_key_match_is_missing(self) -> None:
+        await self._manage(api_key="sk-managed-usage")
+        config = await self._config()
+        config.upstream_usage_amount = 12.375
+        config.upstream_usage_unit = "USD"
+        config.upstream_usage_checked_at = config.created_at
+        await self.db.commit()
+
+        result = discovery_result(
+            group=1.0,
+            recharge=1.0,
+        )
+        with patch(
+            "app.services.upstream_accounts.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            discovered = await self._discover()
+
+        self.assertIsNone(discovered.upstream_usage_amount)
+        self.assertIsNone(discovered.upstream_usage_unit)
+        self.assertIsNone(discovered.upstream_usage_checked_at)
+        stored = await self._config()
+        self.assertIsNone(stored.upstream_usage_amount)
+        self.assertIsNone(stored.upstream_usage_unit)
+        self.assertIsNone(stored.upstream_usage_checked_at)
+
     async def test_duplicate_valid_remote_ids_fail_closed_for_list_and_point_lookup(self) -> None:
         duplicate = dict(self.sub2api.accounts[0])
         duplicate["name"] = "different-account-with-same-id"
@@ -827,6 +853,11 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             selected_group_name="Gold",
         )
         self.assertEqual((created.selected_group_id, created.selected_group_name), ("gold", "Gold"))
+        stored = await self._config()
+        stored.upstream_usage_amount = 12.375
+        stored.upstream_usage_unit = "USD"
+        stored.upstream_usage_checked_at = stored.created_at
+        await self.db.commit()
 
         same = await self.service.upsert_account(
             self.db,
@@ -839,6 +870,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual((same.selected_group_id, same.selected_group_name), ("gold", "Gold"))
+        self.assertEqual(same.upstream_usage_amount, 12.375)
 
         changed_base = await self.service.upsert_account(
             self.db,
@@ -850,6 +882,9 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(changed_base.selected_group_id)
         self.assertIsNone(changed_base.selected_group_name)
+        self.assertIsNone(changed_base.upstream_usage_amount)
+        self.assertIsNone(changed_base.upstream_usage_unit)
+        self.assertIsNone(changed_base.upstream_usage_checked_at)
 
         await self.service.upsert_account(
             self.db,

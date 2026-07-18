@@ -14,6 +14,7 @@ import {
   livenessAccountIds,
   MAX_LIVENESS_ACCOUNTS,
 } from "../src/accountLiveness.ts";
+import { accountFilterFacetCandidates } from "../src/accountFilterFacets.ts";
 import {
   buildUpstreamAccountUpdatePayload,
   canSetManualMultiplier,
@@ -69,6 +70,18 @@ import {
   upstreamRateWritesAllowed,
 } from "../src/upstreamSyncPresentation.ts";
 import { sortUsageLimitSamples } from "../src/usageSampleSort.ts";
+import {
+  apiKeySubviewPaths,
+  normalizePathname,
+  pathForRoute,
+  pathForView,
+  routeFromPath,
+  viewFromPath,
+  viewPaths,
+  type ApiKeySubview,
+  type View,
+} from "../src/viewRouting.ts";
+import { rechargeAdjustedUsage } from "../src/upstreamUsagePresentation.ts";
 import type { UpstreamChannelsResponse, UsageLimitSample } from "../src/types.ts";
 
 const usageSamples: UsageLimitSample[] = [
@@ -105,6 +118,39 @@ const usageSamples: UsageLimitSample[] = [
     updated_at: "2026-07-15T04:00:00Z",
   },
 ];
+
+test("view routes canonicalize paths and keep every dashboard view addressable", () => {
+  const expectedRoutes: Array<[View, string]> = Object.entries(viewPaths) as Array<[View, string]>;
+  for (const [view, path] of expectedRoutes) {
+    assert.equal(pathForView(view), path);
+    assert.equal(viewFromPath(path), view);
+    assert.equal(viewFromPath(`${path}/`), view);
+  }
+  assert.equal(normalizePathname("/settings///"), "/settings");
+  assert.equal(viewFromPath("/"), "overview");
+  assert.equal(viewFromPath("/not-a-view"), "overview");
+
+  const expectedApiKeyRoutes = Object.entries(apiKeySubviewPaths) as Array<[ApiKeySubview, string]>;
+  for (const [apiKeySubview, path] of expectedApiKeyRoutes) {
+    const route = { view: "api-keys" as const, apiKeySubview };
+    assert.deepEqual(routeFromPath(path), route);
+    assert.deepEqual(routeFromPath(`${path}/`), route);
+    assert.equal(pathForRoute(route), path);
+  }
+});
+
+test("App navigation uses history state, a page refresh control, and a top settings submit", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /window\.history\.pushState\(null, "", nextPath\)/);
+  assert.match(source, /window\.addEventListener\("popstate", handlePopState\)/);
+  assert.match(source, /window\.history\.replaceState\(null, "", canonicalPath\)/);
+  assert.match(source, /window\.location\.reload\(\)/);
+  assert.match(source, /form="runtime-settings-form"/);
+  assert.match(source, /id="runtime-settings-form"/);
+  assert.equal((source.match(/保存设置/g) || []).length, 1);
+  const viteConfig = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
+  assert.match(viteConfig, /"\^\/api\(\?:\/\|\$\)"/);
+});
 
 test("history duration helpers format totals, stages, and refresh jobs", () => {
   const details = {
@@ -210,6 +256,55 @@ test("liveness request ids are deduplicated and capped at the backend limit", ()
   assert.deepEqual(ids.slice(0, 3), ["1", "2", "3"]);
 });
 
+test("account filter facets only offer values represented under the other active filter", () => {
+  const accounts = [
+    { id: 1, status: "error", subscription: "plus" },
+    { id: 2, status: "normal", subscription: "plus" },
+    { id: 3, status: "normal", subscription: "k12" },
+  ];
+
+  const errorFacets = accountFilterFacetCandidates(
+    accounts,
+    "error",
+    "",
+    (account, status) => status === "all" || account.status === status,
+    (account) => account.subscription,
+  );
+  assert.deepEqual(errorFacets.subscriptionOptionAccounts.map((account) => account.subscription), ["plus"]);
+  assert.deepEqual(errorFacets.filteredAccounts.map((account) => account.id), [1]);
+
+  const plusFacets = accountFilterFacetCandidates(
+    accounts,
+    "all",
+    "plus",
+    (account, status) => status === "all" || account.status === status,
+    (account) => account.subscription,
+  );
+  assert.deepEqual(plusFacets.statusOptionAccounts.map((account) => account.id), [1, 2]);
+  assert.deepEqual(plusFacets.filteredAccounts.map((account) => account.id), [1, 2]);
+});
+
+test("upstream usage preserves zero and converts USD usage with recharge cost only", () => {
+  assert.equal(rechargeAdjustedUsage(12.375, 0.0621), 0.7684875);
+  assert.equal(rechargeAdjustedUsage(0, 0.0621), 0);
+  assert.equal(rechargeAdjustedUsage(null, 0.0621), null);
+  assert.equal(rechargeAdjustedUsage(12.375, null), null);
+  assert.equal(rechargeAdjustedUsage(-1, 0.0621), null);
+  assert.equal(rechargeAdjustedUsage(true, 0.0621), null);
+});
+
+test("liveness results expose separate copy actions for account names and emails", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const resultBlock = source.slice(
+    source.indexOf("{result.results.map((item) =>"),
+    source.indexOf("function AccountRow"),
+  );
+  assert.match(resultBlock, /title=\{item\.account_name\?\.trim\(\) \? "复制账号名称"/);
+  assert.match(resultBlock, /title="复制账号邮箱"/);
+  assert.match(resultBlock, /value=\{accountName\}/);
+  assert.match(resultBlock, /value=\{email\}/);
+});
+
 test("stale-sensitive upstream mutations include the expected identity fingerprint", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;
@@ -288,6 +383,15 @@ test("API key inventory sync uses the lightweight inventory endpoint", async () 
 
 test("toolbar account syncs refresh only their affected data", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const apiKeySyncTimeBlock = source.slice(
+    source.indexOf("const lastApiKeySyncEvent"),
+    source.indexOf("const oauthSyncActionTime"),
+  );
+  assert.match(apiKeySyncTimeBlock, /"manual_api_key_inventory_sync"/);
+  assert.match(apiKeySyncTimeBlock, /"manual_upstream_sync"/);
+  assert.match(apiKeySyncTimeBlock, /"api_key_inventory_sync"/);
+  assert.match(apiKeySyncTimeBlock, /"upstream_sync"/);
+
   const syncBlock = source.slice(
     source.indexOf("const runSyncAction"),
     source.indexOf("if (authState === \"checking\")"),
@@ -766,6 +870,10 @@ test("session cache strips credentials and credential hints", () => {
       access_token: "secret-access",
       refresh_token: "secret-refresh",
       access_token_set: true,
+      today_balance_used: 3.25,
+      today_balance_unit: "USD",
+      today_balance_status: "ok",
+      today_balance_checked_at: "2026-07-16T08:02:00Z",
       accounts: [{
         sub2api_account_id: 10,
         remote_name: "账号",
@@ -782,6 +890,9 @@ test("session cache strips credentials and credential hints", () => {
         priority_interval_name: "低成本",
         priority_sync_status: "pending",
         composite_multiplier: 0.2,
+        upstream_usage_amount: 12.375,
+        upstream_usage_unit: "USD",
+        upstream_usage_checked_at: "2026-07-16T08:01:30Z",
         upstream_key_status: "disabled",
         upstream_group_status: "invalid",
         upstream_health_invalid_count: 2,
@@ -799,12 +910,16 @@ test("session cache strips credentials and credential hints", () => {
   assert.equal(safe.channels[0].access_token_set, true);
   assert.equal(safe.channels[0].account_count, 1);
   assert.equal(safe.channels[0].probe_enabled, false);
+  assert.equal(safe.channels[0].today_balance_used, 3.25);
+  assert.equal(safe.channels[0].today_balance_status, "ok");
   assert.equal(safe.channels[0].accounts?.[0].api_key_set, true);
   assert.equal(safe.channels[0].accounts?.[0].api_key_hint, undefined);
   assert.equal(safe.channels[0].accounts?.[0].identity_fingerprint, undefined);
   assert.equal(safe.channels[0].accounts?.[0].remote_platform, "anthropic");
   assert.equal(safe.channels[0].accounts?.[0].priority_interval_id, 4);
   assert.equal(safe.channels[0].accounts?.[0].composite_multiplier, 0.2);
+  assert.equal(safe.channels[0].accounts?.[0].upstream_usage_amount, 12.375);
+  assert.equal(safe.channels[0].accounts?.[0].upstream_usage_unit, "USD");
   assert.equal(safe.channels[0].accounts?.[0].upstream_key_status, "disabled");
   assert.equal(safe.channels[0].accounts?.[0].upstream_group_status, "invalid");
   assert.equal(safe.channels[0].accounts?.[0].upstream_health_invalid_count, 2);

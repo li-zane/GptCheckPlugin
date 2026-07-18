@@ -937,6 +937,9 @@ class UpstreamAccountOut(BaseModel):
     balance_status: str | None = None
     balance_message: str | None = None
     balance_checked_at: datetime | None = None
+    upstream_usage_amount: float | None = None
+    upstream_usage_unit: str | None = None
+    upstream_usage_checked_at: datetime | None = None
     last_error: str | None = None
     last_discovered_at: datetime | None = None
     last_applied_at: datetime | None = None
@@ -969,6 +972,10 @@ class UpstreamChannelOut(BaseModel):
     balance_status: str | None = None
     balance_message: str | None = None
     balance_checked_at: datetime | None = None
+    today_balance_used: float | None = None
+    today_balance_unit: str | None = None
+    today_balance_status: str | None = None
+    today_balance_checked_at: datetime | None = None
     last_error: str | None = None
     last_discovered_at: datetime | None = None
     created_at: datetime | None = None

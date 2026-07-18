@@ -56,7 +56,7 @@ class UsageRefreshSummary:
 def resolve_usage_refresh_force(reason: str, force: bool | None) -> bool:
     if force is not None:
         return force
-    return reason == "scheduled"
+    return reason in {"scheduled", "manual", "usage_estimate"}
 
 
 def cached_usage_from_account(account: dict[str, Any]) -> dict[str, Any] | None:

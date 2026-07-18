@@ -7,7 +7,7 @@ import type {
   PriorityInterval,
 } from "./types";
 
-export const upstreamOverviewCacheVersion = 2;
+export const upstreamOverviewCacheVersion = 3;
 const cacheKeyPrefix = "sub2api-at-upstream-overview:";
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem" | "key" | "length">;
@@ -148,6 +148,10 @@ function sanitizeChannel(value: unknown): UpstreamChannel | null {
     balance_status: nullableString(source.balance_status),
     balance_message: nullableString(source.balance_message),
     balance_checked_at: nullableString(source.balance_checked_at),
+    today_balance_used: nullableNumber(source.today_balance_used),
+    today_balance_unit: nullableString(source.today_balance_unit),
+    today_balance_status: nullableString(source.today_balance_status),
+    today_balance_checked_at: nullableString(source.today_balance_checked_at),
     status: nullableString(source.status),
     message: nullableString(source.message),
     checked_at: nullableString(source.checked_at),
@@ -221,6 +225,9 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
     balance_status: nullableString(source.balance_status),
     balance_message: nullableString(source.balance_message),
     balance_checked_at: nullableString(source.balance_checked_at),
+    upstream_usage_amount: nullableNumber(source.upstream_usage_amount),
+    upstream_usage_unit: nullableString(source.upstream_usage_unit),
+    upstream_usage_checked_at: nullableString(source.upstream_usage_checked_at),
     last_error: nullableString(source.last_error),
     last_discovered_at: nullableString(source.last_discovered_at),
     last_applied_at: nullableString(source.last_applied_at),

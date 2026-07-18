@@ -157,6 +157,18 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         await conn.execute(
             text("ALTER TABLE upstream_channels ADD COLUMN encrypted_refresh_token TEXT")
         )
+    optional_channel_columns = {
+        "today_balance_used": "FLOAT",
+        "today_balance_unit": "VARCHAR(32)",
+        "today_balance_status": "VARCHAR(32)",
+        "today_balance_checked_at": "DATETIME",
+    }
+    for column, column_type in optional_channel_columns.items():
+        if channel_columns and column not in channel_columns:
+            await conn.execute(
+                text(f"ALTER TABLE upstream_channels ADD COLUMN {column} {column_type}")
+            )
+            channel_columns.add(column)
 
     result = await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
     columns = {str(row[1]) for row in result.fetchall()}
@@ -218,6 +230,9 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "balance_status": "VARCHAR(32)",
         "balance_message": "TEXT",
         "balance_checked_at": "DATETIME",
+        "upstream_usage_amount": "FLOAT",
+        "upstream_usage_unit": "VARCHAR(32)",
+        "upstream_usage_checked_at": "DATETIME",
         "last_error": "TEXT",
         "last_discovered_at": "DATETIME",
         "last_applied_at": "DATETIME",

@@ -23,11 +23,13 @@ from app.services.usage_refresh import (
 
 
 class RefreshAutomationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_usage_refresh_force_defaults_to_automatic_runs_only(self) -> None:
+    async def test_usage_refresh_force_defaults_to_remote_for_direct_refreshes(self) -> None:
         self.assertTrue(resolve_usage_refresh_force("scheduled", None))
-        self.assertFalse(resolve_usage_refresh_force("manual", None))
+        self.assertTrue(resolve_usage_refresh_force("manual", None))
+        self.assertTrue(resolve_usage_refresh_force("usage_estimate", None))
         self.assertFalse(resolve_usage_refresh_force("oauth_sync", None))
         self.assertTrue(resolve_usage_refresh_force("manual", True))
+        self.assertFalse(resolve_usage_refresh_force("manual", False))
         self.assertFalse(resolve_usage_refresh_force("scheduled", False))
 
     async def test_usage_request_only_sends_force_for_forced_refreshes(self) -> None:
@@ -53,7 +55,7 @@ class RefreshAutomationTests(unittest.IsolatedAsyncioTestCase):
             {"source": "active", "force": "true"},
         )
 
-    async def test_manual_usage_refresh_reads_account_snapshot_without_request(self) -> None:
+    async def test_non_forced_usage_refresh_reads_account_snapshot_without_request(self) -> None:
         account = {
             "id": 7,
             "platform": "openai",
@@ -87,7 +89,7 @@ class RefreshAutomationTests(unittest.IsolatedAsyncioTestCase):
         )
         service.sub2api.refresh_account_usage_data.assert_not_awaited()  # type: ignore[attr-defined]
 
-    async def test_manual_usage_refresh_skips_missing_snapshot_without_request(self) -> None:
+    async def test_non_forced_usage_refresh_skips_missing_snapshot_without_request(self) -> None:
         account = {
             "id": 8,
             "platform": "openai",
@@ -109,7 +111,7 @@ class RefreshAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ("8", "missing@example.com", False, None, None))
         service.sub2api.refresh_account_usage_data.assert_not_awaited()  # type: ignore[attr-defined]
 
-    async def test_automatic_usage_refresh_forces_remote_request(self) -> None:
+    async def test_forced_usage_refresh_makes_remote_request(self) -> None:
         account = {
             "id": 9,
             "platform": "openai",

@@ -32,6 +32,7 @@ MAX_AUTOMATIC_KEY_REVEALS = 200
 KEY_REVEAL_CONCURRENCY = 20
 NEWAPI_BALANCE_ENDPOINT = "/api/user/self"
 SUB2API_BALANCE_ENDPOINT = "/api/v1/auth/me"
+SUB2API_TODAY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/stats"
 SUB2API_REFRESH_ENDPOINT = "/api/v1/auth/refresh"
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 DNS_OVER_HTTPS_URL = "https://cloudflare-dns.com/dns-query"
@@ -64,6 +65,7 @@ SUB2API_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/payment/checkout-info",
     "/api/v1/payment/config",
     SUB2API_BALANCE_ENDPOINT,
+    SUB2API_TODAY_USAGE_ENDPOINT,
 )
 
 NEWAPI_PRIMARY_ENDPOINTS: tuple[str, ...] = (
@@ -80,6 +82,7 @@ SUB2API_PRIMARY_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/keys?page=1&page_size=200",
     "/api/v1/payment/checkout-info",
     SUB2API_BALANCE_ENDPOINT,
+    SUB2API_TODAY_USAGE_ENDPOINT,
 )
 
 
@@ -121,6 +124,8 @@ class AccountUpstreamState:
     group_status: str | None = None
     group_id: str | None = None
     group_name: str | None = None
+    usage_amount: float | None = None
+    usage_unit: str | None = None
 
 
 @dataclass(slots=True)
@@ -146,6 +151,9 @@ class DiscoveryResult:
     balance_unit: str | None = None
     balance_status: str = "unknown"
     balance_message: str = ""
+    today_balance_used: float | None = None
+    today_balance_unit: str | None = None
+    today_balance_status: str = "unknown"
     sub2api_auth_rejected: bool = False
     message: str = ""
 
@@ -520,6 +528,9 @@ class UpstreamClient:
                 access_token=access_token,
                 new_api_user=new_api_user,
             )
+            today_balance_used, today_balance_unit, today_balance_status = (
+                _discover_today_balance_usage(active_type, responses, access_token=access_token)
+            )
         except Exception:
             return safe(_error_result(active_type, source, "Could not parse a valid upstream response."))
 
@@ -546,6 +557,9 @@ class UpstreamClient:
                 balance_unit=balance.unit,
                 balance_status=balance.status,
                 balance_message=balance.message,
+                today_balance_used=today_balance_used,
+                today_balance_unit=today_balance_unit,
+                today_balance_status=today_balance_status,
                 sub2api_auth_rejected=sub2api_auth_rejected,
                 message=_success_message(group_multiplier, recharge_multiplier),
             )
@@ -1104,7 +1118,7 @@ def _headers_for_endpoint(
             raw_authorization=True,
         )
 
-    if endpoint == SUB2API_BALANCE_ENDPOINT:
+    if endpoint in {SUB2API_BALANCE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}:
         if _clean_secret(access_token) is None:
             return None
         return _build_headers(
@@ -1826,14 +1840,33 @@ def _account_upstream_state_from_record(
         group_status = "available" if matches else "unavailable"
     else:
         group_status = None
-    if key_status is None and group_status is None and group_id is None and group_name is None:
+    usage_amount = _account_usage_amount(upstream_type, record)
+    if (
+        key_status is None
+        and group_status is None
+        and group_id is None
+        and group_name is None
+        and usage_amount is None
+    ):
         return None
     return AccountUpstreamState(
         key_status=key_status,
         group_status=group_status,
         group_id=group_id,
         group_name=group_name,
+        usage_amount=usage_amount,
+        usage_unit="USD" if usage_amount is not None else None,
     )
+
+
+def _account_usage_amount(upstream_type: str, record: dict[str, Any]) -> float | None:
+    """Return an upstream API key's cumulative USD usage when explicitly reported."""
+    if upstream_type != "sub2api":
+        return None
+    raw = _finite_number(record.get("quota_used"))
+    if raw is None or raw < 0:
+        return None
+    return raw
 
 
 def _match_account_upstream_states(
@@ -2198,6 +2231,28 @@ def _discover_sub2api_balance(
     )
 
 
+def _discover_today_balance_usage(
+    upstream_type: str,
+    responses: dict[str, _FetchResult],
+    *,
+    access_token: str | None,
+) -> tuple[float | None, str | None, str]:
+    if upstream_type != "sub2api":
+        return None, None, "unsupported"
+    if _clean_secret(access_token) is None:
+        return None, None, "credentials_missing"
+    result = responses.get(SUB2API_TODAY_USAGE_ENDPOINT)
+    if result is None or not result.ok or not _payload_succeeded(result.payload):
+        return None, None, "error"
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict):
+        return None, None, "error"
+    amount = _finite_number(data.get("today_actual_cost"))
+    if amount is None or amount < 0:
+        return None, None, "error"
+    return amount, "USD", "ok"
+
+
 def _balance_fetch_failure(
     result: _FetchResult | None,
     upstream_name: str,
@@ -2502,6 +2557,7 @@ __all__ = [
     "NEWAPI_ENDPOINTS",
     "SUB2API_ENDPOINTS",
     "SUB2API_REFRESH_ENDPOINT",
+    "SUB2API_TODAY_USAGE_ENDPOINT",
     "Sub2ApiTokenPair",
     "UpstreamClient",
     "UpstreamDiscoveryClient",

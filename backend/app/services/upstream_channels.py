@@ -154,6 +154,7 @@ class UpstreamChannelService:
         config.upstream_health_invalid_count = 0
         config.upstream_key_checked_at = None
         config.upstream_group_checked_at = None
+        UpstreamAccountService.clear_upstream_usage_state(config)
         if config.priority_interval_id is not None:
             config.desired_priority = None
             config.priority_sync_status = "multiplier_unavailable"
@@ -174,6 +175,10 @@ class UpstreamChannelService:
         channel.balance_status = "not_checked"
         channel.balance_message = None
         channel.balance_checked_at = None
+        channel.today_balance_used = None
+        channel.today_balance_unit = None
+        channel.today_balance_status = "not_checked"
+        channel.today_balance_checked_at = None
         channel.last_error = None
         channel.last_discovered_at = None
 
@@ -587,6 +592,16 @@ class UpstreamChannelService:
                 and self.accounts._config_binding_status(remote, config) != "bound"
                 and not name_only_binding_change
             ):
+                if any(
+                    value is not None
+                    for value in (
+                        config.upstream_usage_amount,
+                        config.upstream_usage_unit,
+                        config.upstream_usage_checked_at,
+                    )
+                ):
+                    self.accounts.clear_upstream_usage_state(config)
+                    changed = True
                 if config.priority_interval_id is not None:
                     config.priority_interval_id = None
                     config.desired_priority = None
@@ -812,13 +827,6 @@ class UpstreamChannelService:
                 "local_recharge_status": local_status,
                 "target_rate": projected_target_rate,
                 "would_change": projected_would_change,
-                "balance_remaining": channel.balance_remaining,
-                "balance_total": channel.balance_total,
-                "balance_used": channel.balance_used,
-                "balance_unit": channel.balance_unit,
-                "balance_status": channel.balance_status,
-                "balance_message": channel.balance_message,
-                "balance_checked_at": channel.balance_checked_at,
             }
         )
 
@@ -901,6 +909,10 @@ class UpstreamChannelService:
             balance_status=channel.balance_status,
             balance_message=channel.balance_message,
             balance_checked_at=channel.balance_checked_at,
+            today_balance_used=channel.today_balance_used,
+            today_balance_unit=channel.today_balance_unit,
+            today_balance_status=channel.today_balance_status,
+            today_balance_checked_at=channel.today_balance_checked_at,
             last_error=channel.last_error,
             last_discovered_at=channel.last_discovered_at,
             created_at=channel.created_at,
@@ -921,8 +933,10 @@ class UpstreamChannelService:
                 remote_by_id,
                 configs,
                 channels_by_id,
-                _priority_membership_changed,
+                priority_membership_changed,
             ) = await self.sync_inventory(db)
+            if priority_membership_changed:
+                await self._rebalance_priorities_best_effort(db)
         else:
             remote_by_id, configs, channels_by_id = await self._inventory_snapshot(
                 db,
@@ -1132,6 +1146,12 @@ class UpstreamChannelService:
                     desired_priority=None,
                     last_discovered_at=None,
                 )
+            if identity_changed:
+                account_values.update(
+                    upstream_usage_amount=None,
+                    upstream_usage_unit=None,
+                    upstream_usage_checked_at=None,
+                )
             if base_url_changed:
                 account_values["channel_auto_assign_disabled"] = True
             if canonical_origin_changed and payload.confirm_credential_rebind:
@@ -1203,6 +1223,7 @@ class UpstreamChannelService:
             channel.balance_message = _safe_text(
                 _value(result, "balance_message"), limit=300
             ) or "Unable to read the upstream channel."
+            channel.today_balance_status = "error"
             channel.last_error = "Upstream channel discovery failed."
             channel.last_discovered_at = now
             return False
@@ -1250,6 +1271,19 @@ class UpstreamChannelService:
                         setattr(channel, field, parsed)
             channel.balance_unit = _safe_text(_value(result, "balance_unit"), limit=32) or "USD"
             channel.balance_checked_at = now
+        today_status = str(_value(result, "today_balance_status") or "unsupported").strip().lower()
+        channel.today_balance_status = today_status
+        channel.today_balance_used = None
+        channel.today_balance_unit = None
+        channel.today_balance_checked_at = None
+        if today_status == "ok":
+            today_used = _balance_number(_value(result, "today_balance_used"))
+            if today_used is not None and today_used >= 0:
+                channel.today_balance_used = today_used
+                channel.today_balance_unit = _safe_text(
+                    _value(result, "today_balance_unit"), limit=32
+                ) or "USD"
+                channel.today_balance_checked_at = now
         channel.last_error = None if balance_status in {"ok", "success", "available"} else channel.balance_message
         channel.last_discovered_at = now
         return True
@@ -1869,6 +1903,11 @@ class UpstreamChannelService:
                     upstream_state = self._synchronized_upstream_state(
                         result,
                         config.sub2api_account_id,
+                    )
+                    self.accounts.apply_upstream_usage_state(
+                        config,
+                        upstream_state,
+                        now=channel.last_discovered_at or _utcnow(),
                     )
                     health_transition = self.accounts.apply_authoritative_upstream_state(
                         config,

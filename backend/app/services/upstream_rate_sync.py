@@ -125,10 +125,12 @@ class UpstreamRateSyncService:
             return
         started_at = perf_counter()
         async with AsyncSessionLocal() as db:
-            await asyncio.wait_for(
+            inventory = await asyncio.wait_for(
                 self.channel_service.sync_inventory(db),
                 timeout=UPSTREAM_RATE_SYNC_TIMEOUT_SECONDS,
             )
+            if inventory[3]:
+                await self.channel_service._rebalance_priorities_best_effort(db)
         await self._record_event(
             "api_key_inventory_sync",
             "Scheduled API key account inventory synchronization finished.",

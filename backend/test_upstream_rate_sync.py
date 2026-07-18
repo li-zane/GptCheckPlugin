@@ -85,7 +85,11 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inventory_run_has_an_independent_switch(self) -> None:
         session = object()
-        channel_service = SimpleNamespace(discover_all=AsyncMock(), sync_inventory=AsyncMock())
+        channel_service = SimpleNamespace(
+            discover_all=AsyncMock(),
+            sync_inventory=AsyncMock(return_value=({}, {}, {}, False)),
+            _rebalance_priorities_best_effort=AsyncMock(),
+        )
         runtime_config = _runtime()
         service = UpstreamRateSyncService(runtime_config, channel_service)
 
@@ -96,12 +100,30 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
             await service._run_inventory_once()
 
         channel_service.sync_inventory.assert_awaited_once_with(session)
+        channel_service._rebalance_priorities_best_effort.assert_not_awaited()
         channel_service.discover_all.assert_not_awaited()
 
         channel_service.sync_inventory.reset_mock()
         runtime_config.get_api_key_account_sync_enabled = AsyncMock(return_value=False)
         await service._run_inventory_once()
         channel_service.sync_inventory.assert_not_awaited()
+
+    async def test_inventory_run_rebalances_when_priority_membership_changes(self) -> None:
+        session = object()
+        channel_service = SimpleNamespace(
+            sync_inventory=AsyncMock(return_value=({}, {}, {}, True)),
+            _rebalance_priorities_best_effort=AsyncMock(),
+        )
+        service = UpstreamRateSyncService(_runtime(), channel_service)
+
+        with patch(
+            "app.services.upstream_rate_sync.AsyncSessionLocal",
+            return_value=_SessionContext(session),
+        ):
+            await service._run_inventory_once()
+
+        channel_service.sync_inventory.assert_awaited_once_with(session)
+        channel_service._rebalance_priorities_best_effort.assert_awaited_once_with(session)
 
     async def test_loop_can_wake_stop_and_redacts_credential_bearing_errors(self) -> None:
         channel_service = SimpleNamespace(

@@ -336,6 +336,33 @@ class UpstreamAccountService:
         )
 
     @staticmethod
+    def clear_upstream_usage_state(config: UpstreamAccountConfig) -> None:
+        config.upstream_usage_amount = None
+        config.upstream_usage_unit = None
+        config.upstream_usage_checked_at = None
+
+    @staticmethod
+    def apply_upstream_usage_state(
+        config: UpstreamAccountConfig,
+        state: Any,
+        *,
+        now: datetime,
+        secrets: tuple[str | None, ...] = (),
+    ) -> None:
+        if state is None:
+            UpstreamAccountService.clear_upstream_usage_state(config)
+            return
+        usage_amount = _balance_number(_value(state, "usage_amount"))
+        if usage_amount is None or usage_amount < 0:
+            UpstreamAccountService.clear_upstream_usage_state(config)
+            return
+        config.upstream_usage_amount = usage_amount
+        config.upstream_usage_unit = (
+            _safe_text(_value(state, "usage_unit"), secrets=secrets, limit=32) or "USD"
+        )
+        config.upstream_usage_checked_at = now
+
+    @staticmethod
     async def automatic_upstream_disable_allowed() -> bool:
         try:
             runtime = get_runtime_config_service()
@@ -958,6 +985,13 @@ class UpstreamAccountService:
             balance_status=config.balance_status if config else "not_checked",
             balance_message=_safe_text(config.balance_message if config else None, secrets=secrets, limit=300),
             balance_checked_at=config.balance_checked_at if config else None,
+            upstream_usage_amount=config.upstream_usage_amount if config else None,
+            upstream_usage_unit=_safe_text(
+                config.upstream_usage_unit if config else None,
+                secrets=secrets,
+                limit=32,
+            ),
+            upstream_usage_checked_at=config.upstream_usage_checked_at if config else None,
             last_error=(
                 config.last_error
                 if config
@@ -1261,6 +1295,7 @@ class UpstreamAccountService:
                 or
                 ("base_url" in fields and payload.base_url != config.base_url)
                 or ("upstream_type" in fields and payload.upstream_type != config.upstream_type)
+                or ("upstream_user_id" in fields and payload.upstream_user_id != config.upstream_user_id)
                 or (bool(payload.api_key) and payload.api_key != current_api_key)
                 or (bool(payload.access_token) and payload.access_token != current_access_token)
                 or (payload.clear_access_token and current_access_token is not None)
@@ -1380,6 +1415,8 @@ class UpstreamAccountService:
 
             if preview_invalidated and not is_new:
                 self._invalidate_preview(config)
+                if identity_changed:
+                    self.clear_upstream_usage_state(config)
 
             if binding_rebound:
                 config.remote_identity_fingerprint = self._require_remote_binding_fingerprint(
@@ -1697,6 +1734,12 @@ class UpstreamAccountService:
                 else:
                     discovery_succeeded = True
                     upstream_state = _value(upstream_result, "matched_account_state")
+                    self.apply_upstream_usage_state(
+                        config,
+                        upstream_state,
+                        now=now,
+                        secrets=known_secrets,
+                    )
                     resolved_type = str(_value(upstream_result, "upstream_type") or "").strip().lower()
                     if resolved_type in {"newapi", "sub2api"}:
                         config.resolved_upstream_type = resolved_type

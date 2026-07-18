@@ -597,6 +597,9 @@ export type UpstreamAccount = {
   balance_status?: string | null;
   balance_message?: string | null;
   balance_checked_at?: string | null;
+  upstream_usage_amount?: number | null;
+  upstream_usage_unit?: string | null;
+  upstream_usage_checked_at?: string | null;
   last_error?: string | null;
   last_discovered_at?: string | null;
   last_applied_at?: string | null;
@@ -647,6 +650,10 @@ export type UpstreamChannel = {
   balance_status?: string | null;
   balance_message?: string | null;
   balance_checked_at?: string | null;
+  today_balance_used?: number | null;
+  today_balance_unit?: string | null;
+  today_balance_status?: string | null;
+  today_balance_checked_at?: string | null;
   status?: string | null;
   message?: string | null;
   checked_at?: string | null;

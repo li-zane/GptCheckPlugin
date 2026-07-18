@@ -55,6 +55,7 @@ import {
   livenessAccountIds,
   MAX_LIVENESS_ACCOUNTS,
 } from "./accountLiveness";
+import { accountFilterFacetCandidates } from "./accountFilterFacets";
 import {
   apiAccountLegacyBindingConfirmationMessage,
   apiAccountSyncMessage,
@@ -87,6 +88,13 @@ import {
   upstreamOverviewCacheScope,
   writeUpstreamOverviewCache,
 } from "./upstreamOverviewCache";
+import {
+  pathForRoute,
+  routeFromPath,
+  type ApiKeySubview,
+  type AppRoute,
+  type View,
+} from "./viewRouting";
 import type {
   Account,
   AccountExceptionRecord,
@@ -114,7 +122,6 @@ import type {
   UpstreamChannelsResponse,
 } from "./types";
 
-type View = "overview" | "accounts" | "api-keys" | "usage" | "usage-samples" | "mailboxes" | "phones" | "history" | "settings";
 type Theme = "light" | "dark";
 type AccountCounts = { actual: number; deduped: number; duplicates: number };
 type AccountStatusFilter = "all" | "normal" | "normal-no-rate-limit" | "five-hour-rate-limited" | "seven-day-rate-limited" | "monthly-rate-limited" | "error" | "deactive";
@@ -223,7 +230,15 @@ const emptySettings: AppSettings = {
 function App() {
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [authState, setAuthState] = useState<"checking" | "in" | "out">("checking");
-  const [view, setView] = useState<View>("overview");
+  const [route, setRoute] = useState<AppRoute>(() => {
+    const nextRoute = routeFromPath(window.location.pathname);
+    const canonicalPath = pathForRoute(nextRoute);
+    if (window.location.pathname !== canonicalPath) {
+      window.history.replaceState(null, "", canonicalPath);
+    }
+    return nextRoute;
+  });
+  const view = route.view;
   const [summary, setSummary] = useState<Summary>(emptySummary);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([]);
@@ -260,13 +275,47 @@ function App() {
   const now = useRefreshClock();
   const lastOAuthSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
   const lastApiKeySyncEvent = useMemo(
-    () => latestEventByKinds(events, ["manual_api_key_inventory_sync", "manual_upstream_sync"]),
+    () => latestEventByKinds(events, [
+      "manual_api_key_inventory_sync",
+      "manual_upstream_sync",
+      "api_key_inventory_sync",
+      "upstream_sync",
+    ]),
     [events],
   );
   const oauthSyncActionTime = lastOAuthSyncEvent?.created_at ?? null;
   const apiKeySyncActionTime = lastApiKeySyncEvent?.created_at ?? null;
   const syncBusy = busy || oauthSyncBusy || apiKeySyncBusy || apiKeyViewBusy;
   const toggleTheme = useCallback(() => setTheme((current) => (current === "dark" ? "light" : "dark")), []);
+  const navigateToView = useCallback((nextView: View) => {
+    const nextRoute: AppRoute = { view: nextView, apiKeySubview: "accounts" };
+    const nextPath = pathForRoute(nextRoute);
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState(null, "", nextPath);
+    }
+    setRoute(nextRoute);
+  }, []);
+  const navigateToApiKeySubview = useCallback((apiKeySubview: ApiKeySubview) => {
+    const nextRoute: AppRoute = { view: "api-keys", apiKeySubview };
+    const nextPath = pathForRoute(nextRoute);
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState(null, "", nextPath);
+    }
+    setRoute(nextRoute);
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const nextRoute = routeFromPath(window.location.pathname);
+      const canonicalPath = pathForRoute(nextRoute);
+      if (window.location.pathname !== canonicalPath) {
+        window.history.replaceState(null, "", canonicalPath);
+      }
+      setRoute(nextRoute);
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
 
   const beginApiKeyViewOperation = useCallback(() => {
     const token = Symbol("api-key-view-operation");
@@ -731,7 +780,7 @@ function App() {
                 aria-label={item.label}
                 className={view === item.id ? "nav-item active" : "nav-item"}
                 key={item.id}
-                onClick={() => setView(item.id)}
+                onClick={() => navigateToView(item.id)}
                 title={item.label}
                 type="button"
               >
@@ -777,6 +826,15 @@ function App() {
           </div>
           <div className="topbar-actions">
             {notice ? <span className="notice">{notice}</span> : null}
+            <button
+              aria-label="刷新页面"
+              className="icon-button toolbar-page-refresh"
+              onClick={() => window.location.reload()}
+              title="刷新页面"
+              type="button"
+            >
+              <RefreshCcw size={17} />
+            </button>
             <ToolbarTimeButton
               disabled={busy || oauthSyncBusy}
               icon={RefreshCcw}
@@ -864,11 +922,13 @@ function App() {
             key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
             onCacheChange={cacheApiKeyAccounts}
             onOperationStart={beginApiKeyViewOperation}
+            onSubviewChange={navigateToApiKeySubview}
             rateWritesEnabled={upstreamRateWritesAllowed(
               settings.upstream_rate_sync_enabled,
               settings.automation_paused,
             )}
             refreshVersion={apiKeyRefreshVersion}
+            subview={route.apiKeySubview}
           />
         ) : null}
         {view === "usage" ? (
@@ -931,7 +991,7 @@ function App() {
                 sub2apiAccountId: record.sub2api_account_id,
                 requestedAt: Date.now(),
               });
-              setView("accounts");
+              navigateToView("accounts");
             }}
           />
         ) : null}
@@ -1484,60 +1544,70 @@ function AccountsView({
       .map((mailbox) => [mailbox.gpt_email.toLowerCase(), mailbox] as const);
     return new Map(entries);
   }, [mailboxes]);
-  const accountStatusFilterOptions = useMemo(
-    () => availableAccountStatusFilterOptions(orderedAccounts, usageByAccountId, usageByEmail),
-    [orderedAccounts, usageByAccountId, usageByEmail],
+  const accountFilterCandidates = useMemo(
+    () =>
+      accountFilterFacetCandidates(
+        orderedAccounts,
+        accountStatusFilter,
+        accountSubscriptionFilter,
+        (account, filter) => accountMatchesStatusFilter(account, usageForAccount(account, usageByAccountId, usageByEmail), filter),
+        accountSubscriptionTypeLabel,
+      ),
+    [accountStatusFilter, accountSubscriptionFilter, orderedAccounts, usageByAccountId, usageByEmail],
   );
-  const accountSubscriptionFilterOptions = useMemo(() => availableAccountSubscriptionFilterOptions(orderedAccounts), [orderedAccounts]);
+  const accountStatusFilterOptions = useMemo(
+    () => availableAccountStatusFilterOptions(accountFilterCandidates.statusOptionAccounts, usageByAccountId, usageByEmail),
+    [accountFilterCandidates.statusOptionAccounts, usageByAccountId, usageByEmail],
+  );
+  const accountSubscriptionFilterOptions = useMemo(
+    () => availableAccountSubscriptionFilterOptions(accountFilterCandidates.subscriptionOptionAccounts),
+    [accountFilterCandidates.subscriptionOptionAccounts],
+  );
   const filteredAccounts = useMemo(
     () =>
-      orderedAccounts.filter((account) => {
+      accountFilterCandidates.filteredAccounts.filter((account) => {
         const usage = usageForAccount(account, usageByAccountId, usageByEmail);
-        return (
-          accountMatchesStatusFilter(account, usage, accountStatusFilter) &&
-          (!accountSubscriptionFilter || accountSubscriptionTypeLabel(account) === accountSubscriptionFilter) &&
-          textMatchesSearch(
-            [
-              account.account_name,
-              account.email,
-              account.sub2api_account_id,
-              account.sub2api_imported_at,
-              account.last_seen_at,
-              account.updated_at,
-              account.platform,
-              account.account_type,
-              account.status,
-              account.sub2api_error_code,
-              account.sub2api_error_message,
-              account.schedulable === null ? "未知 unknown" : account.schedulable ? "可用 schedulable" : "暂停 unschedulable",
-              accountShowsRateLimit(account, usage) ? `限流 rate limited ${accountRateLimitedWindowsLabel(account, usage)}` : "",
-              usage?.seven_day_token_history.total_tokens,
-              usage?.seven_day_token_history.windows.map((window) => `${window.window_reset_key} ${window.tokens}`).join(" "),
-              account.mailbox_bound ? "已绑定 mailbox bound" : "未绑定 mailbox unbound",
-              account.deactive ? "封禁 deactive deactivated banned" : "",
-              account.refreshing ? "刷新中 refreshing" : "",
-              account.remote_error ? "错误 error" : "",
-              account.is_duplicate ? "重复 duplicate" : "",
-              account.subscription_starts_at,
-              account.subscription_expires_at,
-              account.subscription_renews_at,
-              account.subscription_cancels_at,
-              account.subscription_billing_period,
-              account.subscription_plan,
-              account.has_active_subscription === null ? "" : account.has_active_subscription ? "订阅有效 active subscription" : "订阅无效 inactive subscription",
-              account.last_error,
-              mailboxByEmail.get(account.email.toLowerCase())?.mailbox_email,
-              mailboxByEmail.get(account.email.toLowerCase())?.provider,
-              account.phone_number,
-              account.phone_sms_url,
-              account.phone_sms_cdk,
-              account.phone_sms_recharge_url,
-            ],
-            accountSearch,
-          )
+        return textMatchesSearch(
+          [
+            account.account_name,
+            account.email,
+            account.sub2api_account_id,
+            account.sub2api_imported_at,
+            account.last_seen_at,
+            account.updated_at,
+            account.platform,
+            account.account_type,
+            account.status,
+            account.sub2api_error_code,
+            account.sub2api_error_message,
+            account.schedulable === null ? "未知 unknown" : account.schedulable ? "可用 schedulable" : "暂停 unschedulable",
+            accountShowsRateLimit(account, usage) ? `限流 rate limited ${accountRateLimitedWindowsLabel(account, usage)}` : "",
+            usage?.seven_day_token_history.total_tokens,
+            usage?.seven_day_token_history.windows.map((window) => `${window.window_reset_key} ${window.tokens}`).join(" "),
+            account.mailbox_bound ? "已绑定 mailbox bound" : "未绑定 mailbox unbound",
+            account.deactive ? "封禁 deactive deactivated banned" : "",
+            account.refreshing ? "刷新中 refreshing" : "",
+            account.remote_error ? "错误 error" : "",
+            account.is_duplicate ? "重复 duplicate" : "",
+            account.subscription_starts_at,
+            account.subscription_expires_at,
+            account.subscription_renews_at,
+            account.subscription_cancels_at,
+            account.subscription_billing_period,
+            account.subscription_plan,
+            account.has_active_subscription === null ? "" : account.has_active_subscription ? "订阅有效 active subscription" : "订阅无效 inactive subscription",
+            account.last_error,
+            mailboxByEmail.get(account.email.toLowerCase())?.mailbox_email,
+            mailboxByEmail.get(account.email.toLowerCase())?.provider,
+            account.phone_number,
+            account.phone_sms_url,
+            account.phone_sms_cdk,
+            account.phone_sms_recharge_url,
+          ],
+          accountSearch,
         );
       }),
-    [accountSearch, accountStatusFilter, accountSubscriptionFilter, mailboxByEmail, orderedAccounts, usageByAccountId, usageByEmail],
+    [accountFilterCandidates.filteredAccounts, accountSearch, mailboxByEmail, usageByAccountId, usageByEmail],
   );
   const selectedAccounts = accounts.filter((account) => selectedAccountKeys[accountRowKey(account)]);
   const selectedAccountCount = selectedAccounts.length;
@@ -1570,16 +1640,14 @@ function AccountsView({
   }, [accounts]);
 
   useEffect(() => {
+    if (accountSubscriptionFilter && !accountSubscriptionFilterOptions.some((option) => option.value === accountSubscriptionFilter)) {
+      setAccountSubscriptionFilter("");
+      return;
+    }
     if (!accountStatusFilterOptions.some((option) => option.value === accountStatusFilter)) {
       setAccountStatusFilter("all");
     }
-  }, [accountStatusFilter, accountStatusFilterOptions]);
-
-  useEffect(() => {
-    if (accountSubscriptionFilter && !accountSubscriptionFilterOptions.some((option) => option.value === accountSubscriptionFilter)) {
-      setAccountSubscriptionFilter("");
-    }
-  }, [accountSubscriptionFilter, accountSubscriptionFilterOptions]);
+  }, [accountStatusFilter, accountStatusFilterOptions, accountSubscriptionFilter, accountSubscriptionFilterOptions]);
 
   useEffect(() => {
     if (!accountJumpTarget || handledJumpRequestRef.current === accountJumpTarget.requestedAt) return;
@@ -2141,20 +2209,35 @@ function AccountLivenessDialog({ accounts, onClose }: { accounts: Account[]; onC
                   </tr>
                 </thead>
                 <tbody>
-                  {result.results.map((item) => (
-                    <tr key={item.account_id}>
-                      <td>
-                        <div className="liveness-account-identity">
-                          <strong>{item.account_name || item.email || `账号 #${item.account_id}`}</strong>
-                          {item.email && item.email !== item.account_name ? <span className="mono">{item.email}</span> : null}
-                        </div>
-                      </td>
-                      <td className="mono muted">{item.account_id}</td>
-                      <td><Badge tone={item.success ? "ok" : "deactive"}>{item.success ? "可用" : "失败"}</Badge></td>
-                      <td className="mono muted">{item.duration_ms ? `${(item.duration_ms / 1000).toFixed(1)}s` : "-"}</td>
-                      <td className={item.success ? "muted" : "liveness-error-text"}>{item.success ? "连接成功" : item.error || "测试失败"}</td>
-                    </tr>
-                  ))}
+                  {result.results.map((item) => {
+                    const email = item.email?.trim() || "";
+                    const accountName = item.account_name?.trim() || email || `账号 #${item.account_id}`;
+                    const showEmailSeparately = Boolean(email && email.toLowerCase() !== accountName.toLowerCase());
+                    return (
+                      <tr key={item.account_id}>
+                        <td>
+                          <div className="account-identity-cell liveness-account-identity">
+                            <CopyTextButton
+                              className="account-identity-copy-button account-name-copy-button"
+                              title={item.account_name?.trim() ? "复制账号名称" : email ? "复制账号邮箱" : "复制账号"}
+                              value={accountName}
+                            />
+                            {showEmailSeparately ? (
+                              <CopyTextButton
+                                className="account-identity-copy-button account-email-copy-button mono"
+                                title="复制账号邮箱"
+                                value={email}
+                              />
+                            ) : null}
+                          </div>
+                        </td>
+                        <td className="mono muted">{item.account_id}</td>
+                        <td><Badge tone={item.success ? "ok" : "deactive"}>{item.success ? "可用" : "失败"}</Badge></td>
+                        <td className="mono muted">{item.duration_ms ? `${(item.duration_ms / 1000).toFixed(1)}s` : "-"}</td>
+                        <td className={item.success ? "muted" : "liveness-error-text"}>{item.success ? "连接成功" : item.error || "测试失败"}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -4217,8 +4300,19 @@ function SettingsView({
   return (
     <div className="stack">
       <section className="panel">
-        <PanelTitle title="运行设置" icon={Link2} />
-        <form className="settings-form" onSubmit={submit}>
+        <div className="settings-save-header">
+          <PanelTitle title="运行设置" icon={Link2} />
+          <button
+            className="primary-button"
+            disabled={busy || invalid}
+            form="runtime-settings-form"
+            type="submit"
+          >
+            <Save size={17} />
+            <span>保存设置</span>
+          </button>
+        </div>
+        <form className="settings-form" id="runtime-settings-form" onSubmit={submit}>
           <div className="settings-grid settings-main-grid settings-connection-grid">
             <label className="site-name-label">
               站点名
@@ -4627,10 +4721,6 @@ function SettingsView({
               <KeyRound size={16} />
               <span>{settings.sub2api_x_api_key_set ? `已保存 ${settings.sub2api_x_api_key_hint || ""}` : "未设置"}</span>
             </div>
-            <button className="primary-button" disabled={busy || invalid} type="submit">
-              <Save size={17} />
-              <span>保存设置</span>
-            </button>
           </div>
         </form>
       </section>

@@ -178,6 +178,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         auth_rejected: bool = False,
         balance_remaining: float | None = 42.75,
         account_upstream_states: dict[int, AccountUpstreamState] | None = None,
+        today_balance_used: float | None = 3.25,
+        today_balance_status: str = "ok",
     ) -> SimpleNamespace:
         return SimpleNamespace(
             upstream_type="sub2api",
@@ -193,6 +195,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             balance_unit="USD",
             balance_status="ok" if status == "ok" else "error",
             balance_message="Balance available." if status == "ok" else "Credentials rejected.",
+            today_balance_used=today_balance_used,
+            today_balance_unit="USD" if today_balance_used is not None else None,
+            today_balance_status=today_balance_status,
             account_upstream_states=account_upstream_states or {},
         )
 
@@ -368,6 +373,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         original_channel_row.encrypted_access_token = encrypt_text("old-channel-token")
         stored.encrypted_access_token = original_channel_row.encrypted_access_token
         stored.encrypted_api_key = encrypt_text("old-endpoint-api-key")
+        stored.upstream_usage_amount = 12.375
+        stored.upstream_usage_unit = "USD"
+        stored.upstream_usage_checked_at = stored.created_at
         stored.selected_group_id = "legacy"
         stored.selected_group_name = "Legacy"
         stored.manual_group_multiplier = 2.0
@@ -399,6 +407,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.base_url, "https://replacement.example")
         self.assertIsNone(stored.encrypted_api_key)
         self.assertIsNone(stored.encrypted_access_token)
+        self.assertIsNone(stored.upstream_usage_amount)
+        self.assertIsNone(stored.upstream_usage_unit)
+        self.assertIsNone(stored.upstream_usage_checked_at)
         self.assertTrue(stored.api_key_origin_rebind_required)
         self.assertIsNone(stored.selected_group_id)
         self.assertIsNone(stored.selected_group_name)
@@ -423,6 +434,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         by_id = {item.sub2api_account_id: item for item in configs.scalars().all()}
         original_ciphertext = encrypt_text("sk-original-seven")
         by_id[7].encrypted_api_key = original_ciphertext
+        by_id[7].upstream_usage_amount = 12.375
+        by_id[7].upstream_usage_unit = "USD"
+        by_id[7].upstream_usage_checked_at = by_id[7].created_at
         by_id[8].encrypted_api_key = encrypt_text("sk-current-eight")
         await self.db.commit()
 
@@ -442,6 +456,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(isolated.api_key_set)
         await self.db.refresh(by_id[7])
         self.assertEqual(by_id[7].encrypted_api_key, original_ciphertext)
+        self.assertIsNone(by_id[7].upstream_usage_amount)
+        self.assertIsNone(by_id[7].upstream_usage_unit)
+        self.assertIsNone(by_id[7].upstream_usage_checked_at)
 
         result = SimpleNamespace(
             upstream_type="newapi",
@@ -910,6 +927,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             config.group_multiplier_status = "ok"
             config.target_rate = 0.1
             config.last_discovered_at = channel.updated_at
+            config.upstream_usage_amount = 12.375
+            config.upstream_usage_unit = "USD"
+            config.upstream_usage_checked_at = channel.updated_at
         await self.db.commit()
 
         secret = "fictional-shared-token-rotated"
@@ -940,6 +960,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config.group_multiplier_status, "not_discovered")
             self.assertIsNone(config.target_rate)
             self.assertIsNone(config.last_discovered_at)
+            self.assertIsNone(config.upstream_usage_amount)
+            self.assertIsNone(config.upstream_usage_unit)
+            self.assertIsNone(config.upstream_usage_checked_at)
             self.assertEqual(config.encrypted_access_token, refreshed_channel.encrypted_access_token)
 
     async def test_channel_routes_never_echo_access_token_or_ciphertext(self) -> None:
@@ -1165,6 +1188,113 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(discovered.recharge_multiplier_source, "default")
         self.assertEqual(discovered.recharge_multiplier_status, "default_missing")
 
+    async def test_discovery_persists_key_usage_and_channel_today_balance_use(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        result = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                    usage_amount=12.375,
+                    usage_unit="USD",
+                )
+            },
+            today_balance_used=3.25,
+        )
+        result.account_group_matches = {
+            7: {"id": "default", "name": "Default", "multiplier": 1.0}
+        }
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(discovered.today_balance_used, 3.25)
+        self.assertEqual(discovered.today_balance_unit, "USD")
+        self.assertEqual(discovered.today_balance_status, "ok")
+        account = next(item for item in discovered.accounts if item.sub2api_account_id == 7)
+        self.assertEqual(account.upstream_usage_amount, 12.375)
+        self.assertEqual(account.upstream_usage_unit, "USD")
+        self.assertIsNotNone(account.upstream_usage_checked_at)
+
+        stored_channel = await self.db.get(UpstreamChannel, channel_id)
+        stored_account = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        self.assertEqual(stored_channel.today_balance_used, 3.25)
+        self.assertEqual(stored_account.upstream_usage_amount, 12.375)
+
+    async def test_successful_discovery_clears_stale_usage_for_unmatched_keys(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        configs = (
+            await self.db.execute(select(UpstreamAccountConfig))
+        ).scalars().all()
+        checked_at = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+        by_id = {config.sub2api_account_id: config for config in configs}
+        for config in by_id.values():
+            config.upstream_usage_amount = 12.375
+            config.upstream_usage_unit = "USD"
+            config.upstream_usage_checked_at = checked_at
+        await self.db.commit()
+
+        result = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                )
+            },
+        )
+        result.account_group_matches = {
+            7: {"id": "default", "name": "Default", "multiplier": 1.0}
+        }
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        matched = next(item for item in discovered.accounts if item.sub2api_account_id == 7)
+        unmatched = next(item for item in discovered.accounts if item.sub2api_account_id == 8)
+        self.assertIsNone(matched.upstream_usage_amount)
+        self.assertIsNone(matched.upstream_usage_unit)
+        self.assertIsNone(matched.upstream_usage_checked_at)
+        self.assertIsNone(unmatched.upstream_usage_amount)
+        self.assertIsNone(unmatched.upstream_usage_unit)
+        self.assertIsNone(unmatched.upstream_usage_checked_at)
+
+    async def test_discovery_clears_stale_today_usage_when_upstream_stops_providing_it(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        channel = await self.db.get(UpstreamChannel, channel_id)
+        channel.today_balance_used = 3.25
+        channel.today_balance_unit = "USD"
+        channel.today_balance_status = "ok"
+        channel.today_balance_checked_at = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+        await self.db.commit()
+
+        result = self._discovery_result(
+            today_balance_used=None,
+            today_balance_status="unsupported",
+        )
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(discovered.today_balance_status, "unsupported")
+        self.assertIsNone(discovered.today_balance_used)
+        self.assertIsNone(discovered.today_balance_unit)
+        self.assertIsNone(discovered.today_balance_checked_at)
+
     async def test_unmatched_key_does_not_reuse_historical_group_for_billing(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
         await self.service.update_channel(
@@ -1309,6 +1439,14 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             channel.id,
             UpstreamChannelUpdate(manual_recharge_multiplier=2.0),
         )
+        stored_channel = await self.db.get(UpstreamChannel, channel.id)
+        stored_channel.today_balance_used = 3.25
+        stored_channel.today_balance_unit = "USD"
+        stored_channel.today_balance_status = "ok"
+        stored_channel.today_balance_checked_at = datetime(
+            2026, 7, 16, 8, 0, tzinfo=timezone.utc
+        )
+        await self.db.commit()
 
         with patch(
             "app.services.upstream_channels.discover_upstream",
@@ -1319,6 +1457,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.total, result.succeeded, result.failed), (1, 0, 1))
         self.assertEqual(result.channels[0].recharge_multiplier_status, "fallback_manual")
         self.assertEqual(result.channels[0].last_error, "Upstream channel discovery failed.")
+        self.assertEqual(result.channels[0].today_balance_status, "error")
+        self.assertEqual(result.channels[0].today_balance_used, 3.25)
 
     async def test_failed_management_discovery_uses_one_api_key_balance_without_summing(self) -> None:
         channel = (await self.service.overview(self.db)).channels[0]
@@ -2480,7 +2620,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(failure)
         self.assertIn("Unable to disable", failure.safe_error)
 
-    async def test_overview_inventory_cleanup_never_rebalances_priorities(self) -> None:
+    async def test_overview_inventory_cleanup_rebalances_priorities(self) -> None:
         await self.service.overview(self.db)
         interval = UpstreamPriorityInterval(
             name="removed-account",
@@ -2506,7 +2646,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         ) as rebalance:
             overview = await self.service.overview(self.db)
 
-        rebalance.assert_not_awaited()
+        rebalance.assert_awaited_once_with(self.db)
         self.assertEqual([item.sub2api_account_id for item in overview.channels[0].accounts], [7])
         await self.db.refresh(config)
         self.assertIsNone(config.priority_interval_id)

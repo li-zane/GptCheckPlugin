@@ -13,6 +13,7 @@ from app.services.upstream_client import (
     MAX_UPSTREAM_TOKEN_LENGTH,
     NEWAPI_ENDPOINTS,
     SUB2API_REFRESH_ENDPOINT,
+    SUB2API_TODAY_USAGE_ENDPOINT,
     UpstreamClient,
     _default_resolver,
     _doh_resolver,
@@ -1496,6 +1497,8 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertFalse(any(target.startswith("/api/v1/api/") for target in targets))
 
     def test_sub2api_reports_disabled_key_and_available_group_authoritatively(self) -> None:
+        seen_today_headers: list[tuple[str | None, str | None]] = []
+
         def handler(request: httpx.Request) -> httpx.Response:
             target = request_target(request)
             if target == "/api/v1/groups/available":
@@ -1518,16 +1521,29 @@ class UpstreamClientTests(unittest.TestCase):
                                     "key": "sk-disabled-key",
                                     "status": "disabled",
                                     "group_id": 2,
+                                    "quota_used": 12.375,
                                 }
                             ]
                         },
                     },
+                )
+            if target == SUB2API_TODAY_USAGE_ENDPOINT:
+                seen_today_headers.append(
+                    (
+                        request.headers.get("Authorization"),
+                        request.headers.get("New-Api-User"),
+                    )
+                )
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"today_actual_cost": 3.25}},
                 )
             return httpx.Response(404)
 
         result = self.run_discovery(
             handler,
             upstream_type="sub2api",
+            access_token="sub2api-login-token",
             account_api_keys={7: "sk-disabled-key"},
         )
 
@@ -1536,6 +1552,37 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(state.key_status, "disabled")
         self.assertEqual(state.group_status, "available")
         self.assertEqual(state.group_id, "2")
+        self.assertEqual(state.usage_amount, 12.375)
+        self.assertEqual(state.usage_unit, "USD")
+        self.assertEqual(result.today_balance_used, 3.25)
+        self.assertEqual(result.today_balance_unit, "USD")
+        self.assertEqual(result.today_balance_status, "ok")
+        self.assertEqual(seen_today_headers, [("Bearer sub2api-login-token", None)])
+
+    def test_usage_amount_rejects_invalid_values(self) -> None:
+        cases = (-1, "nan", True, None)
+        for quota_used in cases:
+            with self.subTest(quota_used=quota_used):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    target = request_target(request)
+                    if target == "/api/v1/groups/available":
+                        return httpx.Response(200, json={"code": 0, "data": []})
+                    if target == "/api/v1/keys?page=1&page_size=200":
+                        record = {"key": "sk-invalid-usage", "status": "active"}
+                        if quota_used is not None:
+                            record["quota_used"] = quota_used
+                        return httpx.Response(
+                            200,
+                            json={"code": 0, "data": {"items": [record]}},
+                        )
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    account_api_keys={11: "sk-invalid-usage"},
+                )
+                self.assertIsNone(result.account_upstream_states[11].usage_amount)
 
     def test_sub2api_orphaned_key_group_is_unavailable_even_without_a_rate(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
