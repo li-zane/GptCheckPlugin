@@ -271,6 +271,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [oauthSyncBusy, setOAuthSyncBusy] = useState(false);
   const [apiKeySyncBusy, setApiKeySyncBusy] = useState(false);
+  const [settingsFormInvalid, setSettingsFormInvalid] = useState(false);
   const siteName = settings.site_name?.trim() || defaultSiteName;
   const now = useRefreshClock();
   const lastOAuthSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
@@ -835,6 +836,17 @@ function App() {
             >
               <RefreshCcw size={17} />
             </button>
+            {view === "settings" ? (
+              <button
+                className="primary-button toolbar-settings-save"
+                disabled={syncBusy || settingsFormInvalid}
+                form="runtime-settings-form"
+                type="submit"
+              >
+                <Save size={17} />
+                <span>保存设置</span>
+              </button>
+            ) : null}
             <ToolbarTimeButton
               disabled={busy || oauthSyncBusy}
               icon={RefreshCcw}
@@ -1002,6 +1014,7 @@ function App() {
             subscriptionTypes={[...new Set(accounts.map((account) => account.subscription_type).filter(Boolean))]}
             onScan={() => runAction(api.scanSub2Api, "扫描完成")}
             onSave={saveSettings}
+            onValidityChange={setSettingsFormInvalid}
           />
         ) : null}
       </section>
@@ -3994,12 +4007,14 @@ function SettingsView({
   busy,
   onSave,
   onScan,
+  onValidityChange,
 }: {
   settings: AppSettings;
   subscriptionTypes: string[];
   busy: boolean;
   onSave: (payload: AppSettingsUpdate) => Promise<void> | void;
   onScan: () => Promise<void> | void;
+  onValidityChange: (invalid: boolean) => void;
 }) {
   const [siteName, setSiteName] = useState(settings.site_name || defaultSiteName);
   const [instanceUrl, setInstanceUrl] = useState(toSub2ApiInstanceUrl(settings.sub2api_base_url));
@@ -4213,6 +4228,12 @@ function SettingsView({
     accountLivenessMaxConcurrencyNumber > 50 ||
     usageLimitDefaultRangesInvalid;
 
+  useEffect(() => {
+    onValidityChange(invalid);
+  }, [invalid, onValidityChange]);
+
+  useEffect(() => () => onValidityChange(false), [onValidityChange]);
+
   const addSubscriptionType = () => {
     const normalized = normalizeSubscriptionType(newSubscriptionType);
     if (!normalized || normalized === "unknown") return;
@@ -4302,15 +4323,6 @@ function SettingsView({
       <section className="panel">
         <div className="settings-save-header">
           <PanelTitle title="运行设置" icon={Link2} />
-          <button
-            className="primary-button"
-            disabled={busy || invalid}
-            form="runtime-settings-form"
-            type="submit"
-          >
-            <Save size={17} />
-            <span>保存设置</span>
-          </button>
         </div>
         <form className="settings-form" id="runtime-settings-form" onSubmit={submit}>
           <div className="settings-grid settings-main-grid settings-connection-grid">

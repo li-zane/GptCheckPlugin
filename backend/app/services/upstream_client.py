@@ -11,8 +11,10 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence
 from urllib.parse import urlparse, urlunparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -26,11 +28,13 @@ MAX_PINNED_ADDRESSES = 8
 MAX_UPSTREAM_TOKEN_LENGTH = 8192
 DEFAULT_TIMEOUT_SECONDS = 3.5
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
+DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
 # Upstream key-list requests use page_size=200. Keep detail discovery capable
 # of covering the complete returned page while bounding the request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200
 KEY_REVEAL_CONCURRENCY = 20
 NEWAPI_BALANCE_ENDPOINT = "/api/user/self"
+NEWAPI_TODAY_USAGE_ENDPOINT = "/api/log/self/stat"
 SUB2API_BALANCE_ENDPOINT = "/api/v1/auth/me"
 SUB2API_TODAY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/stats"
 SUB2API_REFRESH_ENDPOINT = "/api/v1/auth/refresh"
@@ -49,6 +53,7 @@ NEWAPI_ENDPOINTS: tuple[str, ...] = (
     "/api/pricing",
     "/api/v1/groups/available",
     "/api/user/self",
+    NEWAPI_TODAY_USAGE_ENDPOINT,
     "/api/token/?p=1&page_size=200",
     "/api/token/search?p=1&size=200",
     "/api/v1/keys?page=1&page_size=200",
@@ -72,6 +77,7 @@ NEWAPI_PRIMARY_ENDPOINTS: tuple[str, ...] = (
     "/api/user/self/groups",
     "/api/pricing",
     "/api/user/self",
+    NEWAPI_TODAY_USAGE_ENDPOINT,
     "/api/token/?p=1&page_size=200",
     "/api/v1/payment/checkout-info",
     "/api/status",
@@ -283,6 +289,7 @@ class UpstreamClient:
         selected_group_name: str | None = None,
         account_api_keys: Mapping[int | str, str] | None = None,
         optimized_endpoint_fallbacks: bool = False,
+        today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
     ) -> DiscoveryResult:
         raw_account_api_keys = account_api_keys if isinstance(account_api_keys, Mapping) else {}
         secrets = (api_key, access_token, *raw_account_api_keys.values())
@@ -337,6 +344,7 @@ class UpstreamClient:
                 else SUB2API_ENDPOINTS
             )
         )
+        newapi_today_usage_params = _newapi_today_usage_params(today_timezone)
 
         timeout = httpx.Timeout(self.timeout_seconds)
         fetched: list[_FetchResult] = []
@@ -374,6 +382,11 @@ class UpstreamClient:
                             normalized_url,
                             endpoint,
                             headers=endpoint_headers,
+                            params=(
+                                newapi_today_usage_params
+                                if endpoint == NEWAPI_TODAY_USAGE_ENDPOINT
+                                else None
+                            ),
                         )
 
                     fetched = await asyncio.gather(
@@ -529,7 +542,12 @@ class UpstreamClient:
                 new_api_user=new_api_user,
             )
             today_balance_used, today_balance_unit, today_balance_status = (
-                _discover_today_balance_usage(active_type, responses, access_token=access_token)
+                _discover_today_balance_usage(
+                    active_type,
+                    responses,
+                    access_token=access_token,
+                    new_api_user=new_api_user,
+                )
             )
         except Exception:
             return safe(_error_result(active_type, source, "Could not parse a valid upstream response."))
@@ -820,6 +838,7 @@ class UpstreamClient:
         *,
         method: str = "GET",
         headers: dict[str, str] | None = None,
+        params: Mapping[str, str | int] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> _FetchResult:
         try:
@@ -827,6 +846,7 @@ class UpstreamClient:
                 method,
                 f"{base_url}{endpoint}",
                 headers=headers,
+                params=params,
                 json=json_body,
             ) as response:
                 if response.status_code < 200 or response.status_code >= 300:
@@ -877,6 +897,7 @@ async def discover_upstream(
     selected_group_name: str | None = None,
     account_api_keys: Mapping[int | str, str] | None = None,
     optimized_endpoint_fallbacks: bool = False,
+    today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     transport: httpx.AsyncBaseTransport | None = None,
     resolver: Resolver | None = None,
@@ -898,6 +919,7 @@ async def discover_upstream(
         selected_group_name=selected_group_name,
         account_api_keys=account_api_keys,
         optimized_endpoint_fallbacks=optimized_endpoint_fallbacks,
+        today_timezone=today_timezone,
     )
 
 
@@ -1107,7 +1129,7 @@ def _headers_for_endpoint(
     if endpoint == "/api/status":
         return {}
 
-    if endpoint == NEWAPI_BALANCE_ENDPOINT:
+    if endpoint in {NEWAPI_BALANCE_ENDPOINT, NEWAPI_TODAY_USAGE_ENDPOINT}:
         user_id = _clean_new_api_user(new_api_user)
         if _clean_secret(access_token) is None or user_id is None:
             return None
@@ -2236,11 +2258,45 @@ def _discover_today_balance_usage(
     responses: dict[str, _FetchResult],
     *,
     access_token: str | None,
+    new_api_user: str | int | None,
 ) -> tuple[float | None, str | None, str]:
-    if upstream_type != "sub2api":
-        return None, None, "unsupported"
     if _clean_secret(access_token) is None:
         return None, None, "credentials_missing"
+
+    if upstream_type == "newapi":
+        if _clean_new_api_user(new_api_user) is None:
+            return None, None, "credentials_missing"
+        result = responses.get(NEWAPI_TODAY_USAGE_ENDPOINT)
+        if result is not None and result.status_code in {404, 405}:
+            return None, None, "unsupported"
+        if result is None or not result.ok or not _payload_succeeded(result.payload):
+            return None, None, "error"
+        data = _unwrap(result.payload)
+        if not isinstance(data, dict):
+            return None, None, "error"
+        quota = _finite_number(data.get("quota"))
+        if quota is None or quota < 0:
+            return None, None, "error"
+
+        quota_per_unit = DEFAULT_NEWAPI_QUOTA_PER_UNIT
+        status_result = responses.get("/api/status")
+        if (
+            status_result is not None
+            and status_result.ok
+            and _payload_succeeded(status_result.payload)
+        ):
+            status_data = _unwrap(status_result.payload)
+            if isinstance(status_data, dict):
+                parsed_quota_per_unit = _positive_number(status_data.get("quota_per_unit"))
+                if parsed_quota_per_unit is not None:
+                    quota_per_unit = parsed_quota_per_unit
+        amount = _quota_points_to_usd(quota, quota_per_unit)
+        if amount is None:
+            return None, None, "error"
+        return amount, "USD", "ok"
+
+    if upstream_type != "sub2api":
+        return None, None, "unsupported"
     result = responses.get(SUB2API_TODAY_USAGE_ENDPOINT)
     if result is None or not result.ok or not _payload_succeeded(result.payload):
         return None, None, "error"
@@ -2251,6 +2307,28 @@ def _discover_today_balance_usage(
     if amount is None or amount < 0:
         return None, None, "error"
     return amount, "USD", "ok"
+
+
+def _newapi_today_usage_params(
+    time_zone: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    cleaned_time_zone = _clean_text(time_zone, 80) or DEFAULT_TODAY_TIME_ZONE
+    try:
+        zone = ZoneInfo(cleaned_time_zone)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo(DEFAULT_TODAY_TIME_ZONE)
+    current = now or datetime.now(zone)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=zone)
+    else:
+        current = current.astimezone(zone)
+    start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "start_timestamp": int(start.timestamp()),
+        "end_timestamp": int(current.timestamp()),
+    }
 
 
 def _balance_fetch_failure(
@@ -2549,12 +2627,14 @@ def _error_result(upstream_type: str, source: str, message: str) -> DiscoveryRes
 __all__ = [
     "AccountGroupMatch",
     "AccountUpstreamState",
+    "DEFAULT_TODAY_TIME_ZONE",
     "DEFAULT_TIMEOUT_SECONDS",
     "DiscoveryResult",
     "GroupOption",
     "MAX_RESPONSE_BYTES",
     "MAX_UPSTREAM_TOKEN_LENGTH",
     "NEWAPI_ENDPOINTS",
+    "NEWAPI_TODAY_USAGE_ENDPOINT",
     "SUB2API_ENDPOINTS",
     "SUB2API_REFRESH_ENDPOINT",
     "SUB2API_TODAY_USAGE_ENDPOINT",

@@ -9,10 +9,44 @@ export function rechargeAdjustedUsage(
   return Number.isFinite(result) ? result : null;
 }
 
+export function formatUpstreamBalance(
+  value: unknown,
+  unit?: string | null,
+  fractionDigits?: number,
+) {
+  const amount = finiteNumber(value);
+  if (amount === null) return "—";
+  const digits = fractionDigits === undefined
+    ? { maximumFractionDigits: 4 }
+    : { minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits };
+  const formatted = amount.toLocaleString("zh-CN", digits);
+  const normalizedUnit = String(unit || "USD").trim().toUpperCase();
+  if (normalizedUnit === "USD") return "$" + formatted;
+  if (normalizedUnit === "USDT") return "$" + formatted + " USDT";
+  if (normalizedUnit === "CNY" || normalizedUnit === "RMB") return "¥" + formatted;
+  return formatted + " " + normalizedUnit;
+}
+
+export function visibleUpstreamBalanceMessage(message?: string | null) {
+  const value = String(message || "").trim();
+  if (/^Balance read from the (?:NewAPI|Sub2API) user account\.?$/i.test(value)) return "";
+  return value;
+}
+
+export function shouldShowUpstreamAccountUsage(upstreamType?: string | null) {
+  return String(upstreamType || "").trim().toLowerCase() !== "newapi";
+}
+
 function finiteNonNegative(value: unknown): number | null {
+  const parsed = finiteNumber(value);
+  if (parsed === null) return null;
+  return parsed >= 0 ? parsed : null;
+}
+
+function finiteNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
   const parsed = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function finitePositive(value: unknown): number | null {

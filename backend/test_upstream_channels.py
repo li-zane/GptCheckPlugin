@@ -124,6 +124,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.sub2api = FakeSub2Api()
         self.service = UpstreamChannelService(self.sub2api)
         self.runtime_config = SimpleNamespace(
+            get_public_settings=AsyncMock(
+                return_value={"display_timezone": "Asia/Shanghai"}
+            ),
             get_upstream_rate_sync_enabled=AsyncMock(return_value=False),
             get_automation_paused=AsyncMock(return_value=False),
             get_api_key_auto_disable_on_upstream_unavailable=AsyncMock(return_value=False),
@@ -1076,6 +1079,24 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         serialized = str(channel.model_dump())
         for secret in (alpha_key, beta_key, by_id[7].encrypted_api_key or ""):
             self.assertNotIn(secret, serialized)
+
+    async def test_channel_discovery_uses_configured_display_timezone(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        self.runtime_config.get_public_settings.return_value = {
+            "display_timezone": "America/New_York"
+        }
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=self._discovery_result()),
+        ) as discover:
+            await self.service.discover_channel(self.db, channel_id)
+
+        discover.assert_awaited_once()
+        self.assertEqual(
+            discover.await_args.kwargs["today_timezone"],
+            "America/New_York",
+        )
 
     async def test_discover_all_syncs_multi_platform_inventory_and_probes_each_channel(self) -> None:
         self.sub2api.exported_api_keys = {

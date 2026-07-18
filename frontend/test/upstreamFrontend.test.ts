@@ -81,7 +81,12 @@ import {
   type ApiKeySubview,
   type View,
 } from "../src/viewRouting.ts";
-import { rechargeAdjustedUsage } from "../src/upstreamUsagePresentation.ts";
+import {
+  formatUpstreamBalance,
+  rechargeAdjustedUsage,
+  shouldShowUpstreamAccountUsage,
+  visibleUpstreamBalanceMessage,
+} from "../src/upstreamUsagePresentation.ts";
 import type { UpstreamChannelsResponse, UsageLimitSample } from "../src/types.ts";
 
 const usageSamples: UsageLimitSample[] = [
@@ -148,8 +153,55 @@ test("App navigation uses history state, a page refresh control, and a top setti
   assert.match(source, /form="runtime-settings-form"/);
   assert.match(source, /id="runtime-settings-form"/);
   assert.equal((source.match(/保存设置/g) || []).length, 1);
+  const refreshButton = source.indexOf('aria-label="刷新页面"');
+  const settingsButton = source.indexOf('className="primary-button toolbar-settings-save"');
+  const firstSyncButton = source.indexOf("<ToolbarTimeButton", refreshButton);
+  assert.ok(refreshButton >= 0 && settingsButton > refreshButton && settingsButton < firstSyncButton);
+  assert.match(source, /disabled=\{syncBusy \|\| settingsFormInvalid\}/);
   const viteConfig = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
   assert.match(viteConfig, /"\^\/api\(\?:\/\|\$\)"/);
+});
+
+test("upstream balance presentation keeps card amounts readable and hides technical copy", () => {
+  assert.equal(formatUpstreamBalance(1234.567, "USD", 2), "$1,234.57");
+  assert.equal(formatUpstreamBalance(12, "CNY", 2), "¥12.00");
+  assert.equal(formatUpstreamBalance(2.3456, "USDT"), "$2.3456 USDT");
+  assert.equal(formatUpstreamBalance(null, "USD", 2), "—");
+  assert.equal(visibleUpstreamBalanceMessage("Balance read from the NewAPI user account."), "");
+  assert.equal(visibleUpstreamBalanceMessage("Balance read from the Sub2API user account."), "");
+  assert.equal(visibleUpstreamBalanceMessage("上游余额读取失败"), "上游余额读取失败");
+});
+
+test("account usage is shown for Sub2API but omitted for NewAPI", () => {
+  assert.equal(shouldShowUpstreamAccountUsage("sub2api"), true);
+  assert.equal(shouldShowUpstreamAccountUsage("NEWAPI"), false);
+  assert.equal(shouldShowUpstreamAccountUsage(null), true);
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(source, /account\.resolved_upstream_type \|\| account\.detected_upstream_type \|\| account\.upstream_type/);
+  assert.match(source, /\{showUsage \? <div className="api-key-account-usage">/);
+});
+
+test("API key dense views keep readable type and collapse change records on narrow screens", () => {
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(styles, /\.api-key-rate-log-row \.api-key-rate-log-identity > strong\s*\{[^}]*font-size: 14px;/s);
+  assert.match(styles, /\.api-key-upstream-transition > span:first-child\s*\{[^}]*font-size: 11px;/s);
+  assert.match(styles, /\.api-key-channel-stat-label\s*\{[^}]*font-size: 12px;/s);
+  assert.match(styles, /\.api-key-account-group-label > span:first-child\s*\{[^}]*font-size: 12px;/s);
+  assert.match(styles, /\.api-key-priority-card-stats span\s*\{[^}]*font-size: 11px;/s);
+  assert.match(styles, /@media \(max-width: 520px\)\s*\{\s*\.api-key-rate-log-filters,\s*\.api-key-rate-log-row\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/s);
+});
+
+test("API key account numbers stay beside the account name", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const nameIndex = source.indexOf('<div className="api-key-account-name">');
+  const numberIndex = source.indexOf('<span className="api-key-mono">#{account.sub2api_account_id}</span>', nameIndex);
+  const statusIndex = source.indexOf('<StatusChip status={effectiveStatus} />', nameIndex);
+  assert.ok(nameIndex >= 0 && numberIndex > nameIndex && statusIndex > numberIndex);
+  assert.match(styles, /\.api-key-account-name\s*\{[^}]*display: flex;[^}]*gap: 5px;/s);
+  assert.match(styles, /\.api-key-account-name > strong\s*\{[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/s);
+  assert.match(styles, /\.api-key-account-priority\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
+  assert.match(styles, /\.api-key-account-priority-value\s*\{[^}]*border-left: 0;[^}]*border-top: 1px solid var\(--line\);/s);
 });
 
 test("history duration helpers format totals, stages, and refresh jobs", () => {

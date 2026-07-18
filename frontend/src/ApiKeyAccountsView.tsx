@@ -75,7 +75,12 @@ import {
   type UpstreamAccountEntry,
 } from "./upstreamPriorityPresentation";
 import { upstreamOverviewHasLiveMutationData } from "./upstreamOverviewCache";
-import { rechargeAdjustedUsage } from "./upstreamUsagePresentation";
+import {
+  formatUpstreamBalance,
+  rechargeAdjustedUsage,
+  shouldShowUpstreamAccountUsage,
+  visibleUpstreamBalanceMessage,
+} from "./upstreamUsagePresentation";
 import type { ApiKeySubview } from "./viewRouting";
 import type {
   PriorityInterval,
@@ -1648,6 +1653,8 @@ function ChannelCard({
   const error = channelDisplayError(channel);
   const busy = Boolean(busyAction) || globallyDisabled;
   const discoveryCopy = upstreamDiscoveryCopy(rateWritesEnabled);
+  const balanceDetails = balanceDetail(channel);
+  const todayUsage = formatTodayBalanceUsed(channel, displayTimeZone);
   return (
     <article className={"api-key-channel-card" + (channelHasAttention(channel) ? " api-key-channel-card--attention" : "")}>
       <header className="api-key-channel-head">
@@ -1705,20 +1712,24 @@ function ChannelCard({
       </header>
 
       <div className="api-key-channel-stats">
-        <ChannelStat icon={<WalletCards size={16} />} label="上游余额">
-          <strong>{formatBalance(channel.balance_remaining, channel.balance_unit)}</strong>
-          <span>{balanceDetail(channel)}</span>
-          <span className="api-key-channel-today-usage">
-            {formatTodayBalanceUsed(channel, displayTimeZone)}
-          </span>
+        <ChannelStat
+          badge={<StatusChip status={channel.balance_status || channel.status || "not_checked"} />}
+          icon={<WalletCards size={16} />}
+          label="上游余额"
+        >
+          <div className="api-key-channel-balance-line">
+            <strong>{formatUpstreamBalance(channel.balance_remaining, channel.balance_unit, 2)}</strong>
+            <span className={"api-key-channel-today-usage api-key-chip api-key-chip--" + todayUsage.tone}>
+              {todayUsage.label} | {todayUsage.value}
+            </span>
+          </div>
+          {balanceDetails ? <span>{balanceDetails}</span> : null}
         </ChannelStat>
         <ChannelStat icon={<BadgeDollarSign size={16} />} label="充值成本">
           <strong>{"¥" + formatCostPerUsd(channel.effective_recharge_multiplier) + " / $1"}</strong>
-          <span>{sourceLabel(channel.recharge_multiplier_source)}</span>
         </ChannelStat>
-        <ChannelStat icon={<Radar size={16} />} label="最近探测">
+        <ChannelStat badge={<StatusChip status={status} />} icon={<Radar size={16} />} label="最近探测">
           <strong>{formatDate(channel.last_discovered_at || channel.checked_at, displayTimeZone)}</strong>
-          <span>{statusLabel(status)}</span>
         </ChannelStat>
       </div>
 
@@ -1782,10 +1793,6 @@ function ChannelCard({
       </section>
 
       <section className="api-key-channel-accounts" aria-label="渠道账号">
-        <div className="api-key-channel-section-label api-key-channel-section-label--accounts">
-          <span>API Key 账号</span>
-          <small>{accountCount} 个</small>
-        </div>
         <button
           aria-label={`查看 ${channelDisplayName(channel)} 的 ${accountCount} 个 API Key 账号`}
           className="api-key-channel-account-button"
@@ -1793,7 +1800,7 @@ function ChannelCard({
           type="button"
         >
           <UsersRound size={16} />
-          <span>{accountCount ? `查看 ${accountCount} 个账号` : "查看账号"}</span>
+          <span>API Key 账号 {accountCount} 个</span>
           <ArrowRight size={15} />
         </button>
       </section>
@@ -1828,10 +1835,6 @@ function UnassignedCard({
         </div>
       </header>
       <section className="api-key-channel-accounts">
-        <div className="api-key-channel-section-label api-key-channel-section-label--accounts">
-          <span>API Key 账号</span>
-          <small>{accountCount} 个</small>
-        </div>
         <button
           aria-label={`查看 ${accountCount} 个待分配 API Key 账号`}
           className="api-key-channel-account-button"
@@ -1839,7 +1842,7 @@ function UnassignedCard({
           type="button"
         >
           <UsersRound size={16} />
-          <span>{accountCount ? `查看 ${accountCount} 个账号` : "查看账号"}</span>
+          <span>API Key 账号 {accountCount} 个</span>
           <ArrowRight size={15} />
         </button>
       </section>
@@ -1922,15 +1925,21 @@ function AccountCard({
     : usageCost === null
       ? "充值倍率待同步"
       : `× 充值倍率 = ¥${formatMoney(usageCost)}`;
+  const accountUpstreamType = channel
+    ? resolvedChannelType(channel)
+    : account.resolved_upstream_type || account.detected_upstream_type || account.upstream_type;
+  const showUsage = shouldShowUpstreamAccountUsage(accountUpstreamType);
   const hasAccountMeta = Boolean(account.auto_disabled_reason || identityBlocked);
   return (
     <article className={"api-key-account-card" + (enabled ? "" : " api-key-account-card--disabled")}>
       <header className="api-key-account-card-head">
         <div className="api-key-account-title-line">
-          <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
+          <div className="api-key-account-name">
+            <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
+            <span className="api-key-mono">#{account.sub2api_account_id}</span>
+          </div>
           <StatusChip status={effectiveStatus} />
           {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
-          <span className="api-key-mono">#{account.sub2api_account_id}</span>
         </div>
         {hasAccountMeta ? <div className="api-key-inline-chips api-key-account-meta-chips">
           {account.auto_disabled_reason ? (
@@ -1985,11 +1994,11 @@ function AccountCard({
             </span>
           ) : null}
         </div>
-        <div className="api-key-account-usage">
+        {showUsage ? <div className="api-key-account-usage">
           <span>累计使用</span>
-          <strong>{formatBalance(usageAmount, account.upstream_usage_unit)}</strong>
+          <strong>{formatUpstreamBalance(usageAmount, account.upstream_usage_unit)}</strong>
           <small>{usageDetail}</small>
-        </div>
+        </div> : null}
       </div>
       <div className="api-key-account-priority">
         <label>
@@ -2023,11 +2032,11 @@ function AccountCard({
           <span className="api-key-account-priority-heading">
             <span>调度优先级</span>
             <small>{account.priority_sync_error || priorityState}</small>
+            <span className="api-key-account-priority-number">
+              <strong>{formatPriority(priority)}</strong>
+              {priorityPending ? <><ArrowRight size={13} /><b>{formatPriority(desiredPriority)}</b></> : null}
+            </span>
           </span>
-          <div>
-            <strong>{formatPriority(priority)}</strong>
-            {priorityPending ? <><ArrowRight size={13} /><b>{formatPriority(desiredPriority)}</b></> : null}
-          </div>
           <div className="api-key-inline-chips api-key-account-rate-chips">
             <RateChip label="综合" value={combinedRateLabel} title={combinedRateTitle} tone="combined" />
             <RateChip label="当前" value={currentRateLabel} title={currentRateTitle} tone="current" />
@@ -2481,10 +2490,20 @@ function CompactRateChange({
   );
 }
 
-function ChannelStat({ icon, label, children }: { icon: React.ReactNode; label: string; children: React.ReactNode }) {
+function ChannelStat({
+  badge,
+  icon,
+  label,
+  children,
+}: {
+  badge?: React.ReactNode;
+  icon: React.ReactNode;
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="api-key-channel-stat">
-      <div className="api-key-channel-stat-label">{icon}<span>{label}</span></div>
+      <div className="api-key-channel-stat-label">{icon}<span>{label}</span>{badge}</div>
       <div className="api-key-channel-stat-value">{children}</div>
     </div>
   );
@@ -2706,7 +2725,7 @@ function channelDisplayMessage(channel: UpstreamChannel) {
     return "缺少登录 Access Token，暂时无法读取余额";
   }
 
-  const message = channel.balance_message || channel.message || "";
+  const message = visibleUpstreamBalanceMessage(channel.balance_message || channel.message);
   if (/rejected the balance credentials/i.test(message)) {
     return "上游拒绝余额凭据，请检查 Access Token 和用户 ID";
   }
@@ -2826,30 +2845,40 @@ function formatCostPerUsd(value: unknown) {
   return number.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
 }
 
-function formatBalance(value: unknown, unit?: string | null) {
-  const number = finiteNumber(value);
-  if (number === null) return "—";
-  const amount = number.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
-  const normalizedUnit = String(unit || "USD").trim().toUpperCase();
-  if (normalizedUnit === "USD") return "$" + amount;
-  if (normalizedUnit === "USDT") return "$" + amount + " USDT";
-  if (normalizedUnit === "CNY" || normalizedUnit === "RMB") return "¥" + amount;
-  return amount + " " + normalizedUnit;
-}
-
 function balanceDetail(channel: UpstreamChannel) {
   const details: string[] = [];
-  if (finiteNumber(channel.balance_total) !== null) details.push("总额 " + formatBalance(channel.balance_total, channel.balance_unit));
-  if (finiteNumber(channel.balance_used) !== null) details.push("上游累计已用 " + formatBalance(channel.balance_used, channel.balance_unit));
-  return details.join(" · ") || statusLabel(channel.balance_status || channel.status || "not_checked");
+  if (finiteNumber(channel.balance_total) !== null) {
+    details.push("总额 " + formatUpstreamBalance(channel.balance_total, channel.balance_unit, 2));
+  }
+  if (finiteNumber(channel.balance_used) !== null) {
+    details.push("上游累计已用 " + formatUpstreamBalance(channel.balance_used, channel.balance_unit, 2));
+  }
+  return details.join(" · ");
 }
 
 function formatTodayBalanceUsed(channel: UpstreamChannel, timeZone: string) {
-  if (String(channel.today_balance_status || "").toLowerCase() !== "ok") {
-    return channel.resolved_upstream_type === "newapi" ? "今日消耗 上游未提供" : "今日消耗 待同步";
+  const status = String(channel.today_balance_status || "not_checked").toLowerCase();
+  if (status !== "ok" || finiteNumber(channel.today_balance_used) === null) {
+    return {
+      label: "今日",
+      tone: statusTone(status),
+      value: channel.resolved_upstream_type === "newapi" && status === "unsupported"
+        ? "上游未提供"
+        : isFailureStatus(status)
+          ? "读取失败"
+          : "待同步",
+    };
   }
-  const amount = formatBalance(channel.today_balance_used, channel.today_balance_unit || channel.balance_unit);
-  return isToday(channel.today_balance_checked_at, timeZone) ? `今日消耗 ${amount}` : `上次同步 ${amount}`;
+  const current = isToday(channel.today_balance_checked_at, timeZone);
+  return {
+    label: current ? "今日" : "上次",
+    tone: current ? "success" : "warn",
+    value: formatUpstreamBalance(
+      channel.today_balance_used,
+      channel.today_balance_unit || channel.balance_unit,
+      2,
+    ),
+  };
 }
 
 function formatMoney(value: unknown) {

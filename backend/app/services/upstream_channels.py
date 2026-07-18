@@ -48,6 +48,7 @@ from app.services.upstream_accounts import (
     _value,
 )
 from app.services.upstream_client import (
+    DEFAULT_TODAY_TIME_ZONE,
     MAX_UPSTREAM_TOKEN_LENGTH,
     discover_upstream,
     refresh_sub2api_tokens,
@@ -1711,6 +1712,21 @@ class UpstreamChannelService:
                 and channel.resolved_upstream_type in {"newapi", "sub2api"}
                 else channel.upstream_type
             )
+            runtime_config = get_runtime_config_service()
+            today_timezone = DEFAULT_TODAY_TIME_ZONE
+            try:
+                public_settings = await runtime_config.get_public_settings()
+                configured_timezone = (
+                    public_settings.get("display_timezone")
+                    if isinstance(public_settings, dict)
+                    else None
+                )
+                if isinstance(configured_timezone, str) and configured_timezone.strip():
+                    today_timezone = configured_timezone.strip()
+            except Exception:
+                # Isolated tests and early startup may not have runtime
+                # settings available; keep the application's default zone.
+                pass
 
             async def run_discovery(active_access_token: str | None, active_type: str) -> Any:
                 discovery = discover_upstream(
@@ -1720,6 +1736,7 @@ class UpstreamChannelService:
                     new_api_user=channel.upstream_user_id,
                     account_api_keys=account_api_keys,
                     optimized_endpoint_fallbacks=True,
+                    today_timezone=today_timezone,
                 )
                 return await discovery if inspect.isawaitable(discovery) else discovery
 
@@ -1829,7 +1846,7 @@ class UpstreamChannelService:
             await self._apply_api_key_balance_fallback(channel, configs)
             local_recharge, local_source, local_status = await self._local_recharge()
             try:
-                sync_enabled = await get_runtime_config_service().get_upstream_rate_sync_enabled()
+                sync_enabled = await runtime_config.get_upstream_rate_sync_enabled()
             except Exception:
                 # Discovery remains read-only if runtime settings are not yet
                 # available during startup or isolated service tests.
