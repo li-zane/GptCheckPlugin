@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,7 @@ from app.services.upstream_client import (
     _doh_resolver,
     _invalidate_dns_cache,
     _newapi_today_usage_params,
+    _newapi_yesterday_usage_params,
     _unique_masked_api_key_records,
 )
 
@@ -92,7 +93,7 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "ok")
-        self.assertEqual(len(seen), 7)
+        self.assertEqual(len(seen), 8)
         self.assertNotIn("/api/token/search?p=1&size=200", seen)
         self.assertNotIn("/api/v1/payment/config", seen)
         self.assertEqual(seen.count("/api/status"), 1)
@@ -436,7 +437,7 @@ class UpstreamClientTests(unittest.TestCase):
             if endpoint == NEWAPI_TODAY_USAGE_ENDPOINT:
                 self.assertEqual(
                     sum(request.url.path == endpoint for request in seen),
-                    1,
+                    2,
                     endpoint,
                 )
             else:
@@ -595,15 +596,18 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertNotIn("/api/usage/token", seen_headers)
 
     def test_newapi_today_usage_reads_self_log_stat_in_configured_timezone(self) -> None:
-        seen_today_request: list[httpx.Request] = []
+        seen_usage_requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             target = request_target(request)
             if request.url.path == NEWAPI_TODAY_USAGE_ENDPOINT:
-                seen_today_request.append(request)
+                seen_usage_requests.append(request)
                 return httpx.Response(
                     200,
-                    json={"success": True, "data": {"quota": 2_500_000}},
+                    json={
+                        "success": True,
+                        "data": {"quota": 2_500_000 if len(seen_usage_requests) == 1 else 1_250_000},
+                    },
                 )
             if target == "/api/status":
                 return httpx.Response(
@@ -634,18 +638,34 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(result.today_balance_used, 2.5)
         self.assertEqual(result.today_balance_unit, "USD")
         self.assertEqual(result.today_balance_status, "ok")
-        self.assertEqual(len(seen_today_request), 1)
-        request = seen_today_request[0]
-        self.assertEqual(request.headers.get("Authorization"), "console-access-token")
-        self.assertEqual(request.headers.get("New-Api-User"), "42")
-        start_timestamp = int(request.url.params["start_timestamp"])
-        end_timestamp = int(request.url.params["end_timestamp"])
+        self.assertEqual(result.yesterday_balance_used, 1.25)
+        self.assertEqual(result.yesterday_balance_unit, "USD")
+        self.assertEqual(result.yesterday_balance_status, "ok")
+        self.assertEqual(len(seen_usage_requests), 2)
+        today_request, yesterday_request = seen_usage_requests
+        for request in seen_usage_requests:
+            self.assertEqual(request.headers.get("Authorization"), "console-access-token")
+            self.assertEqual(request.headers.get("New-Api-User"), "42")
+        start_timestamp = int(today_request.url.params["start_timestamp"])
+        end_timestamp = int(today_request.url.params["end_timestamp"])
         zone = ZoneInfo("America/New_York")
         start = datetime.fromtimestamp(start_timestamp, zone)
         end = datetime.fromtimestamp(end_timestamp, zone)
         self.assertEqual((start.hour, start.minute, start.second), (0, 0, 0))
         self.assertEqual(start.date(), end.date())
         self.assertGreaterEqual(end_timestamp, start_timestamp)
+        yesterday_start = datetime.fromtimestamp(
+            int(yesterday_request.url.params["start_timestamp"]),
+            zone,
+        )
+        yesterday_end = datetime.fromtimestamp(
+            int(yesterday_request.url.params["end_timestamp"]),
+            zone,
+        )
+        self.assertEqual((yesterday_start.hour, yesterday_start.minute, yesterday_start.second), (0, 0, 0))
+        self.assertEqual((yesterday_end.hour, yesterday_end.minute, yesterday_end.second), (23, 59, 59))
+        self.assertEqual(yesterday_start.date(), start.date() - timedelta(days=1))
+        self.assertEqual(yesterday_end.date(), yesterday_start.date())
 
     def test_newapi_today_usage_marks_missing_optional_endpoint_unsupported(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -680,6 +700,9 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertIsNone(result.today_balance_used)
         self.assertIsNone(result.today_balance_unit)
         self.assertEqual(result.today_balance_status, "unsupported")
+        self.assertIsNone(result.yesterday_balance_used)
+        self.assertIsNone(result.yesterday_balance_unit)
+        self.assertEqual(result.yesterday_balance_status, "unsupported")
 
     def test_newapi_today_usage_time_range_falls_back_to_default_timezone(self) -> None:
         now = datetime(2026, 7, 18, 20, 30, tzinfo=timezone.utc)
@@ -694,6 +717,17 @@ class UpstreamClientTests(unittest.TestCase):
                     datetime(2026, 7, 19, 0, 0, tzinfo=zone).timestamp()
                 ),
                 "end_timestamp": int(now.timestamp()),
+            },
+        )
+        self.assertEqual(
+            _newapi_yesterday_usage_params("not/a-zone", now=now),
+            {
+                "start_timestamp": int(
+                    datetime(2026, 7, 18, 0, 0, tzinfo=zone).timestamp()
+                ),
+                "end_timestamp": int(
+                    datetime(2026, 7, 19, 0, 0, tzinfo=zone).timestamp()
+                ) - 1,
             },
         )
 
@@ -1650,7 +1684,13 @@ class UpstreamClientTests(unittest.TestCase):
                 )
                 return httpx.Response(
                     200,
-                    json={"code": 0, "data": {"today_actual_cost": 3.25}},
+                    json={
+                        "code": 0,
+                        "data": {
+                            "today_actual_cost": 3.25,
+                            "yesterday_actual_cost": 2.75,
+                        },
+                    },
                 )
             return httpx.Response(404)
 
@@ -1671,6 +1711,9 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(result.today_balance_used, 3.25)
         self.assertEqual(result.today_balance_unit, "USD")
         self.assertEqual(result.today_balance_status, "ok")
+        self.assertEqual(result.yesterday_balance_used, 2.75)
+        self.assertEqual(result.yesterday_balance_unit, "USD")
+        self.assertEqual(result.yesterday_balance_status, "ok")
         self.assertEqual(seen_today_headers, [("Bearer sub2api-login-token", None)])
 
     def test_usage_amount_rejects_invalid_values(self) -> None:

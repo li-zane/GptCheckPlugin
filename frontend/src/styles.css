@@ -5288,8 +5288,11 @@ fieldset.api-key-field {
 .api-key-channel-urls {
   align-items: center !important;
   display: flex !important;
-  flex-wrap: wrap;
+  flex-wrap: nowrap !important;
   gap: 4px !important;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .api-key-channel-urls a,
@@ -5299,11 +5302,21 @@ fieldset.api-key-field {
   border-radius: 5px;
   color: var(--info-ink) !important;
   display: inline-flex !important;
+  flex: 0 1 auto;
   gap: 5px;
   max-width: 100%;
   min-height: 22px;
+  min-width: 0;
+  overflow: hidden;
   padding: 3px 7px;
-  width: max-content;
+  width: auto;
+}
+
+.api-key-channel-urls a span,
+.api-key-channel-urls .api-key-channel-url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .api-key-channel-urls b {
@@ -5393,6 +5406,15 @@ button.api-key-group-chip--more {
   align-items: center;
   display: flex;
   gap: 5px;
+  min-width: 0;
+}
+
+.api-key-account-side-chips {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 5px;
+  margin-left: auto;
   min-width: 0;
 }
 
@@ -6051,7 +6073,7 @@ button.api-key-group-chip--more {
   border-bottom: 1px solid var(--line);
   border-top: 1px solid var(--line);
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.65fr) minmax(110px, 0.62fr) minmax(145px, 1fr);
   min-width: 0;
 }
 
@@ -6418,7 +6440,7 @@ button.api-key-group-chip--more {
   }
 
   .api-key-channel-stats {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1.55fr) minmax(105px, 0.55fr);
   }
 
   .api-key-channel-stat:last-child {
@@ -6643,41 +6665,81 @@ button.api-key-group-chip--more {
 .api-key-channel-balance-line {
   align-items: center;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px 8px;
   min-width: 0;
 }
 
-.api-key-channel-stat-value .api-key-channel-today-usage {
-  display: inline-flex;
-  flex: 0 0 auto;
-  font-size: 12px;
-  font-weight: 750;
-  line-height: 1.25;
-  margin-left: auto;
-  max-width: 100%;
+.api-key-channel-balance-line > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-key-channel-stat-value .api-key-channel-daily-usage {
+  display: grid;
+  gap: 5px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
   overflow: visible;
   -webkit-box-orient: initial;
   -webkit-line-clamp: initial;
 }
 
-.api-key-channel-stat-value .api-key-channel-today-usage.api-key-chip--success {
+.api-key-channel-stat-value .api-key-channel-usage-chip {
+  align-items: center;
+  display: flex;
+  font-size: 11px;
+  font-weight: 750;
+  gap: 4px;
+  justify-content: space-between;
+  line-height: 1.25;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  -webkit-box-orient: initial;
+  -webkit-line-clamp: initial;
+}
+
+.api-key-channel-stat-value .api-key-channel-usage-chip > span {
+  color: inherit;
+  display: inline;
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: inherit;
+  overflow: visible;
+  white-space: nowrap;
+  -webkit-box-orient: initial;
+  -webkit-line-clamp: initial;
+}
+
+.api-key-channel-stat-value .api-key-channel-usage-chip > b {
+  font-size: 11px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-key-channel-stat-value .api-key-channel-usage-chip.api-key-chip--success {
   color: var(--ok-ink);
 }
 
-.api-key-channel-stat-value .api-key-channel-today-usage.api-key-chip--danger {
+.api-key-channel-stat-value .api-key-channel-usage-chip.api-key-chip--danger {
   color: var(--danger-ink);
 }
 
-.api-key-channel-stat-value .api-key-channel-today-usage.api-key-chip--warn {
+.api-key-channel-stat-value .api-key-channel-usage-chip.api-key-chip--warn {
   color: var(--warn-ink);
 }
 
-.api-key-channel-stat-value .api-key-channel-today-usage.api-key-chip--info {
+.api-key-channel-stat-value .api-key-channel-usage-chip.api-key-chip--info {
   color: var(--info-ink);
 }
 
-.api-key-channel-stat-value .api-key-channel-today-usage.api-key-chip--muted {
+.api-key-channel-stat-value .api-key-channel-usage-chip.api-key-chip--muted {
   color: var(--muted);
 }
 

@@ -178,6 +178,10 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("today_balance_unit", channel_columns)
         self.assertIn("today_balance_status", channel_columns)
         self.assertIn("today_balance_checked_at", channel_columns)
+        self.assertIn("yesterday_balance_used", channel_columns)
+        self.assertIn("yesterday_balance_unit", channel_columns)
+        self.assertIn("yesterday_balance_status", channel_columns)
+        self.assertIn("yesterday_balance_checked_at", channel_columns)
         self.assertTrue(
             set(models.UpstreamAccountConfig.__table__.columns.keys()).issubset(columns)
         )

@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence
 from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -35,6 +35,7 @@ MAX_AUTOMATIC_KEY_REVEALS = 200
 KEY_REVEAL_CONCURRENCY = 20
 NEWAPI_BALANCE_ENDPOINT = "/api/user/self"
 NEWAPI_TODAY_USAGE_ENDPOINT = "/api/log/self/stat"
+NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY = "newapi:yesterday-usage"
 SUB2API_BALANCE_ENDPOINT = "/api/v1/auth/me"
 SUB2API_TODAY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/stats"
 SUB2API_REFRESH_ENDPOINT = "/api/v1/auth/refresh"
@@ -160,6 +161,9 @@ class DiscoveryResult:
     today_balance_used: float | None = None
     today_balance_unit: str | None = None
     today_balance_status: str = "unknown"
+    yesterday_balance_used: float | None = None
+    yesterday_balance_unit: str | None = None
+    yesterday_balance_status: str = "unknown"
     sub2api_auth_rejected: bool = False
     message: str = ""
 
@@ -345,9 +349,11 @@ class UpstreamClient:
             )
         )
         newapi_today_usage_params = _newapi_today_usage_params(today_timezone)
+        newapi_yesterday_usage_params = _newapi_yesterday_usage_params(today_timezone)
 
         timeout = httpx.Timeout(self.timeout_seconds)
         fetched: list[_FetchResult] = []
+        newapi_yesterday_usage_result: _FetchResult | None = None
         revealed_api_key_records: dict[str, dict[str, Any]] = {}
         try:
             for address in pinned_addresses:
@@ -410,6 +416,25 @@ class UpstreamClient:
                         if requested_type == "auto"
                         else requested_type
                     )
+                    if candidate_type == "newapi":
+                        yesterday_headers = _headers_for_endpoint(
+                            NEWAPI_TODAY_USAGE_ENDPOINT,
+                            requested_type=requested_type,
+                            access_token=access_token,
+                            api_key=api_key,
+                            new_api_user=new_api_user,
+                        )
+                        newapi_yesterday_usage_result = (
+                            _FetchResult(ok=False, error_kind="credentials_missing")
+                            if yesterday_headers is None
+                            else await self._request_json(
+                                client,
+                                normalized_url,
+                                NEWAPI_TODAY_USAGE_ENDPOINT,
+                                headers=yesterday_headers,
+                                params=newapi_yesterday_usage_params,
+                            )
+                        )
                     if candidate_type in {"newapi", "sub2api"} and target_api_keys:
                         candidate_endpoints = (
                             NEWAPI_ENDPOINTS if candidate_type == "newapi" else SUB2API_ENDPOINTS
@@ -454,6 +479,8 @@ class UpstreamClient:
                 await self.transport.aclose()
 
         responses = dict(zip(endpoints, fetched))
+        if newapi_yesterday_usage_result is not None:
+            responses[NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY] = newapi_yesterday_usage_result
         if requested_type == "auto":
             detected_type = _detect_upstream_type(responses)
             if detected_type is None:
@@ -549,6 +576,14 @@ class UpstreamClient:
                     new_api_user=new_api_user,
                 )
             )
+            yesterday_balance_used, yesterday_balance_unit, yesterday_balance_status = (
+                _discover_yesterday_balance_usage(
+                    active_type,
+                    responses,
+                    access_token=access_token,
+                    new_api_user=new_api_user,
+                )
+            )
         except Exception:
             return safe(_error_result(active_type, source, "Could not parse a valid upstream response."))
 
@@ -578,6 +613,9 @@ class UpstreamClient:
                 today_balance_used=today_balance_used,
                 today_balance_unit=today_balance_unit,
                 today_balance_status=today_balance_status,
+                yesterday_balance_used=yesterday_balance_used,
+                yesterday_balance_unit=yesterday_balance_unit,
+                yesterday_balance_status=yesterday_balance_status,
                 sub2api_auth_rejected=sub2api_auth_rejected,
                 message=_success_message(group_multiplier, recharge_multiplier),
             )
@@ -2266,44 +2304,93 @@ def _discover_today_balance_usage(
     if upstream_type == "newapi":
         if _clean_new_api_user(new_api_user) is None:
             return None, None, "credentials_missing"
-        result = responses.get(NEWAPI_TODAY_USAGE_ENDPOINT)
-        if result is not None and result.status_code in {404, 405}:
-            return None, None, "unsupported"
-        if result is None or not result.ok or not _payload_succeeded(result.payload):
-            return None, None, "error"
-        data = _unwrap(result.payload)
-        if not isinstance(data, dict):
-            return None, None, "error"
-        quota = _finite_number(data.get("quota"))
-        if quota is None or quota < 0:
-            return None, None, "error"
-
-        quota_per_unit = DEFAULT_NEWAPI_QUOTA_PER_UNIT
-        status_result = responses.get("/api/status")
-        if (
-            status_result is not None
-            and status_result.ok
-            and _payload_succeeded(status_result.payload)
-        ):
-            status_data = _unwrap(status_result.payload)
-            if isinstance(status_data, dict):
-                parsed_quota_per_unit = _positive_number(status_data.get("quota_per_unit"))
-                if parsed_quota_per_unit is not None:
-                    quota_per_unit = parsed_quota_per_unit
-        amount = _quota_points_to_usd(quota, quota_per_unit)
-        if amount is None:
-            return None, None, "error"
-        return amount, "USD", "ok"
+        return _discover_newapi_period_usage(responses, NEWAPI_TODAY_USAGE_ENDPOINT)
 
     if upstream_type != "sub2api":
         return None, None, "unsupported"
+    return _discover_sub2api_period_usage(
+        responses,
+        field="today_actual_cost",
+        missing_status="error",
+    )
+
+
+def _discover_yesterday_balance_usage(
+    upstream_type: str,
+    responses: dict[str, _FetchResult],
+    *,
+    access_token: str | None,
+    new_api_user: str | int | None,
+) -> tuple[float | None, str | None, str]:
+    if _clean_secret(access_token) is None:
+        return None, None, "credentials_missing"
+
+    if upstream_type == "newapi":
+        if _clean_new_api_user(new_api_user) is None:
+            return None, None, "credentials_missing"
+        return _discover_newapi_period_usage(
+            responses,
+            NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY,
+        )
+
+    if upstream_type != "sub2api":
+        return None, None, "unsupported"
+    return _discover_sub2api_period_usage(
+        responses,
+        field="yesterday_actual_cost",
+        missing_status="not_available",
+    )
+
+
+def _discover_newapi_period_usage(
+    responses: dict[str, _FetchResult],
+    response_key: str,
+) -> tuple[float | None, str | None, str]:
+    result = responses.get(response_key)
+    if result is not None and result.status_code in {404, 405}:
+        return None, None, "unsupported"
+    if result is None or not result.ok or not _payload_succeeded(result.payload):
+        return None, None, "error"
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict):
+        return None, None, "error"
+    quota = _finite_number(data.get("quota"))
+    if quota is None or quota < 0:
+        return None, None, "error"
+
+    quota_per_unit = DEFAULT_NEWAPI_QUOTA_PER_UNIT
+    status_result = responses.get("/api/status")
+    if (
+        status_result is not None
+        and status_result.ok
+        and _payload_succeeded(status_result.payload)
+    ):
+        status_data = _unwrap(status_result.payload)
+        if isinstance(status_data, dict):
+            parsed_quota_per_unit = _positive_number(status_data.get("quota_per_unit"))
+            if parsed_quota_per_unit is not None:
+                quota_per_unit = parsed_quota_per_unit
+    amount = _quota_points_to_usd(quota, quota_per_unit)
+    if amount is None:
+        return None, None, "error"
+    return amount, "USD", "ok"
+
+
+def _discover_sub2api_period_usage(
+    responses: dict[str, _FetchResult],
+    *,
+    field: str,
+    missing_status: str,
+) -> tuple[float | None, str | None, str]:
     result = responses.get(SUB2API_TODAY_USAGE_ENDPOINT)
     if result is None or not result.ok or not _payload_succeeded(result.payload):
         return None, None, "error"
     data = _unwrap(result.payload)
     if not isinstance(data, dict):
         return None, None, "error"
-    amount = _finite_number(data.get("today_actual_cost"))
+    if field not in data or data.get(field) is None:
+        return None, None, missing_status
+    amount = _finite_number(data.get(field))
     if amount is None or amount < 0:
         return None, None, "error"
     return amount, "USD", "ok"
@@ -2314,6 +2401,18 @@ def _newapi_today_usage_params(
     *,
     now: datetime | None = None,
 ) -> dict[str, int]:
+    current, start = _newapi_usage_day(time_zone, now=now)
+    return {
+        "start_timestamp": int(start.timestamp()),
+        "end_timestamp": int(current.timestamp()),
+    }
+
+
+def _newapi_usage_day(
+    time_zone: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[datetime, datetime]:
     cleaned_time_zone = _clean_text(time_zone, 80) or DEFAULT_TODAY_TIME_ZONE
     try:
         zone = ZoneInfo(cleaned_time_zone)
@@ -2325,9 +2424,19 @@ def _newapi_today_usage_params(
     else:
         current = current.astimezone(zone)
     start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    return current, start
+
+
+def _newapi_yesterday_usage_params(
+    time_zone: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    _, today_start = _newapi_usage_day(time_zone, now=now)
+    yesterday_start = today_start - timedelta(days=1)
     return {
-        "start_timestamp": int(start.timestamp()),
-        "end_timestamp": int(current.timestamp()),
+        "start_timestamp": int(yesterday_start.timestamp()),
+        "end_timestamp": int(today_start.timestamp()) - 1,
     }
 
 

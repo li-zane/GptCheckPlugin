@@ -1654,7 +1654,8 @@ function ChannelCard({
   const busy = Boolean(busyAction) || globallyDisabled;
   const discoveryCopy = upstreamDiscoveryCopy(rateWritesEnabled);
   const balanceDetails = balanceDetail(channel);
-  const todayUsage = formatTodayBalanceUsed(channel, displayTimeZone);
+  const todayUsage = formatDailyBalanceUsed(channel, "today", displayTimeZone);
+  const yesterdayUsage = formatDailyBalanceUsed(channel, "yesterday", displayTimeZone);
   return (
     <article className={"api-key-channel-card" + (channelHasAttention(channel) ? " api-key-channel-card--attention" : "")}>
       <header className="api-key-channel-head">
@@ -1670,20 +1671,20 @@ function ChannelCard({
           <div className="api-key-channel-urls">
             {isHttpUrl(url) ? (
               <a href={url} rel="noreferrer" target="_blank" title={url}>
-                <span>{displayCanonicalUrl(url)}</span>
+                <span>{middleEllipsis(displayCanonicalUrl(url))}</span>
                 <ExternalLink size={13} />
               </a>
             ) : (
-              <span className="api-key-channel-url">{displayCanonicalUrl(url)}</span>
+              <span className="api-key-channel-url">{middleEllipsis(displayCanonicalUrl(url))}</span>
             )}
             {hasSeparateManagementUrl ? (
               isHttpUrl(managementUrl) ? (
                 <a href={managementUrl} rel="noreferrer" target="_blank" title={managementUrl}>
                   <b>管理</b>
-                  <span>{displayCanonicalUrl(managementUrl)}</span>
+                  <span>{middleEllipsis(displayCanonicalUrl(managementUrl), 42)}</span>
                   <ExternalLink size={13} />
                 </a>
-              ) : <span className="api-key-channel-url"><b>管理</b>{displayCanonicalUrl(managementUrl)}</span>
+              ) : <span className="api-key-channel-url"><b>管理</b>{middleEllipsis(displayCanonicalUrl(managementUrl), 42)}</span>
             ) : null}
           </div>
         </div>
@@ -1714,21 +1715,30 @@ function ChannelCard({
       <div className="api-key-channel-stats">
         <ChannelStat
           badge={<StatusChip status={channel.balance_status || channel.status || "not_checked"} />}
+          className="api-key-channel-stat--balance"
           icon={<WalletCards size={16} />}
           label="上游余额"
         >
           <div className="api-key-channel-balance-line">
             <strong>{formatUpstreamBalance(channel.balance_remaining, channel.balance_unit, 2)}</strong>
-            <span className={"api-key-channel-today-usage api-key-chip api-key-chip--" + todayUsage.tone}>
-              {todayUsage.label} | {todayUsage.value}
-            </span>
+          </div>
+          <div className="api-key-channel-daily-usage">
+            {[yesterdayUsage, todayUsage].map((usage) => (
+              <span
+                className={"api-key-channel-usage-chip api-key-chip api-key-chip--" + usage.tone}
+                key={usage.label}
+                title={`${usage.label}消耗余额 ${usage.value}`}
+              >
+                <span>{usage.label}</span><b>{usage.value}</b>
+              </span>
+            ))}
           </div>
           {balanceDetails ? <span>{balanceDetails}</span> : null}
         </ChannelStat>
-        <ChannelStat icon={<BadgeDollarSign size={16} />} label="充值成本">
+        <ChannelStat className="api-key-channel-stat--recharge" icon={<BadgeDollarSign size={16} />} label="充值成本">
           <strong>{"¥" + formatCostPerUsd(channel.effective_recharge_multiplier) + " / $1"}</strong>
         </ChannelStat>
-        <ChannelStat badge={<StatusChip status={status} />} icon={<Radar size={16} />} label="最近探测">
+        <ChannelStat className="api-key-channel-stat--probe" badge={<StatusChip status={status} />} icon={<Radar size={16} />} label="最近探测">
           <strong>{formatDate(channel.last_discovered_at || channel.checked_at, displayTimeZone)}</strong>
         </ChannelStat>
       </div>
@@ -1938,8 +1948,10 @@ function AccountCard({
             <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
             <span className="api-key-mono">#{account.sub2api_account_id}</span>
           </div>
-          <StatusChip status={effectiveStatus} />
-          {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
+          <div className="api-key-account-side-chips">
+            <StatusChip status={effectiveStatus} />
+            {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
+          </div>
         </div>
         {hasAccountMeta ? <div className="api-key-inline-chips api-key-account-meta-chips">
           {account.auto_disabled_reason ? (
@@ -2492,17 +2504,19 @@ function CompactRateChange({
 
 function ChannelStat({
   badge,
+  className,
   icon,
   label,
   children,
 }: {
   badge?: React.ReactNode;
+  className?: string;
   icon: React.ReactNode;
   label: string;
   children: React.ReactNode;
 }) {
   return (
-    <div className="api-key-channel-stat">
+    <div className={"api-key-channel-stat" + (className ? ` ${className}` : "")}>
       <div className="api-key-channel-stat-label">{icon}<span>{label}</span>{badge}</div>
       <div className="api-key-channel-stat-value">{children}</div>
     </div>
@@ -2850,34 +2864,33 @@ function balanceDetail(channel: UpstreamChannel) {
   if (finiteNumber(channel.balance_total) !== null) {
     details.push("总额 " + formatUpstreamBalance(channel.balance_total, channel.balance_unit, 2));
   }
-  if (finiteNumber(channel.balance_used) !== null) {
+  if (resolvedChannelType(channel) !== "newapi" && finiteNumber(channel.balance_used) !== null) {
     details.push("上游累计已用 " + formatUpstreamBalance(channel.balance_used, channel.balance_unit, 2));
   }
   return details.join(" · ");
 }
 
-function formatTodayBalanceUsed(channel: UpstreamChannel, timeZone: string) {
-  const status = String(channel.today_balance_status || "not_checked").toLowerCase();
-  if (status !== "ok" || finiteNumber(channel.today_balance_used) === null) {
-    return {
-      label: "今日",
-      tone: statusTone(status),
-      value: channel.resolved_upstream_type === "newapi" && status === "unsupported"
-        ? "上游未提供"
-        : isFailureStatus(status)
-          ? "读取失败"
-          : "待同步",
-    };
-  }
-  const current = isToday(channel.today_balance_checked_at, timeZone);
+function formatDailyBalanceUsed(
+  channel: UpstreamChannel,
+  period: "today" | "yesterday",
+  timeZone: string,
+) {
+  const yesterday = period === "yesterday";
+  const amount = yesterday ? channel.yesterday_balance_used : channel.today_balance_used;
+  const unit = yesterday ? channel.yesterday_balance_unit : channel.today_balance_unit;
+  const status = String(
+    (yesterday ? channel.yesterday_balance_status : channel.today_balance_status) || "not_checked",
+  ).toLowerCase();
+  const checkedAt = yesterday
+    ? channel.yesterday_balance_checked_at
+    : channel.today_balance_checked_at;
+  const current = status === "ok"
+    && finiteNumber(amount) !== null
+    && isToday(checkedAt, timeZone);
   return {
-    label: current ? "今日" : "上次",
-    tone: current ? "success" : "warn",
-    value: formatUpstreamBalance(
-      channel.today_balance_used,
-      channel.today_balance_unit || channel.balance_unit,
-      2,
-    ),
+    label: yesterday ? "昨日" : "今日",
+    tone: current ? "success" : isFailureStatus(status) ? "danger" : "muted",
+    value: current ? formatUpstreamBalance(amount, unit || channel.balance_unit, 2) : "-",
   };
 }
 
@@ -2920,6 +2933,15 @@ function displayCanonicalUrl(value?: string | null) {
   if (!value) return "未填写渠道地址";
   const trimmed = value.trim().replace(/\/+$/, "").replace(/\/(?:api\/)?v1$/i, "");
   return trimmed || value;
+}
+
+function middleEllipsis(value: string, maxLength = 54) {
+  if (value.length <= maxLength) return value;
+  const marker = "···";
+  const available = Math.max(2, maxLength - marker.length);
+  const leading = Math.ceil(available / 2);
+  const trailing = Math.floor(available / 2);
+  return value.slice(0, leading) + marker + value.slice(-trailing);
 }
 
 function displayHost(value?: string | null) {

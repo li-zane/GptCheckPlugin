@@ -179,6 +179,18 @@ test("account usage is shown for Sub2API but omitted for NewAPI", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(source, /account\.resolved_upstream_type \|\| account\.detected_upstream_type \|\| account\.upstream_type/);
   assert.match(source, /\{showUsage \? <div className="api-key-account-usage">/);
+  assert.match(source, /resolvedChannelType\(channel\) !== "newapi" && finiteNumber\(channel\.balance_used\)/);
+});
+
+test("upstream channel cards keep URLs and daily usage compact", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(source, /middleEllipsis\(displayCanonicalUrl\(url\)\)/);
+  assert.match(source, /\[yesterdayUsage, todayUsage\]\.map/);
+  assert.match(source, /className="api-key-channel-stat--recharge"/);
+  assert.match(styles, /\.api-key-channel-urls\s*\{[^}]*flex-wrap: nowrap !important;[^}]*overflow: hidden;/s);
+  assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: minmax\(0, 1\.65fr\) minmax\(110px, 0\.62fr\)/s);
+  assert.match(styles, /\.api-key-channel-daily-usage\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
 });
 
 test("API key dense views keep readable type and collapse change records on narrow screens", () => {
@@ -198,8 +210,10 @@ test("API key account numbers stay beside the account name", () => {
   const numberIndex = source.indexOf('<span className="api-key-mono">#{account.sub2api_account_id}</span>', nameIndex);
   const statusIndex = source.indexOf('<StatusChip status={effectiveStatus} />', nameIndex);
   assert.ok(nameIndex >= 0 && numberIndex > nameIndex && statusIndex > numberIndex);
+  assert.match(source, /<div className="api-key-account-side-chips">\s*<StatusChip status=\{effectiveStatus\}/s);
   assert.match(styles, /\.api-key-account-name\s*\{[^}]*display: flex;[^}]*gap: 5px;/s);
   assert.match(styles, /\.api-key-account-name > strong\s*\{[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/s);
+  assert.match(styles, /\.api-key-account-side-chips\s*\{[^}]*margin-left: auto;/s);
   assert.match(styles, /\.api-key-account-priority\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
   assert.match(styles, /\.api-key-account-priority-value\s*\{[^}]*border-left: 0;[^}]*border-top: 1px solid var\(--line\);/s);
 });
@@ -926,6 +940,10 @@ test("session cache strips credentials and credential hints", () => {
       today_balance_unit: "USD",
       today_balance_status: "ok",
       today_balance_checked_at: "2026-07-16T08:02:00Z",
+      yesterday_balance_used: 2.75,
+      yesterday_balance_unit: "USD",
+      yesterday_balance_status: "ok",
+      yesterday_balance_checked_at: "2026-07-16T08:02:00Z",
       accounts: [{
         sub2api_account_id: 10,
         remote_name: "账号",
@@ -964,6 +982,8 @@ test("session cache strips credentials and credential hints", () => {
   assert.equal(safe.channels[0].probe_enabled, false);
   assert.equal(safe.channels[0].today_balance_used, 3.25);
   assert.equal(safe.channels[0].today_balance_status, "ok");
+  assert.equal(safe.channels[0].yesterday_balance_used, 2.75);
+  assert.equal(safe.channels[0].yesterday_balance_status, "ok");
   assert.equal(safe.channels[0].accounts?.[0].api_key_set, true);
   assert.equal(safe.channels[0].accounts?.[0].api_key_hint, undefined);
   assert.equal(safe.channels[0].accounts?.[0].identity_fingerprint, undefined);

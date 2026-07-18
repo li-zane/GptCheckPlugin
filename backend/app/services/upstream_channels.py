@@ -180,6 +180,10 @@ class UpstreamChannelService:
         channel.today_balance_unit = None
         channel.today_balance_status = "not_checked"
         channel.today_balance_checked_at = None
+        channel.yesterday_balance_used = None
+        channel.yesterday_balance_unit = None
+        channel.yesterday_balance_status = "not_checked"
+        channel.yesterday_balance_checked_at = None
         channel.last_error = None
         channel.last_discovered_at = None
 
@@ -914,6 +918,10 @@ class UpstreamChannelService:
             today_balance_unit=channel.today_balance_unit,
             today_balance_status=channel.today_balance_status,
             today_balance_checked_at=channel.today_balance_checked_at,
+            yesterday_balance_used=channel.yesterday_balance_used,
+            yesterday_balance_unit=channel.yesterday_balance_unit,
+            yesterday_balance_status=channel.yesterday_balance_status,
+            yesterday_balance_checked_at=channel.yesterday_balance_checked_at,
             last_error=channel.last_error,
             last_discovered_at=channel.last_discovered_at,
             created_at=channel.created_at,
@@ -1225,6 +1233,7 @@ class UpstreamChannelService:
                 _value(result, "balance_message"), limit=300
             ) or "Unable to read the upstream channel."
             channel.today_balance_status = "error"
+            channel.yesterday_balance_status = "error"
             channel.last_error = "Upstream channel discovery failed."
             channel.last_discovered_at = now
             return False
@@ -1272,19 +1281,26 @@ class UpstreamChannelService:
                         setattr(channel, field, parsed)
             channel.balance_unit = _safe_text(_value(result, "balance_unit"), limit=32) or "USD"
             channel.balance_checked_at = now
-        today_status = str(_value(result, "today_balance_status") or "unsupported").strip().lower()
-        channel.today_balance_status = today_status
-        channel.today_balance_used = None
-        channel.today_balance_unit = None
-        channel.today_balance_checked_at = None
-        if today_status == "ok":
-            today_used = _balance_number(_value(result, "today_balance_used"))
-            if today_used is not None and today_used >= 0:
-                channel.today_balance_used = today_used
-                channel.today_balance_unit = _safe_text(
-                    _value(result, "today_balance_unit"), limit=32
-                ) or "USD"
-                channel.today_balance_checked_at = now
+        for period in ("today", "yesterday"):
+            status = str(
+                _value(result, f"{period}_balance_status") or "unsupported"
+            ).strip().lower()
+            setattr(channel, f"{period}_balance_status", status)
+            setattr(channel, f"{period}_balance_used", None)
+            setattr(channel, f"{period}_balance_unit", None)
+            setattr(channel, f"{period}_balance_checked_at", None)
+            if status != "ok":
+                continue
+            used = _balance_number(_value(result, f"{period}_balance_used"))
+            if used is None or used < 0:
+                continue
+            setattr(channel, f"{period}_balance_used", used)
+            setattr(
+                channel,
+                f"{period}_balance_unit",
+                _safe_text(_value(result, f"{period}_balance_unit"), limit=32) or "USD",
+            )
+            setattr(channel, f"{period}_balance_checked_at", now)
         channel.last_error = None if balance_status in {"ok", "success", "available"} else channel.balance_message
         channel.last_discovered_at = now
         return True

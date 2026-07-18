@@ -162,6 +162,10 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "today_balance_unit": "VARCHAR(32)",
         "today_balance_status": "VARCHAR(32)",
         "today_balance_checked_at": "DATETIME",
+        "yesterday_balance_used": "FLOAT",
+        "yesterday_balance_unit": "VARCHAR(32)",
+        "yesterday_balance_status": "VARCHAR(32)",
+        "yesterday_balance_checked_at": "DATETIME",
     }
     for column, column_type in optional_channel_columns.items():
         if channel_columns and column not in channel_columns:

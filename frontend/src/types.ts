@@ -654,6 +654,10 @@ export type UpstreamChannel = {
   today_balance_unit?: string | null;
   today_balance_status?: string | null;
   today_balance_checked_at?: string | null;
+  yesterday_balance_used?: number | null;
+  yesterday_balance_unit?: string | null;
+  yesterday_balance_status?: string | null;
+  yesterday_balance_checked_at?: string | null;
   status?: string | null;
   message?: string | null;
   checked_at?: string | null;

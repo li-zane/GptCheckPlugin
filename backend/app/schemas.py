@@ -976,6 +976,10 @@ class UpstreamChannelOut(BaseModel):
     today_balance_unit: str | None = None
     today_balance_status: str | None = None
     today_balance_checked_at: datetime | None = None
+    yesterday_balance_used: float | None = None
+    yesterday_balance_unit: str | None = None
+    yesterday_balance_status: str | None = None
+    yesterday_balance_checked_at: datetime | None = None
     last_error: str | None = None
     last_discovered_at: datetime | None = None
     created_at: datetime | None = None

@@ -183,6 +183,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         account_upstream_states: dict[int, AccountUpstreamState] | None = None,
         today_balance_used: float | None = 3.25,
         today_balance_status: str = "ok",
+        yesterday_balance_used: float | None = 2.75,
+        yesterday_balance_status: str = "ok",
     ) -> SimpleNamespace:
         return SimpleNamespace(
             upstream_type="sub2api",
@@ -201,6 +203,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             today_balance_used=today_balance_used,
             today_balance_unit="USD" if today_balance_used is not None else None,
             today_balance_status=today_balance_status,
+            yesterday_balance_used=yesterday_balance_used,
+            yesterday_balance_unit="USD" if yesterday_balance_used is not None else None,
+            yesterday_balance_status=yesterday_balance_status,
             account_upstream_states=account_upstream_states or {},
         )
 
@@ -1249,6 +1254,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(stored_channel.today_balance_used, 3.25)
+        self.assertEqual(stored_channel.yesterday_balance_used, 2.75)
         self.assertEqual(stored_account.upstream_usage_amount, 12.375)
 
     async def test_successful_discovery_clears_stale_usage_for_unmatched_keys(self) -> None:
@@ -1299,11 +1305,17 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         channel.today_balance_unit = "USD"
         channel.today_balance_status = "ok"
         channel.today_balance_checked_at = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+        channel.yesterday_balance_used = 2.75
+        channel.yesterday_balance_unit = "USD"
+        channel.yesterday_balance_status = "ok"
+        channel.yesterday_balance_checked_at = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
         await self.db.commit()
 
         result = self._discovery_result(
             today_balance_used=None,
             today_balance_status="unsupported",
+            yesterday_balance_used=None,
+            yesterday_balance_status="not_available",
         )
         with patch(
             "app.services.upstream_channels.discover_upstream",
@@ -1315,6 +1327,10 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(discovered.today_balance_used)
         self.assertIsNone(discovered.today_balance_unit)
         self.assertIsNone(discovered.today_balance_checked_at)
+        self.assertEqual(discovered.yesterday_balance_status, "not_available")
+        self.assertIsNone(discovered.yesterday_balance_used)
+        self.assertIsNone(discovered.yesterday_balance_unit)
+        self.assertIsNone(discovered.yesterday_balance_checked_at)
 
     async def test_unmatched_key_does_not_reuse_historical_group_for_billing(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
@@ -1467,6 +1483,12 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         stored_channel.today_balance_checked_at = datetime(
             2026, 7, 16, 8, 0, tzinfo=timezone.utc
         )
+        stored_channel.yesterday_balance_used = 2.75
+        stored_channel.yesterday_balance_unit = "USD"
+        stored_channel.yesterday_balance_status = "ok"
+        stored_channel.yesterday_balance_checked_at = datetime(
+            2026, 7, 16, 8, 0, tzinfo=timezone.utc
+        )
         await self.db.commit()
 
         with patch(
@@ -1480,6 +1502,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.channels[0].last_error, "Upstream channel discovery failed.")
         self.assertEqual(result.channels[0].today_balance_status, "error")
         self.assertEqual(result.channels[0].today_balance_used, 3.25)
+        self.assertEqual(result.channels[0].yesterday_balance_status, "error")
+        self.assertEqual(result.channels[0].yesterday_balance_used, 2.75)
 
     async def test_failed_management_discovery_uses_one_api_key_balance_without_summing(self) -> None:
         channel = (await self.service.overview(self.db)).channels[0]
