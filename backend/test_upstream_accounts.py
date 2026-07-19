@@ -657,7 +657,10 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(detached.channel_id)
         self.assertEqual(detached.base_url, "https://upstream.example.com")
         self.assertTrue(stored.channel_auto_assign_disabled)
-        self.assertEqual(roundtrip.channels, [])
+        self.assertEqual(len(roundtrip.channels), 1)
+        self.assertEqual(roundtrip.channels[0].id, channel_id)
+        self.assertEqual(roundtrip.channels[0].account_count, 0)
+        self.assertEqual(roundtrip.channels[0].accounts, [])
         self.assertEqual(
             [item.sub2api_account_id for item in roundtrip.unassigned_accounts],
             [7],

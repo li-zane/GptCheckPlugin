@@ -28,6 +28,7 @@ SUBSCRIPTION_KEYS = (
     "subscription_plan",
     "has_active_subscription",
 )
+SUBSCRIPTION_DETAIL_KEYS = (*SUBSCRIPTION_KEYS, "plan_type")
 
 
 def _redact_error_text(value: str) -> str:
@@ -78,7 +79,7 @@ async def refresh_subscriptions(
         if _snapshot_has_full_subscription(snapshot):
             skipped += 1
             return
-        if _has_subscription_time(remote_metadata):
+        if _has_full_subscription_time(remote_metadata):
             await _save_subscription_metadata(normalized, account, sub2api, remote_metadata)
             refreshed += 1
             return
@@ -107,8 +108,11 @@ async def refresh_subscriptions(
                     skipped += 1
                     return
 
-                credentials = sub2api.subscription_credentials_from_session(session, "")
-                if not _has_subscription_time(credentials):
+                credentials = _merge_subscription_metadata(
+                    sub2api.subscription_credentials_from_session(session, ""),
+                    remote_metadata,
+                )
+                if not _has_subscription_details(credentials):
                     no_subscription_fields += 1
                     return
                 await _save_subscription_metadata(normalized, account, sub2api, credentials)
@@ -226,14 +230,31 @@ def _snapshot_has_full_subscription(snapshot: AccountSnapshot | None) -> bool:
     return bool(snapshot and snapshot.subscription_starts_at and snapshot.subscription_expires_at)
 
 
-def _has_subscription_time(metadata: dict[str, Any]) -> bool:
-    return bool(metadata.get("subscription_starts_at") or metadata.get("subscription_expires_at"))
+def _has_full_subscription_time(metadata: dict[str, Any]) -> bool:
+    return bool(metadata.get("subscription_starts_at") and metadata.get("subscription_expires_at"))
+
+
+def _has_subscription_details(metadata: dict[str, Any]) -> bool:
+    if any(metadata.get(key) not in (None, "") for key in SUBSCRIPTION_DETAIL_KEYS):
+        return True
+    return isinstance(metadata.get("has_active_subscription"), bool)
+
+
+def _merge_subscription_metadata(
+    primary: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: primary.get(key) if primary.get(key) not in (None, "") else fallback.get(key)
+        for key in SUBSCRIPTION_DETAIL_KEYS
+    }
 
 
 def _account_subscription_metadata(account: dict[str, Any]) -> dict[str, Any]:
     credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
     metadata = {key: credentials.get(key) for key in SUBSCRIPTION_KEYS}
-    metadata["subscription_plan"] = credentials.get("plan_type") or credentials.get("planType") or metadata.get("subscription_plan")
+    metadata["plan_type"] = credentials.get("plan_type") or credentials.get("planType")
+    metadata["subscription_plan"] = metadata["plan_type"] or metadata.get("subscription_plan")
     return metadata
 
 
@@ -263,10 +284,11 @@ async def _save_subscription_metadata(
         _set_if_present(
             snapshot,
             "subscription_plan",
-            metadata.get("subscription_plan") or metadata.get("plan_type"),
+            metadata.get("plan_type") or metadata.get("subscription_plan"),
         )
         active_subscription = metadata.get("has_active_subscription")
-        snapshot.has_active_subscription = active_subscription if isinstance(active_subscription, bool) else None
+        if isinstance(active_subscription, bool):
+            snapshot.has_active_subscription = active_subscription
         snapshot.subscription_checked_at = utcnow()
         snapshot.last_seen_at = utcnow()
         await db.commit()

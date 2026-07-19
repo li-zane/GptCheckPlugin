@@ -329,6 +329,46 @@ class UsageEstimateTests(unittest.TestCase):
             self.assertAlmostEqual(aggregate["estimated_limit"], expected_limit)
             self.assertAlmostEqual(aggregate["remaining"], expected_limit)
 
+    def test_zero_percent_with_positive_spend_uses_sample_or_range_midpoint(self) -> None:
+        account = {"email": "k12@example.com", "status": "active", "schedulable": True}
+        spent = 0.31388
+        calibrations = {
+            "five_hour": {
+                "k12": {"lower": 12.0, "upper": 20.0, "mean": 17.27, "sigma": 1.0},
+            },
+            "seven_day": {
+                "k12": {"lower": 90.0, "upper": 130.0, "mean": None, "sigma": None},
+            },
+        }
+
+        for window_key, expected_limit in (("five_hour", 17.27), ("seven_day", 110.0)):
+            with self.subTest(window_key=window_key):
+                window = _window_estimate(
+                    account=account,
+                    usage={
+                        window_key: {
+                            "used_percent": 0.0,
+                            "remaining_seconds": 1_000,
+                            "window_stats": {"cost": spent},
+                        }
+                    },
+                    window_key=window_key,
+                    account_key="id:k12",
+                    account_id="k12",
+                    email="k12@example.com",
+                    plan_cohort="k12",
+                    usage_states={},
+                    limit_calibrations=calibrations,
+                )
+
+                self.assertAlmostEqual(window["estimated_limit"], expected_limit)
+                self.assertAlmostEqual(window["remaining"], expected_limit - spent)
+                self.assertAlmostEqual(
+                    window["remaining_percent"],
+                    (expected_limit - spent) / expected_limit * 100,
+                )
+                self.assertEqual(window["estimate_basis"], "sample_limit_zero_usage")
+
     def test_remaining_seconds_without_reset_at_derives_reset_at(self) -> None:
         before = usage_estimate.utcnow()
         usage = usage_estimate.materialize_usage_reset_times(

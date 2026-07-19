@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import require_admin
 from app.schemas import (
+    MessageResponse,
     UpstreamChannelDiscoverAllRequest,
     UpstreamChannelDiscoverAllOut,
     UpstreamChannelOut,
@@ -53,7 +54,7 @@ async def sync_upstream_channel_inventory(
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
 
-    channel_count = len(result.channels)
+    channel_count = sum(item.account_count > 0 for item in result.channels)
     account_count = sum(item.account_count for item in result.channels) + len(
         result.unassigned_accounts
     )
@@ -104,12 +105,15 @@ async def discover_all_upstream_channels(
             inventory_started_at = perf_counter()
             overview = await service.overview(db)
             inventory_duration_ms = elapsed_ms(inventory_started_at)
+            occupied_channels = [
+                channel for channel in overview.channels if channel.account_count > 0
+            ]
             result = UpstreamChannelDiscoverAllOut(
-                total=len(overview.channels),
+                total=len(occupied_channels),
                 succeeded=0,
                 failed=0,
                 cached=0,
-                skipped=len(overview.channels),
+                skipped=len(occupied_channels),
                 force=True,
                 cache_max_age_seconds=None,
                 probe_globally_enabled=False,
@@ -187,6 +191,20 @@ async def update_upstream_channel(
         return await service.update_channel(db, channel_id, payload)
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
+
+
+@router.delete("/{channel_id}", response_model=MessageResponse)
+async def delete_upstream_channel(
+    channel_id: ChannelId,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+) -> MessageResponse:
+    try:
+        await service.delete_channel(db, channel_id)
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+    return MessageResponse(message="空渠道已删除。")
 
 
 @router.post("/{channel_id}/discover", response_model=UpstreamChannelOut)

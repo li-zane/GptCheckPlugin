@@ -1000,7 +1000,6 @@ class UpstreamChannelService:
         channels = [
             self._channel_out(channel, grouped.get(channel.id, []))
             for channel in sorted(channels_by_id.values(), key=lambda item: (item.display_name.casefold(), item.id))
-            if grouped.get(channel.id)
         ]
         return UpstreamOverviewOut(
             local_recharge_multiplier=local_recharge,
@@ -1017,6 +1016,42 @@ class UpstreamChannelService:
             ),
             priority_intervals=priority_intervals,
         )
+
+    async def delete_channel(self, db: AsyncSession, channel_id: int) -> None:
+        # Keep the same lock order as inventory updates so an account cannot be
+        # assigned to the channel while its final emptiness check is running.
+        async with self._inventory_lock:
+            lock = await self._lock_for(channel_id)
+            async with lock:
+                channel = await self._load_channel(db, channel_id)
+                remote_by_id = {
+                    account_id: account
+                    for account in await self.accounts._remote_accounts()
+                    if (account_id := self.accounts._numeric_remote_id(account)) is not None
+                }
+                config_result = await db.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.channel_id == channel_id
+                    )
+                )
+                configs = list(config_result.scalars().all())
+                has_current_config = any(
+                    config.sub2api_account_id in remote_by_id for config in configs
+                )
+                has_unsynced_origin_account = any(
+                    _remote_base_url(account) == channel.canonical_base_url
+                    for account in remote_by_id.values()
+                )
+                if has_current_config or has_unsynced_origin_account:
+                    raise UpstreamAccountServiceError(
+                        "An upstream channel with API key accounts cannot be deleted.",
+                        status_code=409,
+                    )
+
+                for config in configs:
+                    await db.delete(config)
+                await db.delete(channel)
+                await db.commit()
 
     async def update_channel(
         self,
@@ -2107,9 +2142,12 @@ class UpstreamChannelService:
         channels: list[UpstreamChannelOut] = []
         succeeded = 0
         failed = 0
+        occupied_channels = [
+            channel for channel in overview.channels if channel.account_count > 0
+        ]
         eligible_channels = [
             channel
-            for channel in overview.channels
+            for channel in occupied_channels
             if channel.probe_enabled
             and (
                 not require_management_credentials
@@ -2136,7 +2174,7 @@ class UpstreamChannelService:
         channels_to_probe = [
             channel for channel in eligible_channels if channel.id not in cached_channel_ids
         ]
-        skipped = len(overview.channels) - len(eligible_channels)
+        skipped = len(occupied_channels) - len(eligible_channels)
         effective_concurrency = (
             len(channels_to_probe) if max_concurrency == 0 else max_concurrency
         )
@@ -2231,7 +2269,7 @@ class UpstreamChannelService:
             remote_by_id=remote_by_id,
         )
         return UpstreamChannelDiscoverAllOut(
-            total=len(overview.channels),
+            total=len(occupied_channels),
             succeeded=succeeded,
             failed=failed,
             cached=len(cached_channels),

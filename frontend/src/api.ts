@@ -372,6 +372,10 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
+  deleteUpstreamChannel: (channelId: number | string) =>
+    request<{ message: string }>(`/api/upstream-channels/${encodeURIComponent(String(channelId))}`, {
+      method: "DELETE",
+    }),
   discoverUpstreamChannel: (channelId: number | string) =>
     request<UpstreamChannel>(
       `/api/upstream-channels/${encodeURIComponent(String(channelId))}/discover`,

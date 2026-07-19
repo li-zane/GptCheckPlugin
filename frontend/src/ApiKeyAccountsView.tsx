@@ -94,6 +94,7 @@ import type {
 } from "./types";
 
 type StatusFilter = "all" | "pending" | "attention" | "undiscovered";
+type ChannelOccupancyFilter = "occupied" | "empty";
 type RateLogFilters = { startDate: string; endDate: string };
 type PriorityIntervalFilter = "all" | "unassigned" | string;
 type PlatformFilter = "all" | "__unknown__" | string;
@@ -196,6 +197,7 @@ export function ApiKeyAccountsView({
   const [busyAccounts, setBusyAccounts] = useState<Record<string, string>>({});
   const [channelSearch, setChannelSearch] = useState("");
   const [channelStatusFilter, setChannelStatusFilter] = useState<StatusFilter>("all");
+  const [channelOccupancyFilter, setChannelOccupancyFilter] = useState<ChannelOccupancyFilter>("occupied");
   const [accountSearch, setAccountSearch] = useState("");
   const [accountStatusFilter, setAccountStatusFilter] = useState<StatusFilter>("all");
   const [priorityIntervalFilter, setPriorityIntervalFilter] = useState<PriorityIntervalFilter>("all");
@@ -468,6 +470,15 @@ export function ApiKeyAccountsView({
 
   const allAccountEntries = useMemo(() => flattenUpstreamAccounts(data), [data]);
   const allAccounts = useMemo(() => allAccountEntries.map(({ account }) => account), [allAccountEntries]);
+  const occupiedChannels = useMemo(
+    () => data.channels.filter((channel) => channelAccountCount(channel) > 0),
+    [data.channels],
+  );
+  const emptyChannels = useMemo(
+    () => data.channels.filter((channel) => channelAccountCount(channel) === 0),
+    [data.channels],
+  );
+  const occupancyChannels = channelOccupancyFilter === "occupied" ? occupiedChannels : emptyChannels;
   const priorityIntervals = data.priority_intervals || [];
   const platformOptions = useMemo(() => upstreamAccountPlatforms(allAccountEntries), [allAccountEntries]);
   const filteredAccountEntries = useMemo(() => {
@@ -481,17 +492,17 @@ export function ApiKeyAccountsView({
 
   const summary = useMemo(
     () => ({
-      channels: data.channels.length,
+      channels: occupiedChannels.length,
       accounts: allAccounts.length,
       pending: allAccounts.filter((account) => account.would_change === true).length,
-      readableBalances: data.channels.filter((channel) => finiteNumber(channel.balance_remaining) !== null).length,
+      readableBalances: occupiedChannels.filter((channel) => finiteNumber(channel.balance_remaining) !== null).length,
     }),
-    [allAccounts, data.channels],
+    [allAccounts, occupiedChannels],
   );
 
   const filteredChannels = useMemo(() => {
     const query = channelSearch.trim().toLowerCase();
-    return data.channels
+    return occupancyChannels
       .map((channel) => {
         const channelMatches = !query || channelSearchText(channel).includes(query);
         const accounts = (channel.accounts || []).filter(
@@ -503,13 +514,14 @@ export function ApiKeyAccountsView({
         return { channel, accounts, visible: (channelMatches && channelStatusMatches) || accounts.length > 0 };
       })
       .filter((entry) => entry.visible);
-  }, [channelSearch, channelStatusFilter, data.channels]);
+  }, [channelSearch, channelStatusFilter, occupancyChannels]);
 
   const filteredUnassigned = useMemo(() => {
     const query = channelSearch.trim().toLowerCase();
+    if (channelOccupancyFilter === "empty") return [];
     if (channelStatusFilter !== "all" && channelStatusFilter !== "attention") return [];
     return data.unassigned_accounts.filter((account) => !query || accountSearchText(account).includes(query));
-  }, [channelSearch, channelStatusFilter, data.unassigned_accounts]);
+  }, [channelOccupancyFilter, channelSearch, channelStatusFilter, data.unassigned_accounts]);
 
   const setChannelBusy = (channel: UpstreamChannel, action: string | null) => {
     const key = channelKey(channel);
@@ -853,8 +865,27 @@ export function ApiKeyAccountsView({
     }
   };
 
+  const deleteChannel = async (channel: UpstreamChannel) => {
+    if (channelAccountCount(channel) > 0) return;
+    if (!window.confirm(`确认删除空渠道「${channelDisplayName(channel)}」？`)) return;
+    const finishOperation = onOperationStart();
+    setChannelBusy(channel, "delete");
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.deleteUpstreamChannel(channel.id);
+      await loadData(true);
+      setNotice(result.message || "空渠道已删除。");
+    } catch (reason) {
+      setError(errorMessage(reason, "空渠道删除失败"));
+    } finally {
+      setChannelBusy(channel, null);
+      finishOperation();
+    }
+  };
+
   const discoverAll = async () => {
-    if (!data.channels.length) {
+    if (!occupiedChannels.length) {
       setNotice(upstreamDiscoveryCopy(rateWritesEnabled).empty);
       return;
     }
@@ -1133,7 +1164,7 @@ export function ApiKeyAccountsView({
           <div className="api-key-toolbar-actions">
             <button
               className="api-key-button api-key-button--secondary"
-              disabled={mutationControlsDisabled || anyBusy || !data.channels.length}
+              disabled={mutationControlsDisabled || anyBusy || !occupiedChannels.length}
               onClick={() => void discoverAll()}
               type="button"
             >
@@ -1153,8 +1184,22 @@ export function ApiKeyAccountsView({
               type="search"
               value={channelSearch}
             />
-            <small>{filteredChannels.length}/{data.channels.length}</small>
+            <small>{filteredChannels.length}/{occupancyChannels.length}</small>
           </label>
+          <div className="api-key-segmented api-key-channel-occupancy-filter" role="group" aria-label="渠道账号状态">
+            <button
+              aria-pressed={channelOccupancyFilter === "occupied"}
+              className={channelOccupancyFilter === "occupied" ? "active" : ""}
+              onClick={() => setChannelOccupancyFilter("occupied")}
+              type="button"
+            >有账号渠道 {occupiedChannels.length}</button>
+            <button
+              aria-pressed={channelOccupancyFilter === "empty"}
+              className={channelOccupancyFilter === "empty" ? "active" : ""}
+              onClick={() => setChannelOccupancyFilter("empty")}
+              type="button"
+            >无账号渠道 {emptyChannels.length}</button>
+          </div>
           <label className="api-key-filter-select">
             <span>状态</span>
             <select onChange={(event) => setChannelStatusFilter(event.target.value as StatusFilter)} value={channelStatusFilter}>
@@ -1187,6 +1232,7 @@ export function ApiKeyAccountsView({
                 globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
                 key={channelKey(channel)}
                 onConfigureChannel={() => openChannelConfig(channel)}
+                onDelete={() => void deleteChannel(channel)}
                 onDiscover={() => void discoverChannel(channel)}
                 onShowAccounts={() => openChannelAccounts(channel)}
                 rateWritesEnabled={rateWritesEnabled}
@@ -1627,6 +1673,7 @@ function ChannelCard({
   busyAction,
   globallyDisabled,
   onConfigureChannel,
+  onDelete,
   onDiscover,
   onShowAccounts,
   rateWritesEnabled,
@@ -1637,6 +1684,7 @@ function ChannelCard({
   busyAction?: string;
   globallyDisabled: boolean;
   onConfigureChannel: () => void;
+  onDelete?: () => void;
   onDiscover: () => void;
   onShowAccounts: () => void;
   rateWritesEnabled: boolean;
@@ -1699,16 +1747,29 @@ function ChannelCard({
           >
             <Pencil size={15} />
           </button>
-          <button
-            aria-label={discoveryCopy.channelAriaPrefix + " " + channelDisplayName(channel)}
-            className="api-key-icon-button api-key-icon-button--discover"
-            disabled={busy}
-            onClick={onDiscover}
-            title={discoveryCopy.channelTitle}
-            type="button"
-          >
-            <Radar className={busyAction === "discover" ? "spin" : ""} size={15} />
-          </button>
+          {accountCount > 0 ? (
+            <button
+              aria-label={discoveryCopy.channelAriaPrefix + " " + channelDisplayName(channel)}
+              className="api-key-icon-button api-key-icon-button--discover"
+              disabled={busy}
+              onClick={onDiscover}
+              title={discoveryCopy.channelTitle}
+              type="button"
+            >
+              <Radar className={busyAction === "discover" ? "spin" : ""} size={15} />
+            </button>
+          ) : (
+            <button
+              aria-label={"删除空渠道 " + channelDisplayName(channel)}
+              className="api-key-icon-button api-key-icon-button--danger"
+              disabled={busy}
+              onClick={onDelete}
+              title="删除空渠道"
+              type="button"
+            >
+              <Trash2 size={15} />
+            </button>
+          )}
         </div>
       </header>
 

@@ -176,6 +176,23 @@ test("subscription refresh concurrency preserves zero as unlimited", () => {
   );
 });
 
+test("subscription presentation keeps seat-based K12 plans visible", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /seatBasedSubscriptionTypes = new Set\(\["team", "k12"/);
+  assert.match(source, /return account\.has_active_subscription === false && !seatBasedSubscriptionTypes\.has\(subscriptionType\)/);
+  assert.match(source, /return subscriptionIsInvalid\(account\) \? "订阅无效" : plan === "active" \? "正常" : plan/);
+});
+
+test("upstream channels separate occupied and deletable empty channels", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(source, /useState<ChannelOccupancyFilter>\("occupied"\)/);
+  assert.match(source, />有账号渠道 \{occupiedChannels\.length\}<\/button>/);
+  assert.match(source, />无账号渠道 \{emptyChannels\.length\}<\/button>/);
+  assert.match(source, /accountCount > 0 \? \(/);
+  assert.match(source, /api\.deleteUpstreamChannel\(channel\.id\)/);
+  assert.match(source, /title="删除空渠道"/);
+});
+
 test("overview error count follows the live account rows", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   assert.match(

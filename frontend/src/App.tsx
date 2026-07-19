@@ -134,6 +134,7 @@ const defaultSiteName = "sub2api AT 刷新机";
 const defaultUsageLimitSampleThresholdPercent = 99;
 const usageLimitWindowKeys = ["five_hour", "seven_day", "monthly"] as const;
 const coreSubscriptionTypes = new Set(["plus", "team", "pro", "free", "k12", "unknown"]);
+const seatBasedSubscriptionTypes = new Set(["team", "k12", "enterprise", "enterprise-edu", "edu"]);
 const defaultUsageLimitPlanRanges: UsageLimitPlanRanges = {
   five_hour: { lower: 15, upper: 25 },
   seven_day: { lower: 100, upper: 140 },
@@ -2613,7 +2614,7 @@ function HistoricalQuotaCell({ history }: { history: UsageTokenHistory }) {
 
 function AccountSubscriptionCell({ account, timeZone }: { account: Account; timeZone: string }) {
   const period = account.subscription_billing_period ? periodLabel(account.subscription_billing_period) : null;
-  const activeTone = account.has_active_subscription === false ? "warn" : account.has_active_subscription === true ? "ok" : "ink";
+  const activeTone = subscriptionIsInvalid(account) ? "warn" : account.has_active_subscription === true ? "ok" : "ink";
   const planLabelText = accountSubscriptionTypeLabel(account);
   if (!account.subscription_expires_at && !account.subscription_starts_at && !account.subscription_renews_at) {
     return (
@@ -2938,7 +2939,7 @@ function UsageAccountTags({ groups }: { groups: UsageGroupRef[] }) {
 
 function UsageSubscriptionCell({ account }: { account: AccountUsageEstimate }) {
   const period = account.subscription_billing_period ? periodLabel(account.subscription_billing_period) : null;
-  const tone = account.has_active_subscription === false ? "warn" : account.has_active_subscription === true ? "ok" : "ink";
+  const tone = subscriptionIsInvalid(account) ? "warn" : account.has_active_subscription === true ? "ok" : "ink";
   const label = usageSubscriptionLabel(account);
   return (
     <div className="usage-subscription-cell">
@@ -2989,7 +2990,7 @@ function usageSubscriptionLabel(
   const plan = account.subscription_type
     ? subscriptionTypeLabel(account.subscription_type)
     : account.subscription_label || planLabel(account.subscription_plan || account.account_type || account.platform || "未知");
-  return account.has_active_subscription === false ? "订阅无效" : plan === "active" ? "正常" : plan;
+  return subscriptionIsInvalid(account) ? "订阅无效" : plan === "active" ? "正常" : plan;
 }
 
 function usageSubscriptionFilterOptions(accounts: AccountUsageEstimate[]) {
@@ -5840,7 +5841,14 @@ function accountSubscriptionTypeLabel(
   const plan = account.subscription_type
     ? subscriptionTypeLabel(account.subscription_type)
     : account.subscription_label || planLabel(account.subscription_plan || account.account_type || account.platform || "未知");
-  return account.has_active_subscription === false ? "订阅无效" : plan === "active" ? "正常" : plan;
+  return subscriptionIsInvalid(account) ? "订阅无效" : plan === "active" ? "正常" : plan;
+}
+
+function subscriptionIsInvalid(
+  account: Pick<Account, "has_active_subscription" | "subscription_plan" | "subscription_type">,
+) {
+  const subscriptionType = normalizeSubscriptionType(account.subscription_type || account.subscription_plan);
+  return account.has_active_subscription === false && !seatBasedSubscriptionTypes.has(subscriptionType);
 }
 
 function accountScheduleTone(account: Account, usage?: AccountUsageEstimate) {

@@ -3995,6 +3995,12 @@ select:focus {
   padding-bottom: 13px;
 }
 
+.api-key-segmented.api-key-channel-occupancy-filter {
+  flex: 0 1 270px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 240px;
+}
+
 .api-key-search {
   align-items: center;
   background: var(--field);
@@ -4631,6 +4637,11 @@ fieldset.api-key-field {
   }
 
   .api-key-filter-select {
+    min-width: 0;
+  }
+
+  .api-key-channel-occupancy-filter {
+    grid-column: 1 / -1;
     min-width: 0;
   }
 

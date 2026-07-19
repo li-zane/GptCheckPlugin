@@ -227,6 +227,83 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         channels = await self.db.execute(select(UpstreamChannel))
         self.assertEqual(len(channels.scalars().all()), 1)
 
+    async def test_overview_includes_empty_channel_and_delete_removes_it(self) -> None:
+        empty_channel = UpstreamChannel(
+            display_name="Old upstream",
+            canonical_base_url="https://old-upstream.example",
+            upstream_type="auto",
+            group_options=[],
+            recharge_multiplier_status="not_discovered",
+            balance_status="not_checked",
+        )
+        self.db.add(empty_channel)
+        await self.db.commit()
+
+        overview = await self.service.overview(self.db)
+        empty = next(channel for channel in overview.channels if channel.id == empty_channel.id)
+        self.assertEqual(empty.account_count, 0)
+        self.assertEqual(empty.accounts, [])
+
+        await self.service.delete_channel(self.db, empty_channel.id)
+
+        self.assertIsNone(await self.db.get(UpstreamChannel, empty_channel.id))
+
+    async def test_delete_channel_rejects_current_api_key_accounts(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+
+        with self.assertRaises(UpstreamAccountServiceError) as caught:
+            await self.service.delete_channel(self.db, channel_id)
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIsNotNone(await self.db.get(UpstreamChannel, channel_id))
+
+    async def test_delete_channel_rejects_unsynced_account_with_same_origin(self) -> None:
+        empty_channel = UpstreamChannel(
+            display_name="New upstream",
+            canonical_base_url="https://new-upstream.example",
+            upstream_type="auto",
+        )
+        self.db.add(empty_channel)
+        await self.db.commit()
+        self.sub2api.accounts.append(
+            {
+                "id": 9,
+                "name": "not-yet-synced",
+                "platform": "openai",
+                "type": "api_key",
+                "status": "active",
+                "schedulable": True,
+                "credentials": {"base_url": "https://new-upstream.example/v1"},
+            }
+        )
+
+        with self.assertRaises(UpstreamAccountServiceError) as caught:
+            await self.service.delete_channel(self.db, empty_channel.id)
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIsNotNone(await self.db.get(UpstreamChannel, empty_channel.id))
+
+    async def test_delete_empty_channel_removes_stale_account_configs(self) -> None:
+        empty_channel = UpstreamChannel(
+            display_name="Stale upstream",
+            canonical_base_url="https://stale-upstream.example",
+            upstream_type="auto",
+        )
+        self.db.add(empty_channel)
+        await self.db.flush()
+        stale_config = UpstreamAccountConfig(
+            sub2api_account_id=999,
+            remote_name="Removed account",
+            channel_id=empty_channel.id,
+        )
+        self.db.add(stale_config)
+        await self.db.commit()
+
+        await self.service.delete_channel(self.db, empty_channel.id)
+
+        self.assertIsNone(await self.db.get(UpstreamChannel, empty_channel.id))
+        self.assertIsNone(await self.db.get(UpstreamAccountConfig, stale_config.id))
+
     async def test_read_only_overview_does_not_flush_projected_target_rate(self) -> None:
         overview = await self.service.overview(self.db)
         channel_id = overview.channels[0].id
@@ -2944,6 +3021,25 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpstreamChannelAuthenticationTests(unittest.TestCase):
+    def test_delete_channel_uses_authenticated_service(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-channels")
+        db = AsyncMock()
+        service = SimpleNamespace(delete_channel=AsyncMock())
+
+        async def fake_db():
+            yield db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = fake_db
+        app.dependency_overrides[get_upstream_channel_service] = lambda: service
+        with TestClient(app) as client:
+            response = client.delete("/api/upstream-channels/7")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["message"], "空渠道已删除。")
+        service.delete_channel.assert_awaited_once_with(db, 7)
+
     def test_sync_inventory_returns_overview_without_running_discovery(self) -> None:
         app = FastAPI()
         app.include_router(router, prefix="/api/upstream-channels")
@@ -3083,7 +3179,8 @@ class UpstreamChannelAuthenticationTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertFalse(response.json()["probe_globally_enabled"])
-        self.assertEqual(response.json()["skipped"], 1)
+        self.assertEqual(response.json()["total"], 0)
+        self.assertEqual(response.json()["skipped"], 0)
         service.overview.assert_awaited_once_with(db)
         service.discover_all.assert_not_awaited()
 

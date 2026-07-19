@@ -1671,12 +1671,25 @@ def _window_estimate(
     raw_limit_value = _coerce_float(raw_limit)
     raw_estimated_limit = usage_estimated_limit or raw_limit_value
     used_zero_usage_fallback = False
+    used_zero_percent_fallback = False
     if (
         (raw_estimated_limit is None or raw_estimated_limit <= 0)
-        and (estimate_spent is None or estimate_spent <= 0)
+        and (
+            estimate_spent is None
+            or estimate_spent <= 0
+            or (
+                normalized_used_percent is not None
+                and normalized_used_percent <= EPSILON
+            )
+        )
     ):
         raw_estimated_limit = _zero_usage_limit_estimate(calibration)
         used_zero_usage_fallback = raw_estimated_limit is not None
+        used_zero_percent_fallback = bool(
+            used_zero_usage_fallback
+            and normalized_used_percent is not None
+            and normalized_used_percent <= EPSILON
+        )
     estimated_limit = (
         _trusted_full_window_limit(raw_estimated_limit, normalized_used_percent)
         or _calibrated_limit(
@@ -1714,7 +1727,7 @@ def _window_estimate(
         ):
             remaining = max(parsed_raw_remaining, 0.0)
             remaining_percent = (remaining / estimated_limit * 100) if estimated_limit > 0 else 0
-        elif normalized_used_percent is not None:
+        elif normalized_used_percent is not None and not used_zero_percent_fallback:
             remaining_percent = max(100 - normalized_used_percent, 0)
             remaining = estimated_limit * (remaining_percent / 100)
         elif estimate_spent is not None:
