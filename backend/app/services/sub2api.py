@@ -12,7 +12,6 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings, get_settings
-from app.core.upstream_urls import canonicalize_upstream_url
 from app.services.runtime_config import EffectiveSub2ApiConfig, get_runtime_config_service
 
 
@@ -73,6 +72,9 @@ MAX_REMOTE_ACCOUNT_ERROR_CHARS = 500
 MAX_SUB2API_ACCOUNT_PAGES = 100
 MAX_SUB2API_ACCOUNTS = 10_000
 MAX_SUB2API_PRIORITY = 9_007_199_254_740_991
+MAX_EXPORTED_OAUTH_TOKEN_LENGTH = 65_536
+MAX_EXPORTED_OAUTH_CLIENT_ID_LENGTH = 4_096
+MAX_EXPORTED_OAUTH_METADATA_LENGTH = 512
 SUB2API_MUTATION_READBACK_ATTEMPTS = 3
 SUB2API_MUTATION_READBACK_DELAY_SECONDS = 0.1
 SUB2API_MUTATION_READBACK_TIMEOUT_SECONDS = 10.0
@@ -729,73 +731,133 @@ class Sub2ApiClient:
     def _api_key_export_identity(
         self,
         account: dict[str, Any],
-    ) -> tuple[str, str, str, str] | None:
+    ) -> tuple[str, str] | None:
         name = self.account_name(account)
-        platform = self.account_platform(account)
         raw_type = _first_value(
             account,
             ("type",),
             ("account_type",),
             ("auth_type",),
         )
-        base_url = _first_string(
-            account,
-            ("credentials", "base_url"),
-            ("credentials", "baseURL"),
-            ("credentials", "api_base"),
-            ("credentials", "api_base_url"),
-            ("credentials", "base_uri"),
-            ("credentials", "endpoint"),
-            ("base_url",),
-            ("baseURL",),
-            ("api_base",),
-            ("api_base_url",),
-            ("base_uri",),
-            ("endpoint",),
-        )
-        if not name or not platform or not isinstance(raw_type, str) or not base_url:
+        if not name or not isinstance(raw_type, str):
             return None
         normalized_type = raw_type.strip().lower().replace("-", "_").replace(" ", "_")
         if normalized_type not in {"apikey", "api_key"}:
             return None
-        try:
-            normalized_base_url = canonicalize_upstream_url(base_url)
-        except (TypeError, ValueError):
-            return None
-        return (
-            name,
-            platform.strip().lower(),
-            "api_key",
-            normalized_base_url,
-        )
+        return name, "api_key"
 
-    def _api_key_inventory(
+    def _api_key_account_identity(
         self,
-        accounts: list[dict[str, Any]],
-        requested: set[int],
-    ) -> dict[int, tuple[str, str, str, str]] | None:
-        by_id: dict[int, tuple[str, str, str, str]] = {}
-        by_identity: dict[tuple[str, str, str, str], int] = {}
-        for account in accounts:
-            account_type = (self.account_type(account) or "").strip().lower()
-            normalized_type = account_type.replace("-", "_").replace(" ", "_")
-            if normalized_type not in {"apikey", "api_key"}:
-                continue
-            account_id = _positive_int(self.account_id(account))
-            identity = self._api_key_export_identity(account)
-            if account_id is None or identity is None:
-                return None
-            if account_id in by_id or identity in by_identity:
-                return None
-            by_id[account_id] = identity
-            by_identity[identity] = account_id
-
-        if not requested.issubset(by_id):
+        account: dict[str, Any],
+    ) -> tuple[int, str, str] | None:
+        account_id = _positive_int(self.account_id(account))
+        export_identity = self._api_key_export_identity(account)
+        if account_id is None or export_identity is None:
             return None
-        return by_id
+        return account_id, *export_identity
 
     async def export_api_key_secrets(self, account_ids: list[int]) -> dict[int, str]:
         """Read API keys from the protected local admin export without caching them."""
+
+        normalized_ids: list[int] = []
+        for raw_id in account_ids:
+            account_id = _positive_int(raw_id)
+            if account_id is None or account_id in normalized_ids:
+                continue
+            normalized_ids.append(account_id)
+        if not normalized_ids or len(normalized_ids) > 200:
+            return {}
+
+        config = await get_runtime_config_service().get_sub2api_config()
+
+        async def request_export(account_id: int) -> list[Any] | None:
+            try:
+                payload = await self._request(
+                    "GET",
+                    f"{config.accounts_path}/data",
+                    config=config,
+                    params={"ids": str(account_id), "include_proxies": "false"},
+                )
+            except Sub2ApiRequestError:
+                return None
+            unwrapped = self._unwrap(payload)
+            return unwrapped if isinstance(unwrapped, list) else None
+
+        def exported_key(item: Any) -> str | None:
+            if not isinstance(item, dict):
+                return None
+            credentials = item.get("credentials")
+            if not isinstance(credentials, dict):
+                return None
+            raw_key = _first_value(
+                credentials,
+                ("api_key",),
+                ("apiKey",),
+                ("apikey",),
+            )
+            if not isinstance(raw_key, str):
+                return None
+            api_key = raw_key.strip()
+            if (
+                not api_key
+                or len(api_key) > 8192
+                or _looks_redacted(api_key)
+                or any(ord(char) < 32 or ord(char) == 127 for char in api_key)
+            ):
+                return None
+            return api_key
+
+        result: dict[int, str] = {}
+        for account_id in normalized_ids:
+            try:
+                before = await self.get_account_by_id(account_id, config=config)
+            except Sub2ApiRequestError:
+                continue
+            before_identity = (
+                self._api_key_account_identity(before)
+                if isinstance(before, dict)
+                else None
+            )
+            if before_identity is None or before_identity[0] != account_id:
+                continue
+
+            exported = await request_export(account_id)
+            if exported is None or len(exported) != 1 or not isinstance(exported[0], dict):
+                continue
+            item = exported[0]
+            raw_exported_id = _first_value(
+                item,
+                ("id",),
+                ("account_id",),
+                ("accountId",),
+            )
+            if raw_exported_id is not None and _positive_int(raw_exported_id) != account_id:
+                continue
+            if self._api_key_export_identity(item) != before_identity[1:]:
+                continue
+            api_key = exported_key(item)
+            if api_key is None:
+                continue
+
+            try:
+                after = await self.get_account_by_id(account_id, config=config)
+            except Sub2ApiRequestError:
+                continue
+            after_identity = (
+                self._api_key_account_identity(after)
+                if isinstance(after, dict)
+                else None
+            )
+            if after_identity != before_identity:
+                continue
+            result[account_id] = api_key
+        return result
+
+    async def export_oauth_credentials(
+        self,
+        account_ids: list[int],
+    ) -> dict[int, dict[str, Any]]:
+        """Export an ID-bound, allowlisted OAuth credential set from sub2api."""
 
         normalized_ids: list[int] = []
         for raw_id in account_ids:
@@ -825,74 +887,134 @@ class Sub2ApiClient:
             unwrapped = self._unwrap(payload)
             return unwrapped if isinstance(unwrapped, list) else None
 
+        def exported_secret(item: dict[str, Any], *aliases: str, maximum: int) -> str | None:
+            credentials = item.get("credentials")
+            if not isinstance(credentials, dict):
+                return None
+            raw_value = _first_value(credentials, *((alias,) for alias in aliases))
+            if not isinstance(raw_value, str):
+                return None
+            value = raw_value.strip()
+            if (
+                not value
+                or len(value) > maximum
+                or _looks_redacted(value)
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            ):
+                return None
+            return value
+
+        def exported_credentials(item: Any) -> dict[str, Any] | None:
+            if not isinstance(item, dict) or not self.is_oauth_account(item):
+                return None
+            access_token = exported_secret(
+                item,
+                "access_token",
+                "accessToken",
+                maximum=MAX_EXPORTED_OAUTH_TOKEN_LENGTH,
+            )
+            refresh_token = exported_secret(
+                item,
+                "refresh_token",
+                "refreshToken",
+                "rt",
+                maximum=MAX_EXPORTED_OAUTH_TOKEN_LENGTH,
+            )
+            id_token = exported_secret(
+                item,
+                "id_token",
+                "idToken",
+                maximum=MAX_EXPORTED_OAUTH_TOKEN_LENGTH,
+            )
+            client_id = exported_secret(
+                item,
+                "client_id",
+                "clientId",
+                maximum=MAX_EXPORTED_OAUTH_CLIENT_ID_LENGTH,
+            )
+            result: dict[str, Any] = {}
+            for key, value in (
+                ("access_token", access_token),
+                ("refresh_token", refresh_token),
+                ("id_token", id_token),
+                ("client_id", client_id),
+            ):
+                if value:
+                    result[key] = value
+
+            credentials = item.get("credentials")
+            contexts = [source for source in (credentials, item) if isinstance(source, dict)]
+            for source in contexts:
+                derived = self.credentials_from_session(source, access_token or "")
+                for key in ("expires_at", "plan_type", *SUBSCRIPTION_CREDENTIAL_KEYS):
+                    value = derived.get(key)
+                    if isinstance(value, bool):
+                        result[key] = value
+                    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                        result[key] = value
+                    elif isinstance(value, str):
+                        normalized = value.strip()
+                        if normalized and len(normalized) <= MAX_EXPORTED_OAUTH_METADATA_LENGTH:
+                            result[key] = normalized
+            return result or None
+
+        requested = set(normalized_ids)
         exported = await request_export()
         if exported is None:
             return {}
 
-        requested = set(normalized_ids)
-
-        def exported_key(item: Any) -> str | None:
-            if not isinstance(item, dict):
-                return None
-            credentials = item.get("credentials")
-            if not isinstance(credentials, dict):
-                return None
-            raw_key = _first_value(
-                credentials,
-                ("api_key",),
-                ("apiKey",),
-                ("apikey",),
-            )
-            if not isinstance(raw_key, str):
-                return None
-            api_key = raw_key.strip()
-            if (
-                not api_key
-                or len(api_key) > 8192
-                or _looks_redacted(api_key)
-                or any(ord(char) < 32 or ord(char) == 127 for char in api_key)
-            ):
-                return None
-            return api_key
-
         raw_response_ids = [
-            _first_value(
-                item,
-                ("id",),
-                ("account_id",),
-                ("accountId",),
-            )
+            _first_value(item, ("id",), ("account_id",), ("accountId",))
             if isinstance(item, dict)
             else None
             for item in exported
         ]
-        response_ids = [_positive_int(value) for value in raw_response_ids]
-        result: dict[int, str] = {}
         if any(value is not None for value in raw_response_ids):
+            result: dict[int, dict[str, Any]] = {}
             duplicate_ids: set[int] = set()
-            for account_id, item in zip(response_ids, exported, strict=True):
+            for raw_id, item in zip(raw_response_ids, exported, strict=True):
+                account_id = _positive_int(raw_id)
                 if account_id is None or account_id not in requested:
                     continue
                 if account_id in result:
                     duplicate_ids.add(account_id)
                     continue
-                api_key = exported_key(item)
-                if api_key:
-                    result[account_id] = api_key
+                credentials = exported_credentials(item)
+                if credentials:
+                    result[account_id] = credentials
             for account_id in duplicate_ids:
                 result.pop(account_id, None)
             return result
 
-        # Current sub2api backup exports deliberately omit database ids. The
-        # first export only detects that compatibility format; its secrets are
-        # discarded. Only a second export bracketed by stable inventories can
-        # supply returned credentials.
-        exported = []
+        # Backup-style exports omit database IDs. Discard the format probe and
+        # accept a second export only when the requested ID-to-email inventory
+        # remains stable around it.
+        def inventory_by_id(accounts: list[dict[str, Any]]) -> dict[int, str] | None:
+            by_id: dict[int, str] = {}
+            emails: set[str] = set()
+            for account in accounts:
+                account_id = _positive_int(self.account_id(account))
+                if account_id not in requested:
+                    continue
+                email = self.account_email(account)
+                if (
+                    account_id is None
+                    or not email
+                    or not self.is_gpt_account(account)
+                    or not self.is_oauth_account(account)
+                ):
+                    return None
+                normalized_email = email.strip().lower()
+                if account_id in by_id or normalized_email in emails:
+                    return None
+                by_id[account_id] = normalized_email
+                emails.add(normalized_email)
+            return by_id if set(by_id) == requested else None
+
         try:
             before_accounts = await self.list_accounts(config=config)
         except Sub2ApiRequestError:
             return {}
-
         exported = await request_export()
         if exported is None:
             return {}
@@ -907,31 +1029,31 @@ class Sub2ApiClient:
         except Sub2ApiRequestError:
             return {}
 
-        before_by_id = self._api_key_inventory(before_accounts, requested)
-        after_by_id = self._api_key_inventory(after_accounts, requested)
+        before_by_id = inventory_by_id(before_accounts)
+        after_by_id = inventory_by_id(after_accounts)
         if before_by_id is None or after_by_id is None or before_by_id != after_by_id:
             return {}
 
-        exported_by_identity: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        exported_by_email: dict[str, dict[str, Any]] = {}
         for item in exported:
             if not isinstance(item, dict):
                 return {}
-            identity = self._api_key_export_identity(item)
-            if identity is None or identity in exported_by_identity or exported_key(item) is None:
+            email = self.account_email(item)
+            credentials = exported_credentials(item)
+            if not email or credentials is None:
                 return {}
-            exported_by_identity[identity] = item
+            normalized_email = email.strip().lower()
+            if normalized_email in exported_by_email:
+                return {}
+            exported_by_email[normalized_email] = credentials
 
-        expected_identities = {before_by_id[account_id] for account_id in requested}
-        if set(exported_by_identity) != expected_identities:
+        expected_emails = set(before_by_id.values())
+        if set(exported_by_email) != expected_emails:
             return {}
-
-        for account_id in requested:
-            identity = before_by_id[account_id]
-            item = exported_by_identity[identity]
-            api_key = exported_key(item)
-            if api_key:
-                result[account_id] = api_key
-        return result
+        return {
+            account_id: exported_by_email[email]
+            for account_id, email in before_by_id.items()
+        }
 
     async def get_account_balance(self, account: dict[str, Any] | str | int) -> dict[str, Any]:
         raw_account_id = account if isinstance(account, (str, int)) else self.account_id(account)

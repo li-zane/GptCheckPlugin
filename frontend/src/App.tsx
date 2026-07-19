@@ -1196,6 +1196,9 @@ function Overview({
   const availableAccountCount = accounts.filter(
     (account) => !account.deactive && !accountHasError(account) && !accountRateLimited(account),
   ).length;
+  const errorAccountCount = accounts.filter(
+    (account) => !account.deactive && accountHasError(account),
+  ).length;
   const problemUnusedQuotaTitle = problemUnusedQuota
     ? `错误/封停账号 ${problemUnusedQuota.accountCount} 个，可估 ${problemUnusedQuota.sevenDay.estimable_accounts} 个，5h 未用 ${formatAggregateMoney(problemUnusedQuota.fiveHour)}`
     : "等待额度估算数据";
@@ -1205,7 +1208,7 @@ function Overview({
     { label: "可用", value: availableAccountCount, icon: CheckCircle2, tone: "ok" },
     { label: "重复", value: duplicateAccounts, icon: Link2, tone: "warn" },
     { label: "限流", value: rateLimitedAccountCount, icon: ShieldAlert, tone: "warn" },
-    { label: "错误", value: summary.error_accounts, icon: AlertTriangle, tone: "warn" },
+    { label: "错误", value: errorAccountCount, icon: AlertTriangle, tone: "warn" },
     { label: "暂停", value: summary.paused_accounts ?? 0, icon: PauseCircle, tone: "ink" },
     { label: "恢复中", value: summary.refreshing_accounts, icon: RefreshCcw, tone: "teal" },
     { label: "封禁", value: summary.deactive_accounts, icon: UserRoundX, tone: "danger" },

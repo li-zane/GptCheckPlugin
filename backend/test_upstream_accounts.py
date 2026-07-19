@@ -1698,17 +1698,47 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(readback_call.args, (17,))
             self.assertEqual(readback_call.kwargs, {"config": config})
 
-    async def test_export_maps_reordered_rows_by_explicit_account_id(self) -> None:
+    async def test_export_accepts_matching_explicit_ids_from_single_account_exports(self) -> None:
         client = Sub2ApiClient()
-        client._request = AsyncMock(  # type: ignore[method-assign]
-            return_value={
-                "data": [
-                    {"id": 18, "credentials": {"api_key": "sk-eighteen-private"}},
-                    {"id": 17, "credentials": {"api_key": "sk-seventeen-private"}},
-                ]
-            }
+        account_seventeen = {
+            "id": 17,
+            "name": "account-seventeen",
+            "type": "api_key",
+        }
+        account_eighteen = {
+            "id": 18,
+            "name": "account-eighteen",
+            "type": "apikey",
+        }
+        client.get_account_by_id = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                account_seventeen,
+                account_seventeen,
+                account_eighteen,
+                account_eighteen,
+            ]
         )
-        _config, runtime_patch = self._runtime_patch()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {
+                    "data": [
+                        {
+                            **account_seventeen,
+                            "credentials": {"api_key": "sk-seventeen-private"},
+                        }
+                    ]
+                },
+                {
+                    "data": [
+                        {
+                            **account_eighteen,
+                            "credentials": {"api_key": "sk-eighteen-private"},
+                        }
+                    ]
+                },
+            ]
+        )
+        config, runtime_patch = self._runtime_patch()
         with runtime_patch:
             exported = await client.export_api_key_secrets([17, 18])
 
@@ -1716,51 +1746,81 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
             exported,
             {17: "sk-seventeen-private", 18: "sk-eighteen-private"},
         )
+        self.assertEqual(
+            client._request.await_args_list,  # type: ignore[attr-defined]
+            [
+                call(
+                    "GET",
+                    "/admin/accounts/data",
+                    config=config,
+                    params={"ids": "17", "include_proxies": "false"},
+                ),
+                call(
+                    "GET",
+                    "/admin/accounts/data",
+                    config=config,
+                    params={"ids": "18", "include_proxies": "false"},
+                ),
+            ],
+        )
 
-    async def test_export_maps_backup_rows_by_unique_non_secret_identity(self) -> None:
+    async def test_export_maps_idless_backup_rows_by_isolated_account_id(self) -> None:
         client = Sub2ApiClient()
+        account_seventeen = {
+            "id": "17",
+            "name": "account-seventeen",
+            "platform": "OPENAI",
+            "type": "api-key",
+            "credentials": {"base_url": "https://upstream-seventeen.example"},
+        }
+        account_eighteen = {
+            "id": "18",
+            "name": "account-eighteen",
+            "platform": "anthropic",
+            "type": "apikey",
+            "credentials": {"base_url": "https://upstream-eighteen.example"},
+        }
+        client.get_account_by_id = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                account_seventeen,
+                account_seventeen,
+                account_eighteen,
+                account_eighteen,
+            ]
+        )
         client._request = AsyncMock(  # type: ignore[method-assign]
-            return_value={
-                "data": {
-                    "accounts": [
-                        {
-                            "name": "account-eighteen",
-                            "platform": "anthropic",
-                            "type": "apikey",
-                            "credentials": {
-                                "base_url": "https://upstream-eighteen.example/api/v1",
-                                "api_key": "sk-eighteen-private",
-                            },
-                        },
+            side_effect=[
+                {
+                    "data": {
+                        "accounts": [
                         {
                             "name": "account-seventeen",
-                            "platform": "openai",
+                            "platform": "custom",
                             "type": "api_key",
                             "credentials": {
-                                "base_url": "https://upstream-seventeen.example/v1",
+                                "base_url": "https://different-seventeen.example/v1",
                                 "api_key": "sk-seventeen-private",
                             },
                         },
-                    ],
-                    "proxies": [],
-                }
-            }
-        )
-        client.list_accounts = AsyncMock(  # type: ignore[method-assign]
-            return_value=[
-                {
-                    "id": "17",
-                    "name": "account-seventeen",
-                    "platform": "OPENAI",
-                    "type": "api-key",
-                    "credentials": {"base_url": "https://upstream-seventeen.example"},
+                        ],
+                        "proxies": [],
+                    }
                 },
                 {
-                    "id": "18",
-                    "name": "account-eighteen",
-                    "platform": "anthropic",
-                    "type": "apikey",
-                    "credentials": {"base_url": "https://upstream-eighteen.example"},
+                    "data": {
+                        "accounts": [
+                            {
+                                "name": "account-eighteen",
+                                "platform": "different",
+                                "type": "apikey",
+                                "credentials": {
+                                    "base_url": "https://different-eighteen.example/api/v1",
+                                    "api_key": "sk-eighteen-private",
+                                },
+                            },
+                        ],
+                        "proxies": [],
+                    }
                 },
             ]
         )
@@ -1776,14 +1836,22 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
             "GET",
             "/admin/accounts/data",
             config=config,
-            params={"ids": "17,18", "include_proxies": "false"},
+            params={"ids": "17", "include_proxies": "false"},
         )
         self.assertEqual(client._request.await_count, 2)  # type: ignore[attr-defined]
         self.assertEqual(
             client._request.await_args_list,  # type: ignore[attr-defined]
-            [expected_export_call, expected_export_call],
+            [
+                expected_export_call,
+                call(
+                    "GET",
+                    "/admin/accounts/data",
+                    config=config,
+                    params={"ids": "18", "include_proxies": "false"},
+                ),
+            ],
         )
-        self.assertEqual(client.list_accounts.await_count, 2)  # type: ignore[attr-defined]
+        self.assertEqual(client.get_account_by_id.await_count, 4)  # type: ignore[attr-defined]
 
     async def test_export_backup_rows_with_duplicate_identity_fail_closed(self) -> None:
         client = Sub2ApiClient()

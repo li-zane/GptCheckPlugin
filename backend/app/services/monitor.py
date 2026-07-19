@@ -1,10 +1,13 @@
 import asyncio
+from datetime import datetime, timezone
 from time import perf_counter
+from typing import Any
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.core.crypto import decrypt_text, encrypt_text
 from app.core.database import AsyncSessionLocal
 from app.models import AccountSnapshot, MailboxCredential, PhoneAccountBinding, PhoneNumber, utcnow
 from app.schemas import Sub2ApiSyncResult
@@ -15,10 +18,52 @@ from app.services.refresh import RefreshService, get_refresh_service
 from app.services.routed_mail_config import get_routed_mail_config_service
 from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient, looks_deactive_text, sanitize_payload
-from app.core.crypto import encrypt_text
+from app.services.subscription_refresh import refresh_subscriptions
 
 
 STARTUP_SYNC_DELAY_SECONDS = 10
+OAUTH_CREDENTIAL_EXPORT_BATCH_SIZE = 20
+_initial_subscription_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _consume_initial_subscription_task(task: asyncio.Task[None]) -> None:
+    _initial_subscription_background_tasks.discard(task)
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _coerce_expiry(value: Any) -> datetime | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    elif isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.isdigit():
+            try:
+                parsed = datetime.fromtimestamp(float(normalized), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        else:
+            try:
+                parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed if 0 < parsed.year <= 3000 else None
 
 
 async def _record_event_best_effort(db, *args, **kwargs) -> None:
@@ -137,11 +182,34 @@ class MonitorService:
                 and self.sub2api.is_oauth_account(account)
             ]
         )
+        exported_credentials: dict[int, dict[str, Any]] = {}
+        oauth_account_ids = [
+            int(account_id)
+            for account in accounts
+            if (account_id := self.sub2api.account_id(account)) and account_id.isdigit()
+        ]
+        for start in range(0, len(oauth_account_ids), OAUTH_CREDENTIAL_EXPORT_BATCH_SIZE):
+            batch = oauth_account_ids[start : start + OAUTH_CREDENTIAL_EXPORT_BATCH_SIZE]
+            exported_credentials.update(await self.sub2api.export_oauth_credentials(batch))
+        for account in accounts:
+            account_id = self.sub2api.account_id(account)
+            if not account_id or not account_id.isdigit():
+                continue
+            imported = exported_credentials.get(int(account_id))
+            if not imported:
+                continue
+            credentials = account.get("credentials")
+            if not isinstance(credentials, dict):
+                credentials = {}
+                account["credentials"] = credentials
+            credentials.update(imported)
+
         recovery_enabled = await self.runtime_config.get_recovery_enabled()
         total_seen = 0
         error_seen = 0
         queued = 0
         recovery_candidates: list[dict] = []
+        initial_subscription_candidates: list[dict[str, Any]] = []
         deferred_events: list[tuple[str, str, str]] = []
 
         async with AsyncSessionLocal() as inventory_db:
@@ -153,13 +221,15 @@ class MonitorService:
                 normalized = email.lower()
                 is_error = self.sub2api.is_error_account(account)
                 is_deactive = self.sub2api.is_deactive_account(account)
-                is_deactive, auto_refresh_locked = await self._upsert_snapshot(
+                is_deactive, auto_refresh_locked, initial_subscription_check = await self._upsert_snapshot(
                     normalized,
                     account,
                     is_error,
                     is_deactive,
                     db=inventory_db,
                 )
+                if initial_subscription_check:
+                    initial_subscription_candidates.append(account)
                 await self._ensure_routed_mailbox(normalized, db=inventory_db)
 
                 if is_error or is_deactive:
@@ -214,6 +284,8 @@ class MonitorService:
             )
             await inventory_db.commit()
 
+        self._dispatch_initial_subscription_refresh(initial_subscription_candidates)
+
         for event_kind, event_message, event_email in deferred_events:
             async with AsyncSessionLocal() as event_db:
                 await _record_event_best_effort(
@@ -241,6 +313,8 @@ class MonitorService:
                 "duplicates": duplicate_accounts[:50],
                 "deleted_accounts": deleted_accounts,
                 "deleted_mailboxes": deleted_mailboxes,
+                "oauth_credentials_exported": len(exported_credentials),
+                "initial_subscription_checks_queued": len(initial_subscription_candidates),
                 "duration_ms": elapsed_ms(started_at),
             }
             if account_list_duration_ms is not None:
@@ -259,6 +333,8 @@ class MonitorService:
             message=(
                 f"Synced {total_seen} OAuth GPT accounts; {error_seen} are in error state; queued {queued}; "
                 f"ignored {len(duplicate_accounts)} duplicate sub2api account(s); "
+                f"imported credentials for {len(exported_credentials)} account(s); "
+                f"queued {len(initial_subscription_candidates)} initial subscription check(s); "
                 f"deleted {deleted_accounts} stale local account(s) and {deleted_mailboxes} mailbox credential(s)."
             ),
             total_seen=total_seen,
@@ -277,7 +353,7 @@ class MonitorService:
         is_deactive: bool,
         *,
         db: AsyncSession | None = None,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         if db is None:
             async with AsyncSessionLocal() as owned_db:
                 result = await self._upsert_snapshot(
@@ -296,6 +372,7 @@ class MonitorService:
             snapshot = AccountSnapshot(email=email)
             snapshot.usage_estimate_enabled = not is_deactive
             db.add(snapshot)
+        initial_subscription_check = self._sync_oauth_credentials(snapshot, account)
         remote_healthy = self._remote_looks_healthy(account, is_error, is_deactive)
         effective_deactive = is_deactive or (was_deactive and not remote_healthy)
         if effective_deactive and not was_deactive:
@@ -313,7 +390,101 @@ class MonitorService:
         snapshot.raw = sanitize_payload(account)
         await self._sync_phone_from_account_note(db, snapshot, email, account)
         snapshot.last_seen_at = utcnow()
-        return effective_deactive, bool(snapshot.auto_refresh_locked)
+        return effective_deactive, bool(snapshot.auto_refresh_locked), initial_subscription_check
+
+    def _sync_oauth_credentials(self, snapshot: AccountSnapshot, account: dict[str, Any]) -> bool:
+        credentials = account.get("credentials")
+        if not isinstance(credentials, dict):
+            return False
+        access_token = self.sub2api.account_access_token(account)
+        state = self.sub2api.credentials_from_session(credentials, access_token or "")
+        had_access_token = bool(decrypt_text(snapshot.encrypted_openai_access_token))
+
+        for attribute, key in (
+            ("encrypted_openai_access_token", "access_token"),
+            ("encrypted_openai_refresh_token", "refresh_token"),
+            ("encrypted_openai_id_token", "id_token"),
+            ("encrypted_openai_client_id", "client_id"),
+        ):
+            value = state.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            normalized = value.strip()
+            current = getattr(snapshot, attribute)
+            if decrypt_text(current) != normalized:
+                setattr(snapshot, attribute, encrypt_text(normalized))
+
+        expires_at = _coerce_expiry(state.get("expires_at"))
+        if expires_at is not None:
+            snapshot.openai_token_expires_at = expires_at
+
+        subscription_metadata = {
+            "subscription_starts_at": state.get("subscription_starts_at"),
+            "subscription_expires_at": state.get("subscription_expires_at"),
+            "subscription_renews_at": state.get("subscription_renews_at"),
+            "subscription_cancels_at": state.get("subscription_cancels_at"),
+            "subscription_billing_period": state.get("subscription_billing_period"),
+            "subscription_plan": state.get("subscription_plan") or state.get("plan_type"),
+        }
+        for attribute, value in subscription_metadata.items():
+            if getattr(snapshot, attribute) is not None or not isinstance(value, str):
+                continue
+            normalized = value.strip()
+            if normalized:
+                setattr(snapshot, attribute, normalized)
+        if snapshot.has_active_subscription is None and isinstance(state.get("has_active_subscription"), bool):
+            snapshot.has_active_subscription = state["has_active_subscription"]
+
+        has_subscription_time = bool(snapshot.subscription_starts_at or snapshot.subscription_expires_at)
+        if has_subscription_time and snapshot.subscription_checked_at is None:
+            snapshot.subscription_checked_at = utcnow()
+        newly_imported_access_token = not had_access_token and bool(access_token)
+        if (
+            newly_imported_access_token
+            and not has_subscription_time
+            and snapshot.subscription_checked_at is None
+        ):
+            # Claim the one-time enrichment in the same transaction as the AT.
+            snapshot.subscription_checked_at = utcnow()
+            return True
+        return False
+
+    def _dispatch_initial_subscription_refresh(self, accounts: list[dict[str, Any]]) -> None:
+        if not accounts:
+            return
+        task = asyncio.create_task(self._refresh_initial_subscriptions(accounts))
+        _initial_subscription_background_tasks.add(task)
+        task.add_done_callback(_consume_initial_subscription_task)
+
+    async def _refresh_initial_subscriptions(self, accounts: list[dict[str, Any]]) -> None:
+        try:
+            configured_concurrency = await self.runtime_config.get_subscription_refresh_max_concurrency()
+            result = await refresh_subscriptions(
+                protocol_limit=0,
+                max_concurrency=configured_concurrency,
+                accounts=accounts,
+            )
+            async with AsyncSessionLocal() as db:
+                await _record_event_best_effort(
+                    db,
+                    "initial_subscription_refresh",
+                    result["message"],
+                    details={
+                        "reason": "oauth_credential_import",
+                        "total": result["total"],
+                        "refreshed": result["refreshed"],
+                        "skipped": result["skipped"],
+                        "failed": result["failed"],
+                    },
+                )
+        except Exception as exc:
+            async with AsyncSessionLocal() as db:
+                await _record_event_best_effort(
+                    db,
+                    "initial_subscription_refresh_failed",
+                    f"Initial subscription refresh failed: {self.sub2api.redact_error_text(exc)}",
+                    details={"reason": "oauth_credential_import"},
+                )
 
     async def _sync_phone_from_account_note(
         self,

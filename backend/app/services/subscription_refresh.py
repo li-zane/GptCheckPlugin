@@ -36,16 +36,22 @@ def _redact_error_text(value: str) -> str:
     return text[:500]
 
 
-async def refresh_subscriptions(protocol_limit: int = 3, max_concurrency: int = 1) -> dict[str, Any]:
+async def refresh_subscriptions(
+    protocol_limit: int = 3,
+    max_concurrency: int = 1,
+    *,
+    accounts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
     sub2api = Sub2ApiClient(settings)
     checker = ChatGptAccountStatusChecker(settings)
     protocol = ChatGptProtocolRefresher(settings)
     mail = MailAdapterRegistry()
+    source_accounts = accounts if accounts is not None else await sub2api.list_accounts()
     accounts, _ = sub2api.dedupe_accounts_by_email(
         [
             account
-            for account in await sub2api.list_accounts()
+            for account in source_accounts
             if sub2api.is_gpt_account(account) and sub2api.is_oauth_account(account)
         ]
     )
@@ -254,7 +260,11 @@ async def _save_subscription_metadata(
         _set_if_present(snapshot, "subscription_renews_at", metadata.get("subscription_renews_at"))
         _set_if_present(snapshot, "subscription_cancels_at", metadata.get("subscription_cancels_at"))
         _set_if_present(snapshot, "subscription_billing_period", metadata.get("subscription_billing_period"))
-        _set_if_present(snapshot, "subscription_plan", metadata.get("subscription_plan"))
+        _set_if_present(
+            snapshot,
+            "subscription_plan",
+            metadata.get("subscription_plan") or metadata.get("plan_type"),
+        )
         active_subscription = metadata.get("has_active_subscription")
         snapshot.has_active_subscription = active_subscription if isinstance(active_subscription, bool) else None
         snapshot.subscription_checked_at = utcnow()

@@ -162,6 +162,29 @@ test("App navigation uses history state, a page refresh control, and a top setti
   assert.match(viteConfig, /"\^\/api\(\?:\/\|\$\)"/);
 });
 
+test("subscription refresh concurrency preserves zero as unlimited", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /String\(settings\.subscription_refresh_max_concurrency \?\? 3\)/);
+  assert.match(source, /subscriptionRefreshMaxConcurrencyNumber < 0/);
+  assert.match(
+    source,
+    /max=\{20\}\s+min=\{0\}\s+onChange=\{\(event\) => setSubscriptionRefreshMaxConcurrency\(event\.target\.value\)\}/s,
+  );
+  assert.match(
+    source,
+    /subscription_refresh_max_concurrency: subscriptionRefreshMaxConcurrencyNumber/,
+  );
+});
+
+test("overview error count follows the live account rows", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /const errorAccountCount = accounts\.filter\(\s*\(account\) => !account\.deactive && accountHasError\(account\),/s,
+  );
+  assert.match(source, /\{ label: "错误", value: errorAccountCount, icon: AlertTriangle, tone: "warn" \}/);
+});
+
 test("upstream balance presentation keeps card amounts readable and hides technical copy", () => {
   assert.equal(formatUpstreamBalance(1234.567, "USD", 2), "$1,234.57");
   assert.equal(formatUpstreamBalance(12, "CNY", 2), "¥12.00");

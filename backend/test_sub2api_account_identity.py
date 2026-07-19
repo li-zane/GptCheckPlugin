@@ -246,6 +246,33 @@ class Sub2ApiSecurityBoundaryTests(unittest.IsolatedAsyncioTestCase):
             account["credentials"]["api_key"] = api_key
         return account
 
+    @staticmethod
+    def _oauth_account(
+        account_id: int | None,
+        email: str,
+        *,
+        access_token: str | None = None,
+        refresh_token: str | None = None,
+        id_token: str | None = None,
+    ) -> dict:
+        credentials = {"email": email}
+        if access_token is not None:
+            credentials["access_token"] = access_token
+        if refresh_token is not None:
+            credentials["refresh_token"] = refresh_token
+        if id_token is not None:
+            credentials["id_token"] = id_token
+        account = {
+            "email": email,
+            "name": email,
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": credentials,
+        }
+        if account_id is not None:
+            account["id"] = account_id
+        return account
+
     async def test_remote_error_body_is_never_copied_into_request_exception(self) -> None:
         reflected = "raw-body-secret"
 
@@ -313,69 +340,30 @@ class Sub2ApiSecurityBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, payload)
 
-    async def test_idless_export_requires_stable_before_and_after_identity(self) -> None:
-        before = [
-            self._api_key_account(17, "alpha", "https://alpha.example"),
-            self._api_key_account(18, "beta", "https://beta.example"),
-        ]
-        after_swapped = [
-            self._api_key_account(17, "beta", "https://beta.example"),
-            self._api_key_account(18, "alpha", "https://alpha.example"),
-        ]
-        exported = [
-            self._api_key_account(None, "alpha", "https://alpha.example/v1", "key-alpha"),
-            self._api_key_account(None, "beta", "https://beta.example/v1", "key-beta"),
-        ]
+    async def test_single_id_exports_bind_stable_accounts_without_platform_or_url_matching(self) -> None:
+        before_alpha = self._api_key_account(17, "alpha", "https://list-alpha.example")
+        before_beta = self._api_key_account(18, "beta", "https://list-beta.example")
+        exported_alpha = self._api_key_account(
+            None,
+            "alpha",
+            "https://export-alpha.example/v1",
+            "key-alpha",
+        )
+        exported_alpha["platform"] = "custom"
+        exported_beta = self._api_key_account(
+            None,
+            "beta",
+            "https://export-beta.example/v1",
+            "key-beta",
+        )
         client = Sub2ApiClient()
-        client.list_accounts = AsyncMock(side_effect=[before, after_swapped])
-        client._request = AsyncMock(return_value={"data": {"accounts": exported}})
-        runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
-
-        with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime):
-            result = await client.export_api_key_secrets([17, 18])
-
-        self.assertEqual(result, {})
-        self.assertEqual(client.list_accounts.await_count, 2)
-
-    async def test_idless_export_accepts_complete_stable_identity_continuity(self) -> None:
-        inventory = [
-            self._api_key_account(17, "alpha", "https://alpha.example"),
-            self._api_key_account(18, "beta", "https://beta.example"),
-        ]
-        exported = [
-            self._api_key_account(None, "beta", "https://beta.example/v1", "key-beta"),
-            self._api_key_account(None, "alpha", "https://alpha.example/v1", "key-alpha"),
-        ]
-        client = Sub2ApiClient()
-        client.list_accounts = AsyncMock(side_effect=[inventory, list(reversed(inventory))])
-        client._request = AsyncMock(return_value={"data": {"accounts": exported}})
-        runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
-
-        with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime):
-            result = await client.export_api_key_secrets([17, 18])
-
-        self.assertEqual(result, {17: "key-alpha", 18: "key-beta"})
-        self.assertEqual(client.list_accounts.await_count, 2)
-
-    async def test_idless_export_discards_keys_from_format_probe(self) -> None:
-        inventory = [
-            self._api_key_account(17, "alpha", "https://alpha.example"),
-            self._api_key_account(18, "beta", "https://beta.example"),
-        ]
-        probe_export = [
-            self._api_key_account(None, "alpha", "https://alpha.example", "probe-key-alpha"),
-            self._api_key_account(None, "beta", "https://beta.example", "probe-key-beta"),
-        ]
-        accepted_export = [
-            self._api_key_account(None, "alpha", "https://alpha.example", "actual-key-alpha"),
-            self._api_key_account(None, "beta", "https://beta.example", "actual-key-beta"),
-        ]
-        client = Sub2ApiClient()
-        client.list_accounts = AsyncMock(side_effect=[inventory, inventory])
+        client.get_account_by_id = AsyncMock(
+            side_effect=[before_alpha, before_alpha, before_beta, before_beta]
+        )
         client._request = AsyncMock(
             side_effect=[
-                {"data": {"accounts": probe_export}},
-                {"data": {"accounts": accepted_export}},
+                {"data": {"accounts": [exported_alpha]}},
+                {"data": {"accounts": [exported_beta]}},
             ]
         )
         runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
@@ -383,104 +371,190 @@ class Sub2ApiSecurityBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime):
             result = await client.export_api_key_secrets([17, 18])
 
-        self.assertEqual(result, {17: "actual-key-alpha", 18: "actual-key-beta"})
-        self.assertNotIn("probe-key-alpha", result.values())
-        self.assertNotIn("probe-key-beta", result.values())
-        self.assertEqual(client._request.await_count, 2)
+        self.assertEqual(result, {17: "key-alpha", 18: "key-beta"})
+        self.assertEqual(
+            [item.args[0] for item in client.get_account_by_id.await_args_list],
+            [17, 17, 18, 18],
+        )
+        self.assertEqual(
+            [item.kwargs["params"]["ids"] for item in client._request.await_args_list],
+            ["17", "18"],
+        )
 
-    async def test_idless_export_rejects_added_or_deleted_requested_account(self) -> None:
-        complete = [
-            self._api_key_account(17, "alpha", "https://alpha.example"),
-            self._api_key_account(18, "beta", "https://beta.example"),
-        ]
-        only_alpha = [self._api_key_account(17, "alpha", "https://alpha.example")]
-        exported = [
-            self._api_key_account(None, "alpha", "https://alpha.example", "key-alpha"),
-            self._api_key_account(None, "beta", "https://beta.example", "key-beta"),
-        ]
+    async def test_single_id_export_rejects_zero_or_multiple_rows(self) -> None:
+        account = self._api_key_account(17, "alpha", "https://alpha.example")
+        valid_export = self._api_key_account(
+            None,
+            "alpha",
+            "https://alpha.example",
+            "key-alpha",
+        )
         runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
 
-        for before, after in ((only_alpha, complete), (complete, only_alpha)):
+        for exported in ([], [valid_export, valid_export]):
             client = Sub2ApiClient()
-            client.list_accounts = AsyncMock(side_effect=[before, after])
+            client.get_account_by_id = AsyncMock(return_value=account)
             client._request = AsyncMock(return_value={"data": {"accounts": exported}})
             with (
-                self.subTest(before_count=len(before), after_count=len(after)),
+                self.subTest(exported_count=len(exported)),
                 patch("app.services.sub2api.get_runtime_config_service", return_value=runtime),
             ):
-                result = await client.export_api_key_secrets([17, 18])
+                result = await client.export_api_key_secrets([17])
             self.assertEqual(result, {})
+            self.assertEqual(client.get_account_by_id.await_count, 1)
 
-    async def test_idless_export_rejects_unrelated_api_key_inventory_change(self) -> None:
-        requested_inventory = [
-            self._api_key_account(17, "alpha", "https://alpha.example"),
-            self._api_key_account(18, "beta", "https://beta.example"),
-        ]
-        with_unrelated = [
-            *requested_inventory,
-            self._api_key_account(19, "gamma", "https://gamma.example"),
-        ]
-        exported = [
-            self._api_key_account(None, "alpha", "https://alpha.example", "key-alpha"),
-            self._api_key_account(None, "beta", "https://beta.example", "key-beta"),
-        ]
+    async def test_single_id_export_rejects_changed_or_mismatched_identity(self) -> None:
+        before = self._api_key_account(17, "alpha", "https://alpha.example")
+        changed = self._api_key_account(17, "renamed", "https://alpha.example")
+        matching_export = self._api_key_account(
+            None,
+            "alpha",
+            "https://alpha.example",
+            "key-alpha",
+        )
+        mismatched_export = self._api_key_account(
+            None,
+            "other",
+            "https://alpha.example",
+            "key-alpha",
+        )
         runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
 
-        for before, after in (
-            (requested_inventory, with_unrelated),
-            (with_unrelated, requested_inventory),
-        ):
+        cases = (
+            ([before], mismatched_export),
+            ([before, changed], matching_export),
+        )
+        for account_reads, exported in cases:
             client = Sub2ApiClient()
-            client.list_accounts = AsyncMock(side_effect=[before, after])
-            client._request = AsyncMock(return_value={"data": {"accounts": exported}})
+            client.get_account_by_id = AsyncMock(side_effect=account_reads)
+            client._request = AsyncMock(return_value={"data": {"accounts": [exported]}})
             with (
-                self.subTest(before_count=len(before), after_count=len(after)),
+                self.subTest(read_count=len(account_reads)),
                 patch("app.services.sub2api.get_runtime_config_service", return_value=runtime),
             ):
-                result = await client.export_api_key_secrets([17, 18])
+                result = await client.export_api_key_secrets([17])
             self.assertEqual(result, {})
 
-    async def test_idless_export_rejects_incomplete_or_malformed_inventory(self) -> None:
-        valid = [
-            self._api_key_account(17, "alpha", "https://alpha.example"),
-            self._api_key_account(18, "beta", "https://beta.example"),
-        ]
-        malformed_after = [
-            self._api_key_account(17, "alpha", "https://alpha.example"),
-            {"id": 18, "name": "beta", "platform": "openai", "type": "api_key"},
-        ]
-        exported = [
-            self._api_key_account(None, "alpha", "https://alpha.example", "key-alpha"),
-            self._api_key_account(None, "beta", "https://beta.example", "key-beta"),
-        ]
-        client = Sub2ApiClient()
-        client.list_accounts = AsyncMock(side_effect=[valid, malformed_after])
-        client._request = AsyncMock(return_value={"data": {"accounts": exported}})
+    async def test_single_id_export_rejects_missing_redacted_or_mismatched_id_key(self) -> None:
+        account = self._api_key_account(17, "alpha", "https://alpha.example")
         runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
+        exports = (
+            self._api_key_account(None, "alpha", "https://alpha.example"),
+            self._api_key_account(None, "alpha", "https://alpha.example", "***redacted***"),
+            {
+                **self._api_key_account(None, "alpha", "https://alpha.example", "key-alpha"),
+                "id": 18,
+            },
+        )
 
-        with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime):
-            result = await client.export_api_key_secrets([17, 18])
+        for exported in exports:
+            client = Sub2ApiClient()
+            client.get_account_by_id = AsyncMock(return_value=account)
+            client._request = AsyncMock(return_value={"data": {"accounts": [exported]}})
+            with (
+                self.subTest(exported_id=exported.get("id")),
+                patch("app.services.sub2api.get_runtime_config_service", return_value=runtime),
+            ):
+                result = await client.export_api_key_secrets([17])
+            self.assertEqual(result, {})
 
-        self.assertEqual(result, {})
-
-    async def test_explicit_id_export_survives_inventory_lookup_failure(self) -> None:
+    async def test_explicit_id_oauth_export_returns_only_allowlisted_credentials(self) -> None:
         client = Sub2ApiClient()
-        client.list_accounts = AsyncMock(side_effect=Sub2ApiRequestError("inventory unavailable"))
         client._request = AsyncMock(
             return_value={
                 "data": [
-                    {"id": 18, "credentials": {"api_key": "key-eighteen"}},
-                    {"id": 17, "credentials": {"api_key": "key-seventeen"}},
+                    {
+                        **self._oauth_account(
+                            17,
+                            "alpha@example.com",
+                            access_token="access-alpha",
+                            refresh_token="refresh-alpha",
+                            id_token="id-alpha",
+                        ),
+                        "credentials": {
+                            "email": "alpha@example.com",
+                            "access_token": "access-alpha",
+                            "refresh_token": "refresh-alpha",
+                            "id_token": "id-alpha",
+                            "client_id": "client-alpha",
+                            "password": "must-not-return",
+                        },
+                    }
                 ]
             }
         )
         runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
+        client.list_accounts = AsyncMock(side_effect=AssertionError("must not relist"))
 
         with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime):
-            result = await client.export_api_key_secrets([17, 18])
+            result = await client.export_oauth_credentials([17])
 
-        self.assertEqual(result, {17: "key-seventeen", 18: "key-eighteen"})
+        self.assertEqual(
+            result,
+            {
+                17: {
+                    "access_token": "access-alpha",
+                    "refresh_token": "refresh-alpha",
+                    "id_token": "id-alpha",
+                    "client_id": "client-alpha",
+                }
+            },
+        )
+        self.assertNotIn("password", result[17])
         client.list_accounts.assert_not_awaited()
+
+    async def test_idless_oauth_export_maps_by_stable_unique_email(self) -> None:
+        inventory = [
+            self._oauth_account(17, "alpha@example.com"),
+            self._oauth_account(18, "beta@example.com"),
+        ]
+        probe = [
+            self._oauth_account(None, "alpha@example.com", access_token="probe-alpha"),
+            self._oauth_account(None, "beta@example.com", access_token="probe-beta"),
+        ]
+        accepted = [
+            self._oauth_account(
+                None,
+                "beta@example.com",
+                access_token="access-beta",
+                refresh_token="refresh-beta",
+            ),
+            self._oauth_account(None, "alpha@example.com", access_token="access-alpha"),
+        ]
+        client = Sub2ApiClient()
+        client.list_accounts = AsyncMock(side_effect=[inventory, list(reversed(inventory))])
+        client._request = AsyncMock(
+            side_effect=[
+                {"data": {"accounts": probe}},
+                {"data": {"accounts": accepted}},
+            ]
+        )
+        runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
+
+        with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime):
+            result = await client.export_oauth_credentials([17, 18])
+
+        self.assertEqual(result[17]["access_token"], "access-alpha")
+        self.assertEqual(result[18]["access_token"], "access-beta")
+        self.assertEqual(result[18]["refresh_token"], "refresh-beta")
+        self.assertNotIn("probe-alpha", str(result))
+        self.assertEqual(client._request.await_count, 2)
+
+    async def test_idless_oauth_export_rejects_inventory_email_rebind(self) -> None:
+        before = [self._oauth_account(17, "alpha@example.com")]
+        after = [self._oauth_account(17, "different@example.com")]
+        exported = [
+            self._oauth_account(None, "alpha@example.com", access_token="access-alpha")
+        ]
+        client = Sub2ApiClient()
+        client.list_accounts = AsyncMock(side_effect=[before, after])
+        client._request = AsyncMock(return_value={"data": {"accounts": exported}})
+        runtime = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=self._config()))
+
+        with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime):
+            result = await client.export_oauth_credentials([17])
+
+        self.assertEqual(result, {})
 
 
 if __name__ == "__main__":
