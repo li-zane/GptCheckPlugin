@@ -9,7 +9,11 @@ from app.core.config import Settings, get_settings
 from app.core.crypto import decrypt_text, encrypt_text
 from app.core.database import AsyncSessionLocal
 from app.models import AccountSnapshot, MailboxCredential, utcnow
-from app.services.chatgpt_account import ChatGptAccessTokenInvalid, ChatGptAccountStatusChecker
+from app.services.chatgpt_account import (
+    ChatGptAccountCheckError,
+    ChatGptAccountStatusChecker,
+    complete_subscription_metadata,
+)
 from app.services.chatgpt_protocol import ChatGptProtocolRefresher
 from app.services.mail import MailAdapterRegistry
 from app.services.sub2api import Sub2ApiClient
@@ -88,6 +92,11 @@ async def refresh_subscriptions(
             try:
                 session = await _subscription_session(sub2api, checker, account, snapshot)
                 if session is None:
+                    completed_remote_metadata = complete_subscription_metadata(remote_metadata)
+                    if _has_full_subscription_time(completed_remote_metadata):
+                        await _save_subscription_metadata(normalized, account, sub2api, completed_remote_metadata)
+                        refreshed += 1
+                        return
                     mailbox = mailboxes.get(normalized)
                     if mailbox is None:
                         skipped += 1
@@ -156,12 +165,6 @@ async def _subscription_session(
     account: dict[str, Any],
     snapshot: AccountSnapshot | None = None,
 ) -> dict[str, Any] | None:
-    status = await sub2api.check_openai_account_status(account)
-    if status:
-        if status.get("deactive") or status.get("token_valid") is False:
-            return None
-        return status
-
     access_token = sub2api.account_access_token(account)
     if not access_token and snapshot is not None:
         access_token = decrypt_text(snapshot.encrypted_openai_access_token)
@@ -169,7 +172,7 @@ async def _subscription_session(
         return None
     try:
         checked = await checker.check(access_token)
-    except ChatGptAccessTokenInvalid:
+    except ChatGptAccountCheckError:
         return None
     if checked.deactive:
         return None

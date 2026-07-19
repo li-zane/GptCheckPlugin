@@ -57,6 +57,7 @@ from app.services.account_exceptions import (
     prune_account_exception_records_to_current_accounts,
 )
 from app.services.account_liveness import get_account_liveness_limiter
+from app.services.chatgpt_account import complete_subscription_metadata
 from app.services.events import elapsed_ms, record_event
 from app.services.monitor import get_monitor_service
 from app.services.refresh import get_refresh_service
@@ -317,7 +318,7 @@ def _subscription_metadata(account: dict[str, Any] | None) -> dict[str, Any]:
     if active_subscription is None and expires_at:
         active_subscription = _datetime_is_future(expires_at)
 
-    return {
+    return complete_subscription_metadata({
         "subscription_starts_at": starts_at,
         "subscription_expires_at": expires_at,
         "subscription_renews_at": renews_at,
@@ -347,7 +348,7 @@ def _subscription_metadata(account: dict[str, Any] | None) -> dict[str, Any]:
             ("last_active_subscription", "name"),
         ),
         "has_active_subscription": active_subscription,
-    }
+    })
 
 
 def _merge_subscription_metadata(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
