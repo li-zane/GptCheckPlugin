@@ -1992,7 +1992,7 @@ function AccountCard({
   const usageAmount = finiteNumber(account.upstream_usage_amount);
   const usageCost = rechargeAdjustedUsage(usageAmount, account.effective_recharge_multiplier);
   const usageDetail = usageAmount === null
-    ? "使用额待同步"
+    ? "今日消耗待同步"
     : usageCost === null
       ? "充值倍率待同步"
       : `× 充值倍率 = ¥${formatMoney(usageCost)}`;
@@ -2068,7 +2068,7 @@ function AccountCard({
           ) : null}
         </div>
         {showUsage ? <div className="api-key-account-usage">
-          <span>累计使用</span>
+          <span>今日消耗</span>
           <strong>{formatUpstreamBalance(usageAmount, account.upstream_usage_unit)}</strong>
           <small>{usageDetail}</small>
         </div> : null}

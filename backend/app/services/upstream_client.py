@@ -33,11 +33,14 @@ DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
 # of covering the complete returned page while bounding the request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200
 KEY_REVEAL_CONCURRENCY = 20
+SUB2API_API_KEY_USAGE_BATCH_SIZE = 100
 NEWAPI_BALANCE_ENDPOINT = "/api/user/self"
 NEWAPI_TODAY_USAGE_ENDPOINT = "/api/log/self/stat"
 NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY = "newapi:yesterday-usage"
 SUB2API_BALANCE_ENDPOINT = "/api/v1/auth/me"
 SUB2API_TODAY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/stats"
+SUB2API_USAGE_STATS_ENDPOINT = "/api/v1/usage/stats"
+SUB2API_API_KEY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/api-keys-usage"
 SUB2API_REFRESH_ENDPOINT = "/api/v1/auth/refresh"
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 DNS_OVER_HTTPS_URL = "https://cloudflare-dns.com/dns-query"
@@ -72,6 +75,7 @@ SUB2API_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/payment/config",
     SUB2API_BALANCE_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
+    SUB2API_USAGE_STATS_ENDPOINT,
 )
 
 NEWAPI_PRIMARY_ENDPOINTS: tuple[str, ...] = (
@@ -90,6 +94,7 @@ SUB2API_PRIMARY_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/payment/checkout-info",
     SUB2API_BALANCE_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
+    SUB2API_USAGE_STATS_ENDPOINT,
 )
 
 
@@ -355,6 +360,7 @@ class UpstreamClient:
         fetched: list[_FetchResult] = []
         newapi_yesterday_usage_result: _FetchResult | None = None
         revealed_api_key_records: dict[str, dict[str, Any]] = {}
+        sub2api_api_key_usage_by_key: dict[str, float] = {}
         try:
             for address in pinned_addresses:
                 pinned_transport = _PinnedAsyncTransport(
@@ -383,16 +389,19 @@ class UpstreamClient:
                         )
                         if endpoint_headers is None:
                             return _FetchResult(ok=False, error_kind="credentials_missing")
+                        endpoint_params = (
+                            newapi_today_usage_params
+                            if endpoint == NEWAPI_TODAY_USAGE_ENDPOINT
+                            else _sub2api_yesterday_usage_params(today_timezone)
+                            if endpoint == SUB2API_USAGE_STATS_ENDPOINT
+                            else None
+                        )
                         return await self._request_json(
                             client,
                             normalized_url,
                             endpoint,
                             headers=endpoint_headers,
-                            params=(
-                                newapi_today_usage_params
-                                if endpoint == NEWAPI_TODAY_USAGE_ENDPOINT
-                                else None
-                            ),
+                            params=endpoint_params,
                         )
 
                     fetched = await asyncio.gather(
@@ -460,6 +469,22 @@ class UpstreamClient:
                             # Group and balance discovery remain useful when a
                             # provider does not support automatic key reveal.
                             revealed_api_key_records = {}
+                        if candidate_type == "sub2api":
+                            try:
+                                sub2api_api_key_usage_by_key = (
+                                    await self._fetch_sub2api_api_key_usage(
+                                        client,
+                                        normalized_url,
+                                        payloads=candidate_payloads,
+                                        target_keys=target_api_keys,
+                                        revealed_records=revealed_api_key_records,
+                                        access_token=access_token,
+                                    )
+                                )
+                            except Exception:
+                                # Key state and group discovery remain useful
+                                # when daily per-key statistics are unavailable.
+                                sub2api_api_key_usage_by_key = {}
                 # A status code proves that this pinned address completed an
                 # HTTP exchange. Do not route any request to another address
                 # after that point; fallback is only for total connect/timeout
@@ -537,6 +562,9 @@ class UpstreamClient:
                 active_type,
                 matched_record,
                 available_group_refs,
+                usage_amount=sub2api_api_key_usage_by_key.get(
+                    normalized_api_key or ""
+                ),
             )
             account_upstream_states = _match_account_upstream_states(
                 active_type,
@@ -544,6 +572,7 @@ class UpstreamClient:
                 normalized_account_api_keys,
                 revealed_api_key_records,
                 available_group_refs,
+                usage_by_api_key=sub2api_api_key_usage_by_key,
             )
             for account_group in account_group_matches.values():
                 if (
@@ -745,6 +774,65 @@ class UpstreamClient:
             target_key: records[0]
             for target_key, records in candidates.items()
             if len(records) == 1
+        }
+
+    async def _fetch_sub2api_api_key_usage(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        payloads: dict[str, Any],
+        target_keys: set[str],
+        revealed_records: Mapping[str, dict[str, Any]],
+        access_token: str | None,
+    ) -> dict[str, float]:
+        token = _clean_secret(access_token)
+        if token is None or not target_keys:
+            return {}
+
+        matched_records = _matched_target_api_key_records(
+            "sub2api",
+            payloads,
+            target_keys,
+            revealed_records,
+        )
+        key_by_record_id: dict[int, str] = {}
+        for api_key, record in matched_records.items():
+            record_id = _positive_int64(
+                _first_value(
+                    record,
+                    ("id", "api_key_id", "apiKeyId", "key_id", "keyId"),
+                )
+            )
+            if record_id is not None:
+                key_by_record_id.setdefault(record_id, api_key)
+        record_ids = sorted(key_by_record_id)
+        if not record_ids:
+            return {}
+
+        headers = _build_headers(
+            access_token=token,
+            api_key=None,
+            new_api_user=None,
+        )
+        usage_by_record_id: dict[int, float] = {}
+        for offset in range(0, len(record_ids), SUB2API_API_KEY_USAGE_BATCH_SIZE):
+            batch = record_ids[offset : offset + SUB2API_API_KEY_USAGE_BATCH_SIZE]
+            result = await self._request_json(
+                client,
+                base_url,
+                SUB2API_API_KEY_USAGE_ENDPOINT,
+                method="POST",
+                headers=headers,
+                json_body={"api_key_ids": batch},
+            )
+            usage_by_record_id.update(
+                _parse_sub2api_api_key_usage_batch(result, expected_ids=set(batch))
+            )
+        return {
+            key_by_record_id[record_id]: amount
+            for record_id, amount in usage_by_record_id.items()
+            if record_id in key_by_record_id
         }
 
     async def refresh_sub2api_tokens(
@@ -1178,7 +1266,12 @@ def _headers_for_endpoint(
             raw_authorization=True,
         )
 
-    if endpoint in {SUB2API_BALANCE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}:
+    if endpoint in {
+        SUB2API_BALANCE_ENDPOINT,
+        SUB2API_TODAY_USAGE_ENDPOINT,
+        SUB2API_USAGE_STATS_ENDPOINT,
+        SUB2API_API_KEY_USAGE_ENDPOINT,
+    }:
         if _clean_secret(access_token) is None:
             return None
         return _build_headers(
@@ -1448,6 +1541,7 @@ def _detect_upstream_type(responses: dict[str, _FetchResult]) -> str | None:
             "/api/v1/groups/rates",
             "/api/v1/api-keys",
             SUB2API_BALANCE_ENDPOINT,
+            SUB2API_USAGE_STATS_ENDPOINT,
         }:
             sub2api_score += 4
 
@@ -1699,6 +1793,29 @@ def _find_unique_api_key_record(
     return matches[0] if len(matches) == 1 else None
 
 
+def _matched_target_api_key_records(
+    upstream_type: str,
+    payloads: dict[str, Any],
+    target_keys: set[str],
+    revealed_records: Mapping[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    masked_records = _unique_masked_api_key_records(
+        upstream_type,
+        payloads,
+        target_keys,
+    )
+    matched: dict[str, dict[str, Any]] = {}
+    for target_key in target_keys:
+        record = (
+            revealed_records.get(target_key)
+            or _find_unique_api_key_record(upstream_type, payloads, target_key)
+            or masked_records.get(target_key)
+        )
+        if record is not None:
+            matched[target_key] = record
+    return matched
+
+
 def _deduplicated_api_key_records(
     upstream_type: str,
     payloads: dict[str, Any],
@@ -1883,6 +2000,8 @@ def _account_upstream_state_from_record(
     upstream_type: str,
     record: dict[str, Any] | None,
     available_groups: _AvailableGroupRefs,
+    *,
+    usage_amount: float | None = None,
 ) -> AccountUpstreamState | None:
     if record is None:
         return None
@@ -1900,7 +2019,6 @@ def _account_upstream_state_from_record(
         group_status = "available" if matches else "unavailable"
     else:
         group_status = None
-    usage_amount = _account_usage_amount(upstream_type, record)
     if (
         key_status is None
         and group_status is None
@@ -1919,24 +2037,17 @@ def _account_upstream_state_from_record(
     )
 
 
-def _account_usage_amount(upstream_type: str, record: dict[str, Any]) -> float | None:
-    """Return an upstream API key's cumulative USD usage when explicitly reported."""
-    if upstream_type != "sub2api":
-        return None
-    raw = _finite_number(record.get("quota_used"))
-    if raw is None or raw < 0:
-        return None
-    return raw
-
-
 def _match_account_upstream_states(
     upstream_type: str,
     payloads: dict[str, Any],
     account_api_keys: Mapping[int, str],
     revealed_records: Mapping[str, dict[str, Any]],
     available_groups: _AvailableGroupRefs,
+    *,
+    usage_by_api_key: Mapping[str, float] | None = None,
 ) -> dict[int, AccountUpstreamState]:
     matches: dict[int, AccountUpstreamState] = {}
+    usage_by_api_key = usage_by_api_key or {}
     masked_records = _unique_masked_api_key_records(
         upstream_type,
         payloads,
@@ -1952,6 +2063,7 @@ def _match_account_upstream_states(
             upstream_type,
             record,
             available_groups,
+            usage_amount=usage_by_api_key.get(api_key),
         )
         if state is not None:
             matches[account_id] = state
@@ -2335,11 +2447,7 @@ def _discover_yesterday_balance_usage(
 
     if upstream_type != "sub2api":
         return None, None, "unsupported"
-    return _discover_sub2api_period_usage(
-        responses,
-        field="yesterday_actual_cost",
-        missing_status="not_available",
-    )
+    return _discover_sub2api_yesterday_usage(responses)
 
 
 def _discover_newapi_period_usage(
@@ -2396,6 +2504,69 @@ def _discover_sub2api_period_usage(
     return amount, "USD", "ok"
 
 
+def _discover_sub2api_yesterday_usage(
+    responses: dict[str, _FetchResult],
+) -> tuple[float | None, str | None, str]:
+    result = responses.get(SUB2API_USAGE_STATS_ENDPOINT)
+    if result is not None and result.status_code in {404, 405}:
+        return None, None, "unsupported"
+    if result is None or not result.ok or not _payload_succeeded(result.payload):
+        return None, None, "error"
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict):
+        return None, None, "error"
+    amount = _finite_number(data.get("total_actual_cost"))
+    if amount is None or amount < 0:
+        return None, None, "error"
+    return amount, "USD", "ok"
+
+
+def _parse_sub2api_api_key_usage_batch(
+    result: _FetchResult,
+    *,
+    expected_ids: set[int],
+) -> dict[int, float]:
+    if (
+        not expected_ids
+        or not result.ok
+        or not _payload_succeeded(result.payload)
+    ):
+        return {}
+    data = _unwrap(result.payload)
+    if isinstance(data, dict):
+        for key in ("stats", "results", "items"):
+            if isinstance(data.get(key), (dict, list)):
+                data = data[key]
+                break
+    records = (
+        list(data.items())
+        if isinstance(data, dict)
+        else [(None, item) for item in data]
+        if isinstance(data, list)
+        else []
+    )
+    parsed: dict[int, float] = {}
+    for keyed_id, raw in records:
+        if not isinstance(raw, dict):
+            continue
+        record_id = _positive_int64(
+            _first_value(
+                raw,
+                ("api_key_id", "apiKeyId", "key_id", "keyId", "id"),
+            )
+            or keyed_id
+        )
+        amount = _finite_number(
+            _first_value(
+                raw,
+                ("today_actual_cost", "todayActualCost", "actual_cost", "cost"),
+            )
+        )
+        if record_id in expected_ids and amount is not None and amount >= 0:
+            parsed[record_id] = amount
+    return parsed
+
+
 def _newapi_today_usage_params(
     time_zone: str,
     *,
@@ -2437,6 +2608,21 @@ def _newapi_yesterday_usage_params(
     return {
         "start_timestamp": int(yesterday_start.timestamp()),
         "end_timestamp": int(today_start.timestamp()) - 1,
+    }
+
+
+def _sub2api_yesterday_usage_params(
+    time_zone: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, str]:
+    _, today_start = _newapi_usage_day(time_zone, now=now)
+    yesterday = today_start.date() - timedelta(days=1)
+    date_text = yesterday.isoformat()
+    return {
+        "start_date": date_text,
+        "end_date": date_text,
+        "timezone": str(today_start.tzinfo),
     }
 
 

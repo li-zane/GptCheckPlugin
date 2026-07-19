@@ -363,6 +363,33 @@ class UpstreamAccountService:
         config.upstream_usage_checked_at = now
 
     @staticmethod
+    def apply_local_today_usage_fallback(
+        config: UpstreamAccountConfig,
+        local_cost: Any,
+        current_rate: Any,
+        *,
+        now: datetime,
+    ) -> bool:
+        if config.upstream_usage_amount is not None:
+            return False
+        cost_value = _balance_number(local_cost)
+        group = _decimal_multiplier(config.effective_group_multiplier)
+        rate = _decimal_multiplier(current_rate)
+        if cost_value is None or cost_value < 0 or group is None or rate is None:
+            return False
+        try:
+            converted = Decimal(str(cost_value)) * group / rate
+        except DecimalException:
+            return False
+        converted_value = _balance_number(converted)
+        if converted_value is None or converted_value < 0:
+            return False
+        config.upstream_usage_amount = converted_value
+        config.upstream_usage_unit = "USD"
+        config.upstream_usage_checked_at = now
+        return True
+
+    @staticmethod
     async def automatic_upstream_disable_allowed() -> bool:
         try:
             runtime = get_runtime_config_service()
@@ -1879,6 +1906,22 @@ class UpstreamAccountService:
         current_rate = self._remote_current_rate(remote)
         if current_rate is not None:
             config.current_rate = current_rate
+
+        if config.upstream_usage_amount is None:
+            try:
+                local_today_costs = await self.sub2api.get_account_today_costs(
+                    [config.sub2api_account_id]
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                local_today_costs = {}
+            self.apply_local_today_usage_fallback(
+                config,
+                local_today_costs.get(config.sub2api_account_id),
+                current_rate,
+                now=now,
+            )
 
         if (
             effective_group is not None

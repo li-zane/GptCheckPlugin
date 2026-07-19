@@ -58,6 +58,8 @@ class FakeSub2Api(Sub2ApiClient):
             "checked_at": "2026-07-13T12:00:00Z",
         }
         self.balance_error: BaseException | None = None
+        self.today_costs: dict[int, float] = {}
+        self.today_cost_calls: list[list[int]] = []
         self.local_info: tuple[float, bool] = (1.0, True)
         self.local_error: BaseException | None = None
         self.update_calls: list[tuple[int, float]] = []
@@ -74,6 +76,14 @@ class FakeSub2Api(Sub2ApiClient):
         if self.balance_error is not None:
             raise self.balance_error
         return dict(self.balance_result)
+
+    async def get_account_today_costs(self, account_ids: list[int]) -> dict[int, float]:
+        self.today_cost_calls.append(list(account_ids))
+        return {
+            account_id: self.today_costs[account_id]
+            for account_id in account_ids
+            if account_id in self.today_costs
+        }
 
     async def get_payment_balance_recharge_multiplier_info(self) -> tuple[float, bool]:
         if self.local_error is not None:
@@ -350,6 +360,30 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(stored.upstream_usage_amount)
         self.assertIsNone(stored.upstream_usage_unit)
         self.assertIsNone(stored.upstream_usage_checked_at)
+
+    async def test_single_discovery_falls_back_to_converted_local_today_cost(self) -> None:
+        await self._manage(api_key="sk-managed-usage")
+        self.sub2api.today_costs[7] = 0.4
+        result = discovery_result(
+            group=0.4,
+            recharge=1.0,
+            account_state=AccountUpstreamState(
+                key_status="active",
+                group_status="available",
+                group_id="gold",
+                group_name="Gold",
+            ),
+        )
+
+        with patch(
+            "app.services.upstream_accounts.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            discovered = await self._discover()
+
+        self.assertEqual(self.sub2api.today_cost_calls, [[7]])
+        self.assertAlmostEqual(discovered.upstream_usage_amount or 0, 0.2)
+        self.assertEqual(discovered.upstream_usage_unit, "USD")
 
     async def test_duplicate_valid_remote_ids_fail_closed_for_list_and_point_lookup(self) -> None:
         duplicate = dict(self.sub2api.accounts[0])
@@ -1591,6 +1625,33 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
         _config, mismatch_runtime_patch = self._runtime_patch()
         with mismatch_runtime_patch, self.assertRaises(Sub2ApiRequestError):
             await client.get_account_by_id(17)
+
+    async def test_account_today_costs_deduplicate_ids_and_parse_actual_cost(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "code": 0,
+                "data": {
+                    "stats": {
+                        "17": {"account_id": 17, "today_actual_cost": 0.125},
+                        "18": {"account_id": 18, "today_actual_cost": 0},
+                    }
+                },
+            }
+        )
+        config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch:
+            costs = await client.get_account_today_costs([17, 17, 18])
+
+        self.assertEqual(costs, {17: 0.125, 18: 0})
+        client._request.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "POST",
+            "/admin/accounts/today-stats/batch",
+            config=config,
+            total_timeout_seconds=10.0,
+            json={"account_ids": [17, 18]},
+        )
 
     async def test_account_name_update_uses_put_and_reads_back_from_same_config(self) -> None:
         client = Sub2ApiClient()

@@ -74,6 +74,8 @@ class FakeSub2Api(Sub2ApiClient):
         self.exported_api_keys: dict[int, str] = {}
         self.export_calls: list[list[int]] = []
         self.balance_results: dict[int, dict] = {}
+        self.today_costs: dict[int, float] = {}
+        self.today_cost_calls: list[list[int]] = []
         self.rate_update_calls: list[tuple[int, float]] = []
         self.schedulable_calls: list[tuple[int, bool]] = []
         self.local_credit_per_cny = 10.0
@@ -95,6 +97,14 @@ class FakeSub2Api(Sub2ApiClient):
     async def get_account_balance(self, account: dict | str | int) -> dict:
         account_id = int(account if isinstance(account, (str, int)) else account["id"])
         return dict(self.balance_results.get(account_id, {"status": "unsupported"}))
+
+    async def get_account_today_costs(self, account_ids: list[int]) -> dict[int, float]:
+        self.today_cost_calls.append(list(account_ids))
+        return {
+            account_id: self.today_costs[account_id]
+            for account_id in account_ids
+            if account_id in self.today_costs
+        }
 
     async def get_account_current_rate_multiplier(self, account_id: str | int) -> float:
         parsed_id = int(account_id)
@@ -614,6 +624,74 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             stored.remote_identity_fingerprint,
             self.service.accounts._remote_binding_fingerprint(self.sub2api.accounts[0]),
         )
+        self.assertEqual(stored.encrypted_api_key, original_ciphertext)
+        self.assertEqual(self.sub2api.export_calls, [])
+
+    async def test_remote_rename_recovers_legacy_fingerprint_by_matching_exported_key(self) -> None:
+        await self.service.overview(self.db)
+        stored = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == 7
+                )
+            )
+        ).scalar_one()
+        original_ciphertext = encrypt_text("sk-legacy-name-reconcile")
+        stored.encrypted_api_key = original_ciphertext
+        stored.remote_identity_fingerprint = "f" * 64
+        await self.db.commit()
+        self.sub2api.exported_api_keys[7] = "sk-legacy-name-reconcile"
+        self.sub2api.accounts[0]["name"] = "renamed-legacy-account"
+
+        overview = await self.service.overview(self.db)
+        account = next(
+            account
+            for channel in overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == 7
+        )
+
+        await self.db.refresh(stored)
+        self.assertEqual(self.sub2api.export_calls, [[7]])
+        self.assertEqual(account.remote_name, "renamed-legacy-account")
+        self.assertEqual(account.identity_binding_status, "bound")
+        self.assertTrue(account.managed)
+        self.assertEqual(
+            stored.remote_identity_fingerprint,
+            self.service.accounts._remote_binding_fingerprint(self.sub2api.accounts[0]),
+        )
+        self.assertEqual(stored.encrypted_api_key, original_ciphertext)
+
+    async def test_remote_rename_does_not_rebind_legacy_fingerprint_to_different_key(self) -> None:
+        await self.service.overview(self.db)
+        stored = (
+            await self.db.execute(
+                select(UpstreamAccountConfig).where(
+                    UpstreamAccountConfig.sub2api_account_id == 7
+                )
+            )
+        ).scalar_one()
+        original_ciphertext = encrypt_text("sk-original-account")
+        stored.encrypted_api_key = original_ciphertext
+        stored.remote_identity_fingerprint = "f" * 64
+        await self.db.commit()
+        self.sub2api.exported_api_keys[7] = "sk-replacement-account"
+        self.sub2api.accounts[0]["name"] = "replacement-name"
+
+        overview = await self.service.overview(self.db)
+        account = next(
+            account
+            for channel in overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == 7
+        )
+
+        await self.db.refresh(stored)
+        self.assertEqual(self.sub2api.export_calls, [[7]])
+        self.assertEqual(account.identity_binding_status, "mismatch")
+        self.assertTrue(account.identity_rebind_required)
+        self.assertFalse(account.managed)
+        self.assertEqual(stored.remote_identity_fingerprint, "f" * 64)
         self.assertEqual(stored.encrypted_api_key, original_ciphertext)
 
     async def test_remote_name_reconciliation_redacts_known_credentials(self) -> None:
@@ -1333,6 +1411,35 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored_channel.today_balance_used, 3.25)
         self.assertEqual(stored_channel.yesterday_balance_used, 2.75)
         self.assertEqual(stored_account.upstream_usage_amount, 12.375)
+
+    async def test_discovery_falls_back_to_converted_local_today_cost(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        self.sub2api.today_costs[7] = 2.0
+        result = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                )
+            },
+        )
+        result.account_group_matches = {
+            7: {"id": "default", "name": "Default", "multiplier": 1.0}
+        }
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        account = next(item for item in discovered.accounts if item.sub2api_account_id == 7)
+        self.assertEqual(self.sub2api.today_cost_calls, [[7, 8]])
+        self.assertEqual(account.upstream_usage_amount, 2.0)
+        self.assertEqual(account.upstream_usage_unit, "USD")
+        self.assertIsNotNone(account.upstream_usage_checked_at)
 
     async def test_successful_discovery_clears_stale_usage_for_unmatched_keys(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id

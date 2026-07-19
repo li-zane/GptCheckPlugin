@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import inspect
 import logging
 from contextlib import AsyncExitStack
@@ -563,6 +564,11 @@ class UpstreamChannelService:
 
         config_result = await db.execute(select(UpstreamAccountConfig))
         configs = {item.sub2api_account_id: item for item in config_result.scalars().all()}
+        verified_legacy_bindings = await self._verified_legacy_bindings(
+            remote_by_id,
+            configs,
+            channels,
+        )
         changed = False
         priority_membership_changed = False
 
@@ -592,10 +598,12 @@ class UpstreamChannelService:
                     extra_secrets=self._known_secrets(config, stored_channel),
                 )
             )
+            verified_legacy_binding = account_id in verified_legacy_bindings
             if (
                 config is not None
                 and self.accounts._config_binding_status(remote, config) != "bound"
                 and not name_only_binding_change
+                and not verified_legacy_binding
             ):
                 if any(
                     value is not None
@@ -682,7 +690,7 @@ class UpstreamChannelService:
                     )
                     or f"Account #{account_id}"
                 )
-                if name_only_binding_change:
+                if name_only_binding_change or verified_legacy_binding:
                     config.remote_identity_fingerprint = (
                         self.accounts._require_remote_binding_fingerprint(remote)
                     )
@@ -732,6 +740,72 @@ class UpstreamChannelService:
         config_result = await db.execute(select(UpstreamAccountConfig))
         configs = {item.sub2api_account_id: item for item in config_result.scalars().all()}
         return remote_by_id, configs, channels_by_id, priority_membership_changed
+
+    async def _verified_legacy_bindings(
+        self,
+        remote_by_id: dict[int, dict[str, Any]],
+        configs: dict[int, UpstreamAccountConfig],
+        channels: list[UpstreamChannel],
+    ) -> set[int]:
+        channels_by_id = {channel.id: channel for channel in channels}
+        local_keys: dict[int, str] = {}
+        for account_id, config in configs.items():
+            remote = remote_by_id.get(account_id)
+            if remote is None or self.accounts._config_binding_status(remote, config) != "mismatch":
+                continue
+            channel = channels_by_id.get(config.channel_id) if config.channel_id is not None else None
+            if self.accounts._config_binding_differs_only_by_remote_name(
+                remote,
+                config,
+                extra_secrets=self._known_secrets(config, channel),
+            ):
+                continue
+            if not self._legacy_binding_metadata_matches(remote, config):
+                continue
+            api_key = decrypt_text(config.encrypted_api_key)
+            if api_key:
+                local_keys[account_id] = api_key
+
+        if not local_keys:
+            return set()
+        try:
+            exported = await self.sub2api.export_api_key_secrets(sorted(local_keys))
+        except Exception as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return set()
+        return {
+            account_id
+            for account_id, local_key in local_keys.items()
+            if (exported_key := exported.get(account_id)) is not None
+            and hmac.compare_digest(
+                local_key.encode("utf-8"),
+                exported_key.encode("utf-8"),
+            )
+        }
+
+    def _legacy_binding_metadata_matches(
+        self,
+        remote: dict[str, Any],
+        config: UpstreamAccountConfig,
+    ) -> bool:
+        if self.accounts._numeric_remote_id(remote) != config.sub2api_account_id:
+            return False
+        if not _safe_text(_value(remote, "created_at", "createdAt"), limit=80):
+            return False
+
+        def normalized(value: Any) -> str:
+            return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+
+        if normalized(self.sub2api.account_platform(remote)) != normalized(config.remote_platform):
+            return False
+        if normalized(self.sub2api.account_type(remote)) != normalized(config.remote_account_type):
+            return False
+        try:
+            configured_url = canonicalize_upstream_url(config.base_url or "")
+        except ValueError:
+            return False
+        return _remote_base_url(remote) == configured_url
 
     async def _local_recharge(self) -> tuple[float | None, str | None, str]:
         try:
@@ -1895,6 +1969,36 @@ class UpstreamChannelService:
             previous_channel_recharge = channel.effective_recharge_multiplier
             discovery_succeeded = self._apply_discovery_to_channel(channel, result)
             await self._apply_api_key_balance_fallback(channel, configs)
+            missing_usage_account_ids = (
+                [
+                    config.sub2api_account_id
+                    for config in configs
+                    if (
+                        (state := self._synchronized_upstream_state(
+                            result,
+                            config.sub2api_account_id,
+                        ))
+                        is None
+                        or (
+                            usage_amount := _balance_number(
+                                _value(state, "usage_amount")
+                            )
+                        )
+                        is None
+                        or usage_amount < 0
+                    )
+                ]
+                if discovery_succeeded
+                else []
+            )
+            try:
+                local_today_costs = await self.sub2api.get_account_today_costs(
+                    missing_usage_account_ids
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                local_today_costs = {}
             local_recharge, local_source, local_status = await self._local_recharge()
             try:
                 sync_enabled = await runtime_config.get_upstream_rate_sync_enabled()
@@ -2006,6 +2110,12 @@ class UpstreamChannelService:
                         local_recharge=local_recharge,
                         local_source=local_source,
                         local_status=local_status,
+                    )
+                    self.accounts.apply_local_today_usage_fallback(
+                        config,
+                        local_today_costs.get(config.sub2api_account_id),
+                        self.accounts._remote_current_rate(current_remote),
+                        now=channel.last_discovered_at or _utcnow(),
                     )
                     if synchronized_group is not None:
                         if synchronized_group["multiplier"] is not None:

@@ -15,14 +15,17 @@ from app.services.upstream_client import (
     MAX_UPSTREAM_TOKEN_LENGTH,
     NEWAPI_ENDPOINTS,
     NEWAPI_TODAY_USAGE_ENDPOINT,
+    SUB2API_API_KEY_USAGE_ENDPOINT,
     SUB2API_REFRESH_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
+    SUB2API_USAGE_STATS_ENDPOINT,
     UpstreamClient,
     _default_resolver,
     _doh_resolver,
     _invalidate_dns_cache,
     _newapi_today_usage_params,
     _newapi_yesterday_usage_params,
+    _sub2api_yesterday_usage_params,
     _unique_masked_api_key_records,
 )
 
@@ -1646,6 +1649,8 @@ class UpstreamClientTests(unittest.TestCase):
 
     def test_sub2api_reports_disabled_key_and_available_group_authoritatively(self) -> None:
         seen_today_headers: list[tuple[str | None, str | None]] = []
+        seen_yesterday_requests: list[httpx.Request] = []
+        seen_key_usage_requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             target = request_target(request)
@@ -1688,7 +1693,29 @@ class UpstreamClientTests(unittest.TestCase):
                         "code": 0,
                         "data": {
                             "today_actual_cost": 3.25,
-                            "yesterday_actual_cost": 2.75,
+                        },
+                    },
+                )
+            if request.url.path == SUB2API_USAGE_STATS_ENDPOINT:
+                seen_yesterday_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"total_actual_cost": 2.75}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                seen_key_usage_requests.append(request)
+                self.assertEqual(json.loads(request.content), {"api_key_ids": [21]})
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "21": {
+                                    "api_key_id": 21,
+                                    "today_actual_cost": 12.375,
+                                }
+                            }
                         },
                     },
                 )
@@ -1715,6 +1742,20 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(result.yesterday_balance_unit, "USD")
         self.assertEqual(result.yesterday_balance_status, "ok")
         self.assertEqual(seen_today_headers, [("Bearer sub2api-login-token", None)])
+        self.assertEqual(len(seen_yesterday_requests), 1)
+        self.assertEqual(
+            seen_yesterday_requests[0].url.params["start_date"],
+            seen_yesterday_requests[0].url.params["end_date"],
+        )
+        self.assertEqual(
+            seen_yesterday_requests[0].url.params["timezone"],
+            "Asia/Shanghai",
+        )
+        self.assertEqual(
+            seen_yesterday_requests[0].headers.get("Authorization"),
+            "Bearer sub2api-login-token",
+        )
+        self.assertEqual(len(seen_key_usage_requests), 1)
 
     def test_usage_amount_rejects_invalid_values(self) -> None:
         cases = (-1, "nan", True, None)
@@ -1740,6 +1781,120 @@ class UpstreamClientTests(unittest.TestCase):
                     account_api_keys={11: "sk-invalid-usage"},
                 )
                 self.assertIsNone(result.account_upstream_states[11].usage_amount)
+
+    def test_sub2api_daily_key_usage_never_reuses_cumulative_quota(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 31,
+                                    "key": "sk-cumulative-only",
+                                    "status": "active",
+                                    "quota_used": 321.5,
+                                }
+                            ]
+                        },
+                    },
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(500)
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={11: "sk-cumulative-only"},
+        )
+
+        self.assertIsNone(result.account_upstream_states[11].usage_amount)
+
+    def test_sub2api_daily_key_usage_accepts_authoritative_zero(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 41, "key": "sk-zero-usage", "status": "active"}
+                            ]
+                        },
+                    },
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "41": {
+                                    "api_key_id": 41,
+                                    "today_actual_cost": 0,
+                                }
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={12: "sk-zero-usage"},
+        )
+
+        self.assertEqual(result.account_upstream_states[12].usage_amount, 0)
+        self.assertEqual(result.account_upstream_states[12].usage_unit, "USD")
+
+    def test_sub2api_yesterday_usage_uses_calendar_date_and_timezone(self) -> None:
+        fixed_now = datetime(2026, 7, 19, 12, 30, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _sub2api_yesterday_usage_params("America/New_York", now=fixed_now),
+            {
+                "start_date": "2026-07-18",
+                "end_date": "2026-07-18",
+                "timezone": "America/New_York",
+            },
+        )
+
+    def test_sub2api_yesterday_usage_distinguishes_unsupported_and_failure(self) -> None:
+        for status_code, expected_status in (
+            (404, "unsupported"),
+            (405, "unsupported"),
+            (500, "error"),
+        ):
+            with self.subTest(status_code=status_code):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    if request_target(request) == "/api/v1/groups/available":
+                        return httpx.Response(200, json={"code": 0, "data": []})
+                    if request.url.path == SUB2API_USAGE_STATS_ENDPOINT:
+                        return httpx.Response(status_code)
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    access_token="sub2api-login-token",
+                )
+
+                self.assertIsNone(result.yesterday_balance_used)
+                self.assertEqual(result.yesterday_balance_status, expected_status)
 
     def test_sub2api_orphaned_key_group_is_unavailable_even_without_a_rate(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

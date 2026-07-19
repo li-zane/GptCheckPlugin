@@ -219,6 +219,8 @@ test("account usage is shown for Sub2API but omitted for NewAPI", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(source, /account\.resolved_upstream_type \|\| account\.detected_upstream_type \|\| account\.upstream_type/);
   assert.match(source, /\{showUsage \? <div className="api-key-account-usage">/);
+  assert.match(source, /<span>今日消耗<\/span>/);
+  assert.doesNotMatch(source, /<span>累计使用<\/span>/);
   assert.match(source, /resolvedChannelType\(channel\) !== "newapi" && finiteNumber\(channel\.balance_used\)/);
 });
 

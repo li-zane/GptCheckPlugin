@@ -67,6 +67,8 @@ MAX_SUB2API_TEST_STREAM_BYTES = 64 * 1024
 MAX_SUB2API_TEST_LINE_BYTES = 16 * 1024
 SUB2API_REQUEST_TOTAL_TIMEOUT_SECONDS = 90.0
 SUB2API_USAGE_REFRESH_TIMEOUT_SECONDS = 10.0
+SUB2API_TODAY_STATS_TIMEOUT_SECONDS = 10.0
+SUB2API_TODAY_STATS_BATCH_SIZE = 100
 SUB2API_TEST_TOTAL_TIMEOUT_SECONDS = 70.0
 MAX_REMOTE_ACCOUNT_ERROR_CHARS = 500
 MAX_SUB2API_ACCOUNT_PAGES = 100
@@ -286,6 +288,65 @@ def _bounded_number(value: Any, *, minimum: float = 0, maximum: float = 1000) ->
         return None
     if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
         return None
+    return parsed
+
+
+def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int, float]:
+    if not expected_ids or not isinstance(payload, (dict, list)):
+        return {}
+    if isinstance(payload, dict):
+        if payload.get("success") is False:
+            return {}
+        code = payload.get("code")
+        if code is not None and code not in {0, 200, "0", "200"}:
+            return {}
+        data: Any = payload.get("data", payload)
+    else:
+        data = payload
+    if isinstance(data, dict):
+        for key in ("stats", "results", "items"):
+            if isinstance(data.get(key), (dict, list)):
+                data = data[key]
+                break
+
+    records = (
+        list(data.items())
+        if isinstance(data, dict)
+        else [(None, item) for item in data]
+        if isinstance(data, list)
+        else []
+    )
+    parsed: dict[int, float] = {}
+    for keyed_id, raw in records:
+        explicit_id = (
+            raw.get("account_id", raw.get("accountId", raw.get("id")))
+            if isinstance(raw, dict)
+            else None
+        )
+        account_id = _positive_int(explicit_id if explicit_id is not None else keyed_id)
+        if account_id not in expected_ids:
+            continue
+        raw_cost = (
+            next(
+                (
+                    raw.get(field)
+                    for field in (
+                        "today_actual_cost",
+                        "todayActualCost",
+                        "cost",
+                        "today_cost",
+                        "todayCost",
+                    )
+                    if raw.get(field) is not None
+                ),
+                None,
+            )
+            if isinstance(raw, dict)
+            else raw
+        )
+        cost = _bounded_number(raw_cost, minimum=0, maximum=1_000_000_000_000_000)
+        if cost is not None:
+            parsed[account_id] = cost
     return parsed
 
 
@@ -1068,6 +1129,42 @@ class Sub2ApiClient:
         )
         balance = self._unwrap(payload)
         return balance if isinstance(balance, dict) else {}
+
+    async def get_account_today_costs(
+        self,
+        account_ids: list[int],
+    ) -> dict[int, float]:
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for account_id in account_ids:
+            parsed_id = _positive_int(account_id)
+            if parsed_id is None:
+                raise ValueError("Account ids must be positive integers.")
+            if parsed_id not in seen:
+                normalized_ids.append(parsed_id)
+                seen.add(parsed_id)
+        if len(normalized_ids) > MAX_SUB2API_ACCOUNTS:
+            raise ValueError("Too many account ids were provided.")
+        if not normalized_ids:
+            return {}
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        costs: dict[int, float] = {}
+        try:
+            async with asyncio.timeout(SUB2API_TODAY_STATS_TIMEOUT_SECONDS):
+                for offset in range(0, len(normalized_ids), SUB2API_TODAY_STATS_BATCH_SIZE):
+                    batch = normalized_ids[offset : offset + SUB2API_TODAY_STATS_BATCH_SIZE]
+                    payload = await self._request(
+                        "POST",
+                        "/admin/accounts/today-stats/batch",
+                        config=config,
+                        total_timeout_seconds=SUB2API_TODAY_STATS_TIMEOUT_SECONDS,
+                        json={"account_ids": batch},
+                    )
+                    costs.update(_parse_account_today_costs(payload, set(batch)))
+        except TimeoutError as exc:
+            raise Sub2ApiRequestError("sub2api today statistics request timed out.") from exc
+        return costs
 
     async def get_payment_balance_recharge_multiplier_info(self) -> tuple[float, bool]:
         config = await get_runtime_config_service().get_sub2api_config()
