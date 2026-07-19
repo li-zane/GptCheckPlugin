@@ -3,12 +3,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from app.core.crypto import encrypt_text
 from app.services.sub2api import Sub2ApiClient
 from app.services.subscription_refresh import refresh_subscriptions
 
 
 class SubscriptionRefreshTests(unittest.IsolatedAsyncioTestCase):
-    async def test_partial_remote_expiry_is_enriched_from_account_session(self) -> None:
+    async def test_partial_remote_expiry_uses_saved_access_token_for_enrichment(self) -> None:
         account = {
             "id": 17,
             "email": "plus@example.com",
@@ -17,11 +18,15 @@ class SubscriptionRefreshTests(unittest.IsolatedAsyncioTestCase):
             "status": "active",
             "schedulable": True,
             "credentials": {
-                "access_token": "exported-access-token",
                 "plan_type": "plus",
                 "subscription_expires_at": "2026-08-17T12:06:03Z",
             },
         }
+        snapshot = SimpleNamespace(
+            subscription_starts_at=None,
+            subscription_expires_at="2026-08-17T12:06:03Z",
+            encrypted_openai_access_token=encrypt_text("saved-access-token"),
+        )
         sub2api = Sub2ApiClient()
         sub2api.check_openai_account_status = AsyncMock(return_value={})  # type: ignore[method-assign]
         checker = SimpleNamespace(
@@ -44,14 +49,17 @@ class SubscriptionRefreshTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.services.subscription_refresh.Sub2ApiClient", return_value=sub2api),
             patch("app.services.subscription_refresh.ChatGptAccountStatusChecker", return_value=checker),
-            patch("app.services.subscription_refresh._load_snapshots", new=AsyncMock(return_value={})),
+            patch(
+                "app.services.subscription_refresh._load_snapshots",
+                new=AsyncMock(return_value={"plus@example.com": snapshot}),
+            ),
             patch("app.services.subscription_refresh._load_mailboxes", new=AsyncMock(return_value={})),
             patch("app.services.subscription_refresh._save_subscription_metadata", new=save),
         ):
             result = await refresh_subscriptions(accounts=[account])
 
         self.assertEqual(result["refreshed"], 1)
-        checker.check.assert_awaited_once_with("exported-access-token")
+        checker.check.assert_awaited_once_with("saved-access-token")
         metadata = save.await_args.args[3]
         self.assertEqual(metadata["subscription_starts_at"], "2026-07-17T06:06:03Z")
         self.assertEqual(metadata["subscription_billing_period"], "monthly")

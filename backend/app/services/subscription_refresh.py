@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.core.config import Settings, get_settings
-from app.core.crypto import encrypt_text
+from app.core.crypto import decrypt_text, encrypt_text
 from app.core.database import AsyncSessionLocal
 from app.models import AccountSnapshot, MailboxCredential, utcnow
 from app.services.chatgpt_account import ChatGptAccessTokenInvalid, ChatGptAccountStatusChecker
@@ -86,7 +86,7 @@ async def refresh_subscriptions(
 
         async with semaphore:
             try:
-                session = await _subscription_session(sub2api, checker, account)
+                session = await _subscription_session(sub2api, checker, account, snapshot)
                 if session is None:
                     mailbox = mailboxes.get(normalized)
                     if mailbox is None:
@@ -154,6 +154,7 @@ async def _subscription_session(
     sub2api: Sub2ApiClient,
     checker: ChatGptAccountStatusChecker,
     account: dict[str, Any],
+    snapshot: AccountSnapshot | None = None,
 ) -> dict[str, Any] | None:
     status = await sub2api.check_openai_account_status(account)
     if status:
@@ -162,6 +163,8 @@ async def _subscription_session(
         return status
 
     access_token = sub2api.account_access_token(account)
+    if not access_token and snapshot is not None:
+        access_token = decrypt_text(snapshot.encrypted_openai_access_token)
     if not access_token:
         return None
     try:
