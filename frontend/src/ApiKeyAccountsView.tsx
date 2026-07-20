@@ -1790,7 +1790,7 @@ function ChannelCard({
                 key={usage.label}
                 title={`${usage.label}消耗余额 ${usage.value}${usage.stale ? "，上游本次探测失败，显示当天最后一次有效值" : ""}`}
               >
-                <span>{usage.label}{usage.stale ? "（旧）" : ""}</span><b>{usage.value}</b>
+                <span>{usage.label}</span><b>{usage.value}</b>
               </span>
             ))}
           </div>

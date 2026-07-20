@@ -781,6 +781,33 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(result.today_balance_status, "error")
         self.assertEqual(result.today_balance_error, "http_503")
 
+    def test_daily_usage_uses_a_longer_endpoint_specific_timeout(self) -> None:
+        seen_read_timeouts: dict[str, float] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            timeout = request.extensions.get("timeout")
+            if isinstance(timeout, dict) and isinstance(timeout.get("read"), (int, float)):
+                seen_read_timeouts[request.url.path] = float(timeout["read"])
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == SUB2API_TODAY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"today_actual_cost": 3.25}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+        )
+
+        self.assertEqual(result.today_balance_status, "ok")
+        self.assertEqual(seen_read_timeouts[SUB2API_TODAY_USAGE_ENDPOINT], 10.0)
+        self.assertEqual(seen_read_timeouts["/api/v1/groups/available"], 3.5)
+
     def test_daily_usage_invalid_json_records_specific_reason(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             target = request_target(request)

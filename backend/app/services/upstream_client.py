@@ -29,6 +29,7 @@ MAX_UPSTREAM_TOKEN_LENGTH = 8192
 DEFAULT_TIMEOUT_SECONDS = 3.5
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
 DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
+DAILY_USAGE_TIMEOUT_SECONDS = 10.0
 DAILY_USAGE_RETRY_DELAY_SECONDS = 0.15
 RETRYABLE_DAILY_USAGE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # Upstream key-list requests use page_size=200. Keep detail discovery capable
@@ -414,6 +415,12 @@ class UpstreamClient:
                             endpoint,
                             headers=endpoint_headers,
                             params=endpoint_params,
+                            timeout_seconds=(
+                                max(self.timeout_seconds, DAILY_USAGE_TIMEOUT_SECONDS)
+                                if endpoint
+                                in {NEWAPI_TODAY_USAGE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}
+                                else None
+                            ),
                         )
                         if (
                             endpoint in {NEWAPI_TODAY_USAGE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}
@@ -426,6 +433,10 @@ class UpstreamClient:
                                 endpoint,
                                 headers=endpoint_headers,
                                 params=endpoint_params,
+                                timeout_seconds=max(
+                                    self.timeout_seconds,
+                                    DAILY_USAGE_TIMEOUT_SECONDS,
+                                ),
                             )
                         return result
 
@@ -1005,6 +1016,7 @@ class UpstreamClient:
         headers: dict[str, str] | None = None,
         params: Mapping[str, str | int] | None = None,
         json_body: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> _FetchResult:
         try:
             async with client.stream(
@@ -1013,6 +1025,11 @@ class UpstreamClient:
                 headers=headers,
                 params=params,
                 json=json_body,
+                timeout=(
+                    httpx.Timeout(timeout_seconds)
+                    if timeout_seconds is not None
+                    else client.timeout
+                ),
             ) as response:
                 if response.status_code < 200 or response.status_code >= 300:
                     # Do not consume or echo upstream error bodies.  Redirects
