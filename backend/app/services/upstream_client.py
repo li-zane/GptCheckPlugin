@@ -29,7 +29,7 @@ MAX_UPSTREAM_TOKEN_LENGTH = 8192
 DEFAULT_TIMEOUT_SECONDS = 3.5
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
 DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
-USAGE_STATS_TIMEOUT_SECONDS = 30.0
+USAGE_STATS_TIMEOUT_SECONDS = 60.0
 # Upstream key-list requests use page_size=200. Keep detail discovery capable
 # of covering the complete returned page while bounding the request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200

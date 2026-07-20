@@ -838,9 +838,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertEqual(result.today_balance_status, "ok")
-        self.assertEqual(seen_read_timeouts[SUB2API_TODAY_USAGE_ENDPOINT], 30.0)
-        self.assertEqual(seen_read_timeouts[SUB2API_USAGE_STATS_ENDPOINT], 30.0)
-        self.assertEqual(seen_read_timeouts[SUB2API_API_KEY_USAGE_ENDPOINT], 30.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_TODAY_USAGE_ENDPOINT], 60.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_USAGE_STATS_ENDPOINT], 60.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_API_KEY_USAGE_ENDPOINT], 60.0)
         self.assertEqual(seen_read_timeouts["/api/v1/groups/available"], 3.5)
         self.assertEqual(seen_read_timeouts["/api/v1/keys"], 3.5)
 
