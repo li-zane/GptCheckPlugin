@@ -707,8 +707,8 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertIsNone(result.yesterday_balance_unit)
         self.assertEqual(result.yesterday_balance_status, "unsupported")
 
-    def test_newapi_today_usage_retries_one_transient_failure(self) -> None:
-        for failure in ("http_503", "timeout"):
+    def test_newapi_today_usage_is_requested_once_after_transient_failure(self) -> None:
+        for failure, expected_error in (("http_503", "http_503"), ("timeout", "timeout")):
             with self.subTest(failure=failure):
                 attempts = 0
 
@@ -742,21 +742,19 @@ class UpstreamClientTests(unittest.TestCase):
                         )
                     return httpx.Response(404)
 
-                with patch("app.services.upstream_client.asyncio.sleep", new=AsyncMock()) as sleep:
-                    result = self.run_discovery(
-                        handler,
-                        upstream_type="newapi",
-                        access_token="console-access-token",
-                        new_api_user=42,
-                    )
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="newapi",
+                    access_token="console-access-token",
+                    new_api_user=42,
+                )
 
-                self.assertEqual(attempts, 3)
-                sleep.assert_awaited_once()
-                self.assertEqual(result.today_balance_used, 2.5)
-                self.assertEqual(result.today_balance_status, "ok")
-                self.assertIsNone(result.today_balance_error)
+                self.assertEqual(attempts, 2)
+                self.assertIsNone(result.today_balance_used)
+                self.assertEqual(result.today_balance_status, "error")
+                self.assertEqual(result.today_balance_error, expected_error)
 
-    def test_sub2api_today_usage_retries_only_once_and_reports_failure(self) -> None:
+    def test_sub2api_today_usage_is_requested_once_and_reports_failure(self) -> None:
         attempts = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -769,19 +767,17 @@ class UpstreamClientTests(unittest.TestCase):
                 return httpx.Response(503)
             return httpx.Response(404)
 
-        with patch("app.services.upstream_client.asyncio.sleep", new=AsyncMock()) as sleep:
-            result = self.run_discovery(
-                handler,
-                upstream_type="sub2api",
-                access_token="sub2api-login-token",
-            )
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+        )
 
-        self.assertEqual(attempts, 2)
-        sleep.assert_awaited_once()
+        self.assertEqual(attempts, 1)
         self.assertEqual(result.today_balance_status, "error")
         self.assertEqual(result.today_balance_error, "http_503")
 
-    def test_daily_usage_uses_a_longer_endpoint_specific_timeout(self) -> None:
+    def test_usage_stats_use_a_longer_endpoint_specific_timeout(self) -> None:
         seen_read_timeouts: dict[str, float] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -791,10 +787,46 @@ class UpstreamClientTests(unittest.TestCase):
                 seen_read_timeouts[request.url.path] = float(timeout["read"])
             if target == "/api/v1/groups/available":
                 return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 21,
+                                    "key": "sk-timeout-probe",
+                                    "status": "active",
+                                }
+                            ]
+                        },
+                    },
+                )
             if target == SUB2API_TODAY_USAGE_ENDPOINT:
                 return httpx.Response(
                     200,
                     json={"code": 0, "data": {"today_actual_cost": 3.25}},
+                )
+            if request.url.path == SUB2API_USAGE_STATS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"total_actual_cost": 2.75}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "21": {
+                                    "api_key_id": 21,
+                                    "today_actual_cost": 1.25,
+                                }
+                            }
+                        },
+                    },
                 )
             return httpx.Response(404)
 
@@ -802,11 +834,15 @@ class UpstreamClientTests(unittest.TestCase):
             handler,
             upstream_type="sub2api",
             access_token="sub2api-login-token",
+            account_api_keys={7: "sk-timeout-probe"},
         )
 
         self.assertEqual(result.today_balance_status, "ok")
-        self.assertEqual(seen_read_timeouts[SUB2API_TODAY_USAGE_ENDPOINT], 10.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_TODAY_USAGE_ENDPOINT], 30.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_USAGE_STATS_ENDPOINT], 30.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_API_KEY_USAGE_ENDPOINT], 30.0)
         self.assertEqual(seen_read_timeouts["/api/v1/groups/available"], 3.5)
+        self.assertEqual(seen_read_timeouts["/api/v1/keys"], 3.5)
 
     def test_daily_usage_invalid_json_records_specific_reason(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -817,12 +853,11 @@ class UpstreamClientTests(unittest.TestCase):
                 return httpx.Response(200, content=b"not-json")
             return httpx.Response(404)
 
-        with patch("app.services.upstream_client.asyncio.sleep", new=AsyncMock()):
-            result = self.run_discovery(
-                handler,
-                upstream_type="sub2api",
-                access_token="sub2api-login-token",
-            )
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+        )
 
         self.assertEqual(result.today_balance_status, "error")
         self.assertEqual(result.today_balance_error, "invalid_json")

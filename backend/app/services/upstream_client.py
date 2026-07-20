@@ -29,9 +29,7 @@ MAX_UPSTREAM_TOKEN_LENGTH = 8192
 DEFAULT_TIMEOUT_SECONDS = 3.5
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
 DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
-DAILY_USAGE_TIMEOUT_SECONDS = 10.0
-DAILY_USAGE_RETRY_DELAY_SECONDS = 0.15
-RETRYABLE_DAILY_USAGE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+USAGE_STATS_TIMEOUT_SECONDS = 30.0
 # Upstream key-list requests use page_size=200. Keep detail discovery capable
 # of covering the complete returned page while bounding the request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200
@@ -191,14 +189,6 @@ class _FetchResult:
     status_code: int | None = None
     payload: Any = None
     error_kind: str | None = None
-
-
-def _retryable_daily_usage_result(result: _FetchResult) -> bool:
-    if result.ok:
-        return False
-    if result.status_code in RETRYABLE_DAILY_USAGE_HTTP_STATUSES:
-        return True
-    return result.error_kind in {"timeout", "network", "invalid_json"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,28 +406,16 @@ class UpstreamClient:
                             headers=endpoint_headers,
                             params=endpoint_params,
                             timeout_seconds=(
-                                max(self.timeout_seconds, DAILY_USAGE_TIMEOUT_SECONDS)
+                                max(self.timeout_seconds, USAGE_STATS_TIMEOUT_SECONDS)
                                 if endpoint
-                                in {NEWAPI_TODAY_USAGE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}
+                                in {
+                                    NEWAPI_TODAY_USAGE_ENDPOINT,
+                                    SUB2API_TODAY_USAGE_ENDPOINT,
+                                    SUB2API_USAGE_STATS_ENDPOINT,
+                                }
                                 else None
                             ),
                         )
-                        if (
-                            endpoint in {NEWAPI_TODAY_USAGE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}
-                            and _retryable_daily_usage_result(result)
-                        ):
-                            await asyncio.sleep(DAILY_USAGE_RETRY_DELAY_SECONDS)
-                            result = await self._request_json(
-                                client,
-                                normalized_url,
-                                endpoint,
-                                headers=endpoint_headers,
-                                params=endpoint_params,
-                                timeout_seconds=max(
-                                    self.timeout_seconds,
-                                    DAILY_USAGE_TIMEOUT_SECONDS,
-                                ),
-                            )
                         return result
 
                     fetched = await asyncio.gather(
@@ -478,6 +456,10 @@ class UpstreamClient:
                                 NEWAPI_TODAY_USAGE_ENDPOINT,
                                 headers=yesterday_headers,
                                 params=newapi_yesterday_usage_params,
+                                timeout_seconds=max(
+                                    self.timeout_seconds,
+                                    USAGE_STATS_TIMEOUT_SECONDS,
+                                ),
                             )
                         )
                     if candidate_type in {"newapi", "sub2api"} and target_api_keys:
@@ -875,6 +857,10 @@ class UpstreamClient:
                 method="POST",
                 headers=headers,
                 json_body={"api_key_ids": batch},
+                timeout_seconds=max(
+                    self.timeout_seconds,
+                    USAGE_STATS_TIMEOUT_SECONDS,
+                ),
             )
             usage_by_record_id.update(
                 _parse_sub2api_api_key_usage_batch(result, expected_ids=set(batch))
