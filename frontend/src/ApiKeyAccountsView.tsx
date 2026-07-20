@@ -1788,9 +1788,9 @@ function ChannelCard({
               <span
                 className={"api-key-channel-usage-chip api-key-chip api-key-chip--" + usage.tone}
                 key={usage.label}
-                title={`${usage.label}消耗余额 ${usage.value}`}
+                title={`${usage.label}消耗余额 ${usage.value}${usage.stale ? "，上游本次探测失败，显示当天最后一次有效值" : ""}`}
               >
-                <span>{usage.label}</span><b>{usage.value}</b>
+                <span>{usage.label}{usage.stale ? "（旧）" : ""}</span><b>{usage.value}</b>
               </span>
             ))}
           </div>
@@ -2945,13 +2945,16 @@ function formatDailyBalanceUsed(
   const checkedAt = yesterday
     ? channel.yesterday_balance_checked_at
     : channel.today_balance_checked_at;
+  const hasCurrentValue = finiteNumber(amount) !== null && isToday(checkedAt, timeZone);
   const current = status === "ok"
-    && finiteNumber(amount) !== null
-    && isToday(checkedAt, timeZone);
+    && hasCurrentValue;
+  const stale = status === "stale" && hasCurrentValue;
+  const unsupported = /^(?:credentials_missing|not_available|unsupported)$/.test(status);
   return {
     label: yesterday ? "昨日" : "今日",
-    tone: current ? "success" : isFailureStatus(status) ? "danger" : "muted",
-    value: current ? formatUpstreamBalance(amount, unit || channel.balance_unit, 2) : "-",
+    stale,
+    tone: current ? "success" : stale ? "warn" : unsupported ? "muted" : isFailureStatus(status) ? "danger" : "muted",
+    value: current || stale ? formatUpstreamBalance(amount, unit || channel.balance_unit, 2) : "-",
   };
 }
 

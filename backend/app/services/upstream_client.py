@@ -29,6 +29,8 @@ MAX_UPSTREAM_TOKEN_LENGTH = 8192
 DEFAULT_TIMEOUT_SECONDS = 3.5
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
 DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
+DAILY_USAGE_RETRY_DELAY_SECONDS = 0.15
+RETRYABLE_DAILY_USAGE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # Upstream key-list requests use page_size=200. Keep detail discovery capable
 # of covering the complete returned page while bounding the request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200
@@ -166,9 +168,11 @@ class DiscoveryResult:
     today_balance_used: float | None = None
     today_balance_unit: str | None = None
     today_balance_status: str = "unknown"
+    today_balance_error: str | None = None
     yesterday_balance_used: float | None = None
     yesterday_balance_unit: str | None = None
     yesterday_balance_status: str = "unknown"
+    yesterday_balance_error: str | None = None
     sub2api_auth_rejected: bool = False
     message: str = ""
 
@@ -186,6 +190,14 @@ class _FetchResult:
     status_code: int | None = None
     payload: Any = None
     error_kind: str | None = None
+
+
+def _retryable_daily_usage_result(result: _FetchResult) -> bool:
+    if result.ok:
+        return False
+    if result.status_code in RETRYABLE_DAILY_USAGE_HTTP_STATUSES:
+        return True
+    return result.error_kind in {"timeout", "network", "invalid_json"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,13 +408,26 @@ class UpstreamClient:
                             if endpoint == SUB2API_USAGE_STATS_ENDPOINT
                             else None
                         )
-                        return await self._request_json(
+                        result = await self._request_json(
                             client,
                             normalized_url,
                             endpoint,
                             headers=endpoint_headers,
                             params=endpoint_params,
                         )
+                        if (
+                            endpoint in {NEWAPI_TODAY_USAGE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}
+                            and _retryable_daily_usage_result(result)
+                        ):
+                            await asyncio.sleep(DAILY_USAGE_RETRY_DELAY_SECONDS)
+                            result = await self._request_json(
+                                client,
+                                normalized_url,
+                                endpoint,
+                                headers=endpoint_headers,
+                                params=endpoint_params,
+                            )
+                        return result
 
                     fetched = await asyncio.gather(
                         *(fetch_endpoint(endpoint) for endpoint in endpoints)
@@ -613,6 +638,18 @@ class UpstreamClient:
                     new_api_user=new_api_user,
                 )
             )
+            today_balance_error = _daily_usage_error_detail(
+                active_type,
+                responses,
+                period="today",
+                status=today_balance_status,
+            )
+            yesterday_balance_error = _daily_usage_error_detail(
+                active_type,
+                responses,
+                period="yesterday",
+                status=yesterday_balance_status,
+            )
         except Exception:
             return safe(_error_result(active_type, source, "Could not parse a valid upstream response."))
 
@@ -642,9 +679,11 @@ class UpstreamClient:
                 today_balance_used=today_balance_used,
                 today_balance_unit=today_balance_unit,
                 today_balance_status=today_balance_status,
+                today_balance_error=today_balance_error,
                 yesterday_balance_used=yesterday_balance_used,
                 yesterday_balance_unit=yesterday_balance_unit,
                 yesterday_balance_status=yesterday_balance_status,
+                yesterday_balance_error=yesterday_balance_error,
                 sub2api_auth_rejected=sub2api_auth_rejected,
                 message=_success_message(group_multiplier, recharge_multiplier),
             )
@@ -1411,6 +1450,8 @@ def _scrub_discovery_result(
             160,
         ),
         balance_message=_scrub_text(result.balance_message, secrets, 300) or "",
+        today_balance_error=_scrub_text(result.today_balance_error, secrets, 80),
+        yesterday_balance_error=_scrub_text(result.yesterday_balance_error, secrets, 80),
         message=_scrub_text(result.message, secrets, 500) or "Upstream discovery completed.",
     )
 
@@ -2401,6 +2442,44 @@ def _discover_sub2api_balance(
         status="ok",
         message="Balance read from the Sub2API user account.",
     )
+
+
+def _daily_usage_error_detail(
+    upstream_type: str,
+    responses: dict[str, _FetchResult],
+    *,
+    period: Literal["today", "yesterday"],
+    status: str,
+) -> str | None:
+    if status == "ok":
+        return None
+    if upstream_type == "newapi":
+        endpoint = (
+            NEWAPI_TODAY_USAGE_ENDPOINT
+            if period == "today"
+            else NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY
+        )
+    elif upstream_type == "sub2api":
+        endpoint = (
+            SUB2API_TODAY_USAGE_ENDPOINT
+            if period == "today"
+            else SUB2API_USAGE_STATS_ENDPOINT
+        )
+    else:
+        return "unsupported_upstream_type"
+
+    result = responses.get(endpoint)
+    if result is None:
+        return "response_missing"
+    if result.error_kind and result.error_kind != "http_status":
+        return result.error_kind
+    if result.status_code is not None and not result.ok:
+        return f"http_{result.status_code}"
+    if not _payload_succeeded(result.payload):
+        return "upstream_failure"
+    if status in {"unsupported", "not_available"}:
+        return "field_missing"
+    return "invalid_payload"
 
 
 def _discover_today_balance_usage(

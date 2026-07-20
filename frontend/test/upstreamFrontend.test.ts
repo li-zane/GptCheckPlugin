@@ -230,6 +230,10 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(source, /middleEllipsis\(displayCanonicalUrl\(url\)\)/);
   assert.match(source, /\[yesterdayUsage, todayUsage\]\.map/);
   assert.match(source, /className="api-key-channel-stat--recharge"/);
+  assert.match(source, /const stale = status === "stale" && hasCurrentValue/);
+  assert.match(source, /usage\.stale \? "（旧）" : ""/);
+  assert.match(source, /current \|\| stale \? formatUpstreamBalance/);
+  assert.match(source, /unsupported \? "muted"/);
   assert.match(styles, /\.api-key-channel-urls\s*\{[^}]*flex-wrap: nowrap !important;[^}]*overflow: hidden;/s);
   assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: minmax\(0, 1\.65fr\) minmax\(110px, 0\.62fr\)/s);
   assert.match(styles, /\.api-key-channel-daily-usage\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);

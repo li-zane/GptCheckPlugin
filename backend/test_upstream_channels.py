@@ -193,8 +193,10 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         account_upstream_states: dict[int, AccountUpstreamState] | None = None,
         today_balance_used: float | None = 3.25,
         today_balance_status: str = "ok",
+        today_balance_error: str | None = None,
         yesterday_balance_used: float | None = 2.75,
         yesterday_balance_status: str = "ok",
+        yesterday_balance_error: str | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             upstream_type="sub2api",
@@ -213,9 +215,11 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             today_balance_used=today_balance_used,
             today_balance_unit="USD" if today_balance_used is not None else None,
             today_balance_status=today_balance_status,
+            today_balance_error=today_balance_error,
             yesterday_balance_used=yesterday_balance_used,
             yesterday_balance_unit="USD" if yesterday_balance_used is not None else None,
             yesterday_balance_status=yesterday_balance_status,
+            yesterday_balance_error=yesterday_balance_error,
             account_upstream_states=account_upstream_states or {},
         )
 
@@ -1516,6 +1520,125 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(discovered.yesterday_balance_unit)
         self.assertIsNone(discovered.yesterday_balance_checked_at)
 
+    async def test_transient_daily_usage_failure_retains_same_day_value_then_recovers(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        channel = await self.db.get(UpstreamChannel, channel_id)
+        checked_at = datetime(2026, 7, 19, 18, 0, tzinfo=timezone.utc)
+        channel.today_balance_used = 3.25
+        channel.today_balance_unit = "USD"
+        channel.today_balance_status = "ok"
+        channel.today_balance_checked_at = checked_at
+        await self.db.commit()
+
+        failed = self._discovery_result(
+            today_balance_used=None,
+            today_balance_status="error",
+            today_balance_error="http_503",
+        )
+        now = datetime(2026, 7, 20, 4, 0, tzinfo=timezone.utc)
+        with (
+            patch("app.services.upstream_channels._utcnow", return_value=now),
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=failed),
+            ),
+            self.assertLogs("app.services.upstream_channels", level="WARNING") as logs,
+        ):
+            stale = await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(stale.today_balance_status, "stale")
+        self.assertEqual(stale.today_balance_used, 3.25)
+        self.assertEqual(stale.today_balance_unit, "USD")
+        self.assertEqual(
+            stale.today_balance_checked_at,
+            checked_at.replace(tzinfo=None),
+        )
+        daily_log = "\n".join(logs.output)
+        self.assertIn(f"channel_id={channel_id}", daily_log)
+        self.assertIn("period=today", daily_log)
+        self.assertIn("reason=http_503", daily_log)
+        self.assertIn("retained=True", daily_log)
+
+        recovered_at = datetime(2026, 7, 20, 4, 5, tzinfo=timezone.utc)
+        recovered = self._discovery_result(today_balance_used=4.5)
+        with (
+            patch("app.services.upstream_channels._utcnow", return_value=recovered_at),
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=recovered),
+            ),
+        ):
+            fresh = await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(fresh.today_balance_status, "ok")
+        self.assertEqual(fresh.today_balance_used, 4.5)
+        self.assertEqual(
+            fresh.today_balance_checked_at,
+            recovered_at.replace(tzinfo=None),
+        )
+
+    async def test_transient_daily_usage_failure_clears_previous_day_value(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        channel = await self.db.get(UpstreamChannel, channel_id)
+        channel.today_balance_used = 3.25
+        channel.today_balance_unit = "USD"
+        channel.today_balance_status = "ok"
+        channel.today_balance_checked_at = datetime(
+            2026, 7, 18, 18, 0, tzinfo=timezone.utc
+        )
+        await self.db.commit()
+
+        failed = self._discovery_result(
+            today_balance_used=None,
+            today_balance_status="timeout",
+            today_balance_error="timeout",
+        )
+        now = datetime(2026, 7, 20, 4, 0, tzinfo=timezone.utc)
+        with (
+            patch("app.services.upstream_channels._utcnow", return_value=now),
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=failed),
+            ),
+        ):
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(discovered.today_balance_status, "timeout")
+        self.assertIsNone(discovered.today_balance_used)
+        self.assertIsNone(discovered.today_balance_unit)
+        self.assertIsNone(discovered.today_balance_checked_at)
+
+    async def test_non_transient_daily_usage_failure_clears_same_day_value(self) -> None:
+        channel_id = (await self.service.overview(self.db)).channels[0].id
+        channel = await self.db.get(UpstreamChannel, channel_id)
+        channel.today_balance_used = 3.25
+        channel.today_balance_unit = "USD"
+        channel.today_balance_status = "ok"
+        channel.today_balance_checked_at = datetime(
+            2026, 7, 19, 18, 0, tzinfo=timezone.utc
+        )
+        await self.db.commit()
+
+        failed = self._discovery_result(
+            today_balance_used=None,
+            today_balance_status="error",
+            today_balance_error="http_401",
+        )
+        now = datetime(2026, 7, 20, 4, 0, tzinfo=timezone.utc)
+        with (
+            patch("app.services.upstream_channels._utcnow", return_value=now),
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=failed),
+            ),
+        ):
+            discovered = await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(discovered.today_balance_status, "error")
+        self.assertIsNone(discovered.today_balance_used)
+        self.assertIsNone(discovered.today_balance_unit)
+        self.assertIsNone(discovered.today_balance_checked_at)
+
     async def test_unmatched_key_does_not_reuse_historical_group_for_billing(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
         await self.service.update_channel(
@@ -1685,9 +1808,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.channels[0].recharge_multiplier_status, "fallback_manual")
         self.assertEqual(result.channels[0].last_error, "Upstream channel discovery failed.")
         self.assertEqual(result.channels[0].today_balance_status, "error")
-        self.assertEqual(result.channels[0].today_balance_used, 3.25)
+        self.assertIsNone(result.channels[0].today_balance_used)
         self.assertEqual(result.channels[0].yesterday_balance_status, "error")
-        self.assertEqual(result.channels[0].yesterday_balance_used, 2.75)
+        self.assertIsNone(result.channels[0].yesterday_balance_used)
 
     async def test_failed_management_discovery_uses_one_api_key_balance_without_summing(self) -> None:
         channel = (await self.service.overview(self.db)).channels[0]

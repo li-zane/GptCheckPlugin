@@ -6,10 +6,11 @@ import inspect
 import logging
 from contextlib import AsyncExitStack
 from decimal import Decimal, DecimalException
-from datetime import timezone
+from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -58,6 +59,21 @@ from app.services.workflow_coordination import get_workflow_coordinator
 
 
 API_KEY_EXPORT_BATCH_SIZE = 200
+TRANSIENT_DAILY_USAGE_STATUSES = frozenset(
+    {"failed", "network_error", "timeout", "unavailable"}
+)
+TRANSIENT_DAILY_USAGE_REASONS = frozenset(
+    {
+        "invalid_json",
+        "invalid_payload",
+        "network",
+        "overall_discovery_error",
+        "response_missing",
+        "timeout",
+        "upstream_failure",
+    }
+)
+TRANSIENT_DAILY_USAGE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 logger = logging.getLogger(__name__)
 
 
@@ -1319,7 +1335,82 @@ class UpstreamChannelService:
                 return group
         return None
 
-    def _apply_discovery_to_channel(self, channel: UpstreamChannel, result: Any) -> bool:
+    @staticmethod
+    def _daily_usage_cache_is_current(
+        channel: UpstreamChannel,
+        period: str,
+        *,
+        time_zone: str,
+        now: datetime,
+    ) -> bool:
+        amount = _balance_number(getattr(channel, f"{period}_balance_used", None))
+        checked_at = getattr(channel, f"{period}_balance_checked_at", None)
+        if amount is None or amount < 0 or not isinstance(checked_at, datetime):
+            return False
+        normalized_checked_at = (
+            checked_at.replace(tzinfo=timezone.utc)
+            if checked_at.tzinfo is None
+            else checked_at
+        )
+        normalized_now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+        try:
+            zone = ZoneInfo(time_zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            zone = ZoneInfo(DEFAULT_TODAY_TIME_ZONE)
+        return normalized_checked_at.astimezone(zone).date() == normalized_now.astimezone(zone).date()
+
+    def _apply_daily_usage_failure(
+        self,
+        channel: UpstreamChannel,
+        period: str,
+        *,
+        status: str,
+        reason: str,
+        time_zone: str,
+        now: datetime,
+    ) -> None:
+        normalized_reason = str(reason or "").strip().lower()
+        transient = status in TRANSIENT_DAILY_USAGE_STATUSES
+        if status == "error":
+            transient = normalized_reason in TRANSIENT_DAILY_USAGE_REASONS
+            if normalized_reason.startswith("http_"):
+                try:
+                    transient = int(normalized_reason[5:]) in TRANSIENT_DAILY_USAGE_HTTP_STATUSES
+                except ValueError:
+                    transient = False
+        retained = bool(
+            transient
+            and self._daily_usage_cache_is_current(
+                channel,
+                period,
+                time_zone=time_zone,
+                now=now,
+            )
+        )
+        next_status = "stale" if retained else status
+        setattr(channel, f"{period}_balance_status", next_status)
+        if not retained:
+            setattr(channel, f"{period}_balance_used", None)
+            setattr(channel, f"{period}_balance_unit", None)
+            setattr(channel, f"{period}_balance_checked_at", None)
+        if status not in {"credentials_missing", "not_available", "not_checked", "unsupported"}:
+            logger.warning(
+                "Upstream daily usage probe unavailable: channel_id=%s period=%s "
+                "status=%s reason=%s retained=%s",
+                channel.id,
+                period,
+                status,
+                normalized_reason or "unknown",
+                retained,
+            )
+
+    def _apply_discovery_to_channel(
+        self,
+        channel: UpstreamChannel,
+        result: Any,
+        *,
+        time_zone: str = DEFAULT_TODAY_TIME_ZONE,
+    ) -> bool:
         now = _utcnow()
         status = str(_value(result, "status") or "error").strip().lower()
         if status == "insecure_url":
@@ -1341,8 +1432,21 @@ class UpstreamChannelService:
             channel.balance_message = _safe_text(
                 _value(result, "balance_message"), limit=300
             ) or "Unable to read the upstream channel."
-            channel.today_balance_status = "error"
-            channel.yesterday_balance_status = "error"
+            for period in ("today", "yesterday"):
+                self._apply_daily_usage_failure(
+                    channel,
+                    period,
+                    status="error",
+                    reason=(
+                        _safe_text(
+                            _value(result, f"{period}_balance_error"),
+                            limit=80,
+                        )
+                        or f"overall_discovery_{status}"
+                    ),
+                    time_zone=time_zone,
+                    now=now,
+                )
             channel.last_error = "Upstream channel discovery failed."
             channel.last_discovered_at = now
             return False
@@ -1394,15 +1498,34 @@ class UpstreamChannelService:
             status = str(
                 _value(result, f"{period}_balance_status") or "unsupported"
             ).strip().lower()
-            setattr(channel, f"{period}_balance_status", status)
-            setattr(channel, f"{period}_balance_used", None)
-            setattr(channel, f"{period}_balance_unit", None)
-            setattr(channel, f"{period}_balance_checked_at", None)
             if status != "ok":
+                self._apply_daily_usage_failure(
+                    channel,
+                    period,
+                    status=status,
+                    reason=(
+                        _safe_text(
+                            _value(result, f"{period}_balance_error"),
+                            limit=80,
+                        )
+                        or status
+                    ),
+                    time_zone=time_zone,
+                    now=now,
+                )
                 continue
             used = _balance_number(_value(result, f"{period}_balance_used"))
             if used is None or used < 0:
+                self._apply_daily_usage_failure(
+                    channel,
+                    period,
+                    status="error",
+                    reason="invalid_amount",
+                    time_zone=time_zone,
+                    now=now,
+                )
                 continue
+            setattr(channel, f"{period}_balance_status", "ok")
             setattr(channel, f"{period}_balance_used", used)
             setattr(
                 channel,
@@ -1967,7 +2090,11 @@ class UpstreamChannelService:
                 ):
                     result = await run_discovery(access_token, "auto")
             previous_channel_recharge = channel.effective_recharge_multiplier
-            discovery_succeeded = self._apply_discovery_to_channel(channel, result)
+            discovery_succeeded = self._apply_discovery_to_channel(
+                channel,
+                result,
+                time_zone=today_timezone,
+            )
             await self._apply_api_key_balance_fallback(channel, configs)
             missing_usage_account_ids = (
                 [
