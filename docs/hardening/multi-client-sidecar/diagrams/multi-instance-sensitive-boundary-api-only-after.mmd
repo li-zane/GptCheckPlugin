@@ -1,0 +1,13 @@
+flowchart LR
+    Browser["Admin browser"]
+    Control["Instance-scoped control plane"]
+    Registry["Instance registry and scoped data"]
+    SubA["sub2api A"]
+    SubB["sub2api B"]
+    Manual["Manual break-glass credential restore"]
+
+    Browser -->|"instance_id on every request"| Control
+    Control --> Registry
+    Control -->|"x-api-key A"| SubA
+    Control -->|"x-api-key B"| SubB
+    Manual -->|"explicit selected accounts only"| Control

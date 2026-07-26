@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from decimal import Decimal, DecimalException
+from decimal import Decimal, DecimalException, InvalidOperation, ROUND_DOWN
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
@@ -20,9 +20,11 @@ from app.schemas import (
     PriorityIntervalOut,
     PriorityIntervalUpdate,
     PriorityRebalanceOut,
+    PriorityTieMoveRequest,
     UpstreamAccountOut,
 )
 from app.services.sub2api import Sub2ApiClient
+from app.services.runtime_config import get_runtime_config_service
 from app.services.upstream_accounts import (
     UpstreamAccountService,
     UpstreamAccountServiceError,
@@ -34,6 +36,20 @@ from app.services.upstream_accounts import (
 PRIORITY_SYNC_ERROR = "Unable to update and verify the sub2api account priority."
 PRIORITY_READ_ERROR = "Unable to read sub2api API key account priorities."
 PRIORITY_PREFLIGHT_CONCURRENCY = 10
+TIE_MULTIPLIER_QUANTUM = Decimal("1e-13")
+MAX_COMPOSITE_MULTIPLIER = Decimal("1000000")
+
+
+def _decimal_composite_multiplier(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite() or parsed <= 0 or parsed > MAX_COMPOSITE_MULTIPLIER:
+        return None
+    return parsed
 
 
 def composite_multiplier(config: UpstreamAccountConfig) -> Decimal | None:
@@ -46,6 +62,56 @@ def composite_multiplier(config: UpstreamAccountConfig) -> Decimal | None:
     except DecimalException:
         return None
     return value if value.is_finite() and value > 0 else None
+
+
+def _tie_multiplier_key(value: Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        # The database and API expose multipliers as IEEE-754 floats. Key the
+        # order from that representable value so persistence and UI grouping agree.
+        representable = Decimal(str(float(value)))
+        return representable.quantize(TIE_MULTIPLIER_QUANTUM, rounding=ROUND_DOWN)
+    except (DecimalException, OverflowError, ValueError):
+        return value
+
+
+def _same_composite_multiplier(left: Decimal | None, right: Decimal | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return _tie_multiplier_key(left) == _tie_multiplier_key(right)
+
+
+def _account_name_key(config: UpstreamAccountConfig) -> tuple[str, int]:
+    name = str(config.remote_name or "").strip().casefold()
+    return (name or f"\uffff{config.sub2api_account_id}", config.sub2api_account_id)
+
+
+def _active_tiebreak_order(
+    config: UpstreamAccountConfig,
+    multiplier: Decimal,
+) -> int | None:
+    order = config.priority_tiebreak_order
+    stored_multiplier = _decimal_composite_multiplier(
+        config.priority_tiebreak_multiplier
+    )
+    if order is None or not _same_composite_multiplier(stored_multiplier, multiplier):
+        return None
+    return max(0, int(order))
+
+
+def _priority_sort_key(config: UpstreamAccountConfig) -> tuple[Any, ...]:
+    multiplier = composite_multiplier(config)
+    if multiplier is None:
+        return (True, Decimal(0), True, 0, *_account_name_key(config))
+    tiebreak_order = _active_tiebreak_order(config, multiplier)
+    return (
+        False,
+        _tie_multiplier_key(multiplier),
+        tiebreak_order is None,
+        tiebreak_order or 0,
+        *_account_name_key(config),
+    )
 
 
 def priority_interval_effective_step(
@@ -63,29 +129,44 @@ def priority_interval_effective_step(
 def allocate_interval_priorities(
     interval: UpstreamPriorityInterval,
     configs: list[UpstreamAccountConfig],
+    *,
+    share_same_composite_multiplier: bool = False,
 ) -> tuple[dict[int, int], int]:
     ordered = sorted(
         configs,
-        key=lambda config: (
-            composite_multiplier(config) is None,
-            composite_multiplier(config) or Decimal(0),
-            config.sub2api_account_id,
-        ),
+        key=_priority_sort_key,
     )
     eligible = [config for config in ordered if composite_multiplier(config) is not None]
+    multiplier_groups: list[list[UpstreamAccountConfig]] = []
+    if share_same_composite_multiplier:
+        for config in eligible:
+            multiplier = composite_multiplier(config)
+            if (
+                multiplier_groups
+                and _same_composite_multiplier(
+                    composite_multiplier(multiplier_groups[-1][0]),
+                    multiplier,
+                )
+            ):
+                multiplier_groups[-1].append(config)
+            else:
+                multiplier_groups.append([config])
+    else:
+        multiplier_groups = [[config] for config in eligible]
     effective_step = priority_interval_effective_step(
         interval.start_priority,
         interval.end_priority,
         interval.step,
-        len(eligible),
+        len(multiplier_groups),
     )
     final_priority = interval.end_priority - 1
     assignments = {
         config.sub2api_account_id: min(
-            interval.start_priority + index * effective_step,
+            interval.start_priority + group_index * effective_step,
             final_priority,
         )
-        for index, config in enumerate(eligible)
+        for group_index, group in enumerate(multiplier_groups)
+        for config in group
     }
     return assignments, effective_step
 
@@ -103,7 +184,30 @@ class UpstreamPriorityService:
             self.accounts._priorities = self
 
     @staticmethod
-    async def _interval_counts(db: AsyncSession) -> dict[int, tuple[int, int]]:
+    def _assign_priority_when_disabled(
+        config: UpstreamAccountConfig,
+        global_enabled: bool,
+    ) -> bool:
+        override = config.priority_assignment_when_disabled
+        return bool(override if override is not None else global_enabled)
+
+    async def _global_assign_disabled(self) -> bool:
+        try:
+            return bool(
+                await get_runtime_config_service().get_priority_assign_disabled_api_key_accounts()
+            )
+        except Exception:
+            return False
+
+    async def _share_same_composite_multiplier(self) -> bool:
+        try:
+            return bool(
+                await get_runtime_config_service().get_priority_share_same_composite_multiplier()
+            )
+        except Exception:
+            return False
+
+    async def _interval_counts(self, db: AsyncSession) -> dict[int, tuple[int, int]]:
         result = await db.execute(
             select(
                 UpstreamAccountConfig.priority_interval_id,
@@ -119,9 +223,36 @@ class UpstreamPriorityService:
             )
         )
         eligible_counts: dict[int, int] = defaultdict(int)
+        eligible_multiplier_groups: dict[int, set[Decimal]] = defaultdict(set)
+        global_assign_disabled, share_same_multiplier = await asyncio.gather(
+            self._global_assign_disabled(),
+            self._share_same_composite_multiplier(),
+        )
         for config in config_result.scalars().all():
-            if composite_multiplier(config) is not None and config.priority_interval_id is not None:
-                eligible_counts[config.priority_interval_id] += 1
+            enabled_for_priority = bool(
+                config.remote_schedulable is not False
+                or self._assign_priority_when_disabled(config, global_assign_disabled)
+            )
+            if (
+                enabled_for_priority
+                and composite_multiplier(config) is not None
+                and config.priority_interval_id is not None
+            ):
+                if share_same_multiplier:
+                    multiplier = composite_multiplier(config)
+                    if multiplier is not None:
+                        eligible_multiplier_groups[config.priority_interval_id].add(
+                            _tie_multiplier_key(multiplier)
+                        )
+                else:
+                    eligible_counts[config.priority_interval_id] += 1
+        if share_same_multiplier:
+            eligible_counts.update(
+                {
+                    interval_id: len(multiplier_groups)
+                    for interval_id, multiplier_groups in eligible_multiplier_groups.items()
+                }
+            )
         return {
             interval_id: (count, eligible_counts.get(interval_id, 0))
             for interval_id, count in total_counts.items()
@@ -140,6 +271,12 @@ class UpstreamPriorityService:
             start_priority=interval.start_priority,
             end_priority=interval.end_priority,
             step=interval.step,
+            rate_pause_enabled=bool(interval.rate_pause_enabled),
+            rate_pause_mode=interval.rate_pause_mode or "increase_percent",
+            rate_increase_threshold_percent=float(
+                interval.rate_increase_threshold_percent or 20.0
+            ),
+            rate_absolute_threshold=float(interval.rate_absolute_threshold or 1.0),
             account_count=account_count,
             effective_step=priority_interval_effective_step(
                 interval.start_priority,
@@ -168,42 +305,21 @@ class UpstreamPriorityService:
             for interval in result.scalars().all()
         ]
 
-    @staticmethod
-    async def _require_non_overlapping(
-        db: AsyncSession,
-        *,
-        start_priority: int,
-        end_priority: int,
-        exclude_id: int | None = None,
-    ) -> None:
-        statement = select(UpstreamPriorityInterval.id).where(
-            UpstreamPriorityInterval.start_priority < end_priority,
-            UpstreamPriorityInterval.end_priority > start_priority,
-        )
-        if exclude_id is not None:
-            statement = statement.where(UpstreamPriorityInterval.id != exclude_id)
-        if (await db.execute(statement.limit(1))).scalar_one_or_none() is not None:
-            raise UpstreamAccountServiceError(
-                "Priority intervals must not overlap.",
-                status_code=409,
-            )
-
     async def create_interval(
         self,
         db: AsyncSession,
         payload: PriorityIntervalCreate,
     ) -> PriorityIntervalOut:
         async with self._lock:
-            await self._require_non_overlapping(
-                db,
-                start_priority=payload.start_priority,
-                end_priority=payload.end_priority,
-            )
             interval = UpstreamPriorityInterval(
                 name=payload.name,
                 start_priority=payload.start_priority,
                 end_priority=payload.end_priority,
                 step=payload.step,
+                rate_pause_enabled=payload.rate_pause_enabled,
+                rate_pause_mode=payload.rate_pause_mode,
+                rate_increase_threshold_percent=payload.rate_increase_threshold_percent,
+                rate_absolute_threshold=payload.rate_absolute_threshold,
             )
             db.add(interval)
             try:
@@ -211,7 +327,7 @@ class UpstreamPriorityService:
             except IntegrityError:
                 await db.rollback()
                 raise UpstreamAccountServiceError(
-                    "A priority interval with this name or range already exists.",
+                    "A priority interval with this name already exists.",
                     status_code=409,
                 ) from None
             await db.refresh(interval)
@@ -230,22 +346,20 @@ class UpstreamPriorityService:
                     "The priority interval was not found.",
                     status_code=404,
                 )
-            await self._require_non_overlapping(
-                db,
-                start_priority=payload.start_priority,
-                end_priority=payload.end_priority,
-                exclude_id=interval_id,
-            )
             interval.name = payload.name
             interval.start_priority = payload.start_priority
             interval.end_priority = payload.end_priority
             interval.step = payload.step
+            interval.rate_pause_enabled = payload.rate_pause_enabled
+            interval.rate_pause_mode = payload.rate_pause_mode
+            interval.rate_increase_threshold_percent = payload.rate_increase_threshold_percent
+            interval.rate_absolute_threshold = payload.rate_absolute_threshold
             try:
                 await db.commit()
             except IntegrityError:
                 await db.rollback()
                 raise UpstreamAccountServiceError(
-                    "A priority interval with this name or range already exists.",
+                    "A priority interval with this name already exists.",
                     status_code=409,
                 ) from None
             await self._rebalance_locked(db)
@@ -269,6 +383,8 @@ class UpstreamPriorityService:
                 .values(
                     priority_interval_id=None,
                     desired_priority=None,
+                    priority_tiebreak_order=None,
+                    priority_tiebreak_multiplier=None,
                     priority_sync_status="unassigned",
                     priority_sync_error=None,
                 )
@@ -324,6 +440,8 @@ class UpstreamPriorityService:
                         )
                 config.priority_interval_id = payload.priority_interval_id
                 config.desired_priority = None
+                config.priority_tiebreak_order = None
+                config.priority_tiebreak_multiplier = None
                 config.priority_sync_status = (
                     "pending" if payload.priority_interval_id is not None else "unassigned"
                 )
@@ -343,20 +461,111 @@ class UpstreamPriorityService:
             )
         return found
 
+    async def move_equal_multiplier_priority(
+        self,
+        db: AsyncSession,
+        account_id: int,
+        payload: PriorityTieMoveRequest,
+    ) -> PriorityRebalanceOut:
+        async with self._lock:
+            if await self._share_same_composite_multiplier():
+                raise UpstreamAccountServiceError(
+                    "Accounts with the same composite multiplier currently share one priority.",
+                    status_code=409,
+                )
+            account_lock = await self.accounts._lock_for(account_id)
+            neighbor_id: int
+            async with account_lock:
+                remote = await self.accounts._remote_account(
+                    account_id,
+                    payload.expected_identity_fingerprint,
+                )
+                result = await db.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.sub2api_account_id == account_id
+                    )
+                )
+                config = result.scalar_one_or_none()
+                if config is None:
+                    raise UpstreamAccountServiceError(
+                        "The API Key account is not managed locally.",
+                        status_code=404,
+                    )
+                self.accounts._require_config_binding(remote, config)
+                multiplier = composite_multiplier(config)
+                if config.priority_interval_id is None or multiplier is None:
+                    raise UpstreamAccountServiceError(
+                        "The API Key account needs a priority interval and composite multiplier before its tie order can be changed.",
+                        status_code=409,
+                    )
+                peer_result = await db.execute(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.priority_interval_id
+                        == config.priority_interval_id
+                    )
+                )
+                peers = [
+                    item
+                    for item in peer_result.scalars().all()
+                    if item.desired_priority is not None
+                    and _same_composite_multiplier(composite_multiplier(item), multiplier)
+                ]
+                ordered = sorted(peers, key=_priority_sort_key)
+                target_index = next(
+                    (
+                        index
+                        for index, item in enumerate(ordered)
+                        if item.sub2api_account_id == account_id
+                    ),
+                    -1,
+                )
+                neighbor_index = (
+                    target_index + 1 if payload.direction == "up" else target_index - 1
+                )
+                if (
+                    target_index < 0
+                    or neighbor_index < 0
+                    or neighbor_index >= len(ordered)
+                ):
+                    raise UpstreamAccountServiceError(
+                        "There is no equal-multiplier account in that direction.",
+                        status_code=409,
+                    )
+                ordered[target_index], ordered[neighbor_index] = (
+                    ordered[neighbor_index],
+                    ordered[target_index],
+                )
+                stored_multiplier = float(multiplier)
+                for index, item in enumerate(ordered):
+                    item.priority_tiebreak_order = index
+                    item.priority_tiebreak_multiplier = stored_multiplier
+                neighbor_id = ordered[target_index].sub2api_account_id
+                await db.commit()
+            return await self._rebalance_locked(
+                db,
+                account_ids={account_id, neighbor_id},
+            )
+
     async def rebalance(
         self,
         db: AsyncSession,
         *,
         account_ids: set[int] | None = None,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
     ) -> PriorityRebalanceOut:
         async with self._lock:
-            return await self._rebalance_locked(db, account_ids=account_ids)
+            return await self._rebalance_locked(
+                db,
+                account_ids=account_ids,
+                remote_by_id=remote_by_id,
+            )
 
     async def _rebalance_locked(
         self,
         db: AsyncSession,
         *,
         account_ids: set[int] | None = None,
+        remote_by_id: dict[int, dict[str, Any]] | None = None,
     ) -> PriorityRebalanceOut:
         candidate_query = select(UpstreamAccountConfig.sub2api_account_id).where(
             UpstreamAccountConfig.priority_interval_id.is_not(None)
@@ -452,40 +661,61 @@ class UpstreamPriorityService:
                     failed=0,
                 )
 
-            try:
-                remote_accounts = await self.accounts._remote_accounts()
-            except UpstreamAccountServiceError:
-                for config in assigned:
-                    config.desired_priority = None
-                    config.priority_sync_status = "apply_failed"
-                    config.priority_sync_error = PRIORITY_READ_ERROR
-                await db.commit()
-                return PriorityRebalanceOut(
-                    considered=len(assigned),
-                    updated=0,
-                    unchanged=0,
-                    failed=len(assigned),
-                )
+            if remote_by_id is None:
+                try:
+                    remote_accounts = await self.accounts._remote_accounts()
+                except UpstreamAccountServiceError:
+                    for config in assigned:
+                        config.desired_priority = None
+                        config.priority_sync_status = "apply_failed"
+                        config.priority_sync_error = PRIORITY_READ_ERROR
+                    await db.commit()
+                    return PriorityRebalanceOut(
+                        considered=len(assigned),
+                        updated=0,
+                        unchanged=0,
+                        failed=len(assigned),
+                    )
 
-            remote_by_id = {
-                account_id: remote
-                for remote in remote_accounts
-                if (account_id := self.accounts._numeric_remote_id(remote)) is not None
-            }
+                remote_by_id = {
+                    account_id: remote
+                    for remote in remote_accounts
+                    if (account_id := self.accounts._numeric_remote_id(remote)) is not None
+                }
+            global_assign_disabled, share_same_multiplier = await asyncio.gather(
+                self._global_assign_disabled(),
+                self._share_same_composite_multiplier(),
+            )
             live_assigned: list[UpstreamAccountConfig] = []
             by_interval: dict[int, list[UpstreamAccountConfig]] = defaultdict(list)
             for config in assigned:
                 remote = remote_by_id.get(config.sub2api_account_id)
-                if (
-                    remote is None
-                    or self.accounts._config_binding_status(remote, config) != "bound"
-                ):
+                if remote is None and not config.remote_present:
+                    # Inventory has already recorded when the account was last
+                    # seen. Keep its interval and historical priority so an
+                    # incomplete remote list cannot discard user configuration.
+                    config.priority_sync_status = "remote_missing"
+                    config.priority_sync_error = None
+                    continue
+                if remote is None or self.accounts._config_binding_status(remote, config) != "bound":
                     config.priority_interval_id = None
                     config.desired_priority = None
                     config.priority_sync_status = "unassigned"
                     config.priority_sync_error = None
                     continue
                 live_assigned.append(config)
+                self.accounts.apply_remote_snapshot(config, remote)
+                if (
+                    self.sub2api.account_schedulable(remote) is False
+                    and not self._assign_priority_when_disabled(
+                        config,
+                        global_assign_disabled,
+                    )
+                ):
+                    config.desired_priority = None
+                    config.priority_sync_status = "disabled_excluded"
+                    config.priority_sync_error = None
+                    continue
                 if composite_multiplier(config) is None:
                     config.desired_priority = None
                     config.priority_sync_status = "multiplier_unavailable"
@@ -498,6 +728,7 @@ class UpstreamPriorityService:
                 assignments, _effective_step = allocate_interval_priorities(
                     intervals[interval_id],
                     interval_configs,
+                    share_same_composite_multiplier=share_same_multiplier,
                 )
                 desired_by_id.update(assignments)
                 for config in interval_configs:
@@ -626,15 +857,23 @@ class UpstreamPriorityService:
 
         updated = 0
         if attempted_ids:
+            readback_succeeded = True
             try:
                 readback_accounts = await self.accounts._remote_accounts()
             except UpstreamAccountServiceError:
                 readback_accounts = []
+                readback_succeeded = False
             readback_by_id = {
                 account_id: remote
                 for remote in readback_accounts
                 if (account_id := self.accounts._numeric_remote_id(remote)) is not None
             }
+            if readback_succeeded:
+                # Callers may share this snapshot with the final overview. Keep
+                # it authoritative after priority writes instead of listing all
+                # accounts yet again outside the priority workflow.
+                remote_by_id.clear()
+                remote_by_id.update(readback_by_id)
             for account_id in attempted_ids:
                 config = config_by_id[account_id]
                 remote = readback_by_id.get(account_id)

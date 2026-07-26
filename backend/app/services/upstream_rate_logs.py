@@ -52,7 +52,8 @@ async def list_upstream_rate_change_logs(
     if start_at is not None and end_at is not None and start_at >= end_at:
         raise ValueError("start_at must be earlier than end_at.")
 
-    await prune_upstream_rate_change_logs(db, retention_days=retention_days)
+    if not 1 <= retention_days <= 3650:
+        raise ValueError("retention_days must be between 1 and 3650.")
     changed_fields = (
         (UpstreamRateChangeLog.old_group_multiplier, UpstreamRateChangeLog.new_group_multiplier),
         (UpstreamRateChangeLog.old_upstream_multiplier, UpstreamRateChangeLog.new_upstream_multiplier),

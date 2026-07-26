@@ -1,5 +1,5 @@
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
@@ -9,28 +9,47 @@ from app.core.database import get_db
 from app.core.security import require_admin
 from app.schemas import (
     MessageResponse,
+    AccountSchedulingChangeLogOut,
+    AccountSchedulingChangePageOut,
+    ChangeLogMarkReadRequest,
+    ChangeLogUnreadCountsOut,
     PriorityIntervalAssignment,
     PriorityIntervalCreate,
     PriorityIntervalOut,
     PriorityIntervalUpdate,
     PriorityRebalanceOut,
+    PriorityTieMoveRequest,
     UpstreamAccountEnabledUpdate,
+    UpstreamAccountAvailabilityTestOut,
+    UpstreamAccountConnectionTestOut,
     UpstreamAccountOut,
     UpstreamAccountUpdate,
     UpstreamApplyRequest,
     UpstreamDiscoverAllOut,
     UpstreamIdentityRequest,
     UpstreamRateChangeLogOut,
+    UpstreamChannelChangeEventOut,
+    UpstreamChannelChangePageOut,
     UpstreamRemoteDeleteRequest,
 )
 from app.services.runtime_config import get_runtime_config_service
+from app.services.change_logs import (
+    change_log_unread_counts,
+    list_account_scheduling_changes,
+    list_upstream_channel_changes,
+    mark_account_scheduling_changes_read,
+    mark_upstream_changes_read,
+)
 from app.services.upstream_accounts import (
     UpstreamAccountService,
     UpstreamAccountServiceError,
     get_upstream_account_service,
 )
 from app.services.upstream_rate_logs import list_upstream_rate_change_logs
-from app.services.upstream_channels import get_upstream_channel_service
+from app.services.upstream_channels import (
+    UpstreamChannelService,
+    get_upstream_channel_service,
+)
 from app.services.upstream_priorities import (
     UpstreamPriorityService,
     get_upstream_priority_service,
@@ -81,7 +100,7 @@ async def list_upstream_accounts(
     service: UpstreamAccountService = Depends(get_upstream_account_service),
 ) -> list[UpstreamAccountOut]:
     try:
-        return await service.list_accounts(db)
+        return await service.list_accounts(db, use_cache=True)
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
 
@@ -120,6 +139,115 @@ async def list_upstream_rate_logs(
         end_at=end_at,
     )
     return [UpstreamRateChangeLogOut.model_validate(item) for item in logs]
+
+
+@router.get("/channel-change-events", response_model=UpstreamChannelChangePageOut)
+async def list_channel_change_events(
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    before_id: Annotated[int | None, Query(ge=1)] = None,
+    start_date: Annotated[date | None, Query()] = None,
+    end_date: Annotated[date | None, Query()] = None,
+    time_zone: Annotated[str, Query(min_length=1, max_length=80)] = "UTC",
+    category: Annotated[
+        Literal["all", "upstream", "account_rate"],
+        Query(),
+    ] = "all",
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UpstreamChannelChangePageOut:
+    start_at, end_at = _rate_log_date_bounds(start_date, end_date, time_zone)
+    retention_days = await get_runtime_config_service().get_upstream_rate_log_retention_days()
+    rows, last_read_id, unread_count = await list_upstream_channel_changes(
+        db,
+        retention_days=retention_days,
+        limit=limit,
+        before_id=before_id,
+        start_at=start_at,
+        end_at=end_at,
+        category=category,
+    )
+    items = []
+    for row in rows:
+        item = UpstreamChannelChangeEventOut.model_validate(row)
+        item.unread = not row.legacy_imported and row.id > last_read_id
+        items.append(item)
+    return UpstreamChannelChangePageOut(
+        items=items,
+        unread_count=unread_count,
+        last_read_id=last_read_id,
+    )
+
+
+@router.get("/scheduling-change-events", response_model=AccountSchedulingChangePageOut)
+async def list_scheduling_change_events(
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    before_id: Annotated[int | None, Query(ge=1)] = None,
+    start_date: Annotated[date | None, Query()] = None,
+    end_date: Annotated[date | None, Query()] = None,
+    time_zone: Annotated[str, Query(min_length=1, max_length=80)] = "UTC",
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AccountSchedulingChangePageOut:
+    start_at, end_at = _rate_log_date_bounds(start_date, end_date, time_zone)
+    retention_days = await get_runtime_config_service().get_upstream_rate_log_retention_days()
+    rows, last_read_id, unread_count = await list_account_scheduling_changes(
+        db,
+        retention_days=retention_days,
+        limit=limit,
+        before_id=before_id,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    items = []
+    for row in rows:
+        item = AccountSchedulingChangeLogOut.model_validate(row)
+        item.active_reasons = list(row.active_reasons or [])
+        item.unread = row.id > last_read_id
+        items.append(item)
+    return AccountSchedulingChangePageOut(
+        items=items,
+        unread_count=unread_count,
+        last_read_id=last_read_id,
+    )
+
+
+@router.get("/change-log-unread-counts", response_model=ChangeLogUnreadCountsOut)
+async def get_change_log_unread_counts(
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ChangeLogUnreadCountsOut:
+    upstream, account_rate, scheduling = await change_log_unread_counts(
+        db,
+    )
+    return ChangeLogUnreadCountsOut(
+        upstream_changes=upstream,
+        account_rate_changes=account_rate,
+        account_scheduling_changes=scheduling,
+    )
+
+
+@router.post("/channel-change-events/mark-read", response_model=MessageResponse)
+async def mark_channel_change_events_read(
+    payload: ChangeLogMarkReadRequest,
+    category: Annotated[
+        Literal["all", "upstream", "account_rate"],
+        Query(),
+    ] = "all",
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MessageResponse:
+    await mark_upstream_changes_read(db, payload.through_id, category=category)
+    return MessageResponse(message="Upstream changes marked as read.")
+
+
+@router.post("/scheduling-change-events/mark-read", response_model=MessageResponse)
+async def mark_scheduling_change_events_read(
+    payload: ChangeLogMarkReadRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MessageResponse:
+    await mark_account_scheduling_changes_read(db, payload.through_id)
+    return MessageResponse(message="Account scheduling changes marked as read.")
 
 
 @router.get("/priority-intervals", response_model=list[PriorityIntervalOut])
@@ -190,45 +318,40 @@ async def upsert_upstream_account(
     service: UpstreamAccountService = Depends(get_upstream_account_service),
 ) -> UpstreamAccountOut:
     try:
-        reconcile_fields = {"channel_id", "api_key", "manual_group_multiplier"}
-        reconcile_requested = bool(payload.model_fields_set & reconcile_fields)
+        rate_reconcile_fields = {
+            "channel_id",
+            "api_key",
+            "manual_group_multiplier",
+        }
+        rate_reconcile_requested = bool(
+            payload.model_fields_set & rate_reconcile_fields
+        )
+        priority_reconcile_requested = bool(
+            payload.model_fields_set
+            & {"priority_assignment_when_disabled", "remote_name"}
+        )
+        availability_reconcile_requested = bool(
+            payload.model_fields_set
+            & {
+                "availability_check_mode",
+                "availability_monitor_id",
+                "availability_test_model",
+            }
+        )
+        reconcile_requested = rate_reconcile_requested or priority_reconcile_requested
         account = await service.upsert_account(
             db,
             sub2api_account_id,
             payload,
             defer_priority_rebalance=reconcile_requested,
         )
-        should_reconcile = bool(
+        should_reconcile_in_background = bool(
             account.channel_id
-            and reconcile_requested
+            and (rate_reconcile_requested or availability_reconcile_requested)
         )
-        if should_reconcile and account.channel_id is not None:
-            try:
-                channel = await get_upstream_channel_service().discover_channel(
-                    db,
-                    account.channel_id,
-                )
-            except UpstreamAccountServiceError:
-                if isinstance(service, UpstreamAccountService):
-                    await service._rebalance_priorities_best_effort(db)
-                    refreshed = await service.list_accounts(db)
-                    return next(
-                        (
-                            item
-                            for item in refreshed
-                            if item.sub2api_account_id == sub2api_account_id
-                        ),
-                        account,
-                    )
-                return account
-            return next(
-                (
-                    item
-                    for item in channel.accounts
-                    if item.sub2api_account_id == sub2api_account_id
-                ),
-                account,
-            )
+        if should_reconcile_in_background and account.channel_id is not None:
+            get_upstream_channel_service().queue_discover_channel(account.channel_id)
+            return account
         if reconcile_requested and isinstance(service, UpstreamAccountService):
             await service._rebalance_priorities_best_effort(db)
             refreshed = await service.list_accounts(db)
@@ -255,6 +378,24 @@ async def assign_priority_interval(
 ) -> UpstreamAccountOut:
     try:
         return await service.assign_interval(db, sub2api_account_id, payload)
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+
+@router.put("/{sub2api_account_id}/priority-order", response_model=PriorityRebalanceOut)
+async def move_equal_multiplier_priority(
+    sub2api_account_id: AccountId,
+    payload: PriorityTieMoveRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamPriorityService = Depends(get_upstream_priority_service),
+) -> PriorityRebalanceOut:
+    try:
+        return await service.move_equal_multiplier_priority(
+            db,
+            sub2api_account_id,
+            payload,
+        )
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
 
@@ -293,6 +434,48 @@ async def set_upstream_account_enabled(
             db,
             sub2api_account_id,
             payload.enabled,
+            payload.expected_identity_fingerprint,
+        )
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+
+@router.post(
+    "/{sub2api_account_id}/connection-test",
+    response_model=UpstreamAccountConnectionTestOut,
+)
+async def force_upstream_account_connection_test(
+    sub2api_account_id: AccountId,
+    payload: UpstreamIdentityRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+) -> UpstreamAccountConnectionTestOut:
+    try:
+        return await service.test_account_connection(
+            db,
+            sub2api_account_id,
+            payload.expected_identity_fingerprint,
+        )
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+
+@router.post(
+    "/{sub2api_account_id}/availability-test",
+    response_model=UpstreamAccountAvailabilityTestOut,
+)
+async def test_upstream_account_availability(
+    sub2api_account_id: AccountId,
+    payload: UpstreamIdentityRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+) -> UpstreamAccountAvailabilityTestOut:
+    try:
+        return await service.test_account_availability(
+            db,
+            sub2api_account_id,
             payload.expected_identity_fingerprint,
         )
     except UpstreamAccountServiceError as exc:

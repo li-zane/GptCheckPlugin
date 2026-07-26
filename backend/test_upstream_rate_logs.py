@@ -60,7 +60,7 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         await self.engine.dispose()
 
-    async def test_list_prunes_expired_rows_and_pages_by_id(self) -> None:
+    async def test_list_is_read_only_and_pages_by_id(self) -> None:
         expired = _log(
             account_id=1,
             status="observed",
@@ -84,9 +84,9 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
             limit=10,
             before_id=newest.id,
         )
-        self.assertEqual([item.id for item in second_page], [older.id])
+        self.assertEqual([item.id for item in second_page], [older.id, expired.id])
         count = await self.db.scalar(select(func.count()).select_from(UpstreamRateChangeLog))
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 3)
 
     async def test_invalid_service_bounds_are_rejected(self) -> None:
         with self.assertRaises(ValueError):

@@ -106,12 +106,16 @@ class ProductionSecurityConfigTests(unittest.TestCase):
         fake_uvicorn.run.assert_called_once()  # type: ignore[attr-defined]
         kwargs = fake_uvicorn.run.call_args.kwargs  # type: ignore[attr-defined]
         self.assertEqual(kwargs["host"], "127.0.0.1")
-        self.assertEqual(kwargs["port"], 8000)
+        self.assertEqual(kwargs["port"], 5173)
 
     def test_package_production_script_uses_fail_closed_runner(self) -> None:
         package_path = Path(__file__).resolve().parents[1] / "package.json"
         package = json.loads(package_path.read_text(encoding="utf-8"))
         self.assertEqual(package["scripts"]["backend:prod"], "python backend/run_production.py")
+        self.assertEqual(
+            package["scripts"]["dev"],
+            "npm run frontend:build && npm run backend:dev",
+        )
 
 
 if __name__ == "__main__":

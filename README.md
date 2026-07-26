@@ -8,7 +8,7 @@
 - `frontend/`: Vite + React 管理面板，包含登录、概览、账号、邮箱、历史视图。
 - `.env.example`: 本地配置模板。
 
-## 后端启动
+## 本地启动
 
 ```powershell
 Copy-Item .env.example .env
@@ -16,20 +16,14 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r backend/requirements.txt
 python -m playwright install chromium
-npm run backend:dev
-```
-
-生产环境请把 `.env` 里的 `APP_ADMIN_KEY`、`APP_SESSION_SECRET`、`APP_ENCRYPTION_KEY` 换成长随机值，并把 `COOKIE_SECURE=true` 放在 HTTPS 反代之后使用。
-
-## 前端启动
-
-```powershell
-cd frontend
 npm install
+npm --prefix frontend install
 npm run dev
 ```
 
-默认访问 `http://127.0.0.1:5173`，前端会把 `/api` 代理到 `http://127.0.0.1:8000`。
+默认访问 `http://127.0.0.1:5173`。根目录的 `npm run dev` 会先构建前端，再由同一个 FastAPI 进程提供前端页面和 `/api`，不会额外启动 Vite 或第二个端口。
+
+生产环境请把 `.env` 里的 `APP_ADMIN_KEY`、`APP_SESSION_SECRET`、`APP_ENCRYPTION_KEY` 换成长随机值，并把 `COOKIE_SECURE=true` 放在 HTTPS 反代之后使用。
 
 ## sub2api 配置
 

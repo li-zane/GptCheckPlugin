@@ -1,0 +1,21 @@
+flowchart LR
+    Browser["Admin browser"]
+    Control["Instance-scoped GptCheckPlugin control plane"]
+    Registry["Instance registry and scoped data"]
+    SubA["sub2api A with integration API"]
+    SubB["sub2api B with integration API"]
+    PolicyA["Local capability and derivation policy A"]
+    PolicyB["Local capability and derivation policy B"]
+    DbA["PostgreSQL A"]
+    DbB["PostgreSQL B"]
+
+    Browser -->|"instance_id on every request"| Control
+    Control --> Registry
+    Control -->|"x-api-key A: list and write"| SubA
+    Control -->|"x-api-key B: list and write"| SubB
+    SubA -->|"outbound authenticated derived results"| Control
+    SubB -->|"outbound authenticated derived results"| Control
+    SubA --> PolicyA
+    SubB --> PolicyB
+    PolicyA --> DbA
+    PolicyB --> DbB

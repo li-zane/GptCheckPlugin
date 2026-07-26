@@ -273,8 +273,16 @@ class AccountLivenessBatchTests(unittest.IsolatedAsyncioTestCase):
         }
         sub2api = Sub2ApiClient()
         sub2api.list_accounts = AsyncMock(return_value=[oauth_ok, oauth_failed, api_key])  # type: ignore[method-assign]
+
+        async def connection_result(account: dict, _model_id: str):
+            return (
+                (True, None)
+                if sub2api.account_id(account) == "1"
+                else (False, "API returned 429")
+            )
+
         sub2api.test_account_connection = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[(True, None), (False, "API returned 429")]
+            side_effect=connection_result
         )
         record = AsyncMock()
 

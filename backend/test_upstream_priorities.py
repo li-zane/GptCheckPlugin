@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
@@ -9,7 +10,6 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.upstream_accounts import router
@@ -25,12 +25,15 @@ from app.schemas import (
     PriorityIntervalAssignment,
     PriorityIntervalOut,
     PriorityRebalanceOut,
+    PriorityTieMoveRequest,
 )
 from app.services.sub2api import Sub2ApiClient
 from app.services.upstream_accounts import UpstreamAccountService, UpstreamAccountServiceError
 from app.services.upstream_priorities import (
     UpstreamPriorityService,
+    _tie_multiplier_key,
     allocate_interval_priorities,
+    composite_multiplier,
     get_upstream_priority_service,
 )
 
@@ -135,6 +138,124 @@ class PriorityAllocatorTests(unittest.TestCase):
         self.assertEqual(assignments, {8: 10, 7: 13})
         self.assertNotIn(9, assignments)
 
+    def test_allocator_sorts_equal_multipliers_by_name_then_persisted_override(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="main",
+            start_priority=40,
+            end_priority=70,
+            step=2,
+        )
+        alpha = self._config(8, 0.1)
+        alpha.remote_name = "Alpha"
+        beta = self._config(7, 0.1)
+        beta.remote_name = "beta"
+
+        assignments, _ = allocate_interval_priorities(interval, [beta, alpha])
+        self.assertEqual(assignments, {8: 40, 7: 42})
+
+        alpha.priority_tiebreak_order = 1
+        alpha.priority_tiebreak_multiplier = 0.1
+        beta.priority_tiebreak_order = 0
+        beta.priority_tiebreak_multiplier = 0.1
+        assignments, _ = allocate_interval_priorities(interval, [alpha, beta])
+        self.assertEqual(assignments, {7: 40, 8: 42})
+
+        beta.priority_tiebreak_multiplier = 0.2
+        assignments, _ = allocate_interval_priorities(interval, [beta, alpha])
+        self.assertEqual(assignments, {8: 40, 7: 42})
+
+    def test_allocator_can_share_priority_across_equal_multiplier_accounts(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="main",
+            start_priority=40,
+            end_priority=70,
+            step=2,
+        )
+        alpha = self._config(7, 0.1)
+        beta = self._config(8, 0.1)
+        expensive = self._config(9, 0.2)
+
+        assignments, effective_step = allocate_interval_priorities(
+            interval,
+            [expensive, beta, alpha],
+            share_same_composite_multiplier=True,
+        )
+
+        self.assertEqual(effective_step, 2)
+        self.assertEqual(assignments, {7: 40, 8: 40, 9: 42})
+
+    def test_shared_multiplier_groups_determine_effective_step(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="small",
+            start_priority=40,
+            end_priority=44,
+            step=3,
+        )
+        configs = [
+            self._config(7, 0.1),
+            self._config(8, 0.1),
+            self._config(9, 0.2),
+            self._config(10, 0.2),
+        ]
+
+        assignments, effective_step = allocate_interval_priorities(
+            interval,
+            configs,
+            share_same_composite_multiplier=True,
+        )
+
+        self.assertEqual(effective_step, 3)
+        self.assertEqual(assignments, {7: 40, 8: 40, 9: 43, 10: 43})
+
+    def test_allocator_keeps_high_precision_tiebreak_after_float_storage(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="main",
+            start_priority=40,
+            end_priority=70,
+            step=2,
+        )
+        alpha = self._config(8, 1.23456789012345)
+        alpha.effective_recharge_multiplier = 9.87654321098765
+        alpha.remote_name = "Alpha"
+        beta = self._config(7, 1.23456789012345)
+        beta.effective_recharge_multiplier = 9.87654321098765
+        beta.remote_name = "Beta"
+        alpha.priority_tiebreak_order = 1
+        alpha.priority_tiebreak_multiplier = float(composite_multiplier(alpha))
+        beta.priority_tiebreak_order = 0
+        beta.priority_tiebreak_multiplier = float(composite_multiplier(beta))
+
+        assignments, _ = allocate_interval_priorities(interval, [alpha, beta])
+
+        self.assertEqual(assignments, {7: 40, 8: 42})
+        self.assertEqual(
+            _tie_multiplier_key(Decimal("1.00000000000025")),
+            Decimal("1.0000000000002"),
+        )
+        self.assertEqual(_tie_multiplier_key(Decimal("5e-14")), Decimal("0E-13"))
+
+        large_alpha = self._config(10, 195.3507753057386)
+        large_alpha.effective_recharge_multiplier = 361.49042130810847
+        large_alpha.remote_name = "Alpha"
+        large_beta = self._config(11, 195.3507753057386)
+        large_beta.effective_recharge_multiplier = 361.49042130810847
+        large_beta.remote_name = "Beta"
+        stored_large_multiplier = float(composite_multiplier(large_alpha))
+        large_alpha.priority_tiebreak_order = 1
+        large_alpha.priority_tiebreak_multiplier = stored_large_multiplier
+        large_beta.priority_tiebreak_order = 0
+        large_beta.priority_tiebreak_multiplier = stored_large_multiplier
+
+        large_assignments, _ = allocate_interval_priorities(
+            interval,
+            [large_alpha, large_beta],
+        )
+
+        self.assertEqual(large_assignments, {11: 40, 10: 42})
 
 class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -177,8 +298,11 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         group: float | None,
         recharge: float | None = 1.0,
         priority: int = 50,
+        name: str | None = None,
     ) -> UpstreamAccountConfig:
         remote = remote_account(account_id, priority=priority)
+        if name is not None:
+            remote["name"] = name
         self.sub2api.accounts.append(remote)
         config = self.accounts._new_config(remote, account_id)
         config.priority_interval_id = interval_id
@@ -188,11 +312,73 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         return config
 
-    async def test_intervals_reject_overlap_and_allow_adjacent_bounds(self) -> None:
+    async def test_equal_multiplier_priority_can_be_swapped_and_persists(self) -> None:
+        interval = await self._interval()
+        alpha = await self._add_config(7, interval.id, group=0.1, name="Alpha")
+        beta = await self._add_config(8, interval.id, group=0.1, name="Beta")
+        await self.service.rebalance(self.db)
+        fingerprint = self.accounts._remote_identity_fingerprint(self.sub2api.accounts[0])
+
+        moved = await self.service.move_equal_multiplier_priority(
+            self.db,
+            7,
+            PriorityTieMoveRequest(
+                direction="up",
+                expected_identity_fingerprint=fingerprint,
+            ),
+        )
+
+        self.assertEqual(moved.failed, 0)
+        priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
+        self.assertEqual(priorities, {7: 42, 8: 40})
+        await self.db.refresh(alpha)
+        await self.db.refresh(beta)
+        self.assertEqual((alpha.priority_tiebreak_order, beta.priority_tiebreak_order), (1, 0))
+
+        await self.service.rebalance(self.db)
+        priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
+        self.assertEqual(priorities, {7: 42, 8: 40})
+
+    async def test_shared_multiplier_mode_rebalances_to_one_priority_and_rejects_tie_move(self) -> None:
+        interval = await self._interval()
+        await self._add_config(7, interval.id, group=0.1, name="Alpha")
+        await self._add_config(8, interval.id, group=0.1, name="Beta")
+        await self._add_config(9, interval.id, group=0.2, name="Gamma")
+        runtime = SimpleNamespace(
+            get_priority_assign_disabled_api_key_accounts=AsyncMock(return_value=False),
+            get_priority_share_same_composite_multiplier=AsyncMock(return_value=True),
+        )
+
+        with patch(
+            "app.services.upstream_priorities.get_runtime_config_service",
+            return_value=runtime,
+        ):
+            result = await self.service.rebalance(self.db)
+            with self.assertRaises(UpstreamAccountServiceError) as raised:
+                await self.service.move_equal_multiplier_priority(
+                    self.db,
+                    7,
+                    PriorityTieMoveRequest(
+                        direction="up",
+                        expected_identity_fingerprint=(
+                            self.accounts._remote_identity_fingerprint(
+                                self.sub2api.accounts[0]
+                            )
+                        ),
+                    ),
+                )
+
+        self.assertEqual((result.updated, result.failed), (3, 0))
+        self.assertEqual(raised.exception.status_code, 409)
+        priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
+        self.assertEqual(priorities, {7: 40, 8: 40, 9: 42})
+        listed = await self.service.list_intervals(self.db)
+        self.assertEqual(listed[0].effective_step, 2)
+
+    async def test_intervals_allow_overlap_and_adjacent_bounds(self) -> None:
         await self._interval(start=40, end=70)
-        with self.assertRaises(UpstreamAccountServiceError) as context:
-            await self._interval(name="overlap", start=69, end=90)
-        self.assertEqual(context.exception.status_code, 409)
+        overlap = await self._interval(name="overlap", start=69, end=90)
+        self.assertEqual((overlap.start_priority, overlap.end_priority), (69, 90))
 
         adjacent = await self._interval(name="adjacent", start=70, end=90)
         self.assertEqual((adjacent.start_priority, adjacent.end_priority), (70, 90))
@@ -212,6 +398,73 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item.priority_sync_status == "in_sync" for item in stored))
         listed = await self.accounts.list_accounts(self.db)
         self.assertEqual([item.sub2api_account_id for item in listed], [8, 9, 7])
+
+    async def test_rebalance_reuses_supplied_snapshot_when_priorities_are_unchanged(self) -> None:
+        interval = await self._interval()
+        await self._add_config(7, interval.id, group=1.0, priority=40)
+        await self._add_config(8, interval.id, group=2.0, priority=42)
+        remote_by_id = {
+            int(account["id"]): dict(account)
+            for account in self.sub2api.accounts
+        }
+
+        with patch.object(
+            self.accounts,
+            "_remote_accounts",
+            new=AsyncMock(wraps=self.accounts._remote_accounts),
+        ) as list_accounts:
+            result = await self.service.rebalance(
+                self.db,
+                remote_by_id=remote_by_id,
+            )
+
+        self.assertEqual((result.updated, result.unchanged, result.failed), (0, 2, 0))
+        list_accounts.assert_not_awaited()
+
+    async def test_priority_write_readback_refreshes_supplied_snapshot(self) -> None:
+        interval = await self._interval()
+        await self._add_config(7, interval.id, group=1.0, priority=50)
+        remote_by_id = {7: dict(self.sub2api.accounts[0])}
+
+        with patch.object(
+            self.accounts,
+            "_remote_accounts",
+            new=AsyncMock(wraps=self.accounts._remote_accounts),
+        ) as list_accounts:
+            result = await self.service.rebalance(
+                self.db,
+                remote_by_id=remote_by_id,
+            )
+
+        self.assertEqual((result.updated, result.failed), (1, 0))
+        list_accounts.assert_awaited_once_with()
+        self.assertEqual(remote_by_id[7]["priority"], 40)
+
+    async def test_disabled_account_priority_respects_global_and_account_override(self) -> None:
+        interval = await self._interval()
+        disabled = await self._add_config(7, interval.id, group=0.5)
+        await self._add_config(8, interval.id, group=1.0)
+        self.sub2api.accounts[0]["schedulable"] = False
+        runtime = SimpleNamespace(
+            get_priority_assign_disabled_api_key_accounts=AsyncMock(return_value=False)
+        )
+
+        with patch(
+            "app.services.upstream_priorities.get_runtime_config_service",
+            return_value=runtime,
+        ):
+            await self.service.rebalance(self.db)
+            await self.db.refresh(disabled)
+            self.assertEqual(disabled.priority_sync_status, "disabled_excluded")
+            self.assertIsNone(disabled.desired_priority)
+            self.assertEqual(self.sub2api.accounts[0]["priority"], 50)
+
+            disabled.priority_assignment_when_disabled = True
+            await self.db.commit()
+            await self.service.rebalance(self.db)
+
+        priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
+        self.assertEqual(priorities, {7: 40, 8: 42})
 
     async def test_subset_rebalance_updates_the_complete_affected_interval(self) -> None:
         interval = await self._interval()
@@ -328,7 +581,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.identity_binding_status, "bound")
         self.assertEqual(account.priority, 40)
 
-    async def test_assign_interval_never_rebinds_a_mismatched_identity(self) -> None:
+    async def test_assign_interval_preserves_binding_after_remote_rename(self) -> None:
         interval = await self._interval()
         original = remote_account(7, priority=90)
         config = self.accounts._new_config(original, 7)
@@ -339,23 +592,22 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         replacement = {**original, "name": "replacement-account"}
         self.sub2api.accounts.append(replacement)
 
-        with self.assertRaises(UpstreamAccountServiceError) as mismatch:
-            await self.service.assign_interval(
-                self.db,
-                7,
-                PriorityIntervalAssignment(
-                    expected_identity_fingerprint=(
-                        self.accounts._remote_identity_fingerprint(replacement)
-                    ),
-                    priority_interval_id=interval.id,
-                    confirm_identity_rebind=True,
+        account = await self.service.assign_interval(
+            self.db,
+            7,
+            PriorityIntervalAssignment(
+                expected_identity_fingerprint=(
+                    self.accounts._remote_identity_fingerprint(replacement)
                 ),
-            )
+                priority_interval_id=interval.id,
+            ),
+        )
 
-        self.assertEqual(mismatch.exception.status_code, 409)
         await self.db.refresh(config)
-        self.assertIsNone(config.priority_interval_id)
-        self.assertEqual(self.sub2api.priority_update_calls, [])
+        self.assertEqual(config.priority_interval_id, interval.id)
+        self.assertEqual(config.remote_identity_fingerprint, self.accounts._remote_binding_fingerprint(replacement))
+        self.assertEqual(account.identity_binding_status, "bound")
+        self.assertEqual(account.priority, 40)
 
     async def test_local_and_remote_deletion_rebalance_remaining_accounts(self) -> None:
         interval = await self._interval()
@@ -528,7 +780,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PriorityMigrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_priority_migration_is_idempotent_and_enforces_guards(self) -> None:
+    async def test_priority_migration_is_idempotent_and_cleans_legacy_overlap_guards(self) -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         try:
             async with engine.begin() as connection:
@@ -545,6 +797,25 @@ class PriorityMigrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 await _migrate_upstream_priority_intervals(connection)
+                await connection.execute(
+                    text(
+                        "CREATE TRIGGER trg_upstream_priority_interval_no_overlap_insert "
+                        "BEFORE INSERT ON upstream_priority_intervals "
+                        "WHEN EXISTS (SELECT 1 FROM upstream_priority_intervals "
+                        "WHERE NEW.start_priority < end_priority AND NEW.end_priority > start_priority) "
+                        "BEGIN SELECT RAISE(ABORT, 'overlapping upstream priority interval'); END"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "CREATE TRIGGER trg_upstream_priority_interval_no_overlap_update "
+                        "BEFORE UPDATE OF start_priority, end_priority ON upstream_priority_intervals "
+                        "WHEN EXISTS (SELECT 1 FROM upstream_priority_intervals "
+                        "WHERE id != OLD.id AND NEW.start_priority < end_priority "
+                        "AND NEW.end_priority > start_priority) "
+                        "BEGIN SELECT RAISE(ABORT, 'overlapping upstream priority interval'); END"
+                    )
+                )
                 await _migrate_upstream_priority_intervals(connection)
                 columns = {
                     str(row[1])
@@ -555,6 +826,20 @@ class PriorityMigrationTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchall()
                 }
                 self.assertIn("priority_interval_id", columns)
+                self.assertIn("priority_tiebreak_order", columns)
+                self.assertIn("priority_tiebreak_multiplier", columns)
+                trigger_names = {
+                    str(row[1])
+                    for row in (
+                        await connection.execute(
+                            text(
+                                "SELECT type, name FROM sqlite_master "
+                                "WHERE type = 'trigger' AND name LIKE 'trg_upstream_priority_interval_no_overlap_%'"
+                            )
+                        )
+                    ).fetchall()
+                }
+                self.assertEqual(trigger_names, set())
                 await connection.execute(
                     text(
                         "INSERT INTO upstream_priority_intervals "
@@ -562,14 +847,13 @@ class PriorityMigrationTests(unittest.IsolatedAsyncioTestCase):
                         "VALUES (1, 'main', 40, 70, 2)"
                     )
                 )
-                with self.assertRaises(IntegrityError):
-                    await connection.execute(
-                        text(
-                            "INSERT INTO upstream_priority_intervals "
-                            "(id, name, start_priority, end_priority, step) "
-                            "VALUES (2, 'overlap', 69, 80, 1)"
-                        )
+                await connection.execute(
+                    text(
+                        "INSERT INTO upstream_priority_intervals "
+                        "(id, name, start_priority, end_priority, step) "
+                        "VALUES (2, 'overlap', 69, 80, 1)"
                     )
+                )
                 await connection.execute(
                     text(
                         "UPDATE upstream_account_configs SET priority_interval_id = 1, "
@@ -696,6 +980,37 @@ class PriorityRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["updated"], 1)
         service.rebalance.assert_awaited_once_with(fake_db)
+
+    def test_equal_multiplier_priority_move_route(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-accounts")
+        fake_db = AsyncMock()
+        service = AsyncMock()
+        service.move_equal_multiplier_priority.return_value = PriorityRebalanceOut(
+            considered=2,
+            updated=2,
+            unchanged=0,
+            failed=0,
+        )
+
+        async def db_override():
+            yield fake_db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = db_override
+        app.dependency_overrides[get_upstream_priority_service] = lambda: service
+        fingerprint = "a" * 64
+        with TestClient(app) as client:
+            response = client.put(
+                "/api/upstream-accounts/7/priority-order",
+                json={"direction": "up", "expected_identity_fingerprint": fingerprint},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        service.move_equal_multiplier_priority.assert_awaited_once()
+        args = service.move_equal_multiplier_priority.await_args.args
+        self.assertEqual(args[:2], (fake_db, 7))
+        self.assertEqual((args[2].direction, args[2].expected_identity_fingerprint), ("up", fingerprint))
 
 
 if __name__ == "__main__":

@@ -1,8 +1,19 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.sqlite import JSON
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -33,6 +44,11 @@ class AccountSnapshot(Base):
     subscription_plan: Mapped[str | None] = mapped_column(String(128))
     has_active_subscription: Mapped[bool | None] = mapped_column(Boolean)
     subscription_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    available_models: Mapped[list[dict] | None] = mapped_column(JSON)
+    available_models_status: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    available_models_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     phone_note_sync_marker: Mapped[str | None] = mapped_column(String(64))
     encrypted_openai_refresh_token: Mapped[str | None] = mapped_column(Text)
     encrypted_openai_access_token: Mapped[str | None] = mapped_column(Text)
@@ -204,6 +220,15 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class UsageEstimateCache(Base):
+    __tablename__ = "usage_estimate_cache"
+
+    key: Mapped[str] = mapped_column(String(32), primary_key=True, default="latest")
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class UpstreamChannel(Base):
     __tablename__ = "upstream_channels"
 
@@ -225,14 +250,23 @@ class UpstreamChannel(Base):
     manual_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     discovered_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     effective_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    last_known_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     recharge_multiplier_source: Mapped[str | None] = mapped_column(String(128))
     recharge_multiplier_status: Mapped[str | None] = mapped_column(String(32))
     group_options: Mapped[list[dict] | None] = mapped_column(JSON)
+    pending_group_options: Mapped[list[dict] | None] = mapped_column(JSON)
+    pending_group_removal_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    pending_group_removal_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     balance_remaining: Mapped[float | None] = mapped_column(Float)
     balance_total: Mapped[float | None] = mapped_column(Float)
     balance_used: Mapped[float | None] = mapped_column(Float)
     balance_unit: Mapped[str | None] = mapped_column(String(32))
     balance_status: Mapped[str | None] = mapped_column(String(32))
+    balance_source: Mapped[str | None] = mapped_column(String(64))
     balance_message: Mapped[str | None] = mapped_column(Text)
     balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     today_balance_used: Mapped[float | None] = mapped_column(Float)
@@ -243,6 +277,38 @@ class UpstreamChannel(Base):
     yesterday_balance_unit: Mapped[str | None] = mapped_column(String(32))
     yesterday_balance_status: Mapped[str | None] = mapped_column(String(32))
     yesterday_balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    balance_guard_state: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    balance_guard_basis: Mapped[str | None] = mapped_column(String(32))
+    balance_guard_value: Mapped[float | None] = mapped_column(Float)
+    balance_guard_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    balance_guard_episode_id: Mapped[str | None] = mapped_column(String(64))
+    balance_guard_paused_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    channel_monitors: Mapped[list[dict] | None] = mapped_column(JSON)
+    channel_monitor_test_models: Mapped[dict | None] = mapped_column(JSON)
+    channel_monitor_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    channel_monitor_status: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    channel_monitor_message: Mapped[str | None] = mapped_column(Text)
+    channel_monitor_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    channel_monitor_guard_state: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    channel_monitor_unavailable_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    channel_monitor_recovery_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    channel_monitor_guard_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     last_error: Mapped[str | None] = mapped_column(Text)
     last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -262,16 +328,43 @@ class UpstreamPriorityInterval(Base):
     start_priority: Mapped[int] = mapped_column(Integer, nullable=False)
     end_priority: Mapped[int] = mapped_column(Integer, nullable=False)
     step: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    rate_pause_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+    rate_pause_mode: Mapped[str] = mapped_column(
+        String(32), default="increase_percent", server_default="increase_percent", nullable=False
+    )
+    rate_increase_threshold_percent: Mapped[float] = mapped_column(
+        Float, default=20.0, server_default="20", nullable=False
+    )
+    rate_absolute_threshold: Mapped[float] = mapped_column(
+        Float, default=1.0, server_default="1", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class UpstreamAccountConfig(Base):
     __tablename__ = "upstream_account_configs"
+    __table_args__ = (
+        Index(
+            "uq_upstream_account_configs_channel_record_id",
+            "channel_id",
+            "upstream_api_key_record_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     sub2api_account_id: Mapped[int] = mapped_column(Integer, unique=True, index=True, nullable=False)
     remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    upstream_api_key_record_id: Mapped[int | None] = mapped_column(Integer)
+    upstream_identity_rebind_required: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="0",
+        nullable=False,
+    )
     api_key_origin_rebind_required: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -299,9 +392,27 @@ class UpstreamAccountConfig(Base):
     )
     priority_sync_error: Mapped[str | None] = mapped_column(Text)
     last_priority_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    priority_tiebreak_order: Mapped[int | None] = mapped_column(Integer)
+    priority_tiebreak_multiplier: Mapped[float | None] = mapped_column(Float)
+    priority_assignment_when_disabled: Mapped[bool | None] = mapped_column(Boolean)
+    rate_pause_policy: Mapped[str] = mapped_column(
+        String(16), default="inherit", server_default="inherit", nullable=False
+    )
+    rate_pause_mode: Mapped[str | None] = mapped_column(String(32))
+    rate_increase_threshold_percent: Mapped[float | None] = mapped_column(Float)
+    rate_absolute_threshold: Mapped[float | None] = mapped_column(Float)
     remote_name: Mapped[str | None] = mapped_column(String(200))
     remote_platform: Mapped[str | None] = mapped_column(String(64))
     remote_account_type: Mapped[str | None] = mapped_column(String(32))
+    remote_status: Mapped[str | None] = mapped_column(String(64))
+    remote_schedulable: Mapped[bool | None] = mapped_column(Boolean)
+    remote_priority: Mapped[int | None] = mapped_column(Integer)
+    remote_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    remote_snapshot_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    remote_present: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1", nullable=False, index=True
+    )
+    remote_missing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     base_url: Mapped[str | None] = mapped_column(String(500))
     encrypted_api_key: Mapped[str | None] = mapped_column(Text)
     encrypted_access_token: Mapped[str | None] = mapped_column(Text)
@@ -330,8 +441,43 @@ class UpstreamAccountConfig(Base):
     )
     upstream_key_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     upstream_group_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    availability_check_mode: Mapped[str] = mapped_column(
+        String(32), default="channel_monitor", server_default="channel_monitor", nullable=False
+    )
+    availability_monitor_id: Mapped[int | None] = mapped_column(Integer)
+    availability_test_model: Mapped[str | None] = mapped_column(String(160))
+    available_models: Mapped[list[dict] | None] = mapped_column(JSON)
+    available_models_status: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    available_models_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    availability_status: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    availability_unavailable_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    availability_recovery_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    availability_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    availability_source: Mapped[str | None] = mapped_column(String(32))
+    availability_message: Mapped[str | None] = mapped_column(Text)
     auto_disabled_reason: Mapped[str | None] = mapped_column(String(64))
     last_auto_disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    balance_guard_restore_eligible: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+    balance_guard_channel_id: Mapped[int | None] = mapped_column(Integer)
+    balance_guard_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    balance_guard_operation: Mapped[str | None] = mapped_column(String(32))
+    auto_pause_episode_id: Mapped[str | None] = mapped_column(String(64))
+    pause_owned_by_plugin: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+    auto_pause_channel_id: Mapped[int | None] = mapped_column(Integer)
+    auto_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pause_operation: Mapped[str | None] = mapped_column(String(32))
     manual_group_multiplier: Mapped[float | None] = mapped_column(Float)
     manual_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     group_options: Mapped[list[dict] | None] = mapped_column(JSON)
@@ -353,16 +499,66 @@ class UpstreamAccountConfig(Base):
     balance_used: Mapped[float | None] = mapped_column(Float)
     balance_unit: Mapped[str | None] = mapped_column(String(32))
     balance_status: Mapped[str | None] = mapped_column(String(32))
+    balance_source: Mapped[str | None] = mapped_column(String(64))
     balance_message: Mapped[str | None] = mapped_column(Text)
     balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     upstream_usage_amount: Mapped[float | None] = mapped_column(Float)
     upstream_usage_unit: Mapped[str | None] = mapped_column(String(32))
     upstream_usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    today_upstream_usage_amount: Mapped[float | None] = mapped_column(Float)
+    today_upstream_usage_unit: Mapped[str | None] = mapped_column(String(32))
+    today_upstream_usage_status: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    today_upstream_usage_source: Mapped[str | None] = mapped_column(String(64))
+    today_upstream_usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    pause_holds: Mapped[list["UpstreamAccountPauseHold"]] = relationship(
+        back_populates="account_config",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="UpstreamAccountPauseHold.id",
+    )
+
+
+class UpstreamAccountPauseHold(Base):
+    __tablename__ = "upstream_account_pause_holds"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_config_id",
+            "reason",
+            name="uq_upstream_account_pause_hold_reason",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_config_id: Mapped[int] = mapped_column(
+        ForeignKey("upstream_account_configs.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1", index=True, nullable=False
+    )
+    scope_channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recovery_mode: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_json: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    account_config: Mapped["UpstreamAccountConfig"] = relationship(
+        back_populates="pause_holds"
+    )
 
 
 class UpstreamRateChangeLog(Base):
@@ -375,6 +571,10 @@ class UpstreamRateChangeLog(Base):
     channel_name: Mapped[str | None] = mapped_column(String(200))
     group_id: Mapped[str | None] = mapped_column(String(128))
     group_name: Mapped[str | None] = mapped_column(String(200))
+    old_group_id: Mapped[str | None] = mapped_column(String(128))
+    new_group_id: Mapped[str | None] = mapped_column(String(128))
+    old_group_name: Mapped[str | None] = mapped_column(String(200))
+    new_group_name: Mapped[str | None] = mapped_column(String(200))
     old_group_multiplier: Mapped[float | None] = mapped_column(Float)
     new_group_multiplier: Mapped[float | None] = mapped_column(Float)
     old_upstream_multiplier: Mapped[float | None] = mapped_column(Float)
@@ -397,3 +597,88 @@ class UpstreamRateChangeLog(Base):
     status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     safe_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class UpstreamAccountDataArchive(Base):
+    """Last trustworthy API Key data retained before an identity reset."""
+
+    __tablename__ = "upstream_account_data_archives"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sub2api_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    account_name: Mapped[str | None] = mapped_column(String(200))
+    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    channel_name: Mapped[str | None] = mapped_column(String(200))
+    reason: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class UpstreamChannelChangeEvent(Base):
+    __tablename__ = "upstream_channel_change_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    channel_name: Mapped[str | None] = mapped_column(String(200))
+    event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    group_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    group_name: Mapped[str | None] = mapped_column(String(200))
+    old_value: Mapped[float | None] = mapped_column(Float)
+    new_value: Mapped[float | None] = mapped_column(Float)
+    old_status: Mapped[str | None] = mapped_column(String(32))
+    new_status: Mapped[str | None] = mapped_column(String(32))
+    details: Mapped[dict | None] = mapped_column(JSON)
+    legacy_imported: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", index=True, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class AccountSchedulingChangeLog(Base):
+    __tablename__ = "account_scheduling_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sub2api_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    account_name: Mapped[str | None] = mapped_column(String(200))
+    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    channel_name: Mapped[str | None] = mapped_column(String(200))
+    event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(64), index=True)
+    active_reasons: Mapped[list[str] | None] = mapped_column(JSON)
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+    old_schedulable: Mapped[bool | None] = mapped_column(Boolean)
+    new_schedulable: Mapped[bool | None] = mapped_column(Boolean)
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    safe_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class NotificationOutbox(Base):
+    __tablename__ = "notification_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(256), unique=True, index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    details: Mapped[dict | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(
+        String(32), default="pending", server_default="pending", index=True, nullable=False
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

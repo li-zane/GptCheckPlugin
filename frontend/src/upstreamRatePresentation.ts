@@ -1,4 +1,4 @@
-import type { UpstreamChangeLog } from "./types";
+import type { UpstreamChangeLog, UpstreamChannelChangeEvent } from "./types";
 
 export type RateChangeDirection = "increase" | "decrease" | "unchanged" | "unknown";
 
@@ -13,6 +13,15 @@ export type UpstreamStateChange = {
   oldValue: string | null;
   newValue: string | null;
   direction: "changed" | "unchanged" | "unknown";
+};
+
+export type UpstreamGroupRatePresentation = {
+  oldGroupMultiplier: number | null;
+  newGroupMultiplier: number | null;
+  oldCompositeMultiplier: number | null;
+  newCompositeMultiplier: number | null;
+  rechargeMultiplier: number | null;
+  showCompositeMultiplier: boolean;
 };
 
 /** Converts an upstream group rate to the 1 CNY : 1 USD comparison basis. */
@@ -39,6 +48,38 @@ export function multiplierChange(oldValue: unknown, newValue: unknown): Upstream
     newValue: newNumber,
     delta,
     direction: delta > 0 ? "increase" : "decrease",
+  };
+}
+
+export function upstreamGroupRatePresentation(
+  log: UpstreamChannelChangeEvent,
+  fallbackRechargeMultiplier?: unknown,
+): UpstreamGroupRatePresentation {
+  const oldGroupMultiplier = finiteNumber(log.old_value);
+  const newGroupMultiplier = finiteNumber(log.new_value);
+  const oldRechargeMultiplier = finiteNumber(log.details?.old_recharge_multiplier)
+    ?? finiteNumber(log.details?.recharge_multiplier)
+    ?? finiteNumber(fallbackRechargeMultiplier);
+  const newRechargeMultiplier = finiteNumber(log.details?.new_recharge_multiplier)
+    ?? finiteNumber(log.details?.recharge_multiplier)
+    ?? finiteNumber(fallbackRechargeMultiplier);
+  const rechargeMultiplier = newRechargeMultiplier ?? oldRechargeMultiplier;
+  const showCompositeMultiplier = [oldRechargeMultiplier, newRechargeMultiplier]
+    .some((value) => value !== null && Math.abs(value - 1) > 1e-12);
+
+  return {
+    oldGroupMultiplier,
+    newGroupMultiplier,
+    oldCompositeMultiplier: normalizedUpstreamMultiplier(
+      oldGroupMultiplier,
+      oldRechargeMultiplier,
+    ),
+    newCompositeMultiplier: normalizedUpstreamMultiplier(
+      newGroupMultiplier,
+      newRechargeMultiplier,
+    ),
+    rechargeMultiplier,
+    showCompositeMultiplier,
   };
 }
 
@@ -93,6 +134,33 @@ export function remoteSchedulableChange(log: UpstreamChangeLog) {
   );
 }
 
+export function upstreamChangeSummary(log: UpstreamChangeLog) {
+  const changes: string[] = [];
+  const oldGroupLabel = normalizedText(log.old_group_name) || normalizedText(log.old_group_id);
+  const newGroupLabel = normalizedText(log.new_group_name) || normalizedText(log.new_group_id);
+  if (oldGroupLabel !== null && newGroupLabel !== null && oldGroupLabel !== newGroupLabel) {
+    changes.push(`上游分组名称 ${oldGroupLabel} -> ${newGroupLabel}`);
+  }
+  const groupRate = groupRateChange(log);
+  if (groupRate.direction === "increase" || groupRate.direction === "decrease") {
+    changes.push("上游分组倍率变化");
+  }
+  const groupStatus = upstreamGroupStatusChange(log);
+  if (groupStatus.direction === "changed") {
+    const next = groupStatus.newValue || "unknown";
+    changes.push(isAvailableStatus(next) ? "上游分组恢复可用" : "上游分组不可用");
+  }
+  if (upstreamKeyStatusChange(log).direction === "changed") changes.push("上游 Key 状态变化");
+  if (upstreamRechargeRateChange(log).direction === "increase" || upstreamRechargeRateChange(log).direction === "decrease") {
+    changes.push("上游充值倍率变化");
+  }
+  if (remoteSchedulableChange(log).direction === "changed") changes.push("账号调度状态变化");
+  if (accountBillingRateChange(log).direction === "increase" || accountBillingRateChange(log).direction === "decrease") {
+    changes.push("账号计费倍率变化");
+  }
+  return [...new Set(changes)].join("；");
+}
+
 export function stateChange(oldValue: unknown, newValue: unknown): UpstreamStateChange {
   const oldStatus = normalizedState(oldValue);
   const newStatus = normalizedState(newValue);
@@ -116,6 +184,16 @@ function normalizedState(value: unknown) {
   if (value === null || value === undefined) return null;
   const normalized = String(value).trim().toLowerCase();
   return normalized || null;
+}
+
+function normalizedText(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
+function isAvailableStatus(value: string) {
+  return ["active", "available", "enabled", "ok", "success", "usable", "valid"].includes(value);
 }
 
 function schedulableStatus(value: boolean | null | undefined) {

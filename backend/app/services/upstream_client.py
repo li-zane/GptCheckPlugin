@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import json
@@ -11,7 +12,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence
 from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -27,17 +28,32 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_PINNED_ADDRESSES = 8
 MAX_UPSTREAM_TOKEN_LENGTH = 8192
 DEFAULT_TIMEOUT_SECONDS = 3.5
+# Some upstream deployments aggregate usage on demand. Keep this isolated
+# from balance/group/status probes while preserving longer caller timeouts.
+UPSTREAM_USAGE_TIMEOUT_SECONDS = 60.0
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
 DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
-# Upstream key-list requests use page_size=200. Keep detail discovery capable
-# of covering the complete returned page while bounding the request fan-out.
+# Bound list pagination, detail discovery, and usage batches independently so
+# large upstream accounts remain supported without unbounded request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200
 KEY_REVEAL_CONCURRENCY = 20
+SUB2API_API_KEY_USAGE_BATCH_SIZE = 100
+SUB2API_API_KEY_PAGE_SIZE = 200
+SUB2API_API_KEY_PAGE_CONCURRENCY = 5
+MAX_SUB2API_API_KEY_PAGES = 25
+MAX_CHANNEL_MONITORS = 100
+CHANNEL_MONITOR_DETAIL_CONCURRENCY = 10
+MAX_CHANNEL_MONITOR_EXTRA_MODELS = 20
+MAX_CHANNEL_MONITOR_TIMELINE_POINTS = 60
 NEWAPI_BALANCE_ENDPOINT = "/api/user/self"
 NEWAPI_TODAY_USAGE_ENDPOINT = "/api/log/self/stat"
 NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY = "newapi:yesterday-usage"
+NEWAPI_UPTIME_STATUS_ENDPOINT = "/api/uptime/status"
 SUB2API_BALANCE_ENDPOINT = "/api/v1/auth/me"
 SUB2API_TODAY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/stats"
+SUB2API_USAGE_STATS_ENDPOINT = "/api/v1/usage/stats"
+SUB2API_API_KEY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/api-keys-usage"
+SUB2API_CHANNEL_MONITORS_ENDPOINT = "/api/v1/channel-monitors"
 SUB2API_REFRESH_ENDPOINT = "/api/v1/auth/refresh"
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 DNS_OVER_HTTPS_URL = "https://cloudflare-dns.com/dns-query"
@@ -59,6 +75,7 @@ NEWAPI_ENDPOINTS: tuple[str, ...] = (
     "/api/token/search?p=1&size=200",
     "/api/v1/keys?page=1&page_size=200",
     "/api/status",
+    NEWAPI_UPTIME_STATUS_ENDPOINT,
     "/api/v1/payment/config",
     "/api/v1/payment/checkout-info",
 )
@@ -72,6 +89,8 @@ SUB2API_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/payment/config",
     SUB2API_BALANCE_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
+    SUB2API_USAGE_STATS_ENDPOINT,
+    SUB2API_CHANNEL_MONITORS_ENDPOINT,
 )
 
 NEWAPI_PRIMARY_ENDPOINTS: tuple[str, ...] = (
@@ -82,6 +101,7 @@ NEWAPI_PRIMARY_ENDPOINTS: tuple[str, ...] = (
     "/api/token/?p=1&page_size=200",
     "/api/v1/payment/checkout-info",
     "/api/status",
+    NEWAPI_UPTIME_STATUS_ENDPOINT,
 )
 SUB2API_PRIMARY_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/groups/available",
@@ -90,6 +110,23 @@ SUB2API_PRIMARY_ENDPOINTS: tuple[str, ...] = (
     "/api/v1/payment/checkout-info",
     SUB2API_BALANCE_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
+    SUB2API_USAGE_STATS_ENDPOINT,
+    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+)
+NEWAPI_MANAGEMENT_EVIDENCE_ENDPOINTS = frozenset(
+    {
+        "/api/user/self/groups",
+        NEWAPI_BALANCE_ENDPOINT,
+        NEWAPI_TODAY_USAGE_ENDPOINT,
+        "/api/token/?p=1&page_size=200",
+        "/api/token/search?p=1&size=200",
+        "/api/v1/keys?page=1&page_size=200",
+    }
+)
+SUB2API_MANAGEMENT_EVIDENCE_ENDPOINTS = frozenset(
+    endpoint
+    for endpoint in SUB2API_ENDPOINTS
+    if endpoint != SUB2API_CHANNEL_MONITORS_ENDPOINT
 )
 
 
@@ -127,6 +164,7 @@ class AccountGroupMatch:
 class AccountUpstreamState:
     """Authoritative API-key and group state discovered for one account."""
 
+    key_record_id: int | None = None
     key_status: str | None = None
     group_status: str | None = None
     group_id: str | None = None
@@ -161,9 +199,15 @@ class DiscoveryResult:
     today_balance_used: float | None = None
     today_balance_unit: str | None = None
     today_balance_status: str = "unknown"
+    today_balance_error: str | None = None
     yesterday_balance_used: float | None = None
     yesterday_balance_unit: str | None = None
     yesterday_balance_status: str = "unknown"
+    yesterday_balance_error: str | None = None
+    channel_monitors: list[dict[str, Any]] = field(default_factory=list)
+    channel_monitors_total: int = 0
+    channel_monitors_status: str = "unknown"
+    channel_monitors_message: str = ""
     sub2api_auth_rejected: bool = False
     message: str = ""
 
@@ -292,12 +336,21 @@ class UpstreamClient:
         selected_group_id: str | int | None = None,
         selected_group_name: str | None = None,
         account_api_keys: Mapping[int | str, str] | None = None,
+        account_api_key_record_ids: Mapping[int | str, int | str] | None = None,
         optimized_endpoint_fallbacks: bool = False,
+        include_channel_monitors: bool = True,
+        include_channel_monitor_details: bool = False,
+        monitor_only: bool = False,
         today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
     ) -> DiscoveryResult:
         raw_account_api_keys = account_api_keys if isinstance(account_api_keys, Mapping) else {}
         secrets = (api_key, access_token, *raw_account_api_keys.values())
         normalized_account_api_keys = _normalize_account_api_keys(raw_account_api_keys)
+        normalized_account_api_key_record_ids = _normalize_account_api_key_record_ids(
+            account_api_key_record_ids
+            if isinstance(account_api_key_record_ids, Mapping)
+            else {}
+        )
         normalized_api_key = _clean_secret(api_key)
         target_api_keys = set(normalized_account_api_keys.values())
         if normalized_api_key is not None:
@@ -309,7 +362,6 @@ class UpstreamClient:
         requested_type = _clean_upstream_type(upstream_type)
         if requested_type is None:
             return safe(_error_result("auto", "configured", "Unsupported upstream API type."))
-
         try:
             normalized_url, hostname = _normalize_base_url(base_url)
             if urlparse(normalized_url).scheme != "https":
@@ -335,8 +387,17 @@ class UpstreamClient:
             # a user-facing error.
             return safe(_error_result(requested_type, "configured", "Upstream URL or credentials are invalid."))
 
+        monitor_endpoints = (
+            (NEWAPI_UPTIME_STATUS_ENDPOINT,)
+            if requested_type == "newapi"
+            else (SUB2API_CHANNEL_MONITORS_ENDPOINT,)
+            if requested_type == "sub2api"
+            else (NEWAPI_UPTIME_STATUS_ENDPOINT, SUB2API_CHANNEL_MONITORS_ENDPOINT)
+        )
         endpoints = (
-            _ordered_union(NEWAPI_ENDPOINTS, SUB2API_ENDPOINTS)
+            monitor_endpoints
+            if monitor_only
+            else _ordered_union(NEWAPI_ENDPOINTS, SUB2API_ENDPOINTS)
             if requested_type == "auto"
             else (
                 NEWAPI_PRIMARY_ENDPOINTS
@@ -348,6 +409,15 @@ class UpstreamClient:
                 else SUB2API_ENDPOINTS
             )
         )
+        if not monitor_only and not include_channel_monitors:
+            endpoints = tuple(
+                endpoint
+                for endpoint in endpoints
+                if endpoint not in {
+                    NEWAPI_UPTIME_STATUS_ENDPOINT,
+                    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+                }
+            )
         newapi_today_usage_params = _newapi_today_usage_params(today_timezone)
         newapi_yesterday_usage_params = _newapi_yesterday_usage_params(today_timezone)
 
@@ -355,6 +425,11 @@ class UpstreamClient:
         fetched: list[_FetchResult] = []
         newapi_yesterday_usage_result: _FetchResult | None = None
         revealed_api_key_records: dict[str, dict[str, Any]] = {}
+        sub2api_api_key_page_payloads: dict[str, Any] = {}
+        sub2api_api_key_usage_by_key: dict[str, float] = {}
+        cached_api_key_records_by_account: dict[int, dict[str, Any]] = {}
+        sub2api_api_key_usage_by_account: dict[int, float] = {}
+        sub2api_channel_monitor_details: dict[int, _FetchResult] = {}
         try:
             for address in pinned_addresses:
                 pinned_transport = _PinnedAsyncTransport(
@@ -383,14 +458,30 @@ class UpstreamClient:
                         )
                         if endpoint_headers is None:
                             return _FetchResult(ok=False, error_kind="credentials_missing")
+                        endpoint_params = (
+                            newapi_today_usage_params
+                            if endpoint == NEWAPI_TODAY_USAGE_ENDPOINT
+                            else _sub2api_yesterday_usage_params(today_timezone)
+                            if endpoint == SUB2API_USAGE_STATS_ENDPOINT
+                            else None
+                        )
                         return await self._request_json(
                             client,
                             normalized_url,
                             endpoint,
                             headers=endpoint_headers,
-                            params=(
-                                newapi_today_usage_params
-                                if endpoint == NEWAPI_TODAY_USAGE_ENDPOINT
+                            params=endpoint_params,
+                            timeout_seconds=(
+                                max(
+                                    self.timeout_seconds,
+                                    UPSTREAM_USAGE_TIMEOUT_SECONDS,
+                                )
+                                if endpoint
+                                in {
+                                    NEWAPI_TODAY_USAGE_ENDPOINT,
+                                    SUB2API_TODAY_USAGE_ENDPOINT,
+                                    SUB2API_USAGE_STATS_ENDPOINT,
+                                }
                                 else None
                             ),
                         )
@@ -398,12 +489,25 @@ class UpstreamClient:
                     fetched = await asyncio.gather(
                         *(fetch_endpoint(endpoint) for endpoint in endpoints)
                     )
-                    if optimized_endpoint_fallbacks and requested_type in {"newapi", "sub2api"}:
+                    if (
+                        optimized_endpoint_fallbacks
+                        and not monitor_only
+                        and requested_type in {"newapi", "sub2api"}
+                    ):
                         primary_responses = dict(zip(endpoints, fetched))
                         compatibility_endpoints = _missing_compatibility_endpoints(
                             requested_type,
                             primary_responses,
                         )
+                        if not include_channel_monitors:
+                            compatibility_endpoints = tuple(
+                                endpoint
+                                for endpoint in compatibility_endpoints
+                                if endpoint not in {
+                                    NEWAPI_UPTIME_STATUS_ENDPOINT,
+                                    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+                                }
+                            )
                         if compatibility_endpoints:
                             compatibility_results = await asyncio.gather(
                                 *(fetch_endpoint(endpoint) for endpoint in compatibility_endpoints)
@@ -416,7 +520,26 @@ class UpstreamClient:
                         if requested_type == "auto"
                         else requested_type
                     )
-                    if candidate_type == "newapi":
+                    async def fetch_monitor_details() -> dict[int, _FetchResult]:
+                        if candidate_type != "sub2api" or not include_channel_monitor_details:
+                            return {}
+                        try:
+                            return await self._fetch_sub2api_channel_monitor_details(
+                                client,
+                                normalized_url,
+                                list_result=candidate_responses.get(
+                                    SUB2API_CHANNEL_MONITORS_ENDPOINT
+                                ),
+                                access_token=access_token,
+                            )
+                        except Exception:
+                            # List summaries remain useful when an older
+                            # Sub2API does not expose per-monitor status.
+                            return {}
+
+                    async def fetch_newapi_yesterday_usage() -> _FetchResult | None:
+                        if candidate_type != "newapi" or monitor_only:
+                            return None
                         yesterday_headers = _headers_for_endpoint(
                             NEWAPI_TODAY_USAGE_ENDPOINT,
                             requested_type=requested_type,
@@ -424,18 +547,39 @@ class UpstreamClient:
                             api_key=api_key,
                             new_api_user=new_api_user,
                         )
-                        newapi_yesterday_usage_result = (
-                            _FetchResult(ok=False, error_kind="credentials_missing")
-                            if yesterday_headers is None
-                            else await self._request_json(
-                                client,
-                                normalized_url,
-                                NEWAPI_TODAY_USAGE_ENDPOINT,
-                                headers=yesterday_headers,
-                                params=newapi_yesterday_usage_params,
+                        if yesterday_headers is None:
+                            return _FetchResult(
+                                ok=False,
+                                error_kind="credentials_missing",
                             )
+                        return await self._request_json(
+                            client,
+                            normalized_url,
+                            NEWAPI_TODAY_USAGE_ENDPOINT,
+                            headers=yesterday_headers,
+                            params=newapi_yesterday_usage_params,
+                            timeout_seconds=max(
+                                self.timeout_seconds,
+                                UPSTREAM_USAGE_TIMEOUT_SECONDS,
+                            ),
                         )
-                    if candidate_type in {"newapi", "sub2api"} and target_api_keys:
+
+                    async def fetch_api_key_context() -> tuple[
+                        dict[str, Any],
+                        dict[str, dict[str, Any]],
+                        dict[str, float],
+                        dict[int, dict[str, Any]],
+                        dict[int, float],
+                    ]:
+                        if (
+                            monitor_only
+                            or candidate_type not in {"newapi", "sub2api"}
+                            or (
+                                not target_api_keys
+                                and not normalized_account_api_key_record_ids
+                            )
+                        ):
+                            return {}, {}, {}, {}, {}
                         candidate_endpoints = (
                             NEWAPI_ENDPOINTS if candidate_type == "newapi" else SUB2API_ENDPOINTS
                         )
@@ -446,20 +590,165 @@ class UpstreamClient:
                             and result.ok
                             and _payload_succeeded(result.payload)
                         }
-                        try:
-                            revealed_api_key_records = await self._reveal_api_key_records(
+
+                        cached_records_by_account = (
+                            await self._fetch_cached_api_key_records(
                                 client,
                                 normalized_url,
                                 upstream_type=candidate_type,
                                 payloads=candidate_payloads,
-                                target_keys=target_api_keys,
+                                record_ids_by_account=normalized_account_api_key_record_ids,
+                                api_keys_by_account=normalized_account_api_keys,
                                 access_token=access_token,
                                 new_api_user=new_api_user,
                             )
-                        except Exception:
-                            # Group and balance discovery remain useful when a
-                            # provider does not support automatic key reveal.
-                            revealed_api_key_records = {}
+                        )
+                        fallback_account_api_keys = {
+                            account_id: key
+                            for account_id, key in normalized_account_api_keys.items()
+                            if account_id not in cached_records_by_account
+                        }
+                        key_target_api_keys = set(fallback_account_api_keys.values())
+                        if normalized_api_key is not None:
+                            key_target_api_keys.add(normalized_api_key)
+
+                        initially_matched = _matched_target_api_key_records(
+                            candidate_type,
+                            candidate_payloads,
+                            key_target_api_keys,
+                            {},
+                        )
+                        initially_matched_keys = set(initially_matched)
+
+                        async def fetch_pages() -> dict[str, Any]:
+                            if candidate_type != "sub2api":
+                                return {}
+                            try:
+                                return await self._fetch_sub2api_api_key_pages(
+                                    client,
+                                    normalized_url,
+                                    payloads=candidate_payloads,
+                                    target_keys=key_target_api_keys,
+                                    access_token=access_token,
+                                )
+                            except Exception:
+                                return {}
+
+                        async def fetch_usage(
+                            keys: set[str],
+                            *,
+                            revealed_records: Mapping[str, dict[str, Any]] | None = None,
+                        ) -> dict[str, float]:
+                            if candidate_type != "sub2api" or not keys:
+                                return {}
+                            try:
+                                return await self._fetch_sub2api_api_key_usage(
+                                    client,
+                                    normalized_url,
+                                    payloads=candidate_payloads,
+                                    revealed_records=revealed_records or {},
+                                    target_keys=keys,
+                                    access_token=access_token,
+                                )
+                            except Exception:
+                                return {}
+
+                        # Page-one IDs are already authoritative enough for usage.
+                        # Do not hold those requests behind unrelated later pages.
+                        async def fetch_cached_usage() -> dict[int, float]:
+                            if candidate_type != "sub2api" or not cached_records_by_account:
+                                return {}
+                            record_ids_by_account = {
+                                account_id: record_id
+                                for account_id, record in cached_records_by_account.items()
+                                if (
+                                    record_id := _api_key_record_id(record)
+                                ) is not None
+                            }
+                            try:
+                                usage_by_record_id = await self._fetch_sub2api_usage_by_record_ids(
+                                    client,
+                                    normalized_url,
+                                    record_ids=set(record_ids_by_account.values()),
+                                    access_token=access_token,
+                                )
+                            except Exception:
+                                return {}
+                            return {
+                                account_id: usage_by_record_id[record_id]
+                                for account_id, record_id in record_ids_by_account.items()
+                                if record_id in usage_by_record_id
+                            }
+
+                        page_payloads, usage_by_key, cached_usage_by_account = await asyncio.gather(
+                            fetch_pages(),
+                            fetch_usage(initially_matched_keys),
+                            fetch_cached_usage(),
+                        )
+                        candidate_payloads.update(page_payloads)
+
+                        directly_matched = _matched_target_api_key_records(
+                            candidate_type,
+                            candidate_payloads,
+                            key_target_api_keys,
+                            {},
+                        )
+                        directly_matched_keys = set(directly_matched)
+                        later_direct_keys = directly_matched_keys - initially_matched_keys
+
+                        async def reveal_pending() -> dict[str, dict[str, Any]]:
+                            try:
+                                return await self._reveal_api_key_records(
+                                    client,
+                                    normalized_url,
+                                    upstream_type=candidate_type,
+                                    payloads=candidate_payloads,
+                                    target_keys=key_target_api_keys,
+                                    access_token=access_token,
+                                    new_api_user=new_api_user,
+                                )
+                            except Exception:
+                                # Group and balance discovery remain useful when a
+                                # provider does not support automatic key reveal.
+                                return {}
+
+                        revealed_records, later_direct_usage = await asyncio.gather(
+                            reveal_pending(),
+                            fetch_usage(later_direct_keys),
+                        )
+                        usage_by_key.update(later_direct_usage)
+
+                        unresolved_usage_keys = set(revealed_records) - directly_matched_keys
+                        usage_by_key.update(
+                            await fetch_usage(
+                                unresolved_usage_keys,
+                                revealed_records=revealed_records,
+                            )
+                        )
+                        return (
+                            page_payloads,
+                            revealed_records,
+                            usage_by_key,
+                            cached_records_by_account,
+                            cached_usage_by_account,
+                        )
+
+                    (
+                        sub2api_channel_monitor_details,
+                        newapi_yesterday_usage_result,
+                        api_key_context,
+                    ) = await asyncio.gather(
+                        fetch_monitor_details(),
+                        fetch_newapi_yesterday_usage(),
+                        fetch_api_key_context(),
+                    )
+                    (
+                        sub2api_api_key_page_payloads,
+                        revealed_api_key_records,
+                        sub2api_api_key_usage_by_key,
+                        cached_api_key_records_by_account,
+                        sub2api_api_key_usage_by_account,
+                    ) = api_key_context
                 # A status code proves that this pinned address completed an
                 # HTTP exchange. Do not route any request to another address
                 # after that point; fallback is only for total connect/timeout
@@ -484,7 +773,20 @@ class UpstreamClient:
         if requested_type == "auto":
             detected_type = _detect_upstream_type(responses)
             if detected_type is None:
-                return safe(_discovery_failure(requested_type, "auto", endpoints, responses))
+                newapi_monitor_result = responses.get(NEWAPI_UPTIME_STATUS_ENDPOINT)
+                sub2api_monitor_result = responses.get(SUB2API_CHANNEL_MONITORS_ENDPOINT)
+                if (
+                    monitor_only
+                    and newapi_monitor_result is not None
+                    and newapi_monitor_result.status_code in {404, 405}
+                    and sub2api_monitor_result is not None
+                    and sub2api_monitor_result.status_code in {401, 403}
+                ):
+                    detected_type = "sub2api"
+                else:
+                    return safe(
+                        _discovery_failure(requested_type, "auto", endpoints, responses)
+                    )
             active_type = detected_type
             source = "auto"
         else:
@@ -504,7 +806,59 @@ class UpstreamClient:
             and result.ok
             and _payload_succeeded(result.payload)
         }
-        if not usable:
+        if active_type == "sub2api":
+            usable.update(sub2api_api_key_page_payloads)
+        if monitor_only:
+            try:
+                (
+                    channel_monitors,
+                    channel_monitors_total,
+                    channel_monitors_status,
+                    channel_monitors_message,
+                ) = _discover_channel_monitors(
+                    active_type,
+                    responses,
+                    access_token=access_token,
+                    secrets=secrets,
+                    detail_results=sub2api_channel_monitor_details,
+                )
+            except Exception:
+                return safe(
+                    _error_result(
+                        active_type,
+                        source,
+                        "Could not parse a valid upstream monitor response.",
+                    )
+                )
+            credentials_rejected = channel_monitors_status == "credentials_rejected"
+            monitor_error = channel_monitors_status == "error"
+            return safe(
+                DiscoveryResult(
+                    upstream_type=active_type,
+                    source=source,
+                    status="error" if credentials_rejected or monitor_error else "ok",
+                    channel_monitors=channel_monitors,
+                    channel_monitors_total=channel_monitors_total,
+                    channel_monitors_status=channel_monitors_status,
+                    channel_monitors_message=channel_monitors_message,
+                    sub2api_auth_rejected=(
+                        active_type == "sub2api" and credentials_rejected
+                    ),
+                    message=channel_monitors_message,
+                )
+            )
+
+        management_evidence_endpoints = (
+            NEWAPI_MANAGEMENT_EVIDENCE_ENDPOINTS
+            if active_type == "newapi"
+            else SUB2API_MANAGEMENT_EVIDENCE_ENDPOINTS
+        )
+        management_usable = {
+            endpoint: payload
+            for endpoint, payload in usable.items()
+            if endpoint in management_evidence_endpoints
+        }
+        if not management_usable:
             return safe(_discovery_failure(active_type, source, active_endpoints, responses))
 
         try:
@@ -525,13 +879,19 @@ class UpstreamClient:
                 matched_record,
                 selected_group_id=selected_group_id,
                 selected_group_name=selected_group_name,
+                available_groups=available_group_refs,
             )
             account_group_matches = _match_account_groups(
                 active_type,
                 usable,
                 groups,
-                normalized_account_api_keys,
+                {
+                    account_id: key
+                    for account_id, key in normalized_account_api_keys.items()
+                    if account_id not in cached_api_key_records_by_account
+                },
                 revealed_api_key_records,
+                available_group_refs,
             )
             matched_account_state = _account_upstream_state_from_record(
                 active_type,
@@ -541,10 +901,45 @@ class UpstreamClient:
             account_upstream_states = _match_account_upstream_states(
                 active_type,
                 usable,
-                normalized_account_api_keys,
+                {
+                    account_id: key
+                    for account_id, key in normalized_account_api_keys.items()
+                    if account_id not in cached_api_key_records_by_account
+                },
                 revealed_api_key_records,
                 available_group_refs,
             )
+            for account_id, record in cached_api_key_records_by_account.items():
+                cached_group = _account_group_match_from_record(
+                    groups,
+                    record,
+                    authoritative_groups=available_group_refs.authoritative,
+                )
+                if cached_group is not None:
+                    account_group_matches[account_id] = cached_group
+                cached_state = _account_upstream_state_from_record(
+                    active_type,
+                    record,
+                    available_group_refs,
+                )
+                if cached_state is not None:
+                    account_upstream_states[account_id] = cached_state
+            if active_type == "sub2api":
+                matched_account_state = _state_with_usage(
+                    matched_account_state,
+                    sub2api_api_key_usage_by_key.get(normalized_api_key or ""),
+                )
+                for account_id, account_key in normalized_account_api_keys.items():
+                    if account_id in cached_api_key_records_by_account:
+                        usage_amount = sub2api_api_key_usage_by_account.get(account_id)
+                    else:
+                        usage_amount = sub2api_api_key_usage_by_key.get(account_key)
+                    if usage_amount is None:
+                        continue
+                    account_upstream_states[account_id] = _state_with_usage(
+                        account_upstream_states.get(account_id),
+                        usage_amount,
+                    )
             for account_group in account_group_matches.values():
                 if (
                     account_group.multiplier is not None
@@ -584,6 +979,32 @@ class UpstreamClient:
                     new_api_user=new_api_user,
                 )
             )
+            (
+                channel_monitors,
+                channel_monitors_total,
+                channel_monitors_status,
+                channel_monitors_message,
+            ) = (
+                _discover_channel_monitors(
+                    active_type,
+                    responses,
+                    access_token=access_token,
+                    secrets=secrets,
+                    detail_results=sub2api_channel_monitor_details,
+                )
+            )
+            today_balance_error = _daily_usage_error_detail(
+                active_type,
+                responses,
+                period="today",
+                status=today_balance_status,
+            )
+            yesterday_balance_error = _daily_usage_error_detail(
+                active_type,
+                responses,
+                period="yesterday",
+                status=yesterday_balance_status,
+            )
         except Exception:
             return safe(_error_result(active_type, source, "Could not parse a valid upstream response."))
 
@@ -613,9 +1034,15 @@ class UpstreamClient:
                 today_balance_used=today_balance_used,
                 today_balance_unit=today_balance_unit,
                 today_balance_status=today_balance_status,
+                today_balance_error=today_balance_error,
                 yesterday_balance_used=yesterday_balance_used,
                 yesterday_balance_unit=yesterday_balance_unit,
                 yesterday_balance_status=yesterday_balance_status,
+                yesterday_balance_error=yesterday_balance_error,
+                channel_monitors=channel_monitors,
+                channel_monitors_total=channel_monitors_total,
+                channel_monitors_status=channel_monitors_status,
+                channel_monitors_message=channel_monitors_message,
                 sub2api_auth_rejected=sub2api_auth_rejected,
                 message=_success_message(group_multiplier, recharge_multiplier),
             )
@@ -668,7 +1095,12 @@ class UpstreamClient:
         if not pending_keys:
             return {}
 
-        records_by_id: dict[int, dict[str, Any]] = {}
+        candidate_records_by_id: dict[int, dict[str, Any]] = {}
+        candidate_ids_by_key: dict[str, dict[int, None]] = {
+            target_key: {}
+            for target_key in pending_keys
+        }
+        fallback_records_by_id: dict[int, dict[str, Any]] = {}
         for record in _iter_api_key_records(upstream_type, payloads):
             listed_key = _clean_secret(
                 _first_value(record, ("key", "api_key", "apiKey", "token", "value"))
@@ -683,9 +1115,58 @@ class UpstreamClient:
                 _first_value(record, ("id", "token_id", "tokenId", "key_id", "keyId"))
             )
             if record_id is not None:
-                records_by_id.setdefault(record_id, record)
+                matching_targets = [
+                    target_key
+                    for target_key in pending_keys
+                    if listed_key is not None
+                    and _masked_api_key_matches(listed_key, target_key)
+                ]
+                if matching_targets:
+                    candidate_records_by_id.setdefault(record_id, record)
+                    for target_key in matching_targets:
+                        candidate_ids_by_key[target_key].setdefault(record_id, None)
+                else:
+                    fallback_records_by_id.setdefault(record_id, record)
+
+        records_by_id: dict[int, dict[str, Any]] = {}
+        deferred_candidate_ids: list[list[int]] = []
+        # Resolve small ambiguous sets completely before sharing the remaining
+        # bounded reveal budget across sets that cannot fit in full.
+        ordered_candidates = sorted(
+            candidate_ids_by_key.items(),
+            key=lambda item: (len(item[1]), item[0]),
+        )
+        for _target_key, candidate_ids in ordered_candidates:
+            missing_ids = [
+                record_id
+                for record_id in candidate_ids
+                if record_id not in records_by_id
+            ]
+            remaining_capacity = MAX_AUTOMATIC_KEY_REVEALS - len(records_by_id)
+            if len(missing_ids) <= remaining_capacity:
+                for record_id in missing_ids:
+                    records_by_id[record_id] = candidate_records_by_id[record_id]
+            else:
+                deferred_candidate_ids.append(missing_ids)
+
+        while deferred_candidate_ids and len(records_by_id) < MAX_AUTOMATIC_KEY_REVEALS:
+            next_round: list[list[int]] = []
+            for candidate_ids in deferred_candidate_ids:
+                while candidate_ids and candidate_ids[0] in records_by_id:
+                    candidate_ids.pop(0)
+                if candidate_ids:
+                    record_id = candidate_ids.pop(0)
+                    records_by_id[record_id] = candidate_records_by_id[record_id]
+                if candidate_ids:
+                    next_round.append(candidate_ids)
+                if len(records_by_id) >= MAX_AUTOMATIC_KEY_REVEALS:
+                    break
+            deferred_candidate_ids = next_round
+
+        for record_id, record in fallback_records_by_id.items():
             if len(records_by_id) >= MAX_AUTOMATIC_KEY_REVEALS:
                 break
+            records_by_id.setdefault(record_id, record)
         if not records_by_id:
             return {}
 
@@ -746,6 +1227,346 @@ class UpstreamClient:
             for target_key, records in candidates.items()
             if len(records) == 1
         }
+
+    async def _fetch_sub2api_channel_monitor_details(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        list_result: _FetchResult | None,
+        access_token: str | None,
+    ) -> dict[int, _FetchResult]:
+        token = _clean_secret(access_token)
+        if (
+            token is None
+            or list_result is None
+            or not list_result.ok
+            or not _payload_succeeded(list_result.payload)
+        ):
+            return {}
+        data = _unwrap(list_result.payload)
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            return {}
+
+        monitor_ids: list[int] = []
+        seen_ids: set[int] = set()
+        for raw in data["items"]:
+            monitor_id = _positive_int64(raw.get("id")) if isinstance(raw, dict) else None
+            if monitor_id is None or monitor_id in seen_ids:
+                continue
+            monitor_ids.append(monitor_id)
+            seen_ids.add(monitor_id)
+            if len(monitor_ids) >= MAX_CHANNEL_MONITORS:
+                break
+        if not monitor_ids:
+            return {}
+
+        headers = _build_headers(
+            access_token=token,
+            api_key=None,
+            new_api_user=None,
+        )
+        semaphore = asyncio.Semaphore(CHANNEL_MONITOR_DETAIL_CONCURRENCY)
+
+        async def fetch_detail(monitor_id: int) -> tuple[int, _FetchResult]:
+            # The only interpolated value has passed strict positive-int64
+            # validation, so the request remains on this fixed upstream path.
+            endpoint = f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/{monitor_id}/status"
+            async with semaphore:
+                result = await self._request_json(
+                    client,
+                    base_url,
+                    endpoint,
+                    headers=headers,
+                )
+            return monitor_id, result
+
+        fetched_details = await asyncio.gather(
+            *(fetch_detail(monitor_id) for monitor_id in monitor_ids),
+            return_exceptions=True,
+        )
+        details_by_id: dict[int, _FetchResult] = {}
+        for item in fetched_details:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[0], int)
+                and isinstance(item[1], _FetchResult)
+            ):
+                details_by_id[item[0]] = item[1]
+        return details_by_id
+
+    async def _fetch_cached_api_key_records(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        upstream_type: str,
+        payloads: dict[str, Any],
+        record_ids_by_account: Mapping[int, int],
+        api_keys_by_account: Mapping[int, str],
+        access_token: str | None,
+        new_api_user: str | int | None,
+    ) -> dict[int, dict[str, Any]]:
+        if upstream_type not in {"newapi", "sub2api"} or not record_ids_by_account:
+            return {}
+        verifiable_record_ids_by_account = {
+            account_id: record_id
+            for account_id, record_id in record_ids_by_account.items()
+            if _clean_secret(api_keys_by_account.get(account_id)) is not None
+        }
+        if not verifiable_record_ids_by_account:
+            return {}
+        listed_by_id = {
+            record_id: record
+            for record in _deduplicated_api_key_records(upstream_type, payloads)
+            if (record_id := _api_key_record_id(record)) is not None
+        }
+        matched = {
+            account_id: listed_by_id[record_id]
+            for account_id, record_id in verifiable_record_ids_by_account.items()
+            if record_id in listed_by_id
+            and _api_key_record_matches_account(
+                upstream_type,
+                listed_by_id[record_id],
+                account_id,
+                api_keys_by_account,
+            )
+        }
+        missing_record_ids = sorted(
+            {
+                record_id
+                for account_id, record_id in verifiable_record_ids_by_account.items()
+                if account_id not in matched
+            }
+        )
+        if not missing_record_ids:
+            return matched
+        token = _clean_secret(access_token)
+        if token is None:
+            return matched
+        headers = _build_headers(
+            access_token=token,
+            api_key=None,
+            new_api_user=new_api_user if upstream_type == "newapi" else None,
+        )
+        semaphore = asyncio.Semaphore(KEY_REVEAL_CONCURRENCY)
+
+        async def fetch_record(record_id: int) -> tuple[int, dict[str, Any]] | None:
+            endpoint = (
+                f"/api/token/{record_id}"
+                if upstream_type == "newapi"
+                else f"/api/v1/keys/{record_id}"
+            )
+            async with semaphore:
+                result = await self._request_json(
+                    client,
+                    base_url,
+                    endpoint,
+                    headers=headers,
+                )
+            if not result.ok or not _payload_succeeded(result.payload):
+                return None
+            data = _unwrap(result.payload)
+            if not isinstance(data, dict):
+                return None
+            returned_id = _api_key_record_id(data)
+            if returned_id is not None and returned_id != record_id:
+                return None
+            return record_id, {"id": record_id, **data}
+
+        fetched = await asyncio.gather(
+            *(fetch_record(record_id) for record_id in missing_record_ids),
+            return_exceptions=True,
+        )
+        fetched_by_id = {
+            record_id: record
+            for item in fetched
+            if isinstance(item, tuple) and len(item) == 2
+            for record_id, record in (item,)
+        }
+        matched.update(
+            {
+                account_id: fetched_by_id[record_id]
+                for account_id, record_id in verifiable_record_ids_by_account.items()
+                if account_id not in matched
+                and record_id in fetched_by_id
+                and _api_key_record_matches_account(
+                    upstream_type,
+                    fetched_by_id[record_id],
+                    account_id,
+                    api_keys_by_account,
+                )
+            }
+        )
+        return matched
+
+    async def _fetch_sub2api_api_key_pages(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        payloads: dict[str, Any],
+        target_keys: set[str],
+        access_token: str | None,
+    ) -> dict[str, Any]:
+        token = _clean_secret(access_token)
+        if token is None or not target_keys:
+            return {}
+        source = _sub2api_api_key_page_source(payloads)
+        if source is None:
+            return {}
+        source_path, page_count = source
+        last_page = min(page_count, MAX_SUB2API_API_KEY_PAGES)
+        if last_page <= 1:
+            return {}
+        if _all_target_api_keys_listed_exactly("sub2api", payloads, target_keys):
+            return {}
+
+        headers = _build_headers(
+            access_token=token,
+            api_key=None,
+            new_api_user=None,
+        )
+        semaphore = asyncio.Semaphore(SUB2API_API_KEY_PAGE_CONCURRENCY)
+
+        async def fetch_page(page: int) -> tuple[str, Any] | None:
+            endpoint = (
+                f"{source_path}?page={page}&page_size={SUB2API_API_KEY_PAGE_SIZE}"
+            )
+            async with semaphore:
+                result = await self._request_json(
+                    client,
+                    base_url,
+                    endpoint,
+                    headers=headers,
+                )
+            if not result.ok or not _payload_succeeded(result.payload):
+                return None
+            data = _unwrap(result.payload)
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                return None
+            returned_page = _positive_int64(data.get("page"))
+            returned_page_size = _positive_int64(data.get("page_size"))
+            if (
+                returned_page != page
+                or returned_page_size != SUB2API_API_KEY_PAGE_SIZE
+            ):
+                return None
+            return endpoint, result.payload
+
+        fetched_pages = await asyncio.gather(
+            *(fetch_page(page) for page in range(2, last_page + 1)),
+            return_exceptions=True,
+        )
+        payloads_by_endpoint: dict[str, Any] = {}
+        for item in fetched_pages:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[0], str)
+            ):
+                payloads_by_endpoint[item[0]] = item[1]
+        return payloads_by_endpoint
+
+    async def _fetch_sub2api_api_key_usage(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        payloads: dict[str, Any],
+        revealed_records: Mapping[str, dict[str, Any]],
+        target_keys: set[str],
+        access_token: str | None,
+    ) -> dict[str, float]:
+        token = _clean_secret(access_token)
+        if token is None or not target_keys:
+            return {}
+
+        records = _matched_target_api_key_records(
+            "sub2api",
+            payloads,
+            target_keys,
+            revealed_records,
+        )
+        keys_by_record_id: dict[int, list[str]] = {}
+        for target_key, record in records.items():
+            record_id = _positive_int64(
+                _first_value(record, ("id", "token_id", "tokenId", "key_id", "keyId"))
+            )
+            if record_id is not None:
+                keys_by_record_id.setdefault(record_id, []).append(target_key)
+
+        # One upstream record must identify exactly one distinct target key.
+        # Ambiguous matches are omitted instead of duplicating usage across keys.
+        key_by_record_id = {
+            record_id: keys[0]
+            for record_id, keys in keys_by_record_id.items()
+            if len(keys) == 1
+        }
+        record_ids = sorted(key_by_record_id)
+        if not record_ids:
+            return {}
+
+        usage_by_record_id = await self._fetch_sub2api_usage_by_record_ids(
+            client,
+            base_url,
+            record_ids=set(record_ids),
+            access_token=token,
+        )
+        return {
+            key_by_record_id[record_id]: amount
+            for record_id, amount in usage_by_record_id.items()
+            if record_id in key_by_record_id
+        }
+
+    async def _fetch_sub2api_usage_by_record_ids(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        record_ids: set[int],
+        access_token: str | None,
+    ) -> dict[int, float]:
+        token = _clean_secret(access_token)
+        if token is None or not record_ids:
+            return {}
+        normalized_record_ids = sorted(
+            record_id
+            for value in record_ids
+            if (record_id := _positive_int64(value)) is not None
+        )
+        if not normalized_record_ids:
+            return {}
+        headers = _build_headers(access_token=token, api_key=None, new_api_user=None)
+        batches = [
+            normalized_record_ids[index : index + SUB2API_API_KEY_USAGE_BATCH_SIZE]
+            for index in range(0, len(normalized_record_ids), SUB2API_API_KEY_USAGE_BATCH_SIZE)
+        ]
+        results = await asyncio.gather(
+            *(
+                self._request_json(
+                    client,
+                    base_url,
+                    SUB2API_API_KEY_USAGE_ENDPOINT,
+                    method="POST",
+                    headers=headers,
+                    json_body={"api_key_ids": batch},
+                    timeout_seconds=max(
+                        self.timeout_seconds,
+                        UPSTREAM_USAGE_TIMEOUT_SECONDS,
+                    ),
+                )
+                for batch in batches
+            )
+        )
+
+        usage_by_record_id: dict[int, float] = {}
+        for batch, result in zip(batches, results):
+            usage_by_record_id.update(
+                _parse_sub2api_api_key_usage_batch(result, expected_ids=set(batch))
+            )
+        return usage_by_record_id
 
     async def refresh_sub2api_tokens(
         self,
@@ -878,7 +1699,11 @@ class UpstreamClient:
         headers: dict[str, str] | None = None,
         params: Mapping[str, str | int] | None = None,
         json_body: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> _FetchResult:
+        request_timeout = httpx.Timeout(
+            timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        )
         try:
             async with client.stream(
                 method,
@@ -886,6 +1711,7 @@ class UpstreamClient:
                 headers=headers,
                 params=params,
                 json=json_body,
+                timeout=request_timeout,
             ) as response:
                 if response.status_code < 200 or response.status_code >= 300:
                     # Do not consume or echo upstream error bodies.  Redirects
@@ -934,7 +1760,11 @@ async def discover_upstream(
     selected_group_id: str | int | None = None,
     selected_group_name: str | None = None,
     account_api_keys: Mapping[int | str, str] | None = None,
+    account_api_key_record_ids: Mapping[int | str, int | str] | None = None,
     optimized_endpoint_fallbacks: bool = False,
+    include_channel_monitors: bool = True,
+    include_channel_monitor_details: bool = False,
+    monitor_only: bool = False,
     today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -956,7 +1786,11 @@ async def discover_upstream(
         selected_group_id=selected_group_id,
         selected_group_name=selected_group_name,
         account_api_keys=account_api_keys,
+        account_api_key_record_ids=account_api_key_record_ids,
         optimized_endpoint_fallbacks=optimized_endpoint_fallbacks,
+        include_channel_monitors=include_channel_monitors,
+        include_channel_monitor_details=include_channel_monitor_details,
+        monitor_only=monitor_only,
         today_timezone=today_timezone,
     )
 
@@ -1162,9 +1996,9 @@ def _headers_for_endpoint(
     api_key: str | None,
     new_api_user: str | int | None,
 ) -> dict[str, str] | None:
-    # Status is a public NewAPI endpoint. Do not send either stored credential
-    # to it even though every request remains pinned to the validated origin.
-    if endpoint == "/api/status":
+    # These are public NewAPI endpoints. Do not send either stored credential
+    # to them even though every request remains pinned to the validated origin.
+    if endpoint in {"/api/status", NEWAPI_UPTIME_STATUS_ENDPOINT}:
         return {}
 
     if endpoint in {NEWAPI_BALANCE_ENDPOINT, NEWAPI_TODAY_USAGE_ENDPOINT}:
@@ -1178,7 +2012,13 @@ def _headers_for_endpoint(
             raw_authorization=True,
         )
 
-    if endpoint in {SUB2API_BALANCE_ENDPOINT, SUB2API_TODAY_USAGE_ENDPOINT}:
+    if endpoint in {
+        SUB2API_BALANCE_ENDPOINT,
+        SUB2API_TODAY_USAGE_ENDPOINT,
+        SUB2API_USAGE_STATS_ENDPOINT,
+        SUB2API_API_KEY_USAGE_ENDPOINT,
+        SUB2API_CHANNEL_MONITORS_ENDPOINT,
+    }:
         if _clean_secret(access_token) is None:
             return None
         return _build_headers(
@@ -1236,10 +2076,22 @@ def _secret_variants(secrets: Iterable[str | None]) -> tuple[str, ...]:
 
 
 def _scrub_text(value: Any, secrets: Iterable[str | None], maximum: int) -> str | None:
+    return _scrub_text_with_variants(
+        value,
+        _secret_variants(secrets),
+        maximum,
+    )
+
+
+def _scrub_text_with_variants(
+    value: Any,
+    secret_variants: Sequence[str],
+    maximum: int,
+) -> str | None:
     if value is None or isinstance(value, (dict, list, tuple, set)):
         return None
     text = str(value)
-    for secret in _secret_variants(secrets):
+    for secret in secret_variants:
         text = text.replace(secret, "[redacted]")
     return _clean_text(text, maximum)
 
@@ -1277,29 +2129,52 @@ def _scrub_account_upstream_state(
     )
 
 
+def _scrub_channel_monitor(
+    monitor: dict[str, Any],
+    secret_variants: Sequence[str],
+) -> dict[str, Any] | None:
+    return _sanitize_channel_monitor(
+        monitor,
+        secret_variants=secret_variants,
+    )
+
+
 def _scrub_discovery_result(
     result: DiscoveryResult,
     secrets: Iterable[str | None],
 ) -> DiscoveryResult:
-    scrubbed_groups = [_scrub_group_option(group, secrets) for group in result.groups]
+    secret_values = tuple(secrets)
+    secret_variants = _secret_variants(secret_values)
+    scrubbed_groups = [
+        _scrub_group_option(group, secret_values)
+        for group in result.groups
+    ]
     scrubbed_match = (
-        _scrub_group_option(result.matched_group, secrets)
+        _scrub_group_option(result.matched_group, secret_values)
         if result.matched_group is not None
         else None
     )
     scrubbed_account_matches = {
-        account_id: _scrub_account_group_match(group, secrets)
+        account_id: _scrub_account_group_match(group, secret_values)
         for account_id, group in result.account_group_matches.items()
     }
     scrubbed_account_state = (
-        _scrub_account_upstream_state(result.matched_account_state, secrets)
+        _scrub_account_upstream_state(result.matched_account_state, secret_values)
         if result.matched_account_state is not None
         else None
     )
     scrubbed_account_states = {
-        account_id: _scrub_account_upstream_state(state, secrets)
+        account_id: _scrub_account_upstream_state(state, secret_values)
         for account_id, state in result.account_upstream_states.items()
     }
+    scrubbed_channel_monitors = [
+        scrubbed_monitor
+        for monitor in result.channel_monitors
+        if isinstance(monitor, dict)
+        if (
+            scrubbed_monitor := _scrub_channel_monitor(monitor, secret_variants)
+        ) is not None
+    ]
     return replace(
         result,
         groups=scrubbed_groups,
@@ -1307,18 +2182,32 @@ def _scrub_discovery_result(
         account_group_matches=scrubbed_account_matches,
         matched_account_state=scrubbed_account_state,
         account_upstream_states=scrubbed_account_states,
+        channel_monitors=scrubbed_channel_monitors,
+        channel_monitors_message=(
+            _scrub_text(result.channel_monitors_message, secret_values, 300) or ""
+        ),
         discovered_group_multiplier_source=_scrub_text(
             result.discovered_group_multiplier_source,
-            secrets,
+            secret_values,
             160,
         ),
         discovered_recharge_multiplier_source=_scrub_text(
             result.discovered_recharge_multiplier_source,
-            secrets,
+            secret_values,
             160,
         ),
-        balance_message=_scrub_text(result.balance_message, secrets, 300) or "",
-        message=_scrub_text(result.message, secrets, 500) or "Upstream discovery completed.",
+        balance_message=_scrub_text(result.balance_message, secret_values, 300) or "",
+        today_balance_error=_scrub_text(
+            result.today_balance_error,
+            secret_values,
+            80,
+        ),
+        yesterday_balance_error=_scrub_text(
+            result.yesterday_balance_error,
+            secret_values,
+            80,
+        ),
+        message=_scrub_text(result.message, secret_values, 500) or "Upstream discovery completed.",
     )
 
 
@@ -1436,6 +2325,7 @@ def _detect_upstream_type(responses: dict[str, _FetchResult]) -> str | None:
             "/api/user/self",
             "/api/token/",
             "/api/token/search",
+            NEWAPI_UPTIME_STATUS_ENDPOINT,
         }:
             newapi_score += 3
         elif bare_path == "/api/status":
@@ -1448,6 +2338,8 @@ def _detect_upstream_type(responses: dict[str, _FetchResult]) -> str | None:
             "/api/v1/groups/rates",
             "/api/v1/api-keys",
             SUB2API_BALANCE_ENDPOINT,
+            SUB2API_USAGE_STATS_ENDPOINT,
+            SUB2API_CHANNEL_MONITORS_ENDPOINT,
         }:
             sub2api_score += 4
 
@@ -1670,6 +2562,29 @@ def _api_keys_equal(upstream_type: str, left: str | None, right: str | None) -> 
     return canonical_left is not None and canonical_left == canonical_right
 
 
+def _all_target_api_keys_listed_exactly(
+    upstream_type: str,
+    payloads: dict[str, Any],
+    target_keys: set[str],
+) -> bool:
+    if not target_keys:
+        return True
+    found: set[str] = set()
+    for record in _iter_api_key_records(upstream_type, payloads):
+        listed_key = _clean_secret(
+            _first_value(record, ("api_key", "apiKey", "key", "token", "value"))
+        )
+        if listed_key is None or "*" in listed_key:
+            continue
+        for target_key in target_keys - found:
+            if _api_keys_equal(upstream_type, listed_key, target_key):
+                found.add(target_key)
+                break
+        if found == target_keys:
+            return True
+    return False
+
+
 def _find_api_key_record(upstream_type: str, payloads: dict[str, Any], api_key: str | None) -> dict[str, Any] | None:
     if not api_key:
         return None
@@ -1697,6 +2612,85 @@ def _find_unique_api_key_record(
         and _api_keys_equal(upstream_type, record_key, api_key)
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def _matched_target_api_key_records(
+    upstream_type: str,
+    payloads: dict[str, Any],
+    target_keys: set[str],
+    revealed_records: Mapping[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    masked_records = _unique_masked_api_key_records(
+        upstream_type,
+        payloads,
+        target_keys,
+    )
+    matched: dict[str, dict[str, Any]] = {}
+    for target_key in target_keys:
+        record = (
+            revealed_records.get(target_key)
+            or _find_unique_api_key_record(upstream_type, payloads, target_key)
+            or masked_records.get(target_key)
+        )
+        if record is not None:
+            matched[target_key] = record
+    return matched
+
+
+def _sub2api_api_key_page_source(
+    payloads: Mapping[str, Any],
+) -> tuple[str, int] | None:
+    for endpoint in (
+        "/api/v1/keys?page=1&page_size=200",
+        "/api/v1/api-keys?page=1&page_size=200",
+    ):
+        payload = payloads.get(endpoint)
+        data = _unwrap(payload)
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            continue
+        returned_page = _positive_int64(data.get("page"))
+        page_count = _positive_int64(data.get("pages")) or 1
+        if returned_page is not None and returned_page != 1:
+            continue
+        if (
+            page_count > 1
+            and _positive_int64(data.get("page_size"))
+            != SUB2API_API_KEY_PAGE_SIZE
+        ):
+            continue
+        return endpoint.partition("?")[0], page_count
+    return None
+
+
+def _parse_sub2api_api_key_usage_batch(
+    result: _FetchResult,
+    *,
+    expected_ids: set[int],
+) -> dict[int, float]:
+    if not result.ok or not _payload_succeeded(result.payload):
+        return {}
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict):
+        return {}
+    stats = data.get("stats")
+    if not isinstance(stats, dict):
+        return {}
+
+    parsed: dict[int, float] = {}
+    for record_id in expected_ids:
+        raw = stats.get(str(record_id))
+        if raw is None:
+            raw = stats.get(record_id)
+        if not isinstance(raw, dict):
+            continue
+        returned_id = raw.get("api_key_id")
+        if returned_id is not None and _positive_int64(returned_id) != record_id:
+            continue
+        amount = _finite_number(raw.get("today_actual_cost"))
+        if amount is None or amount < 0:
+            continue
+        parsed[record_id] = amount
+    return parsed
 
 
 def _deduplicated_api_key_records(
@@ -1729,18 +2723,19 @@ def _iter_api_key_records(
     upstream_type: str,
     payloads: dict[str, Any],
 ) -> Iterable[dict[str, Any]]:
-    endpoints = (
-        (
+    if upstream_type == "newapi":
+        endpoints = (
             "/api/token/?p=1&page_size=200",
             "/api/token/search?p=1&size=200",
             "/api/v1/keys?page=1&page_size=200",
         )
-        if upstream_type == "newapi"
-        else (
-            "/api/v1/keys?page=1&page_size=200",
-            "/api/v1/api-keys?page=1&page_size=200",
+    else:
+        endpoints = tuple(
+            endpoint
+            for endpoint in payloads
+            if endpoint.partition("?")[0]
+            in {"/api/v1/keys", "/api/v1/api-keys"}
         )
-    )
     for endpoint in endpoints:
         if endpoint in payloads:
             yield from _extract_key_records(payloads[endpoint])
@@ -1762,6 +2757,48 @@ def _normalize_account_api_keys(
             continue
         normalized[account_id] = api_key
     return normalized
+
+
+def _normalize_account_api_key_record_ids(
+    account_api_key_record_ids: Mapping[int | str, int | str],
+) -> dict[int, int]:
+    normalized: dict[int, int] = {}
+    for raw_account_id, raw_record_id in account_api_key_record_ids.items():
+        account_id = _positive_int64(raw_account_id)
+        record_id = _positive_int64(raw_record_id)
+        if account_id is not None and record_id is not None:
+            normalized[account_id] = record_id
+    return normalized
+
+
+def _api_key_record_id(record: Mapping[str, Any]) -> int | None:
+    return _positive_int64(
+        _first_value(record, ("id", "token_id", "tokenId", "key_id", "keyId"))
+    )
+
+
+def _api_key_record_matches_account(
+    upstream_type: str,
+    record: Mapping[str, Any],
+    account_id: int,
+    api_keys_by_account: Mapping[int, str],
+) -> bool:
+    normalized_key = _clean_secret(api_keys_by_account.get(account_id))
+    if normalized_key is None:
+        return False
+    record_key = _clean_secret(
+        _first_value(record, ("key", "api_key", "apiKey", "token", "value"))
+    )
+    if record_key is None:
+        return False
+    if "*" in record_key:
+        matching_accounts = {
+            candidate_account_id
+            for candidate_account_id, candidate_key in api_keys_by_account.items()
+            if _masked_api_key_matches(record_key, candidate_key)
+        }
+        return matching_accounts == {account_id}
+    return _api_keys_equal(upstream_type, record_key, normalized_key)
 
 
 def _available_group_refs(
@@ -1886,6 +2923,7 @@ def _account_upstream_state_from_record(
 ) -> AccountUpstreamState | None:
     if record is None:
         return None
+    key_record_id = _api_key_record_id(record)
     key_status = _normalize_api_key_status(upstream_type, record)
     group_id, group_name, group_present = _record_group_identity(record)
     if _explicit_group_unavailable(record):
@@ -1897,36 +2935,38 @@ def _account_upstream_state_from_record(
             (group_id and group_id.casefold() in available_groups.ids)
             or (group_name and group_name.casefold() in available_groups.names)
         )
-        group_status = "available" if matches else "unavailable"
+        group_status = "available" if matches else "deleted"
     else:
         group_status = None
-    usage_amount = _account_usage_amount(upstream_type, record)
     if (
-        key_status is None
+        key_record_id is None
+        and key_status is None
         and group_status is None
         and group_id is None
         and group_name is None
-        and usage_amount is None
     ):
         return None
     return AccountUpstreamState(
+        key_record_id=key_record_id,
         key_status=key_status,
         group_status=group_status,
         group_id=group_id,
         group_name=group_name,
-        usage_amount=usage_amount,
-        usage_unit="USD" if usage_amount is not None else None,
     )
 
 
-def _account_usage_amount(upstream_type: str, record: dict[str, Any]) -> float | None:
-    """Return an upstream API key's cumulative USD usage when explicitly reported."""
-    if upstream_type != "sub2api":
-        return None
-    raw = _finite_number(record.get("quota_used"))
-    if raw is None or raw < 0:
-        return None
-    return raw
+def _state_with_usage(
+    state: AccountUpstreamState | None,
+    usage_amount: Any,
+) -> AccountUpstreamState | None:
+    amount = _finite_number(usage_amount)
+    if amount is None or amount < 0:
+        return state
+    return replace(
+        state or AccountUpstreamState(),
+        usage_amount=amount,
+        usage_unit="USD",
+    )
 
 
 def _match_account_upstream_states(
@@ -1964,6 +3004,7 @@ def _match_account_groups(
     groups: list[GroupOption],
     account_api_keys: Mapping[int, str],
     revealed_records: Mapping[str, dict[str, Any]],
+    available_groups: _AvailableGroupRefs,
 ) -> dict[int, AccountGroupMatch]:
     matches: dict[int, AccountGroupMatch] = {}
     masked_records = _unique_masked_api_key_records(
@@ -1979,7 +3020,11 @@ def _match_account_groups(
         )
         if record is None:
             continue
-        group = _account_group_match_from_record(groups, record)
+        group = _account_group_match_from_record(
+            groups,
+            record,
+            authoritative_groups=available_groups.authoritative,
+        )
         if group is not None:
             matches[account_id] = group
     return matches
@@ -2046,6 +3091,8 @@ def _unique_masked_api_key_records(
 def _account_group_match_from_record(
     groups: list[GroupOption],
     record: dict[str, Any],
+    *,
+    authoritative_groups: bool = False,
 ) -> AccountGroupMatch | None:
     raw_group = record.get("group")
     if isinstance(raw_group, dict):
@@ -2074,6 +3121,12 @@ def _account_group_match_from_record(
             multiplier=selected.multiplier,
             source=selected.source or "key.group",
         )
+
+    if authoritative_groups:
+        # The available-groups endpoint is authoritative. Keep the orphaned
+        # identity in the separate health state, but do not expose a synthetic
+        # group match that could be used for billing.
+        return None
 
     multiplier, field_name = _first_positive_field(
         multiplier_source,
@@ -2119,12 +3172,18 @@ def _select_group(
     *,
     selected_group_id: str | int | None,
     selected_group_name: str | None,
+    available_groups: _AvailableGroupRefs | None = None,
 ) -> GroupOption | None:
     explicit_id = _clean_identifier(selected_group_id)
     explicit_name = _clean_text(selected_group_name, 160)
     selected = _lookup_group(groups, explicit_id, explicit_name)
     if selected is not None:
         return selected
+
+    if (explicit_id or explicit_name) and available_groups is not None and available_groups.authoritative:
+        # An explicitly selected group that is absent from the authoritative
+        # list was deleted; do not fall back to an API-key record's stale rate.
+        return None
 
     if matched_record is None:
         return None
@@ -2145,6 +3204,9 @@ def _select_group(
     selected = _lookup_group(groups, record_id, record_name)
     if selected is not None:
         return selected
+
+    if available_groups is not None and available_groups.authoritative:
+        return None
 
     multiplier_source = raw_group if isinstance(raw_group, dict) else matched_record
     record_multiplier, field_name = _first_positive_field(
@@ -2291,6 +3353,44 @@ def _discover_sub2api_balance(
     )
 
 
+def _daily_usage_error_detail(
+    upstream_type: str,
+    responses: dict[str, _FetchResult],
+    *,
+    period: Literal["today", "yesterday"],
+    status: str,
+) -> str | None:
+    if status == "ok":
+        return None
+    if upstream_type == "newapi":
+        endpoint = (
+            NEWAPI_TODAY_USAGE_ENDPOINT
+            if period == "today"
+            else NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY
+        )
+    elif upstream_type == "sub2api":
+        endpoint = (
+            SUB2API_TODAY_USAGE_ENDPOINT
+            if period == "today"
+            else SUB2API_USAGE_STATS_ENDPOINT
+        )
+    else:
+        return "unsupported_upstream_type"
+
+    result = responses.get(endpoint)
+    if result is None:
+        return "response_missing"
+    if result.error_kind and result.error_kind != "http_status":
+        return result.error_kind
+    if result.status_code is not None and not result.ok:
+        return f"http_{result.status_code}"
+    if not _payload_succeeded(result.payload):
+        return "upstream_failure"
+    if status in {"unsupported", "not_available"}:
+        return "field_missing"
+    return "invalid_payload"
+
+
 def _discover_today_balance_usage(
     upstream_type: str,
     responses: dict[str, _FetchResult],
@@ -2335,11 +3435,7 @@ def _discover_yesterday_balance_usage(
 
     if upstream_type != "sub2api":
         return None, None, "unsupported"
-    return _discover_sub2api_period_usage(
-        responses,
-        field="yesterday_actual_cost",
-        missing_status="not_available",
-    )
+    return _discover_sub2api_yesterday_usage(responses)
 
 
 def _discover_newapi_period_usage(
@@ -2396,6 +3492,547 @@ def _discover_sub2api_period_usage(
     return amount, "USD", "ok"
 
 
+def _discover_sub2api_yesterday_usage(
+    responses: dict[str, _FetchResult],
+) -> tuple[float | None, str | None, str]:
+    result = responses.get(SUB2API_USAGE_STATS_ENDPOINT)
+    if result is not None and result.status_code in {404, 405}:
+        return None, None, "unsupported"
+    if result is None or not result.ok or not _payload_succeeded(result.payload):
+        return None, None, "error"
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict):
+        return None, None, "error"
+    amount = _finite_number(data.get("total_actual_cost"))
+    if amount is None or amount < 0:
+        return None, None, "error"
+    return amount, "USD", "ok"
+
+
+_CHANNEL_MONITOR_STATUSES = frozenset(
+    {
+        "available",
+        "degraded",
+        "error",
+        "failed",
+        "healthy",
+        "not_checked",
+        "operational",
+        "timeout",
+        "unavailable",
+        "unknown",
+    }
+)
+_CHANNEL_MONITOR_STATUS_ALIASES = {
+    "active": "available",
+    "enabled": "available",
+    "ok": "available",
+    "success": "available",
+}
+_CHANNEL_MONITOR_DETAIL_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "primary_status": ("primary_status", "primaryStatus", "status"),
+    "primary_latency_ms": ("primary_latency_ms", "primaryLatencyMs", "latency_ms"),
+    "primary_ping_latency_ms": (
+        "primary_ping_latency_ms",
+        "primaryPingLatencyMs",
+        "ping_latency_ms",
+    ),
+    "availability_7d": ("availability_7d", "availability7d"),
+    "extra_models": ("extra_models", "extraModels"),
+    "timeline": ("timeline",),
+}
+_CHANNEL_MONITOR_DETAIL_CONTAINERS = (
+    "monitor",
+    "channel_monitor",
+    "channelMonitor",
+    "result",
+    "status",
+)
+
+
+def _discover_channel_monitors(
+    upstream_type: str,
+    responses: dict[str, _FetchResult],
+    *,
+    access_token: str | None,
+    secrets: Iterable[str | None] = (),
+    detail_results: Mapping[int, _FetchResult] | None = None,
+) -> tuple[list[dict[str, Any]], int, str, str]:
+    if upstream_type == "newapi":
+        return _discover_newapi_uptime_monitors(
+            responses,
+            secrets=secrets,
+        )
+    if upstream_type != "sub2api":
+        return [], 0, "unsupported", "The upstream type does not expose channel monitors."
+    if _clean_secret(access_token) is None:
+        return [], 0, "credentials_missing", "An upstream access token is required to read channel monitors."
+
+    result = responses.get(SUB2API_CHANNEL_MONITORS_ENDPOINT)
+    if result is not None and result.status_code in {404, 405}:
+        return [], 0, "unsupported", "The upstream does not expose channel monitors."
+    if result is not None and result.status_code in {401, 403}:
+        return [], 0, "credentials_rejected", "The upstream rejected channel monitor credentials."
+    if result is None or not result.ok:
+        return [], 0, "error", "Could not read upstream channel monitors."
+    if not _payload_succeeded(result.payload):
+        return [], 0, "error", "The upstream channel monitor response indicated failure."
+
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return [], 0, "error", "The upstream returned invalid channel monitor data."
+
+    secret_variants = _secret_variants((*tuple(secrets), access_token))
+    monitors: list[dict[str, Any]] = []
+    valid_monitor_count = 0
+    attempted_detail_ids: set[int] = set()
+    successful_detail_ids: set[int] = set()
+    details_by_id = detail_results or {}
+    for raw in data["items"]:
+        if not isinstance(raw, dict):
+            continue
+        monitor_id = _positive_int64(raw.get("id"))
+        if monitor_id is None:
+            continue
+        valid_monitor_count += 1
+        if len(monitors) >= MAX_CHANNEL_MONITORS:
+            continue
+
+        merged = dict(raw)
+        detail_result = details_by_id.get(monitor_id)
+        if detail_result is not None:
+            attempted_detail_ids.add(monitor_id)
+            detail_patch = _channel_monitor_detail_patch(detail_result)
+            if detail_patch:
+                merged.update(detail_patch)
+                successful_detail_ids.add(monitor_id)
+        # Never allow a detail response to replace the validated list ID.
+        merged["id"] = monitor_id
+        monitor = _sanitize_channel_monitor(
+            merged,
+            secret_variants=secret_variants,
+        )
+        if monitor is not None:
+            monitors.append(monitor)
+    if valid_monitor_count > len(monitors):
+        message = (
+            f"Read the first {len(monitors)} of {valid_monitor_count} "
+            "upstream channel monitors."
+        )
+    elif monitors:
+        message = f"Read {len(monitors)} upstream channel monitor(s)."
+    else:
+        message = "No upstream channel monitors are available."
+    detail_failure_count = len(attempted_detail_ids - successful_detail_ids)
+    if detail_failure_count:
+        message += (
+            f" Used list summaries for {detail_failure_count} monitor(s) whose "
+            "status details were unavailable."
+        )
+    return monitors, valid_monitor_count, "ok", message
+
+
+def _discover_newapi_uptime_monitors(
+    responses: dict[str, _FetchResult],
+    *,
+    secrets: Iterable[str | None] = (),
+) -> tuple[list[dict[str, Any]], int, str, str]:
+    result = responses.get(NEWAPI_UPTIME_STATUS_ENDPOINT)
+    if result is not None and result.status_code in {404, 405}:
+        return [], 0, "unsupported", "The NewAPI upstream does not expose a public uptime panel."
+    if result is None or not result.ok:
+        return [], 0, "error", "Could not read the NewAPI public uptime panel."
+    if not _payload_succeeded(result.payload):
+        return [], 0, "error", "The NewAPI uptime response indicated failure."
+
+    data = _unwrap(result.payload)
+    if not isinstance(data, list):
+        return [], 0, "error", "The NewAPI upstream returned invalid uptime data."
+    if not data:
+        return [], 0, "not_configured", "The NewAPI upstream has no public uptime monitors configured."
+
+    secret_variants = _secret_variants(tuple(secrets))
+    monitors: list[dict[str, Any]] = []
+    valid_monitor_count = 0
+    incomplete_group_count = 0
+    seen_descriptors: set[str] = set()
+    monitor_indexes: dict[str, int] = {}
+    for raw_group in data:
+        if not isinstance(raw_group, dict):
+            continue
+        category_name = _scrub_text_with_variants(
+            _first_value(raw_group, ("categoryName", "category_name", "name")),
+            secret_variants,
+            160,
+        ) or "Uptime"
+        raw_monitors = raw_group.get("monitors")
+        if not isinstance(raw_monitors, list) or not raw_monitors:
+            incomplete_group_count += 1
+            continue
+        for raw_monitor in raw_monitors:
+            if not isinstance(raw_monitor, dict):
+                continue
+            name = _scrub_text_with_variants(
+                raw_monitor.get("name"),
+                secret_variants,
+                160,
+            )
+            if name is None:
+                continue
+            monitor_group = _scrub_text_with_variants(
+                raw_monitor.get("group"),
+                secret_variants,
+                160,
+            )
+            group_name = " · ".join(
+                value for value in (category_name, monitor_group) if value
+            )
+            descriptor = "\x1f".join((category_name, monitor_group or "", name))
+            current_status = _newapi_uptime_status(raw_monitor.get("status"))
+            current_availability = _bounded_monitor_number(
+                raw_monitor.get("uptime"),
+                maximum=100.0,
+            )
+            if descriptor in seen_descriptors:
+                existing_index = monitor_indexes.get(descriptor)
+                if existing_index is not None:
+                    existing = monitors[existing_index]
+                    existing["primary_status"] = _least_healthy_uptime_status(
+                        str(existing.get("primary_status") or "unknown"),
+                        current_status,
+                    )
+                    existing_availability = _finite_number(
+                        existing.get("availability_7d")
+                    )
+                    if current_availability is not None and (
+                        existing_availability is None
+                        or current_availability < existing_availability
+                    ):
+                        existing["availability_7d"] = current_availability
+                continue
+
+            seen_descriptors.add(descriptor)
+            valid_monitor_count += 1
+            if len(monitors) >= MAX_CHANNEL_MONITORS:
+                continue
+            # Preserve the original first-occurrence ID while collapsing
+            # indistinguishable duplicates into one conservative status.
+            monitor_id = _stable_monitor_id(f"{descriptor}\x1f0")
+            monitor = _sanitize_channel_monitor(
+                {
+                    "id": monitor_id,
+                    "name": name,
+                    "provider": "uptime-kuma",
+                    "group_name": group_name,
+                    "primary_model": "",
+                    "primary_status": current_status,
+                    "availability_7d": current_availability,
+                    "availability_window": "24h",
+                    "extra_models": [],
+                    "timeline": [],
+                },
+                secret_variants=secret_variants,
+            )
+            if monitor is not None:
+                monitor_indexes[descriptor] = len(monitors)
+                monitors.append(monitor)
+
+    if incomplete_group_count:
+        group_label = "group" if incomplete_group_count == 1 else "groups"
+        return (
+            monitors,
+            valid_monitor_count,
+            "error",
+            f"The NewAPI public uptime panel returned incomplete data for {incomplete_group_count} configured {group_label}.",
+        )
+    if not monitors:
+        return [], valid_monitor_count, "error", "The NewAPI public uptime panel is configured but returned no monitor data."
+    message = f"Read {len(monitors)} NewAPI public uptime monitor(s)."
+    if valid_monitor_count > len(monitors):
+        message = f"Read the first {len(monitors)} of {valid_monitor_count} NewAPI public uptime monitors."
+    return monitors, valid_monitor_count, "ok", message
+
+
+def _newapi_uptime_status(value: Any) -> str:
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    return {
+        0: "unavailable",
+        1: "available",
+        2: "degraded",
+        3: "degraded",
+    }.get(status, "unknown")
+
+
+def _least_healthy_uptime_status(left: str, right: str) -> str:
+    rank = {
+        "available": 0,
+        "unknown": 1,
+        "degraded": 2,
+        "unavailable": 3,
+    }
+    return max((left, right), key=lambda value: rank.get(value, 1))
+
+
+def _stable_monitor_id(value: str) -> int:
+    digest = hashlib.sha256(value.encode("utf-8")).digest()
+    return (int.from_bytes(digest[:8], "big") & ((1 << 53) - 1)) or 1
+
+
+def _channel_monitor_detail_patch(result: _FetchResult) -> dict[str, Any]:
+    if not result.ok or not _payload_succeeded(result.payload):
+        return {}
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict):
+        return {}
+
+    patch: dict[str, Any] = {}
+    seen: set[int] = set()
+
+    def merge_candidate(candidate: dict[str, Any], depth: int) -> None:
+        candidate_identity = id(candidate)
+        if candidate_identity in seen or depth > 3:
+            return
+        seen.add(candidate_identity)
+
+        for field, aliases in _CHANNEL_MONITOR_DETAIL_FIELD_ALIASES.items():
+            for alias in aliases:
+                if alias not in candidate:
+                    continue
+                normalized = _normalize_channel_monitor_detail_field(
+                    field,
+                    candidate.get(alias),
+                )
+                if normalized is not None:
+                    patch[field] = normalized
+                break
+
+        for container in _CHANNEL_MONITOR_DETAIL_CONTAINERS:
+            nested = candidate.get(container)
+            if isinstance(nested, dict):
+                merge_candidate(nested, depth + 1)
+
+    merge_candidate(data, 0)
+    return patch
+
+
+def _normalize_channel_monitor_detail_field(field: str, value: Any) -> Any | None:
+    if field == "primary_status":
+        status = _normalize_channel_monitor_status(value)
+        raw_status = _clean_text(value, 32)
+        return (
+            status
+            if status != "unknown"
+            or (raw_status is not None and raw_status.casefold() == "unknown")
+            else None
+        )
+    if field in {"primary_latency_ms", "primary_ping_latency_ms"}:
+        return _bounded_monitor_number(value, maximum=86_400_000)
+    if field == "availability_7d":
+        return _bounded_monitor_number(value, maximum=100)
+    if field in {"extra_models", "timeline"}:
+        return value if isinstance(value, list) else None
+    return None
+
+
+def _sanitize_channel_monitor(
+    raw: Any,
+    *,
+    secret_variants: Sequence[str] = (),
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    monitor_id = _positive_int64(raw.get("id"))
+    if monitor_id is None:
+        return None
+
+    extra_models: list[dict[str, Any]] = []
+    raw_extra_models = raw.get("extra_models")
+    if isinstance(raw_extra_models, list):
+        for extra in raw_extra_models:
+            if len(extra_models) >= MAX_CHANNEL_MONITOR_EXTRA_MODELS:
+                break
+            if not isinstance(extra, dict):
+                continue
+            model = _scrub_text_with_variants(
+                _first_value(extra, ("model", "name")),
+                secret_variants,
+                160,
+            )
+            if model is None:
+                continue
+            extra_models.append(
+                {
+                    "model": model,
+                    "status": _normalize_channel_monitor_status(
+                        _scrub_text_with_variants(
+                            extra.get("status"),
+                            secret_variants,
+                            32,
+                        )
+                    ),
+                    "latency_ms": _bounded_monitor_number(
+                        _first_value(extra, ("latency_ms", "latencyMs")),
+                        maximum=86_400_000,
+                    ),
+                }
+            )
+
+    timeline_candidates: list[tuple[datetime, dict[str, Any]]] = []
+    raw_timeline = raw.get("timeline")
+    if isinstance(raw_timeline, list):
+        for point in raw_timeline:
+            if not isinstance(point, dict):
+                continue
+            checked_at = _normalize_monitor_timestamp(
+                _scrub_text_with_variants(
+                    _first_value(point, ("checked_at", "checkedAt", "time")),
+                    secret_variants,
+                    64,
+                )
+            )
+            if checked_at is None:
+                continue
+            parsed_checked_at = _parse_monitor_timestamp(checked_at)
+            if parsed_checked_at is None:
+                continue
+            timeline_candidates.append(
+                (
+                    parsed_checked_at,
+                    {
+                    "status": _normalize_channel_monitor_status(
+                        _scrub_text_with_variants(
+                            point.get("status"),
+                            secret_variants,
+                            32,
+                        )
+                    ),
+                    "latency_ms": _bounded_monitor_number(
+                        _first_value(point, ("latency_ms", "latencyMs")),
+                        maximum=86_400_000,
+                    ),
+                    "ping_latency_ms": _bounded_monitor_number(
+                        _first_value(point, ("ping_latency_ms", "pingLatencyMs")),
+                        maximum=86_400_000,
+                    ),
+                    "checked_at": checked_at,
+                    },
+                )
+            )
+
+    timeline = [
+        point
+        for _, point in sorted(timeline_candidates, key=lambda item: item[0])[
+            -MAX_CHANNEL_MONITOR_TIMELINE_POINTS:
+        ]
+    ]
+
+    return {
+        "id": monitor_id,
+        "name": _scrub_text_with_variants(
+            raw.get("name"),
+            secret_variants,
+            160,
+        )
+        or f"Monitor #{monitor_id}",
+        "provider": _normalize_channel_monitor_provider(
+            _scrub_text_with_variants(
+                raw.get("provider"),
+                secret_variants,
+                64,
+            )
+        ),
+        "group_name": _scrub_text_with_variants(
+            raw.get("group_name"),
+            secret_variants,
+            160,
+        )
+        or "",
+        "primary_model": _scrub_text_with_variants(
+            raw.get("primary_model"),
+            secret_variants,
+            160,
+        )
+        or "",
+        "primary_status": _normalize_channel_monitor_status(
+            _scrub_text_with_variants(
+                raw.get("primary_status"),
+                secret_variants,
+                32,
+            )
+        ),
+        "primary_latency_ms": _bounded_monitor_number(
+            raw.get("primary_latency_ms"),
+            maximum=86_400_000,
+        ),
+        "primary_ping_latency_ms": _bounded_monitor_number(
+            raw.get("primary_ping_latency_ms"),
+            maximum=86_400_000,
+        ),
+        "availability_7d": _bounded_monitor_number(
+            raw.get("availability_7d"),
+            maximum=100,
+        ),
+        "availability_window": (
+            raw.get("availability_window")
+            if raw.get("availability_window") in {"24h", "7d"}
+            else "7d"
+        ),
+        "extra_models": extra_models,
+        "timeline": timeline,
+    }
+
+
+def _normalize_channel_monitor_status(value: Any) -> str:
+    status = _clean_text(value, 32)
+    normalized = status.casefold() if status is not None else ""
+    normalized = _CHANNEL_MONITOR_STATUS_ALIASES.get(normalized, normalized)
+    return normalized if normalized in _CHANNEL_MONITOR_STATUSES else "unknown"
+
+
+def _normalize_channel_monitor_provider(value: Any) -> str:
+    provider = _clean_text(value, 64)
+    if provider is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", provider) is None:
+        return "unknown"
+    return provider.casefold()
+
+
+def _bounded_monitor_number(value: Any, *, maximum: float) -> float | None:
+    number = _finite_number(value)
+    if number is None or number < 0 or number > maximum:
+        return None
+    return number
+
+
+def _normalize_monitor_timestamp(value: Any) -> str | None:
+    text = _clean_text(value, 64)
+    if text is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    normalized = parsed.isoformat()
+    return normalized[:-6] + "Z" if normalized.endswith("+00:00") else normalized
+
+
+def _parse_monitor_timestamp(value: Any) -> datetime | None:
+    text = _clean_text(value, 64)
+    if text is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def _newapi_today_usage_params(
     time_zone: str,
     *,
@@ -2437,6 +4074,21 @@ def _newapi_yesterday_usage_params(
     return {
         "start_timestamp": int(yesterday_start.timestamp()),
         "end_timestamp": int(today_start.timestamp()) - 1,
+    }
+
+
+def _sub2api_yesterday_usage_params(
+    time_zone: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, str]:
+    _, today_start = _newapi_usage_day(time_zone, now=now)
+    yesterday = today_start.date() - timedelta(days=1)
+    date_text = yesterday.isoformat()
+    return {
+        "start_date": date_text,
+        "end_date": date_text,
+        "timezone": str(today_start.tzinfo),
     }
 
 
@@ -2744,9 +4396,14 @@ __all__ = [
     "MAX_UPSTREAM_TOKEN_LENGTH",
     "NEWAPI_ENDPOINTS",
     "NEWAPI_TODAY_USAGE_ENDPOINT",
+    "NEWAPI_UPTIME_STATUS_ENDPOINT",
+    "SUB2API_API_KEY_USAGE_ENDPOINT",
+    "SUB2API_CHANNEL_MONITORS_ENDPOINT",
     "SUB2API_ENDPOINTS",
     "SUB2API_REFRESH_ENDPOINT",
     "SUB2API_TODAY_USAGE_ENDPOINT",
+    "SUB2API_USAGE_STATS_ENDPOINT",
+    "UPSTREAM_USAGE_TIMEOUT_SECONDS",
     "Sub2ApiTokenPair",
     "UpstreamClient",
     "UpstreamDiscoveryClient",

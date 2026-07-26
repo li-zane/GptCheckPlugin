@@ -20,12 +20,16 @@ export function upstreamChangeReasonLabel(reason?: string | null) {
     upstream_group_status_change: "上游分组状态变化",
     upstream_group_status_changed: "上游分组状态变化",
     upstream_group_availability_change: "上游分组状态变化",
-    upstream_group_invalid: "上游分组已失效",
+    upstream_group_invalid: "上游分组已删除",
     upstream_group_unavailable: "上游分组不可用",
     upstream_group_restored: "上游分组恢复可用",
+    negative_balance: "上游余额不足",
     account_auto_disabled: "账号已自动禁用",
     auto_disable: "账号已自动禁用",
     upstream_auto_disable: "上游失效后自动禁用",
+    upstream_balance_negative: "上游余额低于阈值",
+    channel_monitor_unavailable: "渠道监控与回退测试不可用",
+    upstream_rate_increase: "综合上游倍率上涨",
     upstream_key_recovered: "上游 Key 恢复可用",
     upstream_group_recovered: "上游分组恢复可用",
     remote_schedulable_change: "账号调度状态变化",
@@ -50,7 +54,11 @@ export function upstreamHealthStatusLabel(kind: UpstreamHealthKind, status?: str
   const common = ({
     unknown: "未确认",
     not_checked: "未检查",
+    not_configured: "未配置",
     unavailable: "不可用",
+    deleted: "已删除",
+    removed: "已删除",
+    absent: "已删除",
     not_found: "未找到",
     expired: "已过期",
     quota_exhausted: "额度耗尽",
@@ -69,6 +77,9 @@ export function upstreamHealthStatusLabel(kind: UpstreamHealthKind, status?: str
       invalid: "已失效",
       disabled: "已失效",
       group_missing: "已失效",
+      deleted: "已删除",
+      removed: "已删除",
+      absent: "已删除",
     } as Record<string, string>)[value] || upstreamStatusLabel(value);
   }
   if (kind === "key") {
@@ -95,6 +106,11 @@ export function upstreamStatusLabel(status: string) {
   return ({
     ok: "正常",
     success: "正常",
+    healthy: "正常",
+    operational: "可用",
+    degraded: "降级",
+    timeout: "超时",
+    estimated: "估算值",
     active: "启用",
     inactive: "停用",
     enabled: "启用",
@@ -103,6 +119,9 @@ export function upstreamStatusLabel(status: string) {
     failed: "失败",
     invalid: "无效",
     unavailable: "不可用",
+    deleted: "已删除",
+    removed: "已删除",
+    absent: "已删除",
     available: "可用",
     usable: "可用",
     valid: "有效",
@@ -117,9 +136,11 @@ export function upstreamStatusLabel(status: string) {
     missing: "缺少配置",
     missing_credentials: "缺少凭据",
     credentials_missing: "未绑定凭据",
+    token_invalid: "Token 失效",
     undiscovered: "待探测",
     not_discovered: "待探测",
     not_checked: "未检查",
+    not_configured: "未配置",
     not_ready: "不可计算",
     pending: "待处理",
     pending_apply: "待同步",
@@ -156,11 +177,11 @@ export function upstreamStatusLabel(status: string) {
 
 export function upstreamStatusTone(status: string) {
   const value = normalizedStatus(status);
-  if (["ok", "success", "active", "available", "usable", "valid", "enabled", "in_sync", "managed", "applied", "synced", "unchanged"].includes(value)) return "success";
+  if (["ok", "success", "healthy", "operational", "active", "available", "usable", "valid", "enabled", "in_sync", "managed", "applied", "synced", "unchanged"].includes(value)) return "success";
   if (value === "unmanaged" || value === "unknown") return "muted";
-  if (value === "inactive" || value === "apply_failed") return "danger";
-  if (/(error|fail|invalid|unavailable|unsupported|missing|not[_-]?found|disabled|expired|exhausted|unassigned|blocked|denied)/.test(value)) return "danger";
-  if (/(pending|stale|undiscovered|not_discovered|not_checked|not_ready|fallback_manual|manual|default|skipped)/.test(value)) return "warn";
+  if (value === "inactive" || value === "apply_failed" || value === "timeout") return "danger";
+  if (/(error|fail|invalid|unavailable|unsupported|missing|not[_-]?found|disabled|expired|exhausted|unassigned|blocked|denied|token_invalid|deleted|removed|absent)/.test(value)) return "danger";
+  if (/(pending|stale|degraded|estimated|undiscovered|not_discovered|not_checked|not_configured|not_ready|fallback_manual|manual|default|skipped)/.test(value)) return "warn";
   if (/(auto|observed|discovered|newapi|sub2api|openai|anthropic|api_key)/.test(value)) return "info";
   return "muted";
 }

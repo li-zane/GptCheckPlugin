@@ -1,11 +1,14 @@
 import type {
   Account,
+  AccountSchedulingChangeEvent,
   AccountExceptionRecord,
   AccountLivenessModels,
   AccountLivenessTestResult,
   AppEvent,
   AppSettings,
   AppSettingsUpdate,
+  ChangeLogPage,
+  ChangeLogUnreadCounts,
   DeactivatedCleanupResult,
   Mailbox,
   MailboxImportResult,
@@ -14,10 +17,12 @@ import type {
   PhoneNumber,
   PriorityInterval,
   PriorityIntervalAssignment,
+  PriorityTieMoveInput,
   PriorityIntervalInput,
   PriorityRebalanceResult,
   RefreshJob,
   SelectedAccountDeleteItem,
+  SiteLogoUpdateResult,
   Sub2ApiPortScanResult,
   SubscriptionRefreshResult,
   Summary,
@@ -26,8 +31,12 @@ import type {
   UsageLimitSamples,
   UsageRefreshResult,
   UpstreamAccount,
+  UpstreamAccountAvailabilityTestResult,
+  UpstreamAccountConnectionTestResult,
   UpstreamAccountUpdate,
   UpstreamChannel,
+  UpstreamChannelChangeEvent,
+  UpstreamChannelMonitorsResponse,
   UpstreamChannelDiscoverAllRequest,
   UpstreamChannelDiscoverAllResult,
   UpstreamChannelsResponse,
@@ -246,7 +255,14 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
+  updateSiteLogo: (file: File) => request<SiteLogoUpdateResult>("/api/settings/logo", {
+    method: "PUT",
+    body: file,
+    headers: { "Content-Type": file.type },
+  }, 60_000),
+  resetSiteLogo: () => request<SiteLogoUpdateResult>("/api/settings/logo", { method: "DELETE" }),
   scanSub2Api: () => request<Sub2ApiPortScanResult>("/api/settings/scan-sub2api", { method: "POST" }),
+  testNotification: () => request<{ message: string }>("/api/settings/notifications/test", { method: "POST" }),
   mailboxes: () => request<Mailbox[]>("/api/mailboxes"),
   mailboxMessages: (id: number, folder: "inbox" | "junk") =>
     request<MailMessage[]>(`/api/mailboxes/${id}/messages?folder=${folder}&limit=10`, {}, 50_000),
@@ -297,6 +313,17 @@ export const api = {
     },
     NO_FRONTEND_TIMEOUT,
   ),
+  moveUpstreamAccountPriority: (
+    accountId: number | string,
+    payload: PriorityTieMoveInput,
+  ) => request<PriorityRebalanceResult>(
+    `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/priority-order`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    NO_FRONTEND_TIMEOUT,
+  ),
   rebalancePriorityIntervals: () => request<PriorityRebalanceResult>(
     "/api/upstream-accounts/priority-intervals/rebalance",
     { method: "POST" },
@@ -312,6 +339,28 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ enabled, expected_identity_fingerprint: expectedIdentityFingerprint }),
     }),
+  testUpstreamAccountAvailability: (
+    accountId: number | string,
+    expectedIdentityFingerprint: string,
+  ) => request<UpstreamAccountAvailabilityTestResult>(
+    `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/availability-test`,
+    {
+      method: "POST",
+      body: JSON.stringify({ expected_identity_fingerprint: expectedIdentityFingerprint }),
+    },
+    NO_FRONTEND_TIMEOUT,
+  ),
+  testUpstreamAccountConnection: (
+    accountId: number | string,
+    expectedIdentityFingerprint: string,
+  ) => request<UpstreamAccountConnectionTestResult>(
+    `/api/upstream-accounts/${encodeURIComponent(String(accountId))}/connection-test`,
+    {
+      method: "POST",
+      body: JSON.stringify({ expected_identity_fingerprint: expectedIdentityFingerprint }),
+    },
+    NO_FRONTEND_TIMEOUT,
+  ),
   deleteRemoteUpstreamAccount: (accountId: number | string, expectedIdentityFingerprint: string) =>
     request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}/remote`, {
       method: "DELETE",
@@ -330,6 +379,35 @@ export const api = {
     beforeId?: number | null,
     filters?: UpstreamChangeLogFilters,
   ) => request<UpstreamRateChangeLog[]>(upstreamRateChangeLogsPath(limit, beforeId, filters)),
+  upstreamChannelChangeEvents: (
+    limit = 50,
+    beforeId?: number | null,
+    filters?: UpstreamChangeLogFilters,
+    category: "all" | "upstream" | "account_rate" = "all",
+  ) => request<ChangeLogPage<UpstreamChannelChangeEvent>>(
+    `/api/upstream-accounts/channel-change-events?${upstreamChangeLogsQuery(limit, beforeId, filters)}${category === "all" ? "" : `&category=${category}`}`,
+  ),
+  accountSchedulingChangeEvents: (
+    limit = 50,
+    beforeId?: number | null,
+    filters?: UpstreamChangeLogFilters,
+  ) => request<ChangeLogPage<AccountSchedulingChangeEvent>>(
+    `/api/upstream-accounts/scheduling-change-events?${upstreamChangeLogsQuery(limit, beforeId, filters)}`,
+  ),
+  changeLogUnreadCounts: () => request<ChangeLogUnreadCounts>(
+    "/api/upstream-accounts/change-log-unread-counts",
+  ),
+  markUpstreamChannelChangesRead: (
+    throughId: number,
+    category: "all" | "upstream" | "account_rate" = "all",
+  ) => request<{ message: string }>(
+    `/api/upstream-accounts/channel-change-events/mark-read?category=${category}`,
+    { method: "POST", body: JSON.stringify({ through_id: throughId }) },
+  ),
+  markAccountSchedulingChangesRead: (throughId: number) => request<{ message: string }>(
+    "/api/upstream-accounts/scheduling-change-events/mark-read",
+    { method: "POST", body: JSON.stringify({ through_id: throughId }) },
+  ),
   deleteUpstreamAccount: (accountId: number | string, expectedIdentityFingerprint: string) =>
     request<{ message: string }>(`/api/upstream-accounts/${encodeURIComponent(String(accountId))}`, {
       method: "DELETE",
@@ -360,7 +438,8 @@ export const api = {
       },
       90_000,
     ),
-  upstreamChannels: () => request<UpstreamChannelsResponse>("/api/upstream-channels"),
+  upstreamChannels: (refresh = false) =>
+    request<UpstreamChannelsResponse>(`/api/upstream-channels?refresh=${refresh ? "true" : "false"}`),
   syncApiKeyInventory: () =>
     request<UpstreamChannelsResponse>(
       "/api/upstream-channels/sync-inventory",
@@ -382,6 +461,12 @@ export const api = {
       { method: "POST" },
       90_000,
     ),
+  refreshUpstreamChannelMonitors: (channelId: number | string) =>
+    request<UpstreamChannelMonitorsResponse>(
+      `/api/upstream-channels/${encodeURIComponent(String(channelId))}/channel-monitors/refresh`,
+      { method: "POST" },
+      90_000,
+    ),
   discoverAllUpstreamChannels: (signal?: AbortSignal) =>
     request<UpstreamChannelDiscoverAllResult>(
       "/api/upstream-channels/discover-all",
@@ -391,6 +476,7 @@ export const api = {
   syncApiKeyAccounts: (
     overview: UpstreamChannelsResponse,
     confirmLegacyBindings: boolean,
+    skipChannelIds: number[] = [],
     signal?: AbortSignal,
   ) => {
     const accountBindings = confirmLegacyBindings
@@ -400,8 +486,9 @@ export const api = {
       ? {
           confirm_legacy_bindings: true,
           account_bindings: accountBindings,
+          ...(skipChannelIds.length ? { skip_channel_ids: skipChannelIds } : {}),
         }
-      : {};
+      : (skipChannelIds.length ? { skip_channel_ids: skipChannelIds } : {});
     return request<UpstreamChannelDiscoverAllResult>(
       "/api/upstream-channels/discover-all",
       {

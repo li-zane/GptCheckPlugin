@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from time import perf_counter
 from typing import Annotated
@@ -11,12 +12,17 @@ from app.schemas import (
     MessageResponse,
     UpstreamChannelDiscoverAllRequest,
     UpstreamChannelDiscoverAllOut,
+    UpstreamChannelMonitorsOut,
     UpstreamChannelOut,
     UpstreamChannelUpdate,
     UpstreamOverviewOut,
 )
 from app.services.upstream_accounts import UpstreamAccountServiceError
-from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
+from app.services.upstream_channels import (
+    UpstreamChannelService,
+    UpstreamDiscoveryOptions,
+    get_upstream_channel_service,
+)
 from app.services.events import elapsed_ms, record_event
 from app.services.runtime_config import get_runtime_config_service
 
@@ -24,6 +30,29 @@ from app.services.runtime_config import get_runtime_config_service
 router = APIRouter()
 logger = logging.getLogger(__name__)
 ChannelId = Annotated[int, Path(ge=1, le=9_007_199_254_740_991)]
+MANUAL_UPSTREAM_SYNC_TIMEOUT_SECONDS = 300.0
+
+
+def _manual_discovery_options(settings: dict[str, object]) -> UpstreamDiscoveryOptions:
+    return UpstreamDiscoveryOptions(
+        sync_rates=bool(settings.get("manual_upstream_sync_rate_enabled", True)),
+        sync_priorities=bool(settings.get("manual_upstream_sync_priority_enabled", True)),
+        evaluate_upstream_health=bool(
+            settings.get("manual_upstream_sync_upstream_health_enabled", True)
+        ),
+        refresh_channel_monitors=bool(
+            settings.get("manual_upstream_sync_channel_monitors_enabled", True)
+        ),
+        evaluate_account_availability=bool(
+            settings.get("manual_upstream_sync_account_availability_enabled", False)
+        ),
+        evaluate_balance_guard=bool(
+            settings.get("manual_upstream_sync_balance_guard_enabled", True)
+        ),
+        evaluate_rate_pause=bool(
+            settings.get("manual_upstream_sync_rate_pause_enabled", True)
+        ),
+    )
 
 
 def _http_error(exc: UpstreamAccountServiceError) -> HTTPException:
@@ -37,7 +66,7 @@ async def upstream_channel_overview(
     service: UpstreamChannelService = Depends(get_upstream_channel_service),
 ) -> UpstreamOverviewOut:
     try:
-        return await service.overview(db)
+        return await service.overview(db, sync_inventory=False)
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
 
@@ -99,47 +128,33 @@ async def discover_all_upstream_channels(
                 for item in payload.account_bindings
             }
         runtime = get_runtime_config_service()
+        settings_getter = getattr(runtime, "get_public_settings", None)
+        manual_settings_available = callable(settings_getter)
+        runtime_settings = await settings_getter() if manual_settings_available else {}
+        if not isinstance(runtime_settings, dict):
+            runtime_settings = {}
         max_concurrency = await runtime.get_upstream_sync_max_concurrency()
-        probe_globally_enabled = await runtime.get_upstream_sync_enabled()
-        if not probe_globally_enabled:
-            inventory_started_at = perf_counter()
-            overview = await service.overview(db)
-            inventory_duration_ms = elapsed_ms(inventory_started_at)
-            occupied_channels = [
-                channel for channel in overview.channels if channel.account_count > 0
-            ]
-            result = UpstreamChannelDiscoverAllOut(
-                total=len(occupied_channels),
-                succeeded=0,
-                failed=0,
-                cached=0,
-                skipped=len(occupied_channels),
-                force=True,
-                cache_max_age_seconds=None,
-                probe_globally_enabled=False,
-                inventory_duration_ms=inventory_duration_ms,
-                probe_duration_ms=0,
-                priority_duration_ms=0,
-                channels=overview.channels,
-                overview=overview,
-            )
-        else:
-            result = (
-                await service.discover_all(
-                    db,
-                    legacy_bindings=legacy_bindings,
-                    max_concurrency=max_concurrency,
-                    require_management_credentials=True,
-                    force=True,
-                )
-                if legacy_bindings is not None
-                else await service.discover_all(
-                    db,
-                    max_concurrency=max_concurrency,
-                    require_management_credentials=True,
-                    force=True,
-                )
-            )
+        options = _manual_discovery_options(runtime_settings) if manual_settings_available else None
+        discover_kwargs: dict[str, object] = {
+            "max_concurrency": max_concurrency,
+            "require_management_credentials": True,
+            "force": True,
+        }
+        if legacy_bindings is not None:
+            discover_kwargs["legacy_bindings"] = legacy_bindings
+        if payload is not None and payload.skip_channel_ids:
+            discover_kwargs["skip_channel_ids"] = set(payload.skip_channel_ids)
+        if options is not None:
+            discover_kwargs["options"] = options
+        result = await asyncio.wait_for(
+            service.discover_all(db, **discover_kwargs),
+            timeout=MANUAL_UPSTREAM_SYNC_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Manual API key account synchronization timed out.",
+        ) from None
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
     try:
@@ -155,6 +170,18 @@ async def discover_all_upstream_channels(
             "probe_globally_enabled": result.probe_globally_enabled,
             "duration_ms": elapsed_ms(started_at),
         }
+        if payload is not None and payload.skip_channel_ids:
+            details["skip_channel_ids"] = payload.skip_channel_ids
+        if manual_settings_available and options is not None:
+            details["manual_tasks"] = {
+                "rates": options.sync_rates,
+                "priorities": options.sync_priorities,
+                "upstream_health": options.evaluate_upstream_health,
+                "channel_monitors": options.refresh_channel_monitors,
+                "account_availability": options.evaluate_account_availability,
+                "balance_guard": options.evaluate_balance_guard,
+                "rate_pause": options.evaluate_rate_pause,
+            }
         for field_name in (
             "inventory_duration_ms",
             "probe_duration_ms",
@@ -215,6 +242,27 @@ async def discover_upstream_channel(
     service: UpstreamChannelService = Depends(get_upstream_channel_service),
 ) -> UpstreamChannelOut:
     try:
-        return await service.discover_channel(db, channel_id)
+        settings = await get_runtime_config_service().get_public_settings()
+        return await service.discover_channel(
+            db,
+            channel_id,
+            options=_manual_discovery_options(settings),
+        )
+    except UpstreamAccountServiceError as exc:
+        raise _http_error(exc) from None
+
+
+@router.post(
+    "/{channel_id}/channel-monitors/refresh",
+    response_model=UpstreamChannelMonitorsOut,
+)
+async def refresh_upstream_channel_monitors(
+    channel_id: ChannelId,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+) -> UpstreamChannelMonitorsOut:
+    try:
+        return await service.refresh_channel_monitors(db, channel_id)
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None

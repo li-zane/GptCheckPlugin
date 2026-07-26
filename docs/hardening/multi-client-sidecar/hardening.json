@@ -1,0 +1,631 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "hardening_20260718_multi_client_sidecar",
+  "sourceEvidence": {
+    "kind": "repository_runtime_experiment_collection",
+    "label": "GptCheckPlugin multi-instance and sensitive connector evidence",
+    "collectionSha256": "21332524ee2e29e173ee861534d92d51e62ab3d5970d94123558c98efb0f0c21",
+    "artifactCount": 10,
+    "targetRevision": "a5e99cf293f4ea1a0343e32f95ea27789b3d2a9b",
+    "sourceDrift": "present"
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "A paired outbound connector is feasible, but only after instance identity is made explicit across storage, requests, jobs, caches, and UI state. The connector must return derived metadata by default and remain a narrowly scoped secret reader rather than a TOTP bypass."
+  },
+  "constraints": {
+    "profile": "balanced",
+    "changeHorizons": [
+      "incremental",
+      "medium_term",
+      "foundational"
+    ],
+    "nonNegotiables": [
+      "Do not disable sub2api TOTP step-up protection.",
+      "Do not store a TOTP seed, administrator browser session, or long-lived administrator JWT.",
+      "Normal account operations continue through the selected instance's x-api-key.",
+      "No live credential values enter design artifacts or local experiments.",
+      "Unknown sub2api schema and protocol versions fail closed.",
+      "Raw OAuth refresh tokens are not a normal connector capability."
+    ],
+    "assumptions": [
+      "Existing single-instance data must migrate into one default instance without loss.",
+      "A lightweight outbound connector may be installed on selected sub2api hosts.",
+      "No measured production connector memory, CPU, or network budget was supplied.",
+      "A private sub2api fork is not currently assumed to be maintainable."
+    ]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "instance-scoped-sensitive-access",
+      "title": "Establish instance identity and a least-authority sensitive access boundary",
+      "summary": "Replace singleton connection authority with immutable instance context and isolate protected credential inspection behind an explicit provider.",
+      "diagnosis": "The current control plane treats URL, account identity, scheduler work, and browser cache as global. Its API Key sync also depends on a TOTP-protected bulk export. A direct database reader can restore functionality but becomes a new high-value secret export path.",
+      "evidence": [
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E01",
+          "path": "backend/app/services/runtime_config.py",
+          "claim": "One effective sub2api URL and x-api-key are resolved from global settings."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E02",
+          "path": "backend/app/services/sub2api.py",
+          "claim": "Many client methods implicitly fetch the singleton configuration, and raw API Key synchronization calls the protected export endpoint."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E03",
+          "path": "backend/app/models.py",
+          "claim": "Email, sub2api account ID, and canonical upstream URL have global uniqueness constraints."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E04",
+          "path": "backend/app/services/upstream_rate_sync.py",
+          "claim": "Background inventory and upstream loops have no per-instance work owner."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E05",
+          "path": "frontend/src/App.tsx",
+          "claim": "The frontend settings, loading, and upstream cache assume one active endpoint."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E06",
+          "path": "backend/app/core/crypto.py",
+          "claim": "Application at-rest secrets use one Fernet key derived from APP_ENCRYPTION_KEY, not a per-device identity protocol."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "document",
+          "evidenceId": "E07",
+          "path": "docs/hardening/multi-client-sidecar/context.md",
+          "claim": "Read-only x2 inspection found raw credential fields in PostgreSQL JSONB behind the protected export."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "document",
+          "evidenceId": "E08",
+          "path": "docs/hardening/multi-client-sidecar/context.md",
+          "claim": "Inspected sub2api source and runtime versions differ, creating adapter drift risk."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "experiment",
+          "evidenceId": "E09",
+          "path": "docs/hardening/multi-client-sidecar/experiments/results.md",
+          "claim": "Eight authenticated-envelope checks passed and a 100-account synthetic envelope measured 1.4012 ms median cryptographic round-trip latency."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "experiment",
+          "evidenceId": "E10",
+          "path": "docs/hardening/multi-client-sidecar/experiments/results.md",
+          "claim": "A PostgreSQL 18 connector role read two narrow views while base tables, hidden columns, writes, DDL, and server-file access were denied."
+        },
+        {
+          "claimType": "inferred",
+          "sourceKind": "source",
+          "evidenceId": "E03",
+          "path": "backend/app/models.py",
+          "claim": "A mutable global instance selector would allow account ID and email collisions to cross-wire data and remote actions."
+        },
+        {
+          "claimType": "inferred",
+          "sourceKind": "document",
+          "evidenceId": "E07",
+          "path": "docs/hardening/multi-client-sidecar/context.md",
+          "claim": "Database read-only access protects integrity but cannot protect any credential field visible to a compromised connector."
+        }
+      ],
+      "desiredInvariants": [
+        "Every instance-owned row, API operation, job, cache entry, and response is bound to an immutable instance_id.",
+        "No credential is selected or stored using sub2api_account_id without instance and remote identity binding.",
+        "Normal list and write operations use only the selected instance's x-api-key.",
+        "OAuth AT and RT never reach the browser, and derived metadata is returned instead of raw tokens by default.",
+        "A connector exposes fixed capability operations rather than arbitrary SQL, files, commands, or URLs.",
+        "Each connector identity is independently paired, rotated, revoked, and protected against replay and cross-instance reuse.",
+        "Unknown schema and protocol versions fail without returning guessed credentials."
+      ],
+      "proposalPath": "proposals/multi-instance-sensitive-boundary.md",
+      "options": [
+        {
+          "optionId": "instance-scoped-api-only",
+          "title": "API-only with manual break-glass restore",
+          "kind": "baseline",
+          "summary": "Complete multi-instance isolation, keep normal x-api-key operations, and require explicit account-scoped manual restoration for protected data.",
+          "diagramPaths": {
+            "before": "diagrams/multi-instance-sensitive-boundary-before.mmd",
+            "after": "diagrams/multi-instance-sensitive-boundary-api-only-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E01",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "An instance registry replaces the global URL/token authority."
+            },
+            {
+              "evidenceId": "E02",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "The normal client becomes instance-bound, but protected automatic export is replaced by manual recovery rather than automated."
+            },
+            {
+              "evidenceId": "E03",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Compound unique constraints scope identities to one instance."
+            },
+            {
+              "evidenceId": "E04",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Scheduler work receives persistent instance ownership."
+            },
+            {
+              "evidenceId": "E05",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Frontend requests and caches use stable instance IDs and stale-response rejection."
+            },
+            {
+              "evidenceId": "E06",
+              "effect": "unaffected",
+              "tacticalFixRequired": true,
+              "rationale": "At-rest encryption remains central and still needs key versioning and leakage controls."
+            },
+            {
+              "evidenceId": "E07",
+              "effect": "mitigates",
+              "tacticalFixRequired": false,
+              "rationale": "No new database reader is created, although existing protected data remains unavailable automatically."
+            },
+            {
+              "evidenceId": "E08",
+              "effect": "unaffected",
+              "tacticalFixRequired": false,
+              "rationale": "No database adapter is introduced."
+            },
+            {
+              "evidenceId": "E09",
+              "effect": "unaffected",
+              "tacticalFixRequired": false,
+              "rationale": "The option does not need the connector envelope."
+            },
+            {
+              "evidenceId": "E10",
+              "effect": "unaffected",
+              "tacticalFixRequired": false,
+              "rationale": "The option does not create a connector database role."
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Instance isolation removes cross-instance ambient authority and no resident database reader is added.",
+              "validationPlan": "Exercise two instances with colliding IDs/emails and inspect every normal and manual credential path."
+            },
+            {
+              "dimension": "performance",
+              "direction": "neutral",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "Normal calls add an instance lookup but no network or process hop.",
+              "validationPlan": "Compare normal API request and scheduler latency before and after instance lookup."
+            },
+            {
+              "dimension": "memory",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "No new resident process is introduced; registry/cache entries grow with configured instances.",
+              "validationPlan": "Measure central RSS with one and the expected maximum number of instances."
+            },
+            {
+              "dimension": "reliability",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Normal operations remain available, but missing credentials require manual intervention and metadata can remain stale.",
+              "validationPlan": "Test protected-data failure states and time the manual recovery workflow."
+            },
+            {
+              "dimension": "operability",
+              "direction": "neutral",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "There is no device fleet, but operators assume the burden of selected-account restoration.",
+              "validationPlan": "Run an operator rehearsal and review audit completeness and error clarity."
+            },
+            {
+              "dimension": "migration",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Global uniqueness, routes, services, schedulers, and caches require a broad one-time migration.",
+              "validationPlan": "Migrate and roll back a copied production-like central database with collision fixtures."
+            }
+          ],
+          "residualRisks": [
+            "Protected API Keys and OAuth metadata cannot be recovered automatically.",
+            "Manual restoration can still bind a secret incorrectly without remote identity and origin checks.",
+            "Central at-rest secrets still share one application encryption root unless key versioning is added."
+          ],
+          "implementationReadiness": {
+            "affectedComponents": [
+              "backend/app/models.py",
+              "backend/app/core/database.py",
+              "backend/app/services/runtime_config.py",
+              "backend/app/services/sub2api.py",
+              "backend/app/services/monitor.py",
+              "backend/app/services/usage_refresh.py",
+              "backend/app/services/upstream_rate_sync.py",
+              "frontend/src/App.tsx",
+              "frontend/src/api.ts",
+              "frontend/src/upstreamOverviewCache.ts"
+            ],
+            "workPackages": [
+              "Create the instance registry and migrate all existing rows into a default instance.",
+              "Carry immutable instance context through routes, services, jobs, events, and caches.",
+              "Add instance management and selector UI with stale-response rejection.",
+              "Implement an audited selected-account manual restore path."
+            ],
+            "acceptanceCriteria": [
+              "Two instances with the same account ID and email never share data or remote actions.",
+              "Every normal request uses the intended instance URL and x-api-key.",
+              "The old single-instance data decrypts and remains associated after migration."
+            ],
+            "migrationNotes": [
+              "Keep instance_id and compound constraints during rollback.",
+              "Do not expose the selector until backend and scheduler isolation tests pass."
+            ],
+            "rollback": "Disable non-default instances and retain the default instance-scoped schema and API-only behavior."
+          }
+        },
+        {
+          "optionId": "paired-readonly-connector",
+          "title": "Paired outbound read-only connector",
+          "kind": "isolation",
+          "summary": "Install one paired connector beside each selected sub2api, use narrow database views and fixed operations, and return derived OAuth metadata by default.",
+          "diagramPaths": {
+            "before": "diagrams/multi-instance-sensitive-boundary-before.mmd",
+            "after": "diagrams/multi-instance-sensitive-boundary-paired-sidecar-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E01",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "The central registry and immutable instance context replace singleton connection state."
+            },
+            {
+              "evidenceId": "E02",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Normal and sensitive providers own separate capabilities and both bind to one instance."
+            },
+            {
+              "evidenceId": "E03",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "All instance-owned uniqueness and relationships become instance-scoped."
+            },
+            {
+              "evidenceId": "E04",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Schedulers persist instance ownership and connector capability state."
+            },
+            {
+              "evidenceId": "E05",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "The selector becomes a view of backend isolation rather than the isolation mechanism."
+            },
+            {
+              "evidenceId": "E06",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "Per-device identities and sealed transport avoid reusing the at-rest Fernet key as a shared protocol secret."
+            },
+            {
+              "evidenceId": "E07",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "Narrow views and metadata-first responses reduce exposure, but a compromised connector can still read allowed raw inputs."
+            },
+            {
+              "evidenceId": "E08",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "Versioned schema adapters fingerprint known layouts and fail closed on drift."
+            },
+            {
+              "evidenceId": "E09",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "The local probe supports envelope feasibility; a mature production HPKE/mTLS implementation and independent protocol review remain required."
+            },
+            {
+              "evidenceId": "E10",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "The local role/view probe supports the proposed authorization boundary; production schema and revocation tests remain required."
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The design preserves step-up protection, separates normal and sensitive authority, keeps OAuth tokens local by default, scopes each device, and signs both commands and responses at the application layer. Connector or x1 compromise still permits abuse of allowed operations.",
+              "validationPlan": "Run canary-token leakage, cross-instance, authorization, forged-command/response, replay, revocation, and host-compromise simulations."
+            },
+            {
+              "dimension": "performance",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "measured",
+              "assessment": "Sensitive requests gain a DB query, serialization, encryption, and network hop. The local primitive probe measured 1.4012 ms median crypto round trip for 100 synthetic records, but end-to-end cost is unknown.",
+              "validationPlan": "Measure p50/p95/p99 for 1, 100, and 200-account commands with the target database, TLS path, and network."
+            },
+            {
+              "dimension": "memory",
+              "direction": "regresses",
+              "confidence": "low",
+              "basis": "hypothetical",
+              "assessment": "Each host gains one process, one DB connection, one outbound session, and bounded replay state. A Go idle RSS target of 32 MiB is proposed but unmeasured.",
+              "validationPlan": "Measure idle and peak RSS on x2-like hardware under reconnect, 10,000-account, and maximum-batch workloads."
+            },
+            {
+              "dimension": "reliability",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "Connector failure is contained to sensitive capabilities for one instance while normal x-api-key operations remain available; a new partial-availability state must be managed.",
+              "validationPlan": "Inject connector, x1, database, and network failures and verify bounded backoff, stale state, and no cross-instance fallback."
+            },
+            {
+              "dimension": "operability",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Pairing, device health, certificate/key rotation, revocation, schema adapters, packaging, and incident response become ongoing responsibilities.",
+              "validationPlan": "Rehearse install, pair, rotate, revoke, upgrade, schema rejection, and uninstall with audit review."
+            },
+            {
+              "dimension": "migration",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The option includes the broad instance migration plus provider, protocol, connector, installer, and frontend capability work.",
+              "validationPlan": "Roll out API-only first, canary metadata-only on one instance, then enable each capability and instance independently with rollback drills."
+            }
+          ],
+          "residualRisks": [
+            "A compromised connector can exfiltrate every raw field exposed by its narrow database views.",
+            "A compromised x1 control plane can issue many allowed sensitive requests until rate limits, local approval, or revocation intervene.",
+            "A schema adapter can bind the wrong JSON field unless exact versions and identity fingerprints are validated.",
+            "Raw API Key compatibility export expands x1 storage, backup, and logging blast radius.",
+            "Certificate and application-key loss or rotation can interrupt all sensitive capabilities."
+          ],
+          "implementationReadiness": {
+            "affectedComponents": [
+              "All components listed for instance-scoped-api-only",
+              "A new sensitive provider boundary in the backend",
+              "Pairing, device, capability, and audit models/routes",
+              "A new connector binary and installer",
+              "Narrow sub2api database views/roles",
+              "Frontend connector health and capability state"
+            ],
+            "workPackages": [
+              "Complete and validate the API-only multi-instance milestone.",
+              "Introduce provider interfaces and remote identity/source binding.",
+              "Implement one-time pairing, per-device mTLS, sealed responses, rotation, revocation, and anti-replay state.",
+              "Build the non-root outbound connector and fail-closed schema adapters.",
+              "Provision narrow database views and a dedicated role through a one-time installer.",
+              "Enable OAuth metadata first, then local API Key inspection, with raw Key compatibility export separately gated.",
+              "Add leakage, collision, failure, schema, and resource gates."
+            ],
+            "acceptanceCriteria": [
+              "All API-only multi-instance collision tests pass before any connector capability is enabled.",
+              "OAuth AT/RT canaries never appear in x1 responses, browser storage, logs, errors, or backups.",
+              "The connector cannot read base tables or hidden fields, mutate data, create objects, read host files, or access Docker control.",
+              "The connector has no normal HTTP proxy, scheduler, full-account cache, inbound port, host mount, or Docker Socket, and it stops on ambiguous discovery or unknown schema.",
+              "Forged commands/responses and tampered, replayed, expired, cross-instance, wrong-receiver, oversized, and unknown-version messages are rejected.",
+              "Normal operations remain available during connector outage and never fall through to another instance.",
+              "Target-host resource and latency thresholds are measured and pass before rollout."
+            ],
+            "migrationNotes": [
+              "Use api_only as the default mode and per-instance rollback state.",
+              "Do not add raw OAuth RT to the normal protocol.",
+              "Do not enable raw API Key export until local upstream inspection feasibility is decided."
+            ],
+            "rollback": "Revoke the connector identity, disable its capabilities, and return the instance to api_only while retaining instance-scoped data and routes."
+          }
+        },
+        {
+          "optionId": "sub2api-owned-integration",
+          "title": "sub2api-owned integration boundary",
+          "kind": "foundational",
+          "summary": "Move capability-scoped credential inspection and metadata derivation into sub2api so an external process does not read credential tables.",
+          "diagramPaths": {
+            "before": "diagrams/multi-instance-sensitive-boundary-before.mmd",
+            "after": "diagrams/multi-instance-sensitive-boundary-sub2api-integration-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E01",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "The central control plane still requires the same instance registry."
+            },
+            {
+              "evidenceId": "E02",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "A distinct integration provider replaces implicit bulk export authority."
+            },
+            {
+              "evidenceId": "E03",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Compound uniqueness remains mandatory regardless of provider location."
+            },
+            {
+              "evidenceId": "E04",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Schedulers still receive persistent instance ownership."
+            },
+            {
+              "evidenceId": "E05",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Frontend state and cache remain scoped by stable instance identity."
+            },
+            {
+              "evidenceId": "E06",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "Integration identity remains separate from central at-rest encryption."
+            },
+            {
+              "evidenceId": "E07",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "No external database principal receives credential-table visibility; sub2api returns derived results."
+            },
+            {
+              "evidenceId": "E08",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "Database schema coupling becomes internal, but patched image/source release drift remains an operational risk."
+            },
+            {
+              "evidenceId": "E09",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "The same authenticated result-envelope properties can be used for an outbound sub2api worker."
+            },
+            {
+              "evidenceId": "E10",
+              "effect": "unaffected",
+              "tacticalFixRequired": false,
+              "rationale": "No external connector database role or views are needed."
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "Raw credentials remain in the process that already owns them and only derived capabilities are serialized. Security depends on correct integration authorization and release review.",
+              "validationPlan": "Review the final sub2api integration source and run the same leakage, replay, scope, and canary tests."
+            },
+            {
+              "dimension": "performance",
+              "direction": "neutral",
+              "confidence": "medium",
+              "basis": "analogous",
+              "assessment": "The design avoids an external DB hop but still performs local derivation, serialization, encryption, and a network response.",
+              "validationPlan": "Benchmark patched sub2api normal traffic and integration requests under 1, 100, and 200-account workloads."
+            },
+            {
+              "dimension": "memory",
+              "direction": "regresses",
+              "confidence": "low",
+              "basis": "hypothetical",
+              "assessment": "An internal worker, bounded queue, cryptographic state, and replay cache add memory inside sub2api, likely less than a separate process but unmeasured.",
+              "validationPlan": "Compare sub2api peak RSS and allocation profiles before and after the integration module."
+            },
+            {
+              "dimension": "reliability",
+              "direction": "unknown",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "There are fewer deployed components, but integration defects and resource pressure share sub2api's failure domain.",
+              "validationPlan": "Inject integration queue, crypto, network, and derivation failures and verify normal sub2api service remains healthy."
+            },
+            {
+              "dimension": "operability",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Without upstream support, image provenance, patch rebasing, release qualification, and incident response become local responsibilities.",
+              "validationPlan": "Complete two upstream-version upgrade rehearsals and verify reproducible image builds and rollback."
+            },
+            {
+              "dimension": "migration",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "The central instance migration remains, and sub2api source, build, deployment, and version negotiation must also change.",
+              "validationPlan": "Canary a patched image on a disposable copy, then one instance, with provider-level rollback to api_only or the paired connector."
+            }
+          ],
+          "residualRisks": [
+            "A vulnerability in the integration module runs inside the sub2api failure and credential domain.",
+            "A private fork can lag security and schema fixes from the upstream image.",
+            "A compromised x1 can still request every operation the integration capability allows.",
+            "Improper serialization can still leak raw tokens despite local derivation intent."
+          ],
+          "implementationReadiness": {
+            "affectedComponents": [
+              "All central multi-instance components",
+              "sub2api account and credential service",
+              "sub2api integration identity and protocol",
+              "sub2api image build and deployment pipeline",
+              "Provider compatibility and rollback layer"
+            ],
+            "workPackages": [
+              "Complete central API-only multi-instance isolation and provider abstraction.",
+              "Agree an upstream-capable derived-metadata and local-inspection contract.",
+              "Implement integration authentication, policy, bounded operations, and result sealing inside sub2api.",
+              "Build reproducible images and cross-version release tests.",
+              "Canary per instance with provider rollback."
+            ],
+            "acceptanceCriteria": [
+              "No external process or role can read sub2api credential tables for the integration workflow.",
+              "Raw OAuth AT/RT never cross the integration boundary.",
+              "Normal sub2api availability and latency remain within agreed thresholds under integration faults and load.",
+              "Patched images are reproducible, versioned, upgrade-tested, and rollback-tested."
+            ],
+            "migrationNotes": [
+              "Keep the central sensitive provider interface compatible with api_only and paired connector modes.",
+              "Do not make the integration endpoint a general administrator or SQL API."
+            ],
+            "rollback": "Switch the affected instance to api_only or the paired connector provider and roll back to a verified compatible sub2api image."
+          }
+        }
+      ],
+      "recommendedOptionId": "paired-readonly-connector",
+      "recommendation": "Select the paired connector after the API-only multi-instance milestone. Return derived OAuth metadata, keep raw OAuth RT out of the protocol, prefer local API Key inspection, and retain api_only as the per-instance rollback. Choose the sub2api-owned integration instead if upstream release ownership becomes practical."
+    }
+  ],
+  "openQuestions": [
+    "Does x1 have a hard requirement to retain raw API Keys, or can upstream group/rate inspection run entirely beside sub2api?",
+    "Which entitlement/account-check source is authoritative for subscription dates?",
+    "Will connector-to-x1 traffic traverse a TLS-terminating reverse proxy?",
+    "Who owns device certificate and application encryption key issuance, rotation, and recovery?",
+    "Which exact sub2api versions and schema fingerprints must the first adapter support?",
+    "What maximum instance and account counts should scheduler fairness and resource benchmarks cover?",
+    "Can the sub2api project accept and maintain a capability-scoped integration API?"
+  ]
+}

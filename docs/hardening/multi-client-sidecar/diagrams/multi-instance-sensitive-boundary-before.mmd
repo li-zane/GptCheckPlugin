@@ -1,0 +1,16 @@
+flowchart LR
+    Browser["Admin browser"]
+    Control["GptCheckPlugin control plane"]
+    Global["Global sub2api URL and x-api-key"]
+    Cache["URL-scoped browser cache"]
+    Sub2API["One sub2api instance"]
+    StepUp["TOTP-protected export API"]
+    Database["sub2api PostgreSQL credentials JSONB"]
+
+    Browser -->|"selects actions"| Control
+    Browser --> Cache
+    Control -->|"implicit singleton config"| Global
+    Global -->|"normal admin API"| Sub2API
+    Global -->|"raw credential export"| StepUp
+    Sub2API --> Database
+    StepUp --> Database

@@ -8,6 +8,7 @@ from app import models  # noqa: F401
 from app.core.crypto import decrypt_text, encrypt_text
 from app.core.database import (
     Base,
+    _migrate_legacy_rate_logs_to_change_events,
     _migrate_upstream_channels,
     _migrate_upstream_rate_change_logs,
     _scrub_upstream_plaintext_secret_copies,
@@ -159,6 +160,7 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(channel_count, 2)
         self.assertEqual(index_count, 1)
+
         self.assertEqual(columns["upstream_type"][3], 1)
         self.assertIn("channel_id", columns)
         self.assertIn("probe_enabled", channel_columns)
@@ -182,6 +184,16 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("yesterday_balance_unit", channel_columns)
         self.assertIn("yesterday_balance_status", channel_columns)
         self.assertIn("yesterday_balance_checked_at", channel_columns)
+        self.assertIn("pending_group_options", channel_columns)
+        self.assertEqual(channel_columns["pending_group_options"][3], 0)
+        self.assertIn("pending_group_removal_count", channel_columns)
+        self.assertEqual(channel_columns["pending_group_removal_count"][3], 1)
+        self.assertEqual(
+            str(channel_columns["pending_group_removal_count"][4]).strip("'\""),
+            "0",
+        )
+        self.assertIn("pending_group_removal_checked_at", channel_columns)
+        self.assertEqual(channel_columns["pending_group_removal_checked_at"][3], 0)
         self.assertTrue(
             set(models.UpstreamAccountConfig.__table__.columns.keys()).issubset(columns)
         )
@@ -198,6 +210,207 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row.upstream_key_status == "not_checked" for row in migrated_rows))
         self.assertTrue(all(row.upstream_group_status == "not_checked" for row in migrated_rows))
         self.assertTrue(all(row.upstream_health_invalid_count == 0 for row in migrated_rows))
+        self.assertTrue(all(row.availability_check_mode == "disabled" for row in migrated_rows))
+        self.assertTrue(all(row.availability_status == "disabled" for row in migrated_rows))
+
+    async def test_migration_quarantines_duplicate_upstream_record_bindings(self) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "ALTER TABLE upstream_account_configs "
+                    "ADD COLUMN upstream_api_key_record_id INTEGER"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs "
+                    "SET upstream_api_key_record_id = 41 "
+                    "WHERE id IN (1, 2)"
+                )
+            )
+            await _migrate_upstream_channels(conn)
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT id, channel_id, upstream_api_key_record_id, "
+                        "upstream_identity_rebind_required, balance_remaining, last_error "
+                        "FROM upstream_account_configs WHERE id IN (1, 2) ORDER BY id"
+                    )
+                )
+            ).mappings().all()
+            index_sql = (
+                await conn.execute(
+                    text(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type = 'index' "
+                        "AND name = 'uq_upstream_account_configs_channel_record_id'"
+                    )
+                )
+            ).scalar_one()
+
+        self.assertEqual(rows[0]["channel_id"], rows[1]["channel_id"])
+        self.assertTrue(all(row["upstream_api_key_record_id"] is None for row in rows))
+        self.assertTrue(all(row["upstream_identity_rebind_required"] == 1 for row in rows))
+        self.assertEqual([row["balance_remaining"] for row in rows], [10, 20])
+        self.assertTrue(
+            all("explicit identity confirmation" in row["last_error"] for row in rows)
+        )
+        self.assertIn("UNIQUE INDEX", index_sql)
+
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs "
+                    "SET upstream_api_key_record_id = 52 WHERE id = 1"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs "
+                    "SET upstream_api_key_record_id = 52 WHERE id = 3"
+                )
+            )
+
+        with self.assertRaises(IntegrityError):
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE upstream_account_configs "
+                        "SET upstream_api_key_record_id = 52 WHERE id = 2"
+                    )
+                )
+
+    async def test_legacy_rate_history_is_imported_once_without_becoming_unread(self) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_rate_change_logs ("
+                    "sub2api_account_id, account_name, channel_id, channel_name, "
+                    "group_id, group_name, old_current_rate, new_current_rate, "
+                    "reason, status, created_at"
+                    ") VALUES (7, 'Legacy account', 3, 'Legacy upstream', "
+                    "'vip', 'VIP', 1.0, 1.5, 'rate_drift', 'observed', "
+                    "'2026-07-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_channel_change_events ("
+                    "channel_id, channel_name, event_type, old_value, new_value, "
+                    "legacy_imported, created_at"
+                    ") VALUES (3, 'Legacy upstream', 'account_rate_changed', 1.5, 2.0, "
+                    "0, '2026-07-02 00:00:00')"
+                )
+            )
+            await _migrate_legacy_rate_logs_to_change_events(conn)
+            await _migrate_legacy_rate_logs_to_change_events(conn)
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT event_type, old_value, new_value, legacy_imported, details "
+                        "FROM upstream_channel_change_events ORDER BY created_at"
+                    )
+                )
+            ).mappings().all()
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["event_type"], "account_rate_changed")
+        self.assertEqual((rows[0]["old_value"], rows[0]["new_value"]), (1.0, 1.5))
+        self.assertEqual(rows[0]["legacy_imported"], 1)
+        self.assertIn('"legacy_rate_log_id"', rows[0]["details"])
+
+    async def test_unbound_monitor_modes_are_preserved(self) -> None:
+        async with self.engine.begin() as conn:
+            await _migrate_upstream_channels(conn)
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET "
+                    "availability_check_mode = 'channel_monitor', "
+                    "availability_monitor_id = NULL, availability_test_model = NULL, "
+                    "availability_status = 'unavailable', availability_unavailable_count = 2 "
+                    "WHERE sub2api_account_id = 101"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET "
+                    "availability_check_mode = 'channel_monitor', "
+                    "availability_monitor_id = NULL, availability_test_model = 'model-a', "
+                    "availability_status = 'unavailable', availability_unavailable_count = 2 "
+                    "WHERE sub2api_account_id = 102"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET "
+                    "availability_check_mode = 'channel_monitor', "
+                    "availability_monitor_id = 91, availability_test_model = NULL "
+                    "WHERE sub2api_account_id = 201"
+                )
+            )
+            await _migrate_upstream_channels(conn)
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT sub2api_account_id, availability_check_mode, "
+                        "availability_monitor_id, availability_test_model, availability_status, "
+                        "availability_unavailable_count FROM upstream_account_configs "
+                        "WHERE sub2api_account_id IN (101, 102, 201) "
+                        "ORDER BY sub2api_account_id"
+                    )
+                )
+            ).mappings().all()
+
+        self.assertEqual(rows[0]["availability_check_mode"], "channel_monitor")
+        self.assertIsNone(rows[0]["availability_test_model"])
+        self.assertEqual(rows[0]["availability_status"], "unavailable")
+        self.assertEqual(rows[0]["availability_unavailable_count"], 2)
+        self.assertEqual(rows[1]["availability_check_mode"], "channel_monitor")
+        self.assertEqual(rows[1]["availability_test_model"], "model-a")
+        self.assertEqual(rows[1]["availability_status"], "unavailable")
+        self.assertEqual(rows[1]["availability_unavailable_count"], 2)
+        self.assertEqual(rows[2]["availability_check_mode"], "channel_monitor")
+        self.assertEqual(rows[2]["availability_monitor_id"], 91)
+
+    async def test_legacy_health_pause_migration_claims_restore_ownership(self) -> None:
+        async with self.engine.begin() as conn:
+            await _migrate_upstream_channels(conn)
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET "
+                    "auto_disabled_reason = 'upstream_key_unavailable', "
+                    "last_auto_disabled_at = '2026-07-14 03:00:00' "
+                    "WHERE sub2api_account_id = 101"
+                )
+            )
+            await _migrate_upstream_channels(conn)
+            account = (
+                await conn.execute(
+                    text(
+                        "SELECT channel_id, pause_owned_by_plugin, auto_pause_episode_id, "
+                        "auto_pause_channel_id, auto_paused_at, pause_operation "
+                        "FROM upstream_account_configs WHERE sub2api_account_id = 101"
+                    )
+                )
+            ).mappings().one()
+            hold = (
+                await conn.execute(
+                    text(
+                        "SELECT reason, active, scope_channel_id, recovery_mode "
+                        "FROM upstream_account_pause_holds WHERE account_config_id = 1"
+                    )
+                )
+            ).mappings().one()
+
+        self.assertEqual(account["pause_owned_by_plugin"], 1)
+        self.assertTrue(account["auto_pause_episode_id"])
+        self.assertEqual(account["auto_pause_channel_id"], account["channel_id"])
+        self.assertEqual(str(account["auto_paused_at"]), "2026-07-14 03:00:00")
+        self.assertEqual(account["pause_operation"], "paused")
+        self.assertEqual(hold["reason"], "upstream_key_unavailable")
+        self.assertEqual(hold["active"], 1)
+        self.assertEqual(hold["scope_channel_id"], account["channel_id"])
+        self.assertEqual(hold["recovery_mode"], "upstream_healthy")
 
     async def test_explicitly_unassigned_account_stays_unassigned_on_migration_rerun(self) -> None:
         async with self.engine.begin() as conn:

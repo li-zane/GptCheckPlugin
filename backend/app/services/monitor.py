@@ -17,6 +17,10 @@ from app.services.phone_numbers import bind_phone_to_account, extract_phone_row_
 from app.services.refresh import RefreshService, get_refresh_service
 from app.services.routed_mail_config import get_routed_mail_config_service
 from app.services.runtime_config import get_runtime_config_service
+from app.services.notifications import (
+    enqueue_oauth_account_disabled,
+    enqueue_oauth_account_enabled,
+)
 from app.services.sub2api import Sub2ApiClient, looks_deactive_text, sanitize_payload
 from app.services.subscription_refresh import refresh_subscriptions
 
@@ -24,6 +28,25 @@ from app.services.subscription_refresh import refresh_subscriptions
 STARTUP_SYNC_DELAY_SECONDS = 10
 OAUTH_CREDENTIAL_EXPORT_BATCH_SIZE = 20
 _initial_subscription_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _normalize_available_models(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    models: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value[:1000]:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()[:160]
+        if not model_id or model_id in seen or any(ord(character) < 32 for character in model_id):
+            continue
+        display_name = str(item.get("display_name") or model_id).strip()[:200]
+        seen.add(model_id)
+        models.append({"id": model_id, "display_name": display_name or model_id})
+        if len(models) >= 500:
+            break
+    return models
 
 
 def _consume_initial_subscription_task(task: asyncio.Task[None]) -> None:
@@ -205,6 +228,9 @@ class MonitorService:
             credentials.update(imported)
 
         recovery_enabled = await self.runtime_config.get_recovery_enabled()
+        # Whitelist refresh has its own scheduler. Normal account sync only
+        # fills a missing local whitelist so it remains fast and predictable.
+        model_whitelist_force = False
         total_seen = 0
         error_seen = 0
         queued = 0
@@ -281,6 +307,11 @@ class MonitorService:
             deleted_accounts, deleted_mailboxes = await self._delete_missing_remote_accounts(
                 present_remote_emails,
                 db=inventory_db,
+            )
+            await self._sync_oauth_available_models(
+                inventory_db,
+                accounts,
+                force=model_whitelist_force,
             )
             await inventory_db.commit()
 
@@ -377,6 +408,18 @@ class MonitorService:
         effective_deactive = is_deactive or (was_deactive and not remote_healthy)
         if effective_deactive and not was_deactive:
             snapshot.usage_estimate_enabled = False
+            await enqueue_oauth_account_disabled(
+                db,
+                email,
+                "Sub2API reported the OAuth account as disabled.",
+            )
+        elif was_deactive and not effective_deactive:
+            await enqueue_oauth_account_enabled(
+                db,
+                email,
+                "Sub2API reported the OAuth account as enabled again.",
+                account_id=self.sub2api.account_id(account),
+            )
         if remote_healthy or effective_deactive:
             snapshot.auto_refresh_locked = False
         snapshot.sub2api_account_id = self.sub2api.account_id(account)
@@ -573,8 +616,66 @@ class MonitorService:
         mailbox_result = await db.execute(
             delete(MailboxCredential).where(func.lower(MailboxCredential.gpt_email).in_(stale_emails))
         )
-        account_result = await db.execute(delete(AccountSnapshot).where(AccountSnapshot.id.in_([snapshot.id for snapshot in stale])))
+        account_result = await db.execute(
+            delete(AccountSnapshot).where(
+                AccountSnapshot.id.in_([snapshot.id for snapshot in stale])
+            )
+        )
         return account_result.rowcount or 0, mailbox_result.rowcount or 0
+
+    async def _sync_oauth_available_models(
+        self,
+        db: AsyncSession,
+        accounts: list[dict[str, Any]],
+        *,
+        force: bool,
+    ) -> int:
+        remote_by_id = {
+            account_id: account
+            for account in accounts
+            if (account_id := self.sub2api.account_id(account))
+        }
+        if not remote_by_id:
+            return 0
+        await db.flush()
+        snapshots = list(
+            (
+                await db.execute(
+                    select(AccountSnapshot).where(
+                        AccountSnapshot.sub2api_account_id.in_(remote_by_id)
+                    )
+                )
+            ).scalars()
+        )
+        targets = [
+            (snapshot, remote_by_id[str(snapshot.sub2api_account_id)])
+            for snapshot in snapshots
+            if str(snapshot.sub2api_account_id) in remote_by_id
+            and (force or snapshot.available_models is None)
+        ]
+        semaphore = asyncio.Semaphore(8)
+
+        async def fetch(snapshot: AccountSnapshot, account: dict[str, Any]) -> bool:
+            async with semaphore:
+                try:
+                    models = _normalize_available_models(
+                        await self.sub2api.get_account_models(account)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    snapshot.available_models_status = "error"
+                    snapshot.available_models_checked_at = utcnow()
+                    return False
+            snapshot.available_models = models
+            snapshot.available_models_status = "ok"
+            snapshot.available_models_checked_at = utcnow()
+            return True
+
+        results = await asyncio.gather(
+            *(fetch(snapshot, account) for snapshot, account in targets)
+        )
+        return sum(results)
 
     async def _has_enabled_mailbox(
         self,

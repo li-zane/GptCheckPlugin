@@ -15,18 +15,53 @@ import {
   MAX_LIVENESS_ACCOUNTS,
 } from "../src/accountLiveness.ts";
 import { accountFilterFacetCandidates } from "../src/accountFilterFacets.ts";
+import { sortAccountsForTable } from "../src/accountTableSort.ts";
 import {
   buildUpstreamAccountUpdatePayload,
   canSetManualMultiplier,
 } from "../src/upstreamAccountForm.ts";
 import { channelCredentialBindingChanged } from "../src/upstreamCredentialBinding.ts";
 import {
+  CHANNEL_MONITOR_TIMELINE_LIMIT,
+  latestChannelMonitorStatus,
+  recentChannelMonitorTimeline,
+} from "../src/channelMonitorPresentation.ts";
+import {
+  CHANGE_LOG_READ_RETRY_DELAYS_MS,
+  departedChangeLogSubview,
+  pendingReadThroughId,
+  visibleChangeLogUnreadCounts,
+} from "../src/changeLogReadState.ts";
+import {
+  changeLogCacheKey,
+  clearChangeLogMemoryCache,
+  markChangeLogCacheRead,
+  mergeChangeLogItems,
+  readChangeLogCache,
+  writeChangeLogCache,
+} from "../src/changeLogCache.ts";
+import {
+  isGenericUpstreamChannelError,
+  partitionUpstreamChannels,
+  upstreamChannelTokenInvalid,
+} from "../src/upstreamChannelPresentation.ts";
+import {
   eventDurationBreakdown,
   eventDurationMs,
   formatElapsedDuration,
   timestampDurationMs,
 } from "../src/durationPresentation.ts";
+import {
+  firstUnusedFallbackModel,
+  MAX_FALLBACK_TEST_MODELS,
+  moveFallbackModel,
+  normalizeFallbackModelChain,
+} from "../src/fallbackModelChain.ts";
 import { oauthUsageBackgroundRefreshIntervals } from "../src/oauthUsageRefresh.ts";
+import {
+  persistOverviewBalanceAlertDismissed,
+  readOverviewBalanceAlertDismissed,
+} from "../src/overviewBalanceAlertPreference.ts";
 import {
   clearUpstreamOverviewCache,
   readUpstreamOverviewCache,
@@ -39,6 +74,7 @@ import {
   upstreamChangeReasonLabel,
   upstreamHealthStatusLabel,
   upstreamStatusLabel,
+  upstreamStatusTone,
 } from "../src/upstreamLabels.ts";
 import {
   accountBillingRateChange,
@@ -48,6 +84,8 @@ import {
   upstreamKeyStatusChange,
   upstreamRateChange,
   upstreamRechargeRateChange,
+  upstreamChangeSummary,
+  upstreamGroupRatePresentation,
 } from "../src/upstreamRatePresentation.ts";
 import {
   accountCompositeMultiplier,
@@ -55,9 +93,13 @@ import {
   flattenUpstreamAccounts,
   priorityIntervalAssignmentBlocked,
   priorityIntervalAssignmentNeedsConfirmation,
+  priorityTieMoveOptions,
+  priorityTieMultiplierKey,
   sortUpstreamAccountEntries,
+  sortUpstreamAccountEntriesByName,
   upstreamAccountMatchesStatus,
   upstreamAccountPlatforms,
+  upstreamAccountChannels,
 } from "../src/upstreamPriorityPresentation.ts";
 import {
   apiAccountSyncMessage,
@@ -87,7 +129,7 @@ import {
   shouldShowUpstreamAccountUsage,
   visibleUpstreamBalanceMessage,
 } from "../src/upstreamUsagePresentation.ts";
-import type { UpstreamChannelsResponse, UsageLimitSample } from "../src/types.ts";
+import type { Account, UpstreamAccount, UpstreamChannelsResponse, UsageLimitSample } from "../src/types.ts";
 
 const usageSamples: UsageLimitSample[] = [
   {
@@ -134,6 +176,8 @@ test("view routes canonicalize paths and keep every dashboard view addressable",
   assert.equal(normalizePathname("/settings///"), "/settings");
   assert.equal(viewFromPath("/"), "overview");
   assert.equal(viewFromPath("/not-a-view"), "overview");
+  assert.deepEqual(routeFromPath("/api-keys"), { view: "api-keys", apiKeySubview: "channels" });
+  assert.deepEqual(routeFromPath("/api-keys/"), { view: "api-keys", apiKeySubview: "channels" });
 
   const expectedApiKeyRoutes = Object.entries(apiKeySubviewPaths) as Array<[ApiKeySubview, string]>;
   for (const [apiKeySubview, path] of expectedApiKeyRoutes) {
@@ -146,20 +190,556 @@ test("view routes canonicalize paths and keep every dashboard view addressable",
 
 test("App navigation uses history state, a page refresh control, and a top settings submit", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const rootPackage = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+  const productionServer = readFileSync(new URL("../../backend/run_production.py", import.meta.url), "utf8");
   assert.match(source, /window\.history\.pushState\(null, "", nextPath\)/);
   assert.match(source, /window\.addEventListener\("popstate", handlePopState\)/);
   assert.match(source, /window\.history\.replaceState\(null, "", canonicalPath\)/);
-  assert.match(source, /window\.location\.reload\(\)/);
+  assert.doesNotMatch(source, /window\.location\.reload\(\)/);
+  assert.match(source, /const refreshCurrentView = useCallback\(async \(\) =>/);
+  assert.match(source, /onClick=\{\(\) => void refreshCurrentView\(\)\}/);
   assert.match(source, /form="runtime-settings-form"/);
   assert.match(source, /id="runtime-settings-form"/);
   assert.equal((source.match(/保存设置/g) || []).length, 1);
-  const refreshButton = source.indexOf('aria-label="刷新页面"');
+  const refreshButton = source.indexOf('aria-label="刷新当前页面数据"');
   const settingsButton = source.indexOf('className="primary-button toolbar-settings-save"');
   const firstSyncButton = source.indexOf("<ToolbarTimeButton", refreshButton);
   assert.ok(refreshButton >= 0 && settingsButton > refreshButton && settingsButton < firstSyncButton);
   assert.match(source, /disabled=\{syncBusy \|\| settingsFormInvalid\}/);
   const viteConfig = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
+  assert.match(viteConfig, /port:\s*5173/);
+  assert.match(viteConfig, /strictPort:\s*true/);
   assert.match(viteConfig, /"\^\/api\(\?:\/\|\$\)"/);
+  assert.match(rootPackage.scripts["backend:dev"], /--port 5173$/);
+  assert.match(productionServer, /port=5173/);
+  assert.doesNotMatch(rootPackage.scripts.dev, /frontend:dev/);
+  assert.match(source, /const loadApiKeyAccountsView = \(\) => import\("\.\/ApiKeyAccountsView"\)/);
+  assert.match(source, /const ApiKeyAccountsView = lazy\(async \(\) =>/);
+  assert.match(source, /<Suspense fallback=\{<Empty label="正在加载 API Key 页面" \/>\}>/);
+  assert.match(source, /if \(item\.id === "api-keys"\) void loadApiKeyAccountsView\(\)/);
+  assert.match(source, /const loadHistoryView = \(\) => import\("\.\/HistoryView"\)/);
+  assert.match(source, /const HistoryView = lazy\(async \(\) =>/);
+  assert.doesNotMatch(source, /from "\.\/HistoryView"/);
+  const historySource = readFileSync(new URL("../src/HistoryView.tsx", import.meta.url), "utf8");
+  assert.match(historySource, /export function HistoryView/);
+  assert.match(source, /view !== "usage-samples" \|\| usageLimitSamples \|\| usageLimitSamplesLoading/);
+  assert.match(source, /loadUsageLimitSamples\(\)\.catch\(\(\) => undefined\);/);
+  assert.match(source, /discord-bot-setup-screenshot/);
+  assert.match(source, /discord-bot-setup-screenshot-button/);
+  assert.match(source, /DiscordBotSetupScreenshotPreviewDialog/);
+  assert.match(source, /discord\.com\/developers\/applications/);
+  const styleSource = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(styleSource, /\.discord-bot-setup-guide-body[\s\S]*overflow-y:\s*auto/);
+  assert.match(styleSource, /\.discord-bot-setup-screenshot/);
+  assert.match(styleSource, /\.discord-bot-screenshot-preview-dialog/);
+});
+
+test("automatic pause settings keep balance controls while multiplier policy belongs to intervals and accounts", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(appSource, /上游余额低于阈值时自动暂停 API Key 账号/);
+  assert.match(appSource, /余额达到或高于阈值且其他暂停原因均解除后自动恢复/);
+  assert.match(appSource, /upstream_balance_pause_threshold: balancePauseThresholdNumber/);
+  assert.match(appSource, /首页显示上次已知低余额提醒/);
+  assert.doesNotMatch(appSource, /api_key_auto_pause_on_upstream_rate_increase_enabled:/);
+  assert.doesNotMatch(appSource, /upstream_rate_pause_mode:/);
+  assert.doesNotMatch(appSource, /综合上游倍率上涨时自动暂停 API Key 账号/);
+  assert.match(accountSource, /综合上游倍率上涨时自动暂停账号/);
+  assert.match(accountSource, /rate_pause_enabled: form\.ratePauseEnabled/);
+  assert.match(accountSource, /<option value="inherit">继承优先级区间<\/option>/);
+  assert.match(accountSource, /<option value="disabled">关闭<\/option>/);
+  assert.match(accountSource, /<option value="custom">单独设置<\/option>/);
+  assert.match(accountSource, /当前账号未绑定优先级区间，继承后不会启用倍率上涨暂停/);
+  assert.match(accountSource, /const rateThreshold = account\.rate_pause_effective_enabled\s*\?\s*account\.rate_pause_mode/);
+  assert.doesNotMatch(appSource, /aria-disabled=\{!apiKeyChannelMonitorPauseEnabled\}/);
+});
+
+test("API key availability settings preserve unbound monitor mode and support explicit disabling", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
+  const helpSource = readFileSync(new URL("../src/HelpPopover.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+  assert.match(accountSource, /<option value="channel_monitor">绑定监控面板（默认）<\/option>/);
+  assert.match(accountSource, /<option value="disabled">关闭<\/option>/);
+  assert.match(accountSource, /请选择具体监控面板/);
+  const monitorSelectStart = accountSource.indexOf('<select\n                    id="api-key-availability-monitor"');
+  const monitorSelectEnd = accountSource.indexOf("</select>", monitorSelectStart);
+  assert.ok(monitorSelectStart >= 0 && monitorSelectEnd > monitorSelectStart);
+  assert.doesNotMatch(accountSource.slice(monitorSelectStart, monitorSelectEnd), /required/);
+  assert.match(accountSource, /const submittedAvailabilityMode = accountForm\.availabilityCheckMode;/);
+  assert.doesNotMatch(accountSource, /accountForm\.availabilityCheckMode === "channel_monitor"\s*&& !accountForm\.availabilityMonitorId\s*\? "disabled"/);
+  assert.match(accountSource, /payload\.availability_test_model = submittedAvailabilityMode === "disabled"/);
+  assert.match(accountSource, /indicatorTone === "unconfigured"\s*\? <CircleOff size=\{13\}/);
+  assert.match(accountSource, /api-key-availability-indicator--\$\{indicatorTone\}/);
+  assert.match(accountSource, /automaticMonitoringPaused\s*\? "paused"/);
+  assert.match(accountSource, /automaticMonitoringPaused/);
+  assert.match(accountSource, /已暂停；手动检测仍可用/);
+  assert.match(accountSource, /没有属于该账号模型白名单的候选模型/);
+  assert.match(accountSource, /可用性与上游数据正在后台探测/);
+  assert.match(accountSource, /channel\.background_discovery_pending === true/);
+  assert.match(accountSource, /generation !== backgroundRefreshGeneration\.current/);
+  assert.match(accountSource, /consecutiveFailures >= 9/);
+  assert.match(accountSource, /scheduleBackgroundAccountRefresh\(\)/);
+  assert.match(accountSource, /loadData\(true, true\)/);
+  assert.match(accountSource, /api\.testUpstreamAccountAvailability\(/);
+  assert.match(accountSource, /api\.testUpstreamAccountConnection\(/);
+  assert.match(accountSource, /强制连接测试完成/);
+  assert.match(accountSource, /<AccountCardConfigurationTags/);
+  assert.match(accountSource, /middleEllipsis\(monitorName \|\| "监控面板", 12\)/);
+  assert.match(accountSource, /api-key-account-config-tag-wrap--availability/);
+  assert.match(accountSource, /label="查看 API Key 可用性检测设置"/);
+  assert.match(accountSource, /正常账号使用暂停判定次数/);
+  assert.doesNotMatch(accountSource, /连续不可用监测轮次/);
+  assert.doesNotMatch(accountSource, /连续可用监测轮次/);
+  assert.match(appSource, /暂停判定测试次数/);
+  assert.match(appSource, /恢复判定测试次数/);
+  assert.match(appSource, /未绑定监控面板时使用回退模型链/);
+  assert.match(appSource, /channel_monitor_fallback_test_models: fallbackTestModels/);
+  assert.match(appSource, /按从上到下的顺序选择账号白名单中第一个存在的模型/);
+  assert.match(appSource, /aria-label=\{`回退测试模型 \$\{index \+ 1\}`\}/);
+  assert.match(appSource, /上移回退测试模型/);
+  assert.match(appSource, /下移回退测试模型/);
+  assert.match(appSource, /删除回退测试模型/);
+  assert.match(appSource, /新增模型/);
+  assert.match(appSource, /className="settings-model-chain-row" key=\{selectedModel\}/);
+  assert.match(appSource, /function FallbackModelChainDialog/);
+  assert.match(appSource, /className="settings-model-chain-field settings-model-chain-summary"/);
+  assert.match(appSource, /fallbackModelDialogOpen \? \(/);
+  assert.match(styles, /\.settings-model-chain-dialog-list\s*\{[^}]*max-height:[^;]+;[^}]*overflow-y:\s*auto;/s);
+  assert.doesNotMatch(appSource, /channel-monitor-fallback-model-options/);
+  assert.match(appSource, /任意一次连接成功即判定可用，全部失败才暂停或保持暂停/);
+  assert.match(appSource, /label="API Key 账号可用性监测与自动暂停"/);
+  assert.doesNotMatch(appSource, /跟随 API Key 上游同步/);
+  assert.match(appSource, /label="API Key 账号可用性监测与自动暂停"[\s\S]*?<AutomationSettingInherited>跟随上游同步<\/AutomationSettingInherited>/);
+  const availabilityRequestStart = apiSource.indexOf("testUpstreamAccountAvailability:");
+  const availabilityRequestEnd = apiSource.indexOf("deleteRemoteUpstreamAccount:", availabilityRequestStart);
+  assert.ok(availabilityRequestStart >= 0 && availabilityRequestEnd > availabilityRequestStart);
+  assert.match(apiSource.slice(availabilityRequestStart, availabilityRequestEnd), /NO_FRONTEND_TIMEOUT/);
+  assert.match(apiSource.slice(availabilityRequestStart, availabilityRequestEnd), /testUpstreamAccountConnection:/);
+  assert.doesNotMatch(apiSource.slice(availabilityRequestStart, availabilityRequestEnd), /90_000/);
+  assert.match(appSource, /globallyBusy=\{busy \|\| apiKeySyncBusy \|\| pageRefreshing\}/);
+  assert.doesNotMatch(appSource, /必须绑定具体监控点/);
+  assert.match(appSource, /监控面板代表上游的单个分组或模型路由，不代表上游站点整体状态/);
+  assert.doesNotMatch(appSource, /明确结果连续达到设置阈值后才暂停或恢复/);
+  assert.match(helpSource, /createPortal\(/);
+  assert.match(helpSource, /onMouseEnter=\{\(\) => setOpen\(true\)\}/);
+  assert.match(helpSource, /onClick=\{\(event\) =>/);
+  assert.match(helpSource, /event\.stopPropagation\(\)/);
+  assert.match(helpSource, /if \(!nextPinned\) event\.currentTarget\.blur\(\)/);
+  assert.match(helpSource, /document\.addEventListener\("pointerdown"/);
+  assert.match(styles, /\.help-popover-content\s*\{[^}]*position: fixed;/s);
+  assert.match(styles, /\.help-popover-content\s*\{[^}]*pointer-events: auto;/s);
+  assert.doesNotMatch(styles, /\.help-popover:hover \.help-popover-content/);
+});
+
+test("fallback model chain preserves unique order and supports list controls", () => {
+  assert.deepEqual(
+    normalizeFallbackModelChain([" gpt-5.4-mini ", "grok-4.5", "gpt-5.4-mini", ""]),
+    ["gpt-5.4-mini", "grok-4.5"],
+  );
+  assert.deepEqual(normalizeFallbackModelChain([], " legacy-model "), ["legacy-model"]);
+  assert.equal(
+    normalizeFallbackModelChain(Array.from({ length: 12 }, (_, index) => `model-${index}`)).length,
+    MAX_FALLBACK_TEST_MODELS,
+  );
+  assert.deepEqual(moveFallbackModel(["a", "b", "c"], 1, -1), ["b", "a", "c"]);
+  assert.deepEqual(moveFallbackModel(["a", "b", "c"], 1, 1), ["a", "c", "b"]);
+  assert.deepEqual(moveFallbackModel(["a", "b"], 0, -1), ["a", "b"]);
+  assert.equal(firstUnusedFallbackModel(["a", "b", "c"], ["a", "c"]), "b");
+  assert.equal(firstUnusedFallbackModel(["a"], ["a"]), null);
+});
+
+test("API key operation feedback uses the title bar and upstream card widths stay stable", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+  assert.match(appSource, /onNotice=\{setNotice\}/);
+  assert.match(accountSource, /const setNotice = onNotice/);
+  assert.doesNotMatch(accountSource, /<Feedback tone="success"/);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(min\(100%, 520px\), 1fr\)\);/s);
+});
+
+test("API key change pages expose separate ledgers and unread highlighting", () => {
+  assert.equal(apiKeySubviewPaths["rate-log"], "/api-keys/upstream-changes");
+  assert.equal(apiKeySubviewPaths["schedule-log"], "/api-keys/scheduling-changes");
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(source, /记录上游充值倍率、分组倍率、名称与可用性，以及 API Key 账号实际倍率变化/);
+  assert.match(source, /记录插件根据余额、渠道监控、上游可用性和综合倍率策略执行的暂停、恢复及失败/);
+  assert.match(source, /markUpstreamChannelChangesRead/);
+  assert.match(source, /markAccountSchedulingChangesRead/);
+  assert.match(source, /departedChangeLogSubview\(previousSubview, subview\)/);
+  assert.match(source, /changeLogUnreadRefreshIntervalMs = 12_000/);
+  assert.match(source, /document\.addEventListener\("visibilitychange", refreshWhenVisible\)/);
+  assert.match(source, /item\.unread && item\.id <= throughId \? \{ \.\.\.item, unread: false \} : item/);
+  assert.match(source, /api-key-unread-chip/);
+  assert.match(source, /function schedulingEvidenceLabel/);
+  assert.match(source, /账号连接测试：\$\{testStatus\}/);
+  assert.match(source, /观测综合倍率/);
+  assert.match(source, /阈值 \$\{formatSchedulingEvidenceNumber\(threshold\)\}/);
+  assert.match(styles, /\.api-key-rate-log-row\.is-unread/);
+  assert.match(styles, /\.api-key-scheduling-evidence/);
+});
+
+test("change ledger highlighting remains pending until its subview is left", () => {
+  assert.deepEqual(CHANGE_LOG_READ_RETRY_DELAYS_MS, [1_000, 2_000, 4_000]);
+  assert.equal(pendingReadThroughId(null, [
+    { id: 11, unread: false },
+    { id: 12, unread: true },
+    { id: 10, unread: true },
+  ]), 12);
+  assert.equal(pendingReadThroughId(12, [
+    { id: 13, unread: false },
+    { id: 14, unread: true },
+  ]), 14);
+  assert.equal(pendingReadThroughId(null, [{ id: 20, unread: false }]), null);
+
+  assert.equal(departedChangeLogSubview("accounts", "rate-log"), null);
+  assert.equal(departedChangeLogSubview("rate-log", "rate-log"), null);
+  assert.equal(departedChangeLogSubview("rate-log", "schedule-log"), "rate-log");
+  assert.equal(departedChangeLogSubview("schedule-log", "accounts"), "schedule-log");
+
+  const unreadCounts = {
+    upstream_changes: 3,
+    account_rate_changes: 2,
+    account_scheduling_changes: 1,
+  };
+  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "rate-log"), {
+    ...unreadCounts,
+  });
+  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "schedule-log"), {
+    ...unreadCounts,
+  });
+  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "account-rate-log"), {
+    ...unreadCounts,
+  });
+
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(source, /previousSubviewRef\.current !== "rate-log"/);
+  assert.match(source, /previousSubviewRef\.current !== "schedule-log"/);
+  assert.match(source, /rateLogsRequestSequence\.current \+= 1/);
+  assert.match(source, /scheduleLogsRequestSequence\.current \+= 1/);
+  assert.match(source, /CHANGE_LOG_READ_RETRY_DELAYS_MS\[retryAttempt\]/);
+  assert.match(source, /const nextRoute = routeFromPath\(window\.location\.pathname\)/);
+  assert.match(source, /const stillViewingSameLog = nextRoute\.view === "api-keys"/);
+  assert.match(source, /visibleChangeLogUnreadCounts\(changeLogUnreadCounts, subview\)/);
+  assert.match(source, /await refreshChangeLogUnreadCounts\(\);/);
+  assert.match(source, /useLayoutEffect\(\(\) => \{\s*componentMountedRef\.current = true;/);
+  assert.doesNotMatch(source, /unmountReadTimerRef/);
+});
+
+test("account table sorting supports names and imported timestamps in both directions", () => {
+  const accounts: UpstreamAccount[] = [
+    {
+      account_name: "Charlie",
+      duplicate_rank: 0,
+      email: "charlie@example.com",
+      sub2api_account_id: "3",
+      sub2api_imported_at: null,
+    },
+    {
+      account_name: "alice",
+      duplicate_rank: 0,
+      email: "alice@example.com",
+      sub2api_account_id: "1",
+      sub2api_imported_at: "2026-07-18T08:00:00Z",
+    },
+    {
+      account_name: "Bravo",
+      duplicate_rank: 0,
+      email: "bravo@example.com",
+      sub2api_account_id: "2",
+      sub2api_imported_at: "2026-07-17T08:00:00Z",
+    },
+  ] as Account[];
+
+  assert.deepEqual(sortAccountsForTable(accounts, "account", "asc").map((account) => account.sub2api_account_id), ["1", "2", "3"]);
+  assert.deepEqual(sortAccountsForTable(accounts, "account", "desc").map((account) => account.sub2api_account_id), ["3", "2", "1"]);
+  assert.deepEqual(sortAccountsForTable(accounts, "imported_at", "asc").map((account) => account.sub2api_account_id), ["2", "1", "3"]);
+  assert.deepEqual(sortAccountsForTable(accounts, "imported_at", "desc").map((account) => account.sub2api_account_id), ["1", "2", "3"]);
+  assert.deepEqual(accounts.map((account) => account.sub2api_account_id), ["3", "1", "2"]);
+});
+
+test("new account and upstream controls are present without exposing Sub2API-only NewAPI fields", () => {
+  const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const helpSource = readFileSync(new URL("../src/HelpPopover.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+  assert.match(accountSource, /<option value="enabled">已启用<\/option>/);
+  assert.match(accountSource, /<option value="disabled">已停用<\/option>/);
+  assert.match(accountSource, /<UpstreamBalanceSummary channels=\{assignedChannels\} \/>/);
+  assert.match(accountSource, /<span>渠道状态 \{channel\.channel_monitor_count/);
+  assert.match(accountSource, /<span>今日使用<\/span>/);
+  assert.match(accountSource, /<option value="inherit">/);
+  assert.match(accountSource, /priority_assignment_when_disabled = accountForm\.priorityAssignmentWhenDisabled === "inherit"\s*\? null/s);
+  assert.doesNotMatch(accountSource, /today_upstream_usage_amount \?\? account\.upstream_usage_amount/);
+  assert.match(accountSource, /local_sub2api_today_cost_converted: "本站今日用量换算"/);
+  assert.match(accountSource, /channelForm\.upstreamType === "auto"\s*\? editingChannel\?\.resolved_upstream_type \|\| "auto"/s);
+  assert.match(accountSource, /editingChannelType !== "sub2api" \? <label className="api-key-field">\s*<span>NewAPI 用户 ID（余额探测）<\/span>/s);
+  assert.match(accountSource, /<span>API 地址<\/span>/);
+  assert.match(accountSource, /<UpstreamBalanceCard channel=\{channel\} key=\{String\(channel\.id\)\} \/>/);
+  assert.match(accountSource, /const configuredName = channel\.display_name\?\.trim\(\) \|\| "";/);
+  assert.match(accountSource, /className="api-key-balance-channel-name api-key-balance-channel-name--link"/);
+  assert.match(accountSource, /configuredName \? \([\s\S]*<BalanceManagementLink className="api-key-balance-management-url" url=\{managementUrl\} \/>/);
+  assert.match(accountSource, /function BalanceManagementLink[\s\S]*href=\{url\}/);
+  assert.match(accountSource, /className="api-key-balance-amount api-key-balance-amount--platform"/);
+  assert.match(accountSource, /className="api-key-balance-amount api-key-balance-amount--adjusted"/);
+  assert.match(styles, /\.api-key-balance-summary\s*\{[^}]*grid-column: 1 \/ -1;/s);
+  assert.match(styles, /\.api-key-balance-summary\s*\{[^}]*background: var\(--panel\);[^}]*box-shadow: var\(--shadow\);/s);
+  assert.match(styles, /\.api-key-balance-summary-list\s*\{[^}]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 230px\), 1fr\)\);/s);
+  assert.match(styles, /\.api-key-balance-channel-card\s*\{[^}]*grid-template-areas:\s*"name platform"\s*"address adjusted";/s);
+  assert.match(styles, /\.api-key-dialog-account-grid\s*\{[^}]*height: 100%;[^}]*max-height: 100%;[^}]*overflow-y: auto;/s);
+  const openMonitor = accountSource.match(/const openChannelMonitors = \(channel: UpstreamChannel\) => \{[\s\S]*?\n  \};/)?.[0] || "";
+  assert.ok(openMonitor);
+  assert.doesNotMatch(openMonitor, /refreshChannelMonitors/);
+  assert.match(accountSource, /onRefresh=\{\(\) => void refreshChannelMonitors\(channelMonitorDialog\)\}/);
+  assert.doesNotMatch(accountSource, /监控失败时测试模型/);
+  assert.doesNotMatch(accountSource, /saveChannelMonitorTestModels/);
+  assert.match(accountSource, /请选择具体监控面板/);
+  assert.match(accountSource, /面板可用时不直连账号/);
+  assert.match(accountSource, /白名单尚未同步，禁止执行测试/);
+  assert.match(accountSource, /editingAccountModels\.map/);
+  assert.match(accountSource, /<AccountAvailabilityIndicator\s+account=\{account\}/);
+  assert.match(accountSource, /api-key-monitor-card-status-row/);
+
+  assert.match(appSource, /api_key_auto_pause_on_negative_balance_enabled: apiKeyNegativeBalancePauseEnabled/);
+  assert.match(appSource, /api_key_auto_pause_on_channel_monitor_unavailable_enabled: apiKeyChannelMonitorPauseEnabled/);
+  assert.match(appSource, /channel_monitor_auto_probe_enabled: channelMonitorAutoProbeEnabled/);
+  assert.match(appSource, /account_model_whitelist_sync_enabled: accountModelWhitelistSyncEnabled/);
+  assert.match(appSource, /channel_monitor_fallback_test_attempts: Math\.max/);
+  assert.match(appSource, /channel_monitor_recovery_test_attempts: Math\.max/);
+  assert.doesNotMatch(appSource, /channel_monitor_unavailable_consecutive_threshold: channelMonitorUnavailableThresholdNumber/);
+  assert.doesNotMatch(appSource, /channel_monitor_recovery_consecutive_threshold: channelMonitorRecoveryThresholdNumber/);
+  assert.doesNotMatch(appSource, /api_key_auto_pause_on_upstream_rate_increase_enabled:/);
+  assert.doesNotMatch(appSource, /upstream_rate_increase_threshold_percent:/);
+  assert.match(accountSource, /payload\.rate_pause_policy = accountForm\.ratePausePolicy/);
+  assert.match(accountSource, /rate_pause_effective_source === "account"/);
+  assert.match(appSource, /仅处理已绑定具体监控面板或已启用独立模型测试的账号/);
+  assert.match(appSource, /没有可用回退模型时不会据此暂停账号/);
+  assert.match(appSource, /自动探测上游渠道监控/);
+  assert.match(appSource, /自动刷新账号可用模型白名单/);
+  assert.match(appSource, /settings\.available_test_models/);
+  assert.match(accountSource, /账号独立阈值优先于优先级区间；回落到阈值后自动恢复/);
+  assert.match(appSource, /channelHasLowBalance\(\s*channel,\s*showStaleNegativeBalanceAlert,\s*balanceBasis,\s*balanceThreshold/s);
+  assert.match(appSource, /show_stale_negative_balance_alert: showStaleNegativeBalanceAlert/);
+  assert.match(appSource, /aria-label="关闭提示"/);
+  assert.match(appSource, /onClick=\{\(\) => setNotice\(""\)\}/);
+  assert.match(appSource, /settings-local-nav/);
+  assert.match(appSource, /id="settings-connection"/);
+  assert.match(appSource, /id="settings-notifications"/);
+  assert.match(appSource, /上游 Key \/ 分组不可用时自动停用 API Key 账号/);
+  assert.match(appSource, /上游恢复后，仅自动恢复由本插件暂停的账号/);
+  assert.match(appSource, /余额达到或高于阈值且其他暂停原因均解除后自动恢复/);
+  assert.match(appSource, /停用的 API Key 账号也参与优先级分配/);
+  assert.doesNotMatch(appSource, /checked=\{priorityAssignDisabledAccounts\}\s+disabled=/);
+  assert.match(appSource, /同综合倍率账号使用相同优先级/);
+  assert.match(appSource, /priority_share_same_composite_multiplier: priorityShareSameCompositeMultiplier/);
+  assert.match(appSource, /shareSameCompositePriority=\{settings\.priority_share_same_composite_multiplier \?\? false\}/);
+  assert.match(accountSource, /shareSameCompositePriority \? new Map\(\) : priorityTieMoveOptions\(allAccounts\)/);
+  assert.match(accountSource, /相同倍率账号共用一个优先级/);
+  assert.match(accountSource, /\.map\(priorityTieMultiplierKey\)/);
+  assert.match(appSource, /继续按当前口径和阈值展示上次成功余额；不会使用过期余额暂停账号/);
+  assert.match(appSource, /channel\.balance_source !== "upstream_wallet"/);
+  assert.match(appSource, /!channel\.balance_checked_at/);
+  assert.match(appSource, /priority_assign_disabled_api_key_accounts: priorityAssignDisabledAccounts/);
+  assert.match(appSource, /discord_bot_notifications_enabled: discordNotificationsEnabled/);
+  assert.match(appSource, /notify_oauth_account_disabled: notifyAccountScheduling/);
+  assert.match(appSource, /notify_account_enabled: notifyAccountScheduling/);
+  assert.match(appSource, />账号调度<\/span>/);
+  assert.match(appSource, />倍率变化<\/span>/);
+  assert.doesNotMatch(appSource, /账号停用（OAuth \/ API Key）/);
+  assert.doesNotMatch(appSource, /账号启用（OAuth \/ API Key）/);
+  assert.match(appSource, /上游分组变化/);
+  assert.match(appSource, /onTestNotification=\{\(\) => runAction\(api\.testNotification/);
+  assert.match(appSource, />发送测试通知<\/span>/);
+  assert.match(appSource, /payload\.clear_discord_bot_token = true/);
+  assert.match(appSource, /onClick=\{\(\) => onLocateAccount\(account\)\}/);
+  assert.match(appSource, /await api\.updateSiteLogo\(branding\.logoFile\)/);
+  assert.match(appSource, /file\.size > 1024 \* 1024/);
+  assert.match(appSource, /其他设置已保存，但 Logo 更新失败/);
+  assert.match(accountSource, /refreshUpstreamChannelMonitors/);
+  assert.match(accountSource, /当前探测可用/);
+  assert.match(accountSource, /model\.name \|\| model\.model/);
+  assert.match(accountSource, /point\.time \|\| point\.checked_at/);
+  assert.match(accountSource, /account\.active_pause_holds !== undefined/);
+  assert.doesNotMatch(accountSource, /visiblePauseHolds\.map\(\(hold, index\) =>/);
+  assert.match(accountSource, /pauseHoldReasonLabel\(hold\)/);
+  assert.match(accountSource, /<AccountStatusIndicator/);
+  assert.match(accountSource, /查看 \$\{accountDisplayName\(account\)\} 的停用详情/);
+  assert.match(accountSource, /查看 \$\{accountDisplayName\(account\)\} 的可用性监测详情/);
+  assert.match(accountSource, /监控面板未能确认可用，随后由回退连接测试判定/);
+  assert.match(accountSource, /为节省测试 token，暂不进行可用性测试/);
+  assert.match(accountSource, /\["当前回退候选模型", source === "channel_monitor_fallback" \? chosenModel : null\]/);
+  assert.doesNotMatch(accountSource, /监控面板未能确认可用后连接测试判定/);
+  assert.match(accountSource, /\["配置阈值", evidence\.threshold/);
+  assert.match(helpSource, /trigger\?: ReactNode/);
+  assert.doesNotMatch(accountSource, /不具备自动恢复资格/);
+  assert.doesNotMatch(accountSource, />可自动恢复</);
+  assert.match(styles, /\.settings-local-nav\s*\{/);
+  assert.match(styles, /\.settings-auto-pause-thresholds\s*\{/);
+  assert.match(appSource, /new ResizeObserver\(updateLayoutOffsets\)/);
+  assert.match(styles, /\.topbar\s*\{[\s\S]*?position:\s*sticky;/);
+  assert.match(styles, /\.api-key-subview-tabs\s*\{[\s\S]*?position:\s*sticky;/);
+  assert.match(styles, /\.settings-local-nav\s*\{[\s\S]*?top:\s*calc\(var\(--app-sidebar-offset\) \+ var\(--app-header-height\)\);/);
+  assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.settings-local-nav\s*\{\s*top:\s*calc\(var\(--app-sidebar-offset\) \+ var\(--app-header-height\)\);/);
+  assert.match(styles, /\.notice > button\s*\{/);
+  assert.match(styles, /\.api-key-monitor-current--success/);
+  assert.match(styles, /\.api-key-channel-card\s*\{\s*height: 368px;/);
+  assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: 437px;/);
+  assert.doesNotMatch(styles, /\.api-key-channel-accounts\s*\{[^}]*margin-top:\s*auto;/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(min\(100%, 520px\), 1fr\)\);/s);
+  assert.match(styles, /@media \(max-width: 1160px\)\s*\{\s*\.api-key-channel-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
+  assert.doesNotMatch(styles, /api-key-channel-card--groups-expanded/);
+  assert.match(accountSource, /trigger=\{<span>原<\/span>\}/);
+  assert.match(accountSource, /trigger=\{<span>综<\/span>\}/);
+  assert.match(accountSource, /上游钱包原始余额，直接读取自上游站点的钱包余额/);
+  assert.match(accountSource, /综合余额等于上游钱包原始余额乘以上游充值倍率/);
+  assert.match(accountSource, /onClick=\{onShowGroups\}/);
+  assert.match(accountSource, /<ChannelGroupList channel=\{channelGroupDialog\} \/>/);
+  assert.match(styles, /\.api-key-group-dialog-list\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 210px\), 240px\)\);/s);
+  assert.doesNotMatch(accountSource, /api-key-account-rate-pause-tags/);
+  assert.doesNotMatch(accountSource, /api-key-rate-pause-tag--independent/);
+  assert.doesNotMatch(accountSource, /api-key-rate-pause-tag--inherited/);
+  assert.doesNotMatch(accountSource, /api-key-rate-pause-tag--paused/);
+  assert.doesNotMatch(styles, /\.api-key-account-rate-pause-tags/);
+  assert.doesNotMatch(styles, /\.api-key-account-rate-pause-summary/);
+  assert.match(accountSource, /onTestAvailability=\{\(\) => void testAccountAvailability\(entry\.account\)\}/);
+  assert.match(accountSource, /onForceConnectionTest=\{\(\) => void forceAccountConnectionTest\(entry\.account\)\}/);
+  assert.match(accountSource, /<PlugZap size=\{15\} \/>/);
+  assert.doesNotMatch(accountSource, /onTestAvailability=\{\(\) => \{\s*closeDialog\(\);/);
+  assert.doesNotMatch(accountSource, /onDelete=\{\(\) => \{\s*closeDialog\(\);/);
+  assert.doesNotMatch(accountSource, /onPriorityIntervalChange=\{\(intervalId\) => \{\s*closeDialog\(\);/);
+  assert.doesNotMatch(accountSource, /onToggle=\{\(\) => \{\s*closeDialog\(\);/);
+  assert.doesNotMatch(accountSource, /onDiscover=\{\(\) => \{\s*closeDialog\(\);/);
+  assert.match(accountSource, /availabilityTestPromisesRef = useRef<Map<string, Promise<UpstreamAccount \| null>>>/);
+  assert.match(accountSource, /await pendingAvailabilityTest/);
+  assert.match(accountSource, /const latestAccount = flattenUpstreamAccounts\(latestData\)[\s\S]*?\?\.account \|\| testedAccount \|\| submittedAccount;/);
+  assert.match(accountSource, /mergeUpstreamAccountSnapshot\(dataRef\.current, result\.account\)/);
+  assert.match(accountSource, /return \{ \.\.\.account, \.\.\.snapshot \};/);
+  assert.match(accountSource, /const currentData = dataRef\.current;[\s\S]*?channels: currentData\.channels\.map/);
+  assert.match(accountSource, /if \(!focusable\.length\) \{\s*event\.preventDefault\(\);\s*dialog\.focus\(\);/);
+  assert.match(accountSource, /savingLabel=\{accountSaveWaitingForTest \? "等待检测完成" : undefined\}/);
+  assert.match(accountSource, /disabled=\{\["availability-test", "connection-test"\]\.includes\(busyAction \|\| ""\) \? false : busy\}/);
+  assert.match(accountSource, /<fieldset className="api-key-config-fields api-key-config-fieldset" disabled=\{savingDialog\}>/);
+  assert.match(appSource, /dialogRef\.current\.querySelectorAll<HTMLElement>/);
+  assert.match(appSource, /fallbackModelDialogTriggerRef\.current\?\.focus\(\)/);
+  assert.doesNotMatch(styles, /api-key-rate-pause-tag--inherited/);
+  assert.match(accountSource, /className="api-key-scheduling-columns"/);
+  assert.match(accountSource, />暂停原因<\/span>/);
+  assert.doesNotMatch(accountSource, />同时生效<\/span>/);
+});
+
+test("channel monitor current status uses the newest timestamp rather than response order", () => {
+  assert.equal(
+    latestChannelMonitorStatus("degraded", [
+      { checked_at: "2026-07-20T10:00:00Z", status: "available" },
+      { checked_at: "2026-07-20T08:00:00Z", status: "unavailable" },
+      { checked_at: "2026-07-20T09:00:00Z", status: "timeout" },
+    ]),
+    "available",
+  );
+  assert.equal(
+    latestChannelMonitorStatus("healthy", [
+      { checked_at: null, status: "unavailable" },
+    ]),
+    "healthy",
+  );
+});
+
+test("channel monitor timeline keeps the newest 60 records in past-to-now order", () => {
+  const timeline = Array.from({ length: 75 }, (_, index) => ({
+    checked_at: new Date(Date.UTC(2026, 6, 20, 0, index)).toISOString(),
+    status: index % 2 ? "available" : "error",
+  })).reverse();
+  const recent = recentChannelMonitorTimeline(timeline);
+
+  assert.equal(recent.length, CHANNEL_MONITOR_TIMELINE_LIMIT);
+  assert.equal(recent[0]?.checked_at, "2026-07-20T00:15:00.000Z");
+  assert.equal(recent[59]?.checked_at, "2026-07-20T01:14:00.000Z");
+});
+
+test("overview balance alert dismissal persists across page reloads", () => {
+  const storage = new MemoryStorage();
+  assert.equal(readOverviewBalanceAlertDismissed(storage), false);
+
+  persistOverviewBalanceAlertDismissed(storage);
+
+  assert.equal(readOverviewBalanceAlertDismissed(storage), true);
+});
+
+test("change log cache restores, merges, and marks records read without crossing scopes", () => {
+  const storage = new MemoryStorage();
+  const key = changeLogCacheKey(
+    "https://sub2api.example.com/",
+    "upstream",
+    "2026-07-01",
+    "",
+    "Asia/Shanghai",
+  );
+  const accountRateKey = changeLogCacheKey(
+    "https://sub2api.example.com/",
+    "account_rate",
+    "2026-07-01",
+    "",
+    "Asia/Shanghai",
+  );
+  assert.notEqual(key, accountRateKey);
+
+  const older = {
+    id: 10,
+    channel_id: 1,
+    event_type: "group_added" as const,
+    created_at: "2026-07-20T01:00:00Z",
+    unread: true,
+  };
+  const newer = {
+    id: 11,
+    channel_id: 1,
+    event_type: "group_removed" as const,
+    created_at: "2026-07-20T02:00:00Z",
+    unread: true,
+  };
+  writeChangeLogCache(storage, key, {
+    items: [older],
+    hasMore: false,
+    unreadCount: 1,
+    lastReadId: 0,
+  });
+  const merged = mergeChangeLogItems([older], [newer, { ...older, unread: false }]);
+  assert.deepEqual(merged.map((item) => item.id), [11, 10]);
+  assert.equal(merged[1].unread, false);
+  writeChangeLogCache(storage, key, {
+    items: merged,
+    hasMore: false,
+    unreadCount: 2,
+    lastReadId: 0,
+  });
+
+  clearChangeLogMemoryCache();
+  const restored = readChangeLogCache(storage, key);
+  assert.deepEqual(restored?.items.map((item) => item.id), [11, 10]);
+  assert.equal(readChangeLogCache(storage, accountRateKey), null);
+
+  markChangeLogCacheRead(storage, key, 11);
+  clearChangeLogMemoryCache();
+  const marked = readChangeLogCache(storage, key);
+  assert.equal(marked?.unreadCount, 0);
+  assert.equal(marked?.lastReadId, 11);
+  assert.equal(marked?.items.every((item) => !item.unread), true);
+});
+
+test("API key view warms default change-log caches before a record subview is opened", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(source, /const warmDefaultChangeLogCaches = useCallback/);
+  assert.match(source, /Promise\.allSettled\(tasks\)/);
+  assert.match(source, /subview !== "rate-log"/);
+  assert.match(source, /subview !== "account-rate-log"/);
+  assert.match(source, /subview !== "schedule-log"/);
+  assert.match(source, /void warmDefaultChangeLogCaches\(\)/);
 });
 
 test("subscription refresh concurrency preserves zero as unlimited", () => {
@@ -183,14 +763,61 @@ test("subscription presentation keeps seat-based K12 plans visible", () => {
   assert.match(source, /return subscriptionIsInvalid\(account\) \? "订阅无效" : plan === "active" \? "正常" : plan/);
 });
 
-test("upstream channels separate occupied and deletable empty channels", () => {
+test("upstream channels expose occupied, no-enabled, and empty upstream filters", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(source, /useState<ChannelOccupancyFilter>\("occupied"\)/);
-  assert.match(source, />有账号渠道 \{occupiedChannels\.length\}<\/button>/);
-  assert.match(source, />无账号渠道 \{emptyChannels\.length\}<\/button>/);
+  assert.match(source, />有账号上游 \{occupiedChannels\.length\}<\/button>/);
+  assert.match(source, />无启用上游 \{noEnabledChannels\.length\}<\/button>/);
+  assert.match(source, />无账号上游 \{emptyChannels\.length\}<\/button>/);
+  assert.match(source, /partitionUpstreamChannels\(data\.channels\)/);
+  assert.match(source, /channelOccupancyFilter !== "occupied"/);
+  assert.match(source, /上游未配置公开监控面板/);
   assert.match(source, /accountCount > 0 \? \(/);
   assert.match(source, /api\.deleteUpstreamChannel\(channel\.id\)/);
   assert.match(source, /title="删除空渠道"/);
+});
+
+test("upstream channel occupancy partitions are mutually exclusive", () => {
+  const makeChannel = (
+    id: number,
+    accountCount: number,
+    schedulingStates: boolean[],
+  ) => ({
+    id,
+    account_count: accountCount,
+    accounts: schedulingStates.map((remote_schedulable, index) => ({
+      sub2api_account_id: `${id}-${index}`,
+      remote_schedulable,
+    })),
+  }) as UpstreamChannel;
+  const partitions = partitionUpstreamChannels([
+    makeChannel(1, 2, [true, false]),
+    makeChannel(2, 2, [false, false]),
+    makeChannel(3, 0, []),
+    makeChannel(4, 2, [false]),
+  ]);
+
+  assert.deepEqual(partitions.assigned.map((channel) => channel.id), [1, 2, 4]);
+  assert.deepEqual(partitions.enabled.map((channel) => channel.id), [1, 4]);
+  assert.deepEqual(partitions.noEnabled.map((channel) => channel.id), [2]);
+  assert.deepEqual(partitions.empty.map((channel) => channel.id), [3]);
+  assert.equal(new Set([
+    ...partitions.enabled.map((channel) => channel.id),
+    ...partitions.noEnabled.map((channel) => channel.id),
+    ...partitions.empty.map((channel) => channel.id),
+  ]).size, 4);
+});
+
+test("enabled account filtering excludes unknown scheduling state", () => {
+  const account = (remote_schedulable: boolean | null) => ({
+    remote_schedulable,
+  }) as Parameters<typeof upstreamAccountMatchesStatus>[0];
+
+  assert.equal(upstreamAccountMatchesStatus(account(true), "enabled"), true);
+  assert.equal(upstreamAccountMatchesStatus(account(false), "enabled"), false);
+  assert.equal(upstreamAccountMatchesStatus(account(null), "enabled"), false);
+  assert.equal(upstreamAccountMatchesStatus(account(false), "disabled"), true);
+  assert.equal(upstreamAccountMatchesStatus(account(null), "disabled"), false);
 });
 
 test("overview error count follows the live account rows", () => {
@@ -228,6 +855,10 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(source, /middleEllipsis\(displayCanonicalUrl\(url\)\)/);
   assert.match(source, /\[yesterdayUsage, todayUsage\]\.map/);
   assert.match(source, /className="api-key-channel-stat--recharge"/);
+  assert.match(source, /const stale = status === "stale" && hasCurrentValue/);
+  assert.match(source, /usage\.stale \? "（旧）" : ""/);
+  assert.match(source, /current \|\| stale/);
+  assert.match(source, /unsupported\s*\?\s*"muted"/);
   assert.match(styles, /\.api-key-channel-urls\s*\{[^}]*flex-wrap: nowrap !important;[^}]*overflow: hidden;/s);
   assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: minmax\(0, 1\.65fr\) minmax\(110px, 0\.62fr\)/s);
   assert.match(styles, /\.api-key-channel-daily-usage\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
@@ -243,19 +874,38 @@ test("API key dense views keep readable type and collapse change records on narr
   assert.match(styles, /@media \(max-width: 520px\)\s*\{\s*\.api-key-rate-log-filters,\s*\.api-key-rate-log-row\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/s);
 });
 
+test("help popover triggers stay below sticky ledger headers", () => {
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(styles, /\.help-popover\s*\{[^}]*position:\s*relative;[^}]*\}/s);
+  assert.doesNotMatch(styles, /\.help-popover\s*\{[^}]*z-index\s*:/s);
+  assert.match(styles, /\.help-popover-content\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*100;/s);
+  assert.match(styles, /\.api-key-ledger-sticky\s*\{[^}]*position:\s*sticky;[^}]*z-index:\s*22;/s);
+  assert.match(accountSource, /evidence\.monitor_status \? upstreamStatusLabel/);
+  assert.match(accountSource, /"account_availability_healthy"/);
+});
+
 test("API key account numbers stay beside the account name", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   const nameIndex = source.indexOf('<div className="api-key-account-name">');
   const numberIndex = source.indexOf('<span className="api-key-mono">#{account.sub2api_account_id}</span>', nameIndex);
-  const statusIndex = source.indexOf('<StatusChip status={effectiveStatus} />', nameIndex);
+  const statusIndex = source.indexOf('<AccountStatusIndicator', nameIndex);
   assert.ok(nameIndex >= 0 && numberIndex > nameIndex && statusIndex > numberIndex);
-  assert.match(source, /<div className="api-key-account-side-chips">\s*<StatusChip status=\{effectiveStatus\}/s);
+  assert.match(source, /<div className="api-key-account-side-chips">\s*<AccountStatusIndicator/s);
   assert.match(styles, /\.api-key-account-name\s*\{[^}]*display: flex;[^}]*gap: 5px;/s);
   assert.match(styles, /\.api-key-account-name > strong\s*\{[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/s);
   assert.match(styles, /\.api-key-account-side-chips\s*\{[^}]*margin-left: auto;/s);
   assert.match(styles, /\.api-key-account-priority\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
   assert.match(styles, /\.api-key-account-priority-value\s*\{[^}]*border-left: 0;[^}]*border-top: 1px solid var\(--line\);/s);
+});
+
+test("upstream API key identity conflicts require explicit confirmation", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(source, /latestAccount\.upstream_identity_rebind_required/);
+  assert.match(source, /payload\.confirm_upstream_identity_rebind = true/);
+  assert.match(source, /account\.identity_rebind_required\s*\|\|\s*account\.upstream_identity_rebind_required/);
+  assert.match(source, /上游 Key 身份待确认/);
 });
 
 test("history duration helpers format totals, stages, and refresh jobs", () => {
@@ -487,6 +1137,66 @@ test("API key inventory sync uses the lightweight inventory endpoint", async () 
   }]);
 });
 
+test("upstream overview reads the persisted snapshot unless an explicit refresh is requested", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    paths.push(String(input));
+    return new Response(JSON.stringify({ channels: [], unassigned_accounts: [], priority_intervals: [] }), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  try {
+    await api.upstreamChannels();
+    await api.upstreamChannels(true);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(paths, [
+    "/api/upstream-channels?refresh=false",
+    "/api/upstream-channels?refresh=true",
+  ]);
+});
+
+test("site logo upload sends the selected image as the raw request body", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const file = new File(["logo-bytes"], "site-logo.png", { type: "image/png" });
+  let captured: { path: string; init?: RequestInit } | null = null;
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    captured = { path: String(input), init };
+    return new Response(JSON.stringify({ site_logo_url: "/api/settings/logo", site_logo_updated_at: "2026-07-19T00:00:00Z" }), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  try {
+    await api.updateSiteLogo(file);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.ok(captured);
+  assert.equal(captured.path, "/api/settings/logo");
+  assert.equal(captured.init?.method, "PUT");
+  assert.equal(captured.init?.body, file);
+  assert.equal((captured.init?.headers as Record<string, string>)["Content-Type"], "image/png");
+});
+
 test("toolbar account syncs refresh only their affected data", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const apiKeySyncTimeBlock = source.slice(
@@ -511,6 +1221,18 @@ test("toolbar account syncs refresh only their affected data", () => {
   assert.doesNotMatch(syncBlock, /syncOperationRef\.current/);
   assert.match(syncBlock, /loadAllRequestSequenceRef\.current \+= 1/);
   assert.match(syncBlock, /setApiKeyRefreshVersion\(\(current\) => current \+ 1\)/);
+});
+
+test("toolbar API key sync remains available during a single-channel discovery", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const viewSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(appSource, /disabled=\{busy \|\| apiKeySyncBusy \|\| apiKeyViewBlocking\}/);
+  assert.match(appSource, /operation\.kind === "channel-discovery"/);
+  assert.match(appSource, /skipChannelIds/);
+  assert.match(
+    viewSource,
+    /kind: "channel-discovery"[\s\S]*channelId: Number\(channel\.id\)/,
+  );
 });
 
 test("OAuth sync refreshes usage snapshots in bounded non-blocking retries", () => {
@@ -579,6 +1301,10 @@ test("priority interval API requests use stable paths and identity-checked assig
       expected_identity_fingerprint: fingerprint,
       confirm_identity_rebind: true,
     });
+    await api.moveUpstreamAccountPriority(9, {
+      direction: "up",
+      expected_identity_fingerprint: fingerprint,
+    });
     await api.rebalancePriorityIntervals();
   } finally {
     globalThis.window = originalWindow;
@@ -589,12 +1315,17 @@ test("priority interval API requests use stable paths and identity-checked assig
     { path: "/api/upstream-accounts/priority-intervals/3", method: "PUT" },
     { path: "/api/upstream-accounts/priority-intervals/3", method: "DELETE" },
     { path: "/api/upstream-accounts/9/priority-interval", method: "PUT" },
+    { path: "/api/upstream-accounts/9/priority-order", method: "PUT" },
     { path: "/api/upstream-accounts/priority-intervals/rebalance", method: "POST" },
   ]);
   assert.deepEqual(requests[3].body, {
     priority_interval_id: 3,
     expected_identity_fingerprint: fingerprint,
     confirm_identity_rebind: true,
+  });
+  assert.deepEqual(requests[4].body, {
+    direction: "up",
+    expected_identity_fingerprint: fingerprint,
   });
 });
 
@@ -638,6 +1369,7 @@ test("API key account presentation flattens once, sorts cheap multipliers first,
   assert.equal(accountCompositeMultiplier(entries.find(({ account }) => account.sub2api_account_id === 3)!.account), 0.1);
   assert.deepEqual(
     sortUpstreamAccountEntries(filterUpstreamAccountEntries(entries, {
+      channel: "5",
       interval: "7",
       platform: "openai",
       query: "渠道甲",
@@ -646,6 +1378,7 @@ test("API key account presentation flattens once, sorts cheap multipliers first,
   );
   assert.deepEqual(
     filterUpstreamAccountEntries(entries, {
+      channel: "all",
       interval: "unassigned",
       platform: "anthropic",
       query: "",
@@ -654,6 +1387,7 @@ test("API key account presentation flattens once, sorts cheap multipliers first,
   );
   assert.deepEqual(
     filterUpstreamAccountEntries(entries, {
+      channel: "__unassigned__",
       interval: "unassigned",
       platform: "__unknown__",
       query: "",
@@ -667,6 +1401,67 @@ test("API key account presentation flattens once, sorts cheap multipliers first,
       { value: "openai", label: "OpenAI" },
     ],
   });
+  assert.deepEqual(upstreamAccountChannels(entries), {
+    hasUnassigned: true,
+    channels: [{ value: "5", label: "渠道甲" }],
+  });
+});
+
+test("equal multiplier accounts sort by name and expose persistent neighbor moves", () => {
+  const accounts = [
+    {
+      sub2api_account_id: 2,
+      remote_name: "Beta",
+      composite_multiplier: 0.1,
+      desired_priority: 42,
+      priority_interval_id: 7,
+    },
+    {
+      sub2api_account_id: 1,
+      remote_name: "alpha",
+      composite_multiplier: 0.1,
+      desired_priority: 40,
+      priority_interval_id: 7,
+    },
+  ];
+  const entries = accounts.map((account) => ({ account, channel: null }));
+
+  assert.deepEqual(
+    sortUpstreamAccountEntries(entries).map(({ account }) => account.sub2api_account_id),
+    [1, 2],
+  );
+  assert.deepEqual(
+    sortUpstreamAccountEntriesByName([...entries].reverse()).map(({ account }) => account.sub2api_account_id),
+    [1, 2],
+  );
+  assert.deepEqual(priorityTieMoveOptions(accounts).get("1"), {
+    canMoveDown: false,
+    canMoveUp: true,
+    peerCount: 2,
+  });
+  assert.deepEqual(priorityTieMoveOptions(accounts).get("2"), {
+    canMoveDown: true,
+    canMoveUp: false,
+    peerCount: 2,
+  });
+
+  accounts[0].priority_tiebreak_order = 0;
+  accounts[0].priority_tiebreak_multiplier = 0.1;
+  accounts[1].priority_tiebreak_order = 1;
+  accounts[1].priority_tiebreak_multiplier = 0.1;
+  assert.equal(priorityTieMoveOptions(accounts).get("2")?.canMoveUp, true);
+
+  const nearEqual = accounts.map((account, index) => ({
+    ...account,
+    sub2api_account_id: index + 10,
+    composite_multiplier: index === 0 ? 1.0000000000001 : 1.0000000000002,
+    priority_tiebreak_order: null,
+    priority_tiebreak_multiplier: null,
+  }));
+  assert.equal(priorityTieMoveOptions(nearEqual).size, 0);
+  assert.equal(priorityTieMultiplierKey(1.00000000000025), "1.0000000000002");
+  assert.equal(priorityTieMultiplierKey(5e-14), "0.0000000000000");
+  assert.equal(priorityTieMultiplierKey(0.00123), "0.0012300000000");
 });
 
 test("priority interval assignment allows explicitly claiming legacy identities but blocks mismatches", () => {
@@ -695,6 +1490,7 @@ test("priority interval assignment allows explicitly claiming legacy identities 
 async function apiKeySyncRequestBody(
   overview: UpstreamChannelsResponse,
   confirmLegacyBindings: boolean,
+  skipChannelIds: number[] = [],
 ) {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;
@@ -718,7 +1514,7 @@ async function apiKeySyncRequestBody(
   }) as typeof fetch;
 
   try {
-    await api.syncApiKeyAccounts(overview, confirmLegacyBindings);
+    await api.syncApiKeyAccounts(overview, confirmLegacyBindings, skipChannelIds);
   } finally {
     globalThis.window = originalWindow;
     globalThis.fetch = originalFetch;
@@ -778,6 +1574,12 @@ test("legacy API account binding summary matches the confirmation payload", () =
 
 test("unconfirmed API account sync omits binding confirmation payload", async () => {
   assert.deepEqual(await apiKeySyncRequestBody(apiKeySyncOverview, false), {});
+});
+
+test("API account sync sends channels already under manual discovery as skips", async () => {
+  assert.deepEqual(await apiKeySyncRequestBody(apiKeySyncOverview, false, [7, 11]), {
+    skip_channel_ids: [7, 11],
+  });
 });
 
 test("confirmed API account sync with no accounts omits binding confirmation payload", async () => {
@@ -965,6 +1767,10 @@ test("session cache strips credentials and credential hints", () => {
       start_priority: 40,
       end_priority: 70,
       step: 2,
+      rate_pause_enabled: true,
+      rate_pause_mode: "absolute_multiplier",
+      rate_increase_threshold_percent: 25,
+      rate_absolute_threshold: 1.25,
       account_count: 1,
       effective_step: 2,
     }],
@@ -976,6 +1782,33 @@ test("session cache strips credentials and credential hints", () => {
       access_token: "secret-access",
       refresh_token: "secret-refresh",
       access_token_set: true,
+      recharge_adjusted_balance: 8.5,
+      balance_guard_state: "insufficient",
+      balance_guard_basis: "recharge_adjusted",
+      balance_guard_value: -0.5,
+      balance_guard_checked_at: "2026-07-16T08:03:00Z",
+      balance_guard_paused_count: 1,
+      channel_monitor_count: 1,
+      channel_monitor_status: "ok",
+      channel_monitor_checked_at: "2026-07-16T08:04:00Z",
+      channel_monitor_test_models: { 12: "gpt-5.5", invalid: "ignored" },
+      channel_monitors: [{
+        id: 12,
+        name: "主线路",
+        provider: "OpenAI",
+        primary_model: "gpt-5",
+        primary_status: "available",
+        primary_latency_ms: 218,
+        availability_7d: 99.95,
+        extra_models: [{ model: "gpt-4.1", status: "available", latency_ms: 190 }],
+        timeline: [{ checked_at: "2026-07-16T08:00:00Z", status: "available", latency_ms: 218 }],
+        effective_status: "available",
+        effective_source: "connection_test",
+        fallback_test_status: "available",
+        fallback_test_model: "gpt-5.5",
+        fallback_test_attempts: 2,
+        fallback_test_checked_at: "2026-07-16T08:04:00Z",
+      }],
       today_balance_used: 3.25,
       today_balance_unit: "USD",
       today_balance_status: "ok",
@@ -999,18 +1832,71 @@ test("session cache strips credentials and credential hints", () => {
         priority_interval_id: 4,
         priority_interval_name: "低成本",
         priority_sync_status: "pending",
+        priority_assignment_when_disabled: true,
+        priority_assignment_when_disabled_effective: true,
+        rate_pause_policy: "inherit",
+        rate_pause_effective_enabled: true,
+        rate_pause_effective_source: "priority_interval",
+        rate_pause_mode: "absolute_multiplier",
+        rate_increase_threshold_percent: 25,
+        rate_absolute_threshold: 1.25,
         composite_multiplier: 0.2,
+        balance_guard_restore_eligible: true,
+        balance_guard_channel_id: 2,
+        balance_guard_paused_at: "2026-07-16T08:03:00Z",
         upstream_usage_amount: 12.375,
         upstream_usage_unit: "USD",
         upstream_usage_checked_at: "2026-07-16T08:01:30Z",
+        today_upstream_usage_amount: 1.875,
+        today_upstream_usage_unit: "USD",
+        today_upstream_usage_status: "ok",
+        today_upstream_usage_source: "sub2api_daily_usage",
+        today_upstream_usage_checked_at: "2026-07-16T08:02:30Z",
         upstream_key_status: "disabled",
         upstream_group_status: "invalid",
         upstream_health_invalid_count: 2,
         upstream_health_checked_at: "2026-07-16T08:00:00Z",
         upstream_key_checked_at: "2026-07-16T08:00:10Z",
         upstream_group_checked_at: "2026-07-16T08:00:20Z",
+        availability_check_mode: "independent_model",
+        availability_monitor_id: 12,
+        availability_test_model: "gpt-5.5",
+        available_models: [
+          { id: "gpt-5.5", display_name: "GPT 5.5" },
+          { id: "gpt-5.5", display_name: "duplicate" },
+        ],
+        available_models_status: "ok",
+        available_models_checked_at: "2026-07-16T08:03:30Z",
+        availability_status: "available",
+        availability_unavailable_count: 0,
+        availability_recovery_count: 2,
+        availability_checked_at: "2026-07-16T08:04:00Z",
+        availability_source: "independent_model",
         auto_disabled_reason: "Upstream key is disabled.",
         last_auto_disabled_at: "2026-07-16T08:01:00Z",
+        active_pause_holds: [{
+          reason: "channel_monitor_unavailable",
+          triggered_at: "2026-07-16T08:05:00Z",
+          recovery_mode: "monitor_recovered",
+          scope_channel_id: 2,
+          evidence: {
+            monitor_status: "unavailable",
+            threshold: 3,
+            unit: "CNY",
+            ignored: "must-not-survive",
+          },
+          evidence_json: { token: "secret-hold-evidence" },
+        }, {
+          reason: "upstream_rate_increase",
+          triggered_at: "2026-07-16T08:06:00Z",
+          recovery_mode: "rate_within_threshold",
+          scope_channel_id: 2,
+        }],
+        pause_owned_by_plugin: true,
+        auto_restore_eligible: true,
+        auto_pause_episode_id: "episode-1",
+        auto_pause_channel_id: 2,
+        auto_paused_at: "2026-07-16T08:05:30Z",
       }],
     }],
     unassigned_accounts: [],
@@ -1020,6 +1906,19 @@ test("session cache strips credentials and credential hints", () => {
   assert.equal(safe.channels[0].access_token_set, true);
   assert.equal(safe.channels[0].account_count, 1);
   assert.equal(safe.channels[0].probe_enabled, false);
+  assert.equal(safe.channels[0].recharge_adjusted_balance, 8.5);
+  assert.equal(safe.channels[0].balance_guard_state, "insufficient");
+  assert.equal(safe.channels[0].balance_guard_basis, "recharge_adjusted");
+  assert.equal(safe.channels[0].balance_guard_value, -0.5);
+  assert.equal(safe.channels[0].balance_guard_paused_count, 1);
+  assert.equal(safe.channels[0].channel_monitor_count, 1);
+  assert.equal((safe.channels[0] as Record<string, unknown>).channel_monitor_test_models, undefined);
+  assert.equal(safe.channels[0].channel_monitors?.[0].primary_latency_ms, 218);
+  assert.equal(safe.channels[0].channel_monitors?.[0].extra_models?.[0].name, "gpt-4.1");
+  assert.equal(safe.channels[0].channel_monitors?.[0].timeline?.[0].time, "2026-07-16T08:00:00Z");
+  assert.equal(safe.channels[0].channel_monitors?.[0].timeline?.[0].status, "available");
+  assert.equal(safe.channels[0].channel_monitors?.[0].effective_source, undefined);
+  assert.equal(safe.channels[0].channel_monitors?.[0].fallback_test_attempts, undefined);
   assert.equal(safe.channels[0].today_balance_used, 3.25);
   assert.equal(safe.channels[0].today_balance_status, "ok");
   assert.equal(safe.channels[0].yesterday_balance_used, 2.75);
@@ -1029,29 +1928,93 @@ test("session cache strips credentials and credential hints", () => {
   assert.equal(safe.channels[0].accounts?.[0].identity_fingerprint, undefined);
   assert.equal(safe.channels[0].accounts?.[0].remote_platform, "anthropic");
   assert.equal(safe.channels[0].accounts?.[0].priority_interval_id, 4);
+  assert.equal(safe.channels[0].accounts?.[0].priority_assignment_when_disabled, true);
+  assert.equal(safe.channels[0].accounts?.[0].priority_assignment_when_disabled_effective, true);
+  assert.equal(safe.channels[0].accounts?.[0].rate_pause_policy, "inherit");
+  assert.equal(safe.channels[0].accounts?.[0].rate_pause_effective_enabled, true);
+  assert.equal(safe.channels[0].accounts?.[0].rate_pause_effective_source, "priority_interval");
+  assert.equal(safe.channels[0].accounts?.[0].rate_pause_mode, "absolute_multiplier");
+  assert.equal(safe.channels[0].accounts?.[0].rate_increase_threshold_percent, 25);
+  assert.equal(safe.channels[0].accounts?.[0].rate_absolute_threshold, 1.25);
+  assert.deepEqual(safe.channels[0].accounts?.[0].available_models, [
+    { id: "gpt-5.5", display_name: "GPT 5.5" },
+  ]);
+  assert.equal(safe.channels[0].accounts?.[0].available_models_status, "ok");
+  assert.equal(safe.channels[0].accounts?.[0].availability_source, "independent_model");
   assert.equal(safe.channels[0].accounts?.[0].composite_multiplier, 0.2);
+  assert.equal(safe.channels[0].accounts?.[0].balance_guard_restore_eligible, true);
+  assert.equal(safe.channels[0].accounts?.[0].balance_guard_channel_id, 2);
   assert.equal(safe.channels[0].accounts?.[0].upstream_usage_amount, 12.375);
   assert.equal(safe.channels[0].accounts?.[0].upstream_usage_unit, "USD");
+  assert.equal(safe.channels[0].accounts?.[0].today_upstream_usage_amount, 1.875);
+  assert.equal(safe.channels[0].accounts?.[0].today_upstream_usage_status, "ok");
+  assert.equal(safe.channels[0].accounts?.[0].today_upstream_usage_source, "sub2api_daily_usage");
   assert.equal(safe.channels[0].accounts?.[0].upstream_key_status, "disabled");
   assert.equal(safe.channels[0].accounts?.[0].upstream_group_status, "invalid");
   assert.equal(safe.channels[0].accounts?.[0].upstream_health_invalid_count, 2);
   assert.equal(safe.channels[0].accounts?.[0].upstream_health_checked_at, "2026-07-16T08:00:00Z");
   assert.equal(safe.channels[0].accounts?.[0].upstream_key_checked_at, "2026-07-16T08:00:10Z");
   assert.equal(safe.channels[0].accounts?.[0].upstream_group_checked_at, "2026-07-16T08:00:20Z");
+  assert.equal(safe.channels[0].accounts?.[0].availability_check_mode, "independent_model");
+  assert.equal(safe.channels[0].accounts?.[0].availability_monitor_id, 12);
+  assert.equal(safe.channels[0].accounts?.[0].availability_test_model, "gpt-5.5");
+  assert.equal(safe.channels[0].accounts?.[0].availability_status, "available");
+  assert.equal(safe.channels[0].accounts?.[0].availability_recovery_count, 2);
   assert.equal(safe.channels[0].accounts?.[0].auto_disabled_reason, "Upstream key is disabled.");
   assert.equal(safe.channels[0].accounts?.[0].last_auto_disabled_at, "2026-07-16T08:01:00Z");
+  assert.deepEqual(safe.channels[0].accounts?.[0].active_pause_holds, [{
+    reason: "channel_monitor_unavailable",
+    triggered_at: "2026-07-16T08:05:00Z",
+    recovery_mode: "monitor_recovered",
+    scope_channel_id: 2,
+    evidence: {
+      balance: undefined,
+      basis: undefined,
+      threshold: 3,
+      unit: "CNY",
+      key_status: undefined,
+      group_status: undefined,
+      monitor_status: "unavailable",
+      unavailable_count: undefined,
+      test_status: undefined,
+      test_purpose: undefined,
+      test_attempts: undefined,
+      max_test_attempts: undefined,
+      baseline_multiplier: undefined,
+      mode: undefined,
+      observed_multiplier: undefined,
+      absolute_threshold: undefined,
+      increase_percent: undefined,
+      threshold_percent: undefined,
+    },
+  }, {
+    reason: "upstream_rate_increase",
+    triggered_at: "2026-07-16T08:06:00Z",
+    recovery_mode: "rate_within_threshold",
+    scope_channel_id: 2,
+  }]);
+  assert.equal(safe.channels[0].accounts?.[0].pause_owned_by_plugin, true);
+  assert.equal(safe.channels[0].accounts?.[0].auto_restore_eligible, true);
+  assert.equal(safe.channels[0].accounts?.[0].auto_pause_episode_id, "episode-1");
+  assert.equal(safe.channels[0].accounts?.[0].auto_pause_channel_id, 2);
+  assert.equal(safe.channels[0].accounts?.[0].auto_paused_at, "2026-07-16T08:05:30Z");
   assert.deepEqual(safe.priority_intervals, [{
     id: 4,
     name: "低成本",
     start_priority: 40,
     end_priority: 70,
     step: 2,
+    rate_pause_enabled: true,
+    rate_pause_mode: "absolute_multiplier",
+    rate_increase_threshold_percent: 25,
+    rate_absolute_threshold: 1.25,
     account_count: 1,
     effective_step: 2,
   }]);
 
   const serialized = JSON.stringify(safe);
   assert.doesNotMatch(serialized, /secret-access|secret-refresh|secret-key|secret-ciphertext|key-tail/);
+  assert.doesNotMatch(serialized, /secret-hold-evidence|evidence_json/);
   assert.doesNotMatch(serialized, /"access_token"|"refresh_token"|"api_key"|"encrypted_api_key"|"api_key_hint"/);
   assert.equal(upstreamOverviewHasLiveMutationData(safe), false);
   assert.equal(
@@ -1192,13 +2155,17 @@ test("upstream change reasons and statuses use user-facing Chinese labels", () =
   assert.equal(upstreamChangeReasonLabel("target_recalculated"), "目标倍率重算");
   assert.equal(upstreamChangeReasonLabel("rate_drift"), "账号倍率偏离目标");
   assert.equal(upstreamChangeReasonLabel("upstream_key_disabled"), "上游 Key 已禁用");
-  assert.equal(upstreamChangeReasonLabel("upstream_group_invalid"), "上游分组已失效");
+  assert.equal(upstreamChangeReasonLabel("upstream_group_invalid"), "上游分组已删除");
   assert.equal(upstreamChangeReasonLabel("account_auto_disabled"), "账号已自动禁用");
   assert.equal(upstreamChangeReasonLabel("upstream_auto_disable"), "上游失效后自动禁用");
   assert.equal(upstreamChangeReasonLabel("upstream_key_recovered"), "上游 Key 恢复可用");
   assert.equal(upstreamChangeReasonLabel("upstream_group_recovered"), "上游分组恢复可用");
+  assert.equal(upstreamChangeReasonLabel("negative_balance"), "上游余额不足");
+  assert.equal(upstreamChangeReasonLabel("channel_monitor_unavailable"), "渠道监控与回退测试不可用");
+  assert.equal(upstreamChangeReasonLabel("upstream_rate_increase"), "综合上游倍率上涨");
   assert.equal(upstreamHealthStatusLabel("key", "disabled"), "已禁用");
   assert.equal(upstreamHealthStatusLabel("group", "invalid"), "已失效");
+  assert.equal(upstreamHealthStatusLabel("group", "deleted"), "已删除");
   assert.equal(upstreamHealthStatusLabel("key", "expired"), "已过期");
   assert.equal(upstreamHealthStatusLabel("key", "quota_exhausted"), "额度耗尽");
   assert.equal(upstreamHealthStatusLabel("group", "unassigned"), "未分配");
@@ -1211,6 +2178,24 @@ test("upstream change reasons and statuses use user-facing Chinese labels", () =
   assert.equal(upstreamStatusLabel("anthropic"), "Anthropic");
   assert.equal(upstreamStatusLabel("gemini"), "Gemini");
   assert.equal(upstreamStatusLabel("xai"), "xAI");
+  assert.equal(upstreamStatusLabel("operational"), "可用");
+  assert.equal(upstreamStatusLabel("token_invalid"), "Token 失效");
+  assert.equal(upstreamStatusLabel("degraded"), "降级");
+  assert.equal(upstreamStatusLabel("timeout"), "超时");
+  assert.equal(upstreamStatusTone("healthy"), "success");
+  assert.equal(upstreamStatusTone("operational"), "success");
+  assert.equal(upstreamStatusTone("degraded"), "warn");
+  assert.equal(upstreamStatusTone("timeout"), "danger");
+});
+
+test("upstream token failures replace generic channel errors", () => {
+  assert.equal(upstreamChannelTokenInvalid({ balance_status: "token_invalid" }), true);
+  assert.equal(upstreamChannelTokenInvalid({ channel_monitor_status: "credentials_rejected" }), true);
+  assert.equal(upstreamChannelTokenInvalid({ last_error: "Upstream channel token is invalid." }), true);
+  assert.equal(upstreamChannelTokenInvalid({ balance_status: "error", last_error: "network timeout" }), false);
+  assert.equal(isGenericUpstreamChannelError("Unable to read the upstream channel."), true);
+  assert.equal(isGenericUpstreamChannelError("Upstream channel discovery failed."), true);
+  assert.equal(isGenericUpstreamChannelError("The upstream rejected the credentials."), false);
 });
 
 test("rate log presentation prefers persisted 1:1 upstream multipliers", () => {
@@ -1230,6 +2215,36 @@ test("rate log presentation prefers persisted 1:1 upstream multipliers", () => {
   assert.equal(change.newValue, 0.4);
   assert.equal(change.direction, "increase");
   assert.ok(Math.abs((change.delta || 0) - 0.15) < 1e-12);
+});
+
+test("upstream change summaries identify the concrete upstream transition", () => {
+  const summary = upstreamChangeSummary({
+    id: 7,
+    sub2api_account_id: 42,
+    old_group_id: "basic",
+    new_group_id: "premium",
+    old_group_name: "基础",
+    new_group_name: "高级",
+    old_group_multiplier: 1,
+    new_group_multiplier: 2,
+    old_upstream_group_status: "available",
+    new_upstream_group_status: "invalid",
+    old_upstream_key_status: "available",
+    new_upstream_key_status: "disabled",
+    old_upstream_recharge_multiplier: 0.1,
+    new_upstream_recharge_multiplier: 0.2,
+    old_remote_schedulable: true,
+    new_remote_schedulable: false,
+    old_target_rate: 0.1,
+    new_target_rate: 0.4,
+    status: "observed",
+    created_at: "2026-07-16T08:00:00Z",
+  });
+
+  assert.equal(
+    summary,
+    "上游分组名称 基础 -> 高级；上游分组倍率变化；上游分组不可用；上游 Key 状态变化；上游充值倍率变化；账号调度状态变化；账号计费倍率变化",
+  );
 });
 
 test("legacy rate logs derive normalized upstream multipliers from recharge cost", () => {
@@ -1283,6 +2298,44 @@ test("upstream recharge changes update the normalized upstream multiplier", () =
   assert.equal(normalized.oldValue, 0.2);
   assert.equal(normalized.newValue, 0.4);
   assert.equal(normalized.direction, "increase");
+});
+
+test("channel group changes expose first-seen and recharge-adjusted multipliers", () => {
+  const added = upstreamGroupRatePresentation({
+    id: 1,
+    event_type: "group_added",
+    new_value: 2,
+    details: { new_recharge_multiplier: 0.25 },
+    created_at: "2026-07-26T00:00:00Z",
+    unread: true,
+  });
+  assert.equal(added.newGroupMultiplier, 2);
+  assert.equal(added.newCompositeMultiplier, 0.5);
+  assert.equal(added.showCompositeMultiplier, true);
+
+  const changed = upstreamGroupRatePresentation({
+    id: 2,
+    event_type: "group_multiplier_changed",
+    old_value: 2,
+    new_value: 3,
+    details: { old_recharge_multiplier: 0.25, new_recharge_multiplier: 0.25 },
+    created_at: "2026-07-26T00:00:00Z",
+    unread: false,
+  });
+  assert.equal(changed.oldCompositeMultiplier, 0.5);
+  assert.equal(changed.newCompositeMultiplier, 0.75);
+
+  const legacy = upstreamGroupRatePresentation({
+    id: 3,
+    event_type: "group_multiplier_changed",
+    old_value: 1,
+    new_value: 2,
+    created_at: "2026-07-26T00:00:00Z",
+    unread: false,
+  }, 0.1);
+  assert.equal(legacy.oldCompositeMultiplier, 0.1);
+  assert.equal(legacy.newCompositeMultiplier, 0.2);
+  assert.equal(legacy.showCompositeMultiplier, true);
 });
 
 test("upstream health transitions preserve unknown, invalid, and auto-disabled states", () => {
@@ -1396,6 +2449,60 @@ test("upstream change API prefers the new ledger and falls back only when unavai
     await api.upstreamChangeLogs(6);
     assert.match(paths[0], /\/upstream-change-logs\?/);
     assert.match(paths[1], /\/rate-change-logs\?/);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("separate change ledger APIs include filters, unread counts, and mark-read cursors", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const path = String(input);
+    calls.push({ path, init });
+    const body = path.includes("change-log-unread-counts")
+      ? { upstream_changes: 2, account_scheduling_changes: 3 }
+      : path.includes("mark-read")
+        ? { message: "ok" }
+        : { items: [], unread_count: 0, last_read_id: 0 };
+    return new Response(JSON.stringify(body), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  try {
+    await api.upstreamChannelChangeEvents(25, 80, {
+      startDate: "2026-07-01",
+      endDate: "2026-07-21",
+      timeZone: "Asia/Shanghai",
+    });
+    await api.accountSchedulingChangeEvents(10);
+    await api.changeLogUnreadCounts();
+    await api.markUpstreamChannelChangesRead(91);
+    await api.markAccountSchedulingChangesRead(92);
+
+    const channelUrl = new URL(calls[0].path, "http://localhost");
+    assert.equal(channelUrl.pathname, "/api/upstream-accounts/channel-change-events");
+    assert.deepEqual(Object.fromEntries(channelUrl.searchParams), {
+      limit: "25",
+      before_id: "80",
+      start_date: "2026-07-01",
+      end_date: "2026-07-21",
+      time_zone: "Asia/Shanghai",
+    });
+    assert.match(calls[1].path, /\/api\/upstream-accounts\/scheduling-change-events\?/);
+    assert.equal(calls[2].path, "/api/upstream-accounts/change-log-unread-counts");
+    assert.equal(calls[3].init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(calls[3].init?.body)), { through_id: 91 });
+    assert.equal(calls[4].init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(calls[4].init?.body)), { through_id: 92 });
   } finally {
     globalThis.window = originalWindow;
     globalThis.fetch = originalFetch;

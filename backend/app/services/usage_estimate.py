@@ -6,10 +6,18 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import delete, select
 
 from app.core.database import AsyncSessionLocal
-from app.models import AccountSnapshot, UsageLimitSample, UsageTokenWindow, UsageWindowState, utcnow
+from app.models import (
+    AccountSnapshot,
+    UsageEstimateCache,
+    UsageLimitSample,
+    UsageTokenWindow,
+    UsageWindowState,
+    utcnow,
+)
 from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient, Sub2ApiRequestError
 from app.core.subscription_types import (
@@ -117,16 +125,30 @@ def _usage_limit_sample_allowed(
 async def build_usage_estimate(
     refresh: bool = True,
     usage_by_account_id: dict[str, dict[str, Any]] | None = None,
+    accounts_override: list[dict[str, Any]] | None = None,
+    *,
+    persist_cache: bool = True,
 ) -> dict[str, Any]:
     sub2api = Sub2ApiClient()
+    source_accounts = accounts_override
+    if source_accounts is None:
+        source_accounts = (
+            await sub2api.list_accounts()
+            if refresh
+            else await _load_local_account_snapshots()
+        )
     accounts, _ = sub2api.dedupe_accounts_by_email(
         [
             account
-            for account in await sub2api.list_accounts()
+            for account in source_accounts
             if sub2api.is_gpt_account(account) and sub2api.is_oauth_account(account)
         ]
     )
-    group_map = await _load_group_map(sub2api)
+    group_map = (
+        await _load_group_map(sub2api)
+        if refresh
+        else _group_map_from_accounts(accounts)
+    )
     estimate_preferences = await _load_usage_estimate_preferences()
     usage_states = await _load_usage_window_states()
 
@@ -181,7 +203,56 @@ async def build_usage_estimate(
         "groups": _group_estimates(account_rows),
         "accounts": account_rows,
     }
+    if persist_cache:
+        await save_usage_estimate_cache(result)
     return result
+
+
+async def get_cached_usage_estimate() -> dict[str, Any] | None:
+    async with AsyncSessionLocal() as db:
+        row = await db.get(UsageEstimateCache, "latest")
+        if row is None or not isinstance(row.payload, dict):
+            return None
+        return dict(row.payload)
+
+
+async def save_usage_estimate_cache(payload: dict[str, Any]) -> None:
+    encoded = jsonable_encoder(payload)
+    async with AsyncSessionLocal() as db:
+        row = await db.get(UsageEstimateCache, "latest")
+        if row is None:
+            row = UsageEstimateCache(key="latest", payload=encoded)
+            db.add(row)
+        else:
+            row.payload = encoded
+            row.updated_at = utcnow()
+        await db.commit()
+
+
+async def _load_local_account_snapshots() -> list[dict[str, Any]]:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(AccountSnapshot).order_by(AccountSnapshot.id))
+        return [
+            dict(snapshot.raw)
+            for snapshot in result.scalars().all()
+            if isinstance(snapshot.raw, dict)
+        ]
+
+
+def _group_map_from_accounts(accounts: list[dict[str, Any]]) -> dict[str, str]:
+    group_map: dict[str, str] = {}
+    for account in accounts:
+        raw_groups = account.get("groups")
+        if not isinstance(raw_groups, list):
+            continue
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                continue
+            group_id = _stringify(group.get("id"))
+            name = _stringify(group.get("name")) or group_id
+            if group_id and name:
+                group_map[group_id] = name
+    return group_map
 
 
 def _normalize_plan_cohort(value: Any) -> str:
@@ -374,6 +445,16 @@ async def _save_usage_token_windows(
     now = utcnow()
     async with AsyncSessionLocal() as db:
         for observation in observations:
+            if observation.get("authoritative_seven_day"):
+                monthly_result = await db.execute(
+                    select(UsageTokenWindow).where(
+                        UsageTokenWindow.account_key == observation["account_key"],
+                        UsageTokenWindow.window_key == MONTHLY_SAMPLE_WINDOW_KEY,
+                    )
+                )
+                for monthly_row in monthly_result.scalars().all():
+                    if _same_sample_reset(monthly_row.reset_at, observation.get("reset_at")):
+                        await db.delete(monthly_row)
             result = await db.execute(
                 select(UsageTokenWindow).where(
                     UsageTokenWindow.account_key == observation["account_key"],
@@ -610,6 +691,7 @@ def _usage_token_window_observations(
         email = sub2api.account_email(account) or _stringify(account.get("name")) or account_id
         values, _, window_kind = _estimate_window_values(account, usage, "seven_day")
         history_window_key = MONTHLY_SAMPLE_WINDOW_KEY if window_kind == "monthly" else "seven_day"
+        window_minutes = _coerce_int(values.get("window_minutes"))
         tokens = _tokens_value(values["stats"], values["window_data"])
         spent = _coerce_float(values.get("raw_spent"))
         if (tokens is None or tokens <= 0) and (spent is None or spent <= 0):
@@ -619,7 +701,7 @@ def _usage_token_window_observations(
             _coerce_int(values.get("remaining_seconds")),
             observed_at,
             history_window_key,
-            _coerce_int(values.get("window_minutes")),
+            window_minutes,
         )
         observations.append(
             {
@@ -632,6 +714,10 @@ def _usage_token_window_observations(
                 "reset_at": reset_at,
                 "spent": spent or 0.0,
                 "tokens": tokens or 0,
+                "authoritative_seven_day": _is_authoritative_seven_day_duration(
+                    history_window_key,
+                    window_minutes,
+                ),
             }
         )
     return observations
@@ -732,6 +818,16 @@ async def _save_usage_limit_samples(
 
     async with AsyncSessionLocal() as db:
         for sample in valid_samples:
+            if sample.get("authoritative_seven_day"):
+                monthly_result = await db.execute(
+                    select(UsageLimitSample).where(
+                        UsageLimitSample.account_key == sample["account_key"],
+                        UsageLimitSample.window_key == MONTHLY_SAMPLE_WINDOW_KEY,
+                    )
+                )
+                for monthly_row in monthly_result.scalars().all():
+                    if _same_sample_reset(monthly_row.reset_at, sample.get("reset_at")):
+                        await db.delete(monthly_row)
             result = await db.execute(
                 select(UsageLimitSample)
                 .where(
@@ -1020,6 +1116,10 @@ def _add_usage_limit_sample(
         "observed_limit": observed_limit,
         "raw_spent": raw_spent,
         "used_percent": used_percent,
+        "authoritative_seven_day": _is_authoritative_seven_day_duration(
+            sample_window_key,
+            _coerce_int(values.get("window_minutes")),
+        ),
     }
 
 
@@ -1057,6 +1157,14 @@ def _same_sample_reset(left: str | None, right: str | None) -> bool:
     if left_epoch is None or right_epoch is None:
         return False
     return abs(left_epoch - right_epoch) <= LIMIT_SAMPLE_RESET_TOLERANCE_SECONDS
+
+
+def _is_authoritative_seven_day_duration(window_key: str, window_minutes: int | None) -> bool:
+    return bool(
+        window_key == "seven_day"
+        and window_minutes is not None
+        and 0 < window_minutes < MONTHLY_WINDOW_MINUTES_THRESHOLD
+    )
 
 
 def _reset_epoch(value: str) -> float | None:
@@ -1483,7 +1591,13 @@ def _estimate_window_values(
     account_values = _window_values(account, {}, window_key)
     window_kind = _window_kind(window_key, values, account_values)
     can_infer_monthly = _plan_cohort_from_account(account) == "team"
-    if window_key == "seven_day" and window_kind == "seven_day" and can_infer_monthly and (
+    explicit_window_minutes = _window_minutes(values, account_values)
+    has_explicit_seven_day_duration = bool(
+        window_key == "seven_day"
+        and explicit_window_minutes is not None
+        and 0 < explicit_window_minutes < MONTHLY_WINDOW_MINUTES_THRESHOLD
+    )
+    if window_key == "seven_day" and window_kind == "seven_day" and can_infer_monthly and not has_explicit_seven_day_duration and (
         _account_has_no_independent_five_hour(account, usage)
         or (_window_looks_monthly_quota(values) and not _account_has_independent_five_hour_quota(account, usage))
     ):
@@ -1495,10 +1609,16 @@ def _estimate_window_values(
 
     monthly_values = _window_values(account, usage, "seven_day")
     monthly_account_values = _window_values(account, {}, "seven_day")
+    monthly_minutes = _window_minutes(monthly_values, monthly_account_values)
+    has_explicit_seven_day_duration = bool(
+        monthly_minutes is not None
+        and 0 < monthly_minutes < MONTHLY_WINDOW_MINUTES_THRESHOLD
+    )
     if (
         _window_kind("seven_day", monthly_values, monthly_account_values) == "monthly"
         or (
             can_infer_monthly
+            and not has_explicit_seven_day_duration
             and (
                 (_window_looks_monthly_quota(monthly_values) and not _account_has_independent_five_hour_quota(account, usage))
                 or (

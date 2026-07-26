@@ -31,6 +31,10 @@ from app.services.phone_numbers import (
     require_oauth_phone_match,
 )
 from app.services.runtime_config import get_runtime_config_service
+from app.services.notifications import (
+    enqueue_oauth_account_disabled,
+    enqueue_oauth_account_enabled,
+)
 from app.services.sub2api import Sub2ApiClient, looks_deactive_text, sanitize_payload
 from app.services.usage_estimate import materialize_usage_reset_times, record_usage_limit_samples
 
@@ -1259,6 +1263,7 @@ class RefreshService:
                 job.finished_at = utcnow()
             snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
             if snapshot:
+                was_deactive = bool(snapshot.deactive)
                 snapshot.refreshing = False
                 snapshot.last_error = None if status == "succeeded" else reason
                 if status == "failed":
@@ -1285,6 +1290,13 @@ class RefreshService:
                     snapshot.schedulable = self.sub2api.account_schedulable(remote_account)
                     snapshot.deactive = self.sub2api.is_deactive_account(remote_account)
                     snapshot.raw = sanitize_payload(remote_account)
+                if was_deactive and not snapshot.deactive:
+                    await enqueue_oauth_account_enabled(
+                        db,
+                        email,
+                        reason or "OAuth account refresh restored the account.",
+                        account_id=snapshot.sub2api_account_id,
+                    )
             account_id = self.sub2api.account_id(remote_account) if remote_account is not None else None
             if account_id is None and job is not None:
                 account_id = job.sub2api_account_id
@@ -1342,12 +1354,15 @@ class RefreshService:
         async with AsyncSessionLocal() as db:
             snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
             if snapshot:
+                was_deactive = bool(snapshot.deactive)
                 if not snapshot.deactive:
                     snapshot.usage_estimate_enabled = False
                 snapshot.deactive = True
                 snapshot.refreshing = False
                 snapshot.auto_refresh_locked = False
                 snapshot.last_error = reason
+                if not was_deactive:
+                    await enqueue_oauth_account_disabled(db, email, reason)
             await db.commit()
         await self._record_event_safely("account_deactive", reason, email)
 

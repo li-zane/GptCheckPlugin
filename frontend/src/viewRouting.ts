@@ -11,14 +11,16 @@ export const viewPaths = {
 } as const;
 
 export type View = keyof typeof viewPaths;
-export type ApiKeySubview = "accounts" | "channels" | "intervals" | "rate-log";
+export type ApiKeySubview = "accounts" | "channels" | "intervals" | "rate-log" | "account-rate-log" | "schedule-log";
 export type AppRoute = { view: View; apiKeySubview: ApiKeySubview };
 
 export const apiKeySubviewPaths: Record<ApiKeySubview, string> = {
-  accounts: "/api-keys",
+  accounts: "/api-keys/accounts",
   channels: "/api-keys/channels",
   intervals: "/api-keys/priority-intervals",
   "rate-log": "/api-keys/upstream-changes",
+  "account-rate-log": "/api-keys/account-rate-changes",
+  "schedule-log": "/api-keys/scheduling-changes",
 };
 
 const viewPathEntries = Object.entries(viewPaths) as Array<[View, string]>;
@@ -40,6 +42,11 @@ export function pathForRoute(route: AppRoute): string {
 
 export function routeFromPath(pathname: string): AppRoute {
   const normalizedPath = normalizePathname(pathname);
+  // The API Key landing page is the upstream overview. Keep account management
+  // addressable at its own path so the landing route can have a stable default.
+  if (normalizedPath === "/api-keys") {
+    return { view: "api-keys", apiKeySubview: "channels" };
+  }
   const apiKeySubview = apiKeySubviewPathEntries.find(([, path]) => path === normalizedPath)?.[0];
   if (apiKeySubview) return { view: "api-keys", apiKeySubview };
   const view = viewPathEntries.find(([, path]) => path === normalizedPath)?.[0] || "overview";

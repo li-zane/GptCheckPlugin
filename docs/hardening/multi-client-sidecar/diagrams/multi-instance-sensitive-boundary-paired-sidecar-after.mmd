@@ -1,0 +1,23 @@
+flowchart LR
+    Browser["Admin browser"]
+    Control["Instance-scoped GptCheckPlugin control plane"]
+    Registry["Instance and agent registry"]
+    SubA["sub2api A normal API"]
+    SubB["sub2api B normal API"]
+    AgentA["Paired connector A"]
+    AgentB["Paired connector B"]
+    ViewA["Narrow read-only views A"]
+    ViewB["Narrow read-only views B"]
+    DbA["PostgreSQL A"]
+    DbB["PostgreSQL B"]
+
+    Browser -->|"instance_id on every request"| Control
+    Control --> Registry
+    Control -->|"x-api-key A: list and write"| SubA
+    Control -->|"x-api-key B: list and write"| SubB
+    AgentA -->|"outbound mTLS plus sealed payload"| Control
+    AgentB -->|"outbound mTLS plus sealed payload"| Control
+    AgentA -->|"fixed queries only"| ViewA
+    AgentB -->|"fixed queries only"| ViewB
+    ViewA --> DbA
+    ViewB --> DbB

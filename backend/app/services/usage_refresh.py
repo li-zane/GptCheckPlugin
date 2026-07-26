@@ -13,8 +13,14 @@ from app.core.database import AsyncSessionLocal
 from app.models import AccountSnapshot
 from app.services.events import elapsed_ms, record_event
 from app.services.runtime_config import get_runtime_config_service
+from app.services.notifications import enqueue_oauth_account_disabled
 from app.services.sub2api import Sub2ApiClient, looks_deactive_text
-from app.services.usage_estimate import account_rate_limited_windows, materialize_usage_reset_times, record_usage_limit_samples
+from app.services.usage_estimate import (
+    account_rate_limited_windows,
+    build_usage_estimate,
+    materialize_usage_reset_times,
+    record_usage_limit_samples,
+)
 from app.services.workflow_coordination import get_workflow_coordinator
 
 
@@ -276,6 +282,12 @@ class UsageRefreshService:
         await record_usage_limit_samples(self.sub2api, accounts, usage_by_id)
         self._latest_usage_by_id = dict(usage_by_id)
         self._latest_usage_monotonic = time.monotonic()
+        await build_usage_estimate(
+            refresh=False,
+            usage_by_account_id=usage_by_id,
+            accounts_override=accounts,
+            persist_cache=True,
+        )
         return summary
 
     async def _refresh_one(
@@ -387,12 +399,18 @@ class UsageRefreshService:
             if snapshot is None:
                 snapshot = AccountSnapshot(email=normalized_email, usage_estimate_enabled=False)
                 db.add(snapshot)
+                was_deactive = False
             elif not snapshot.deactive:
+                was_deactive = False
                 snapshot.usage_estimate_enabled = False
+            else:
+                was_deactive = True
             snapshot.deactive = True
             snapshot.refreshing = False
             snapshot.auto_refresh_locked = False
             snapshot.last_error = reason
+            if not was_deactive:
+                await enqueue_oauth_account_disabled(db, normalized_email, reason)
             await db.commit()
             await record_event(db, "account_deactive", reason, normalized_email)
 

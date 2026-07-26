@@ -10,20 +10,33 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app.services.upstream_client import (
+    CHANNEL_MONITOR_DETAIL_CONCURRENCY,
+    DiscoveryResult,
     MAX_DOH_RESPONSE_BYTES,
+    MAX_CHANNEL_MONITORS,
+    MAX_CHANNEL_MONITOR_EXTRA_MODELS,
+    MAX_CHANNEL_MONITOR_TIMELINE_POINTS,
     MAX_RESPONSE_BYTES,
     MAX_UPSTREAM_TOKEN_LENGTH,
     NEWAPI_ENDPOINTS,
     NEWAPI_TODAY_USAGE_ENDPOINT,
+    NEWAPI_UPTIME_STATUS_ENDPOINT,
+    SUB2API_API_KEY_USAGE_ENDPOINT,
+    SUB2API_CHANNEL_MONITORS_ENDPOINT,
     SUB2API_REFRESH_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
+    SUB2API_USAGE_STATS_ENDPOINT,
+    UPSTREAM_USAGE_TIMEOUT_SECONDS,
     UpstreamClient,
     _default_resolver,
     _doh_resolver,
     _invalidate_dns_cache,
     _newapi_today_usage_params,
     _newapi_yesterday_usage_params,
+    _scrub_discovery_result,
+    _sub2api_yesterday_usage_params,
     _unique_masked_api_key_records,
+    discover_upstream,
 )
 
 
@@ -47,6 +60,16 @@ class UpstreamClientTests(unittest.TestCase):
             resolver=public_resolver,
         )
         return asyncio.run(client.discover("https://upstream.example", **kwargs))
+
+    def run_discovery_wrapper(self, handler, **kwargs):
+        return asyncio.run(
+            discover_upstream(
+                "https://upstream.example",
+                transport=httpx.MockTransport(handler),
+                resolver=public_resolver,
+                **kwargs,
+            )
+        )
 
     def run_refresh(self, handler, *, base_url: str = "https://upstream.example"):
         client = UpstreamClient(
@@ -93,10 +116,11 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "ok")
-        self.assertEqual(len(seen), 8)
+        self.assertEqual(len(seen), 9)
         self.assertNotIn("/api/token/search?p=1&size=200", seen)
         self.assertNotIn("/api/v1/payment/config", seen)
         self.assertEqual(seen.count("/api/status"), 1)
+        self.assertEqual(seen.count(NEWAPI_UPTIME_STATUS_ENDPOINT), 1)
 
     def test_sub2api_refresh_posts_expected_contract_and_parses_envelope(self) -> None:
         seen: list[httpx.Request] = []
@@ -354,9 +378,13 @@ class UpstreamClientTests(unittest.TestCase):
             all(
                 headers[1:] == ("access-token-wins", "7")
                 for headers in seen_headers
-                if headers[0] != "/api/status"
+                if headers[0] not in {"/api/status", NEWAPI_UPTIME_STATUS_ENDPOINT}
             )
         )
+        uptime_headers = next(
+            headers for headers in seen_headers if headers[0] == NEWAPI_UPTIME_STATUS_ENDPOINT
+        )
+        self.assertEqual(uptime_headers[1:], (None, None))
 
     def test_newapi_batch_matches_masked_and_full_keys_without_leaking_secrets(self) -> None:
         alpha_key = "sk-local-alpha-secret-Z7Q9"
@@ -425,13 +453,11 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(set(result.account_group_matches), {7, 8, 10})
+        self.assertEqual(set(result.account_group_matches), {7, 8})
         self.assertEqual(result.account_group_matches[7].name, "default")
         self.assertEqual(result.account_group_matches[7].multiplier, 1)
         self.assertEqual(result.account_group_matches[8].name, "vip")
         self.assertEqual(result.account_group_matches[8].multiplier, 2)
-        self.assertEqual(result.account_group_matches[10].name, "retired")
-        self.assertIsNone(result.account_group_matches[10].multiplier)
         targets = [request_target(request) for request in seen]
         for endpoint in NEWAPI_ENDPOINTS:
             if endpoint == NEWAPI_TODAY_USAGE_ENDPOINT:
@@ -638,14 +664,20 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(result.today_balance_used, 2.5)
         self.assertEqual(result.today_balance_unit, "USD")
         self.assertEqual(result.today_balance_status, "ok")
+        self.assertIsNone(result.today_balance_error)
         self.assertEqual(result.yesterday_balance_used, 1.25)
         self.assertEqual(result.yesterday_balance_unit, "USD")
         self.assertEqual(result.yesterday_balance_status, "ok")
+        self.assertIsNone(result.yesterday_balance_error)
         self.assertEqual(len(seen_usage_requests), 2)
         today_request, yesterday_request = seen_usage_requests
         for request in seen_usage_requests:
             self.assertEqual(request.headers.get("Authorization"), "console-access-token")
             self.assertEqual(request.headers.get("New-Api-User"), "42")
+            self.assertEqual(
+                set(request.extensions["timeout"].values()),
+                {UPSTREAM_USAGE_TIMEOUT_SECONDS},
+            )
         start_timestamp = int(today_request.url.params["start_timestamp"])
         end_timestamp = int(today_request.url.params["end_timestamp"])
         zone = ZoneInfo("America/New_York")
@@ -703,6 +735,122 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertIsNone(result.yesterday_balance_used)
         self.assertIsNone(result.yesterday_balance_unit)
         self.assertEqual(result.yesterday_balance_status, "unsupported")
+
+    def test_sub2api_today_usage_is_requested_once_and_reports_failure_reason(self) -> None:
+        cases = (
+            ("http_503", "http_503"),
+            ("http_429", "http_429"),
+            ("http_401", "http_401"),
+            ("timeout", "timeout"),
+            ("invalid_json", "invalid_json"),
+            ("invalid_payload", "invalid_payload"),
+        )
+        for failure, expected_error in cases:
+            with self.subTest(failure=failure):
+                attempts = 0
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    target = request_target(request)
+                    if target == "/api/v1/groups/available":
+                        return httpx.Response(200, json={"code": 0, "data": []})
+                    if target == SUB2API_TODAY_USAGE_ENDPOINT:
+                        attempts += 1
+                        if failure == "timeout":
+                            raise httpx.ReadTimeout(
+                                "usage timed out",
+                                request=request,
+                            )
+                        if failure == "invalid_json":
+                            return httpx.Response(200, content=b"not-json")
+                        if failure == "invalid_payload":
+                            return httpx.Response(200, json={"code": 0, "data": {}})
+                        return httpx.Response(int(failure.removeprefix("http_")))
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    access_token="sub2api-login-token",
+                )
+
+                self.assertEqual(attempts, 1)
+                self.assertIsNone(result.today_balance_used)
+                self.assertEqual(result.today_balance_status, "error")
+                self.assertEqual(result.today_balance_error, expected_error)
+
+    def test_usage_timeout_preserves_longer_caller_timeout(self) -> None:
+        seen_read_timeouts: dict[str, float] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            timeout = request.extensions.get("timeout") or {}
+            if "read" in timeout:
+                seen_read_timeouts[request.url.path] = float(timeout["read"])
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 21,
+                                    "key": "sk-long-timeout",
+                                    "status": "active",
+                                }
+                            ]
+                        },
+                    },
+                )
+            if target == SUB2API_TODAY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"today_actual_cost": 3.25}},
+                )
+            if request.url.path == SUB2API_USAGE_STATS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"total_actual_cost": 2.75}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "21": {
+                                    "api_key_id": 21,
+                                    "today_actual_cost": 1.25,
+                                }
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        client = UpstreamClient(
+            timeout_seconds=75.0,
+            transport=httpx.MockTransport(handler),
+            resolver=public_resolver,
+        )
+        result = asyncio.run(
+            client.discover(
+                "https://upstream.example",
+                upstream_type="sub2api",
+                access_token="sub2api-login-token",
+                account_api_keys={7: "sk-long-timeout"},
+            )
+        )
+
+        self.assertEqual(result.today_balance_status, "ok")
+        self.assertEqual(UPSTREAM_USAGE_TIMEOUT_SECONDS, 60.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_TODAY_USAGE_ENDPOINT], 75.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_USAGE_STATS_ENDPOINT], 75.0)
+        self.assertEqual(seen_read_timeouts[SUB2API_API_KEY_USAGE_ENDPOINT], 75.0)
 
     def test_newapi_today_usage_time_range_falls_back_to_default_timezone(self) -> None:
         now = datetime(2026, 7, 18, 20, 30, tzinfo=timezone.utc)
@@ -1646,10 +1794,15 @@ class UpstreamClientTests(unittest.TestCase):
 
     def test_sub2api_reports_disabled_key_and_available_group_authoritatively(self) -> None:
         seen_today_headers: list[tuple[str | None, str | None]] = []
+        seen_today_requests: list[httpx.Request] = []
+        seen_yesterday_requests: list[httpx.Request] = []
+        seen_key_usage_requests: list[httpx.Request] = []
+        seen_core_requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             target = request_target(request)
             if target == "/api/v1/groups/available":
+                seen_core_requests.append(request)
                 return httpx.Response(
                     200,
                     json={
@@ -1669,13 +1822,14 @@ class UpstreamClientTests(unittest.TestCase):
                                     "key": "sk-disabled-key",
                                     "status": "disabled",
                                     "group_id": 2,
-                                    "quota_used": 12.375,
+                                    "quota_used": 999.0,
                                 }
                             ]
                         },
                     },
                 )
             if target == SUB2API_TODAY_USAGE_ENDPOINT:
+                seen_today_requests.append(request)
                 seen_today_headers.append(
                     (
                         request.headers.get("Authorization"),
@@ -1688,7 +1842,31 @@ class UpstreamClientTests(unittest.TestCase):
                         "code": 0,
                         "data": {
                             "today_actual_cost": 3.25,
-                            "yesterday_actual_cost": 2.75,
+                        },
+                    },
+                )
+            if request.url.path == SUB2API_USAGE_STATS_ENDPOINT:
+                seen_yesterday_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"total_actual_cost": 2.75}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                seen_key_usage_requests.append(request)
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(json.loads(request.content), {"api_key_ids": [21]})
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "21": {
+                                    "api_key_id": 21,
+                                    "today_actual_cost": 12.375,
+                                    "total_actual_cost": 999.0,
+                                }
+                            }
                         },
                     },
                 )
@@ -1715,33 +1893,1875 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(result.yesterday_balance_unit, "USD")
         self.assertEqual(result.yesterday_balance_status, "ok")
         self.assertEqual(seen_today_headers, [("Bearer sub2api-login-token", None)])
+        self.assertEqual(len(seen_yesterday_requests), 1)
+        self.assertEqual(len(seen_key_usage_requests), 1)
+        for request in (
+            *seen_today_requests,
+            *seen_yesterday_requests,
+            *seen_key_usage_requests,
+        ):
+            self.assertEqual(request.headers.get("Authorization"), "Bearer sub2api-login-token")
+            self.assertIsNone(request.headers.get("New-Api-User"))
+            self.assertEqual(
+                set(request.extensions["timeout"].values()),
+                {UPSTREAM_USAGE_TIMEOUT_SECONDS},
+            )
+        self.assertEqual(
+            set(seen_core_requests[0].extensions["timeout"].values()),
+            {3.5},
+        )
 
-    def test_usage_amount_rejects_invalid_values(self) -> None:
+    def test_sub2api_today_key_usage_rejects_invalid_values(self) -> None:
         cases = (-1, "nan", True, None)
-        for quota_used in cases:
-            with self.subTest(quota_used=quota_used):
+        for today_actual_cost in cases:
+            with self.subTest(today_actual_cost=today_actual_cost):
                 def handler(request: httpx.Request) -> httpx.Response:
                     target = request_target(request)
                     if target == "/api/v1/groups/available":
                         return httpx.Response(200, json={"code": 0, "data": []})
                     if target == "/api/v1/keys?page=1&page_size=200":
-                        record = {"key": "sk-invalid-usage", "status": "active"}
-                        if quota_used is not None:
-                            record["quota_used"] = quota_used
                         return httpx.Response(
                             200,
-                            json={"code": 0, "data": {"items": [record]}},
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "items": [
+                                        {
+                                            "id": 31,
+                                            "key": "sk-invalid-usage",
+                                            "status": "active",
+                                        }
+                                    ]
+                                },
+                            },
+                        )
+                    if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                        stats = {
+                            "31": {
+                                "api_key_id": 31,
+                                "today_actual_cost": today_actual_cost,
+                            }
+                        }
+                        return httpx.Response(200, json={"code": 0, "data": {"stats": stats}})
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    access_token="sub2api-login-token",
+                    account_api_keys={11: "sk-invalid-usage"},
+                )
+                self.assertIsNone(result.account_upstream_states[11].usage_amount)
+
+    def test_sub2api_today_key_usage_failure_never_reuses_cumulative_quota(self) -> None:
+        for usage_response in (
+            httpx.Response(404),
+            httpx.Response(500),
+            httpx.Response(200, json={"code": 0, "data": {"stats": {}}}),
+        ):
+            with self.subTest(status_code=usage_response.status_code):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    target = request_target(request)
+                    if target == "/api/v1/groups/available":
+                        return httpx.Response(200, json={"code": 0, "data": []})
+                    if target == "/api/v1/keys?page=1&page_size=200":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "items": [
+                                        {
+                                            "id": 32,
+                                            "key": "sk-failed-usage",
+                                            "status": "active",
+                                            "quota_used": 321.5,
+                                        }
+                                    ]
+                                },
+                            },
+                        )
+                    if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                        return usage_response
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    access_token="sub2api-login-token",
+                    account_api_keys={13: "sk-failed-usage"},
+                )
+                self.assertIsNone(result.account_upstream_states[13].usage_amount)
+                self.assertIsNone(result.account_upstream_states[13].usage_unit)
+
+    def test_sub2api_yesterday_usage_uses_date_range_and_timezone(self) -> None:
+        fixed_now = datetime(2026, 7, 19, 12, 30, tzinfo=timezone.utc)
+        self.assertEqual(
+            _sub2api_yesterday_usage_params("America/New_York", now=fixed_now),
+            {
+                "start_date": "2026-07-18",
+                "end_date": "2026-07-18",
+                "timezone": "America/New_York",
+            },
+        )
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request_target(request) == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if request.url.path == SUB2API_USAGE_STATS_ENDPOINT:
+                seen.append(request)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"total_actual_cost": 0}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            today_timezone="America/New_York",
+        )
+
+        self.assertEqual(result.yesterday_balance_used, 0)
+        self.assertEqual(result.yesterday_balance_status, "ok")
+        self.assertEqual(len(seen), 1)
+        request = seen[0]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.url.params["start_date"], request.url.params["end_date"])
+        self.assertEqual(request.url.params["timezone"], "America/New_York")
+        self.assertEqual(request.headers.get("Authorization"), "Bearer sub2api-login-token")
+
+    def test_sub2api_yesterday_usage_distinguishes_unsupported_and_failure(self) -> None:
+        for status_code, expected_status in ((404, "unsupported"), (405, "unsupported"), (500, "error")):
+            with self.subTest(status_code=status_code):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    if request_target(request) == "/api/v1/groups/available":
+                        return httpx.Response(200, json={"code": 0, "data": []})
+                    if request.url.path == SUB2API_USAGE_STATS_ENDPOINT:
+                        return httpx.Response(status_code)
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    access_token="sub2api-login-token",
+                )
+                self.assertIsNone(result.yesterday_balance_used)
+                self.assertIsNone(result.yesterday_balance_unit)
+                self.assertEqual(result.yesterday_balance_status, expected_status)
+
+    def test_sub2api_today_key_usage_accepts_authoritative_zero(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {"items": [{"id": 41, "key": "sk-zero-usage", "status": "active"}]},
+                    },
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "41": {"api_key_id": 41, "today_actual_cost": 0}
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={12: "sk-zero-usage"},
+        )
+
+        self.assertEqual(result.account_upstream_states[12].usage_amount, 0)
+        self.assertEqual(result.account_upstream_states[12].usage_unit, "USD")
+
+    def test_sub2api_today_key_usage_batches_at_one_hundred_ids(self) -> None:
+        account_api_keys = {
+            account_id: f"sk-batch-{account_id:03d}"
+            for account_id in range(1, 102)
+        }
+        records = [
+            {"id": account_id, "key": api_key, "status": "active"}
+            for account_id, api_key in account_api_keys.items()
+        ]
+        seen_batches: list[list[int]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"items": records}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                body = json.loads(request.content)
+                batch = body["api_key_ids"]
+                self.assertLessEqual(len(batch), 100)
+                seen_batches.append(batch)
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                str(record_id): {
+                                    "api_key_id": record_id,
+                                    "today_actual_cost": record_id / 10,
+                                }
+                                for record_id in batch
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys=account_api_keys,
+        )
+
+        self.assertEqual(sorted(len(batch) for batch in seen_batches), [1, 100])
+        self.assertEqual(result.account_upstream_states[1].usage_amount, 0.1)
+        self.assertEqual(result.account_upstream_states[101].usage_amount, 10.1)
+
+    def test_sub2api_exact_page_one_targets_skip_later_pages_and_key_reveal(self) -> None:
+        target_key = "sk-page-one-target"
+        later_page_requests: list[str] = []
+        reveal_requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [{"id": 41, "key": target_key, "status": "active"}],
+                            "total": 601,
+                            "page": 1,
+                            "page_size": 200,
+                            "pages": 4,
+                        },
+                    },
+                )
+            if target.startswith("/api/v1/keys?page="):
+                later_page_requests.append(target)
+                return httpx.Response(200, json={"code": 0, "data": {"items": []}})
+            if target.startswith("/api/v1/keys/"):
+                reveal_requests.append(target)
+                return httpx.Response(200, json={"code": 0, "data": {"key": target_key}})
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "41": {"api_key_id": 41, "today_actual_cost": 3.25}
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={41: target_key},
+        )
+
+        self.assertEqual(result.account_upstream_states[41].usage_amount, 3.25)
+        self.assertEqual(later_page_requests, [])
+        self.assertEqual(reveal_requests, [])
+
+    def test_cached_sub2api_key_record_id_uses_page_one_without_reveal(self) -> None:
+        detail_requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [{"id": 41, "key": "sk****rget", "status": "active"}],
+                            "total": 1,
+                        },
+                    },
+                )
+            if target.startswith("/api/v1/keys/"):
+                detail_requests.append(target)
+                return httpx.Response(500)
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "41": {"api_key_id": 41, "today_actual_cost": 3.25}
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: "sk-page-one-target"},
+            account_api_key_record_ids={7: 41},
+        )
+
+        state = result.account_upstream_states[7]
+        self.assertEqual(state.key_record_id, 41)
+        self.assertEqual(state.usage_amount, 3.25)
+        self.assertEqual(detail_requests, [])
+
+    def test_discovery_wrapper_forwards_cached_api_key_record_ids(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [{"id": 41, "key": "sk****rget", "status": "active"}],
+                            "total": 1,
+                        },
+                    },
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"stats": {"41": {"today_actual_cost": 1.5}}}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery_wrapper(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: "sk-page-one-target"},
+            account_api_key_record_ids={7: 41},
+        )
+
+        self.assertEqual(result.account_upstream_states[7].key_record_id, 41)
+        self.assertEqual(result.account_upstream_states[7].usage_amount, 1.5)
+
+    def test_cached_record_id_without_local_key_remains_unverified(self) -> None:
+        detail_requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 41, "key": "sk-another-account", "status": "disabled"}
+                            ],
+                            "total": 1,
+                        },
+                    },
+                )
+            if target.startswith("/api/v1/keys/"):
+                detail_requests.append(target)
+                return httpx.Response(200, json={"code": 0, "data": {"id": 41}})
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_key_record_ids={7: 41},
+        )
+
+        self.assertNotIn(7, result.account_upstream_states)
+        self.assertEqual(detail_requests, [])
+
+    def test_cached_record_without_key_field_remains_unverified(self) -> None:
+        detail_requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [{"id": 41, "status": "disabled"}],
+                            "total": 1,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys/41":
+                detail_requests.append(target)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"id": 41, "status": "disabled"}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: "sk-local-seven"},
+            account_api_key_record_ids={7: 41},
+        )
+
+        self.assertNotIn(7, result.account_upstream_states)
+        self.assertGreaterEqual(detail_requests.count("/api/v1/keys/41"), 1)
+
+    def test_cached_sub2api_key_record_id_fetches_detail_without_scanning_pages(self) -> None:
+        later_page_requests: list[str] = []
+        detail_requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"items": [], "total": 601, "pages": 4}},
+                )
+            if target == "/api/v1/keys/401":
+                detail_requests.append(target)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"id": 401, "key": "sk****page", "status": "active"}},
+                )
+            if target.startswith("/api/v1/keys?page="):
+                later_page_requests.append(target)
+                return httpx.Response(500)
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"stats": {"401": {"today_actual_cost": 8.5}}}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: "sk-record-on-later-page"},
+            account_api_key_record_ids={7: 401},
+        )
+
+        self.assertEqual(result.account_upstream_states[7].key_record_id, 401)
+        self.assertEqual(result.account_upstream_states[7].usage_amount, 8.5)
+        self.assertEqual(detail_requests, ["/api/v1/keys/401"])
+        self.assertEqual(later_page_requests, [])
+
+    def test_cached_newapi_key_record_id_fetches_authenticated_detail(self) -> None:
+        target_key = "sk-cached-newapi-target-Z7Q9"
+        for detail_key in ("sk**********Z7Q9", target_key):
+            with self.subTest(detail_key=detail_key):
+                detail_requests: list[httpx.Request] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    target = request_target(request)
+                    if target == "/api/user/self/groups":
+                        return httpx.Response(200, json={"success": True, "data": {}})
+                    if target == "/api/token/?p=1&page_size=200":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "success": True,
+                                "data": {
+                                    "items": [
+                                        {
+                                            "id": 12,
+                                            "key": "sk-unrelated-page-one-key",
+                                            "status": 1,
+                                        }
+                                    ],
+                                    "total": 1,
+                                },
+                            },
+                        )
+                    if target == "/api/token/401":
+                        detail_requests.append(request)
+                        return httpx.Response(
+                            200,
+                            json={
+                                "success": True,
+                                "data": {"id": 401, "key": detail_key, "status": 1},
+                            },
+                        )
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="newapi",
+                    access_token="newapi-management-token",
+                    new_api_user="17",
+                    account_api_keys={7: target_key},
+                    account_api_key_record_ids={7: 401},
+                )
+
+                state = result.account_upstream_states[7]
+                self.assertEqual(state.key_record_id, 401)
+                self.assertEqual(len(detail_requests), 1)
+                detail_request = detail_requests[0]
+                self.assertEqual(detail_request.method, "GET")
+                self.assertEqual(request_target(detail_request), "/api/token/401")
+                self.assertEqual(
+                    detail_request.headers.get("Authorization"),
+                    "Bearer newapi-management-token",
+                )
+                self.assertEqual(detail_request.headers.get("New-Api-User"), "17")
+
+    def test_cached_newapi_key_record_id_rejects_detail_for_another_key(self) -> None:
+        detail_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/user/self/groups":
+                return httpx.Response(200, json={"success": True, "data": {}})
+            if target == "/api/token/?p=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"items": [], "total": 0}},
+                )
+            if target == "/api/token/401":
+                detail_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "id": 401,
+                            "key": "sk-another-newapi-account",
+                            "status": 1,
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            access_token="newapi-management-token",
+            new_api_user=17,
+            account_api_keys={7: "sk-cached-newapi-target-Z7Q9"},
+            account_api_key_record_ids={7: 401},
+        )
+
+        self.assertNotIn(7, result.account_upstream_states)
+        self.assertEqual(
+            [request_target(request) for request in detail_requests],
+            ["/api/token/401"],
+        )
+
+    def test_missing_cached_sub2api_key_record_id_falls_back_and_rebinds(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [{"id": 52, "key": "sk-recreated-key", "status": "active"}],
+                            "total": 1,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys/41":
+                return httpx.Response(404)
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"stats": {"52": {"today_actual_cost": 1.5}}}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: "sk-recreated-key"},
+            account_api_key_record_ids={7: 41},
+        )
+
+        self.assertEqual(result.account_upstream_states[7].key_record_id, 52)
+        self.assertEqual(result.account_upstream_states[7].usage_amount, 1.5)
+
+    def test_cached_record_id_for_another_key_is_rejected_and_rebound(self) -> None:
+        detail_requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 41, "key": "sk-another-account", "status": "disabled"},
+                                {"id": 52, "key": "sk-current-account", "status": "active"},
+                            ],
+                            "total": 2,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys/41":
+                detail_requests.append(target)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"id": 41, "key": "sk-another-account"}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"stats": {"52": {"today_actual_cost": 2.5}}}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: "sk-current-account"},
+            account_api_key_record_ids={7: 41},
+        )
+
+        state = result.account_upstream_states[7]
+        self.assertEqual(state.key_record_id, 52)
+        self.assertEqual(state.key_status, "active")
+        self.assertEqual(state.usage_amount, 2.5)
+        self.assertEqual(detail_requests, ["/api/v1/keys/41"])
+
+    def test_cached_record_ids_disambiguate_identically_masked_keys(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 11, "key": "sk****same", "status": "active"},
+                                {"id": 12, "key": "sk****same", "status": "disabled"},
+                            ],
+                            "total": 2,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys/11":
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"id": 11, "key": "sk-first-same", "status": "active"}},
+                )
+            if target == "/api/v1/keys/12":
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"id": 12, "key": "sk-other-same", "status": "disabled"}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "11": {"today_actual_cost": 1.1},
+                                "12": {"today_actual_cost": 1.2},
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: "sk-first-same", 8: "sk-other-same"},
+            account_api_key_record_ids={7: 11, 8: 12},
+        )
+
+        self.assertEqual(result.account_upstream_states[7].key_record_id, 11)
+        self.assertEqual(result.account_upstream_states[7].key_status, "active")
+        self.assertEqual(result.account_upstream_states[8].key_record_id, 12)
+        self.assertEqual(result.account_upstream_states[8].key_status, "disabled")
+
+    def test_key_usage_overlaps_reveal_and_monitor_detail_branches(self) -> None:
+        async def scenario():
+            direct_key = "sk-direct-account"
+            unresolved_key = "sk-unresolved-secret"
+            usage_started = asyncio.Event()
+            reveal_observed_usage: list[bool] = []
+            monitor_observed_usage: list[bool] = []
+            usage_batches: list[list[int]] = []
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                target = request_target(request)
+                if target == "/api/v1/groups/available":
+                    return httpx.Response(200, json={"code": 0, "data": []})
+                if target == "/api/v1/keys?page=1&page_size=200":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "code": 0,
+                            "data": {
+                                "items": [
+                                    {"id": 1, "key": direct_key, "status": "active"},
+                                    {"id": 2, "key": "sk****cret", "status": "active"},
+                                    {"id": 3, "key": "sk****cret", "status": "active"},
+                                ],
+                                "total": 3,
+                                "page": 1,
+                                "page_size": 200,
+                                "pages": 1,
+                            },
+                        },
+                    )
+                if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                    return httpx.Response(
+                        200,
+                        json={"code": 0, "data": {"items": [{"id": 9, "name": "Primary"}]}},
+                    )
+                if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/9/status":
+                    await asyncio.wait_for(usage_started.wait(), timeout=0.5)
+                    monitor_observed_usage.append(usage_started.is_set())
+                    return httpx.Response(
+                        200,
+                        json={"code": 0, "data": {"primary_status": "operational"}},
+                    )
+                if target.startswith("/api/v1/keys/"):
+                    await asyncio.wait_for(usage_started.wait(), timeout=0.5)
+                    reveal_observed_usage.append(usage_started.is_set())
+                    record_id = int(target.rsplit("/", 1)[-1])
+                    revealed = unresolved_key if record_id == 2 else "sk-unrelated-secret"
+                    return httpx.Response(200, json={"code": 0, "data": {"key": revealed}})
+                if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                    batch = json.loads(request.content)["api_key_ids"]
+                    usage_batches.append(batch)
+                    if batch == [1]:
+                        usage_started.set()
+                    return httpx.Response(
+                        200,
+                        json={
+                            "code": 0,
+                            "data": {
+                                "stats": {
+                                    str(record_id): {
+                                        "api_key_id": record_id,
+                                        "today_actual_cost": float(record_id),
+                                    }
+                                    for record_id in batch
+                                }
+                            },
+                        },
+                    )
+                return httpx.Response(404)
+
+            client = UpstreamClient(
+                transport=httpx.MockTransport(handler),
+                resolver=public_resolver,
+            )
+            result = await client.discover(
+                "https://upstream.example",
+                upstream_type="sub2api",
+                access_token="sub2api-login-token",
+                account_api_keys={1: direct_key, 2: unresolved_key},
+                include_channel_monitor_details=True,
+            )
+            return result, reveal_observed_usage, monitor_observed_usage, usage_batches
+
+        result, reveal_observed, monitor_observed, usage_batches = asyncio.run(scenario())
+
+        self.assertTrue(reveal_observed)
+        self.assertTrue(all(reveal_observed))
+        self.assertEqual(monitor_observed, [True])
+        self.assertIn([1], usage_batches)
+        self.assertIn([2], usage_batches)
+        self.assertEqual(result.account_upstream_states[1].usage_amount, 1.0)
+        self.assertEqual(result.account_upstream_states[2].usage_amount, 2.0)
+        self.assertEqual(result.channel_monitors[0]["primary_status"], "operational")
+
+    def test_sub2api_today_key_usage_reads_later_key_pages(self) -> None:
+        target_key = "sk-page-two-target"
+        seen_second_pages: list[httpx.Request] = []
+        seen_usage_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": record_id,
+                                    "key": f"sk-page-one-{record_id:03d}",
+                                    "status": "active",
+                                }
+                                for record_id in range(1, 201)
+                            ],
+                            "total": 201,
+                            "page": 1,
+                            "page_size": 200,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys?page=2&page_size=200":
+                seen_second_pages.append(request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 201, "key": target_key, "status": "active"}
+                            ],
+                            "total": 201,
+                            "page": 2,
+                            "page_size": 200,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                seen_usage_requests.append(request)
+                self.assertEqual(json.loads(request.content), {"api_key_ids": [201]})
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "201": {
+                                    "api_key_id": 201,
+                                    "today_actual_cost": 4.25,
+                                }
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={201: target_key},
+        )
+
+        self.assertEqual(result.account_upstream_states[201].usage_amount, 4.25)
+        self.assertEqual(len(seen_second_pages), 1)
+        self.assertEqual(len(seen_usage_requests), 1)
+        self.assertEqual(
+            seen_second_pages[0].headers.get("Authorization"),
+            "Bearer sub2api-login-token",
+        )
+
+    def test_later_page_mask_candidates_are_prioritized_for_key_reveal(self) -> None:
+        target_key = "sk-sub2-target-secret-T9Z8"
+        detail_ids: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": record_id,
+                                    "key": f"sk****A{record_id:03d}",
+                                    "status": "active",
+                                }
+                                for record_id in range(1, 201)
+                            ],
+                            "total": 202,
+                            "page": 1,
+                            "page_size": 200,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys?page=2&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 201, "key": "sk****T9Z8", "status": "active"},
+                                {"id": 202, "key": "sk****T9Z8", "status": "active"},
+                            ],
+                            "total": 202,
+                            "page": 2,
+                            "page_size": 200,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if target.startswith("/api/v1/keys/"):
+                record_id = int(target.rsplit("/", 1)[-1])
+                detail_ids.append(record_id)
+                revealed_key = (
+                    target_key
+                    if record_id == 201
+                    else f"sk-unrelated-detail-{record_id:03d}"
+                )
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"key": revealed_key}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                self.assertEqual(json.loads(request.content), {"api_key_ids": [201]})
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "201": {
+                                    "api_key_id": 201,
+                                    "today_actual_cost": 6.5,
+                                }
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={7: target_key},
+        )
+
+        self.assertIn(201, detail_ids)
+        self.assertIn(202, detail_ids)
+        self.assertLessEqual(len(detail_ids), 200)
+        self.assertEqual(result.account_upstream_states[7].usage_amount, 6.5)
+
+    def test_key_reveal_budget_covers_rare_candidates_before_ambiguous_sets(self) -> None:
+        ambiguous_key = "sk-high-ambiguity-target-AAAA"
+        rare_key = "sk-rare-target-BBBB"
+        detail_ids: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": record_id, "key": "sk****AAAA", "status": "active"}
+                                for record_id in range(1, 201)
+                            ],
+                            "total": 202,
+                            "page": 1,
+                            "page_size": 200,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys?page=2&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 201, "key": "sk****BBBB", "status": "active"},
+                                {"id": 202, "key": "sk****BBBB", "status": "active"},
+                            ],
+                            "total": 202,
+                            "page": 2,
+                            "page_size": 200,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if target.startswith("/api/v1/keys/"):
+                record_id = int(target.rsplit("/", 1)[-1])
+                detail_ids.append(record_id)
+                revealed_key = rare_key if record_id == 201 else f"sk-unrelated-{record_id}"
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"key": revealed_key}},
+                )
+            if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                self.assertEqual(json.loads(request.content), {"api_key_ids": [201]})
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "stats": {
+                                "201": {
+                                    "api_key_id": 201,
+                                    "today_actual_cost": 7.75,
+                                }
+                            }
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            account_api_keys={1: ambiguous_key, 2: rare_key},
+        )
+
+        self.assertIn(201, detail_ids)
+        self.assertIn(202, detail_ids)
+        self.assertLessEqual(len(detail_ids), 200)
+        self.assertNotIn(1, result.account_upstream_states)
+        self.assertEqual(result.account_upstream_states[2].usage_amount, 7.75)
+
+    def test_sub2api_channel_monitor_details_are_opt_in(self) -> None:
+        detail_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request_target(request) == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 17,
+                                    "name": "Summary",
+                                    "primary_status": "degraded",
+                                }
+                            ]
+                        },
+                    },
+                )
+            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status":
+                detail_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"primary_status": "operational"}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+        )
+
+        self.assertEqual(detail_requests, [])
+        self.assertEqual(result.channel_monitors[0]["primary_status"], "degraded")
+
+    def test_sub2api_channel_monitor_list_can_be_skipped(self) -> None:
+        requested_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_paths.append(request.url.path)
+            if request.url.path == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            return httpx.Response(404)
+
+        self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            optimized_endpoint_fallbacks=True,
+            include_channel_monitors=False,
+        )
+
+        self.assertNotIn(SUB2API_CHANNEL_MONITORS_ENDPOINT, requested_paths)
+
+    def test_sub2api_monitor_only_discovery_skips_balance_usage_and_key_endpoints(self) -> None:
+        requested_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_paths.append(request.url.path)
+            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 17,
+                                    "name": "Summary",
+                                    "primary_status": "ok",
+                                }
+                            ]
+                        },
+                    },
+                )
+            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status":
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"primary_status": "success"}},
+                )
+            self.fail(f"monitor-only discovery requested unrelated endpoint {request.url.path}")
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            include_channel_monitor_details=True,
+            monitor_only=True,
+        )
+
+        self.assertEqual(
+            requested_paths,
+            [
+                SUB2API_CHANNEL_MONITORS_ENDPOINT,
+                f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status",
+            ],
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.channel_monitors_status, "ok")
+        self.assertEqual(result.channel_monitors[0]["primary_status"], "available")
+
+    def test_newapi_monitor_only_reads_public_uptime_panel_without_credentials(self) -> None:
+        requested_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_paths.append(request.url.path)
+            self.assertNotIn("Authorization", request.headers)
+            self.assertNotIn("New-Api-User", request.headers)
+            if request.url.path == NEWAPI_UPTIME_STATUS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": [
+                            {
+                                "categoryName": "Models",
+                                "monitors": [
+                                    {
+                                        "name": "OpenAI",
+                                        "group": "Primary",
+                                        "status": 1,
+                                        "uptime": 0.9985,
+                                    },
+                                    {
+                                        "name": "Claude",
+                                        "group": "Fallback",
+                                        "status": 0,
+                                        "uptime": 0.75,
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                )
+            self.fail(f"monitor-only discovery requested unrelated endpoint {request.url.path}")
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            access_token="must-not-be-sent",
+            new_api_user="7",
+            monitor_only=True,
+        )
+
+        self.assertEqual(requested_paths, [NEWAPI_UPTIME_STATUS_ENDPOINT])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.channel_monitors_status, "ok")
+        self.assertEqual(result.channel_monitors_total, 2)
+        self.assertEqual(
+            [item["primary_status"] for item in result.channel_monitors],
+            ["available", "unavailable"],
+        )
+        self.assertEqual(result.channel_monitors[0]["provider"], "uptime-kuma")
+        self.assertEqual(result.channel_monitors[0]["group_name"], "Models · Primary")
+        self.assertEqual(result.channel_monitors[0]["availability_7d"], 0.9985)
+        self.assertEqual(result.channel_monitors[0]["availability_window"], "24h")
+        self.assertLessEqual(result.channel_monitors[0]["id"], (1 << 53) - 1)
+
+    def test_public_uptime_alone_does_not_make_regular_newapi_discovery_succeed(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == NEWAPI_UPTIME_STATUS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": [
+                            {
+                                "categoryName": "Models",
+                                "monitors": [
+                                    {"name": "OpenAI", "status": 1, "uptime": 1.0}
+                                ],
+                            }
+                        ],
+                    },
+                )
+            if request.url.path == "/api/status":
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"price": 0.1}},
+                )
+            if request.url.path == "/api/pricing":
+                return httpx.Response(200, json={"success": True, "data": []})
+            return httpx.Response(401)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            access_token="expired-token",
+            new_api_user="7",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.channel_monitors_status, "unknown")
+
+    def test_auto_monitor_only_prefers_successful_newapi_uptime_over_sub2api_401(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == NEWAPI_UPTIME_STATUS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": [
+                            {
+                                "categoryName": "Models",
+                                "monitors": [
+                                    {"name": "OpenAI", "status": 1, "uptime": 1.0}
+                                ],
+                            }
+                        ],
+                    },
+                )
+            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                return httpx.Response(401)
+            self.fail(f"monitor-only discovery requested unrelated endpoint {request.url.path}")
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="auto",
+            access_token="sub2api-token",
+            monitor_only=True,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.upstream_type, "newapi")
+        self.assertEqual(result.channel_monitors_status, "ok")
+        self.assertFalse(result.sub2api_auth_rejected)
+
+    def test_auto_monitor_only_preserves_unresolved_sub2api_credential_rejection(self) -> None:
+        for rejected_status in (401, 403):
+            with self.subTest(rejected_status=rejected_status):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    if request.url.path == NEWAPI_UPTIME_STATUS_ENDPOINT:
+                        return httpx.Response(404)
+                    if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                        return httpx.Response(rejected_status)
+                    self.fail(
+                        f"monitor-only discovery requested unrelated endpoint {request.url.path}"
+                    )
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="auto",
+                    access_token="rejected-sub2api-token",
+                    monitor_only=True,
+                )
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.upstream_type, "sub2api")
+                self.assertTrue(result.sub2api_auth_rejected)
+                self.assertEqual(
+                    result.channel_monitors_status,
+                    "credentials_rejected",
+                )
+
+    def test_monitor_only_preserves_unsupported_and_rejected_statuses(self) -> None:
+        newapi_result = self.run_discovery(
+            lambda _request: httpx.Response(404),
+            upstream_type="newapi",
+            monitor_only=True,
+        )
+        self.assertTrue(newapi_result.ok)
+        self.assertEqual(newapi_result.channel_monitors_status, "unsupported")
+
+        sub2api_result = self.run_discovery(
+            lambda _request: httpx.Response(403),
+            upstream_type="sub2api",
+            access_token="rejected-token",
+            monitor_only=True,
+        )
+        self.assertFalse(sub2api_result.ok)
+        self.assertTrue(sub2api_result.sub2api_auth_rejected)
+        self.assertEqual(
+            sub2api_result.channel_monitors_status,
+            "credentials_rejected",
+        )
+
+    def test_newapi_empty_public_uptime_panel_is_not_configured(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, NEWAPI_UPTIME_STATUS_ENDPOINT)
+            return httpx.Response(200, json={"success": True, "data": []})
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            monitor_only=True,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.channel_monitors, [])
+        self.assertEqual(result.channel_monitors_status, "not_configured")
+        self.assertIn("no public uptime monitors", result.channel_monitors_message)
+
+    def test_newapi_configured_empty_uptime_group_is_an_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, NEWAPI_UPTIME_STATUS_ENDPOINT)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": [{"categoryName": "Models", "monitors": []}],
+                },
+            )
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            monitor_only=True,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.channel_monitors, [])
+        self.assertEqual(result.channel_monitors_status, "error")
+        self.assertIn("configured", result.channel_monitors_message)
+
+    def test_newapi_partial_empty_uptime_group_preserves_error_state(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, NEWAPI_UPTIME_STATUS_ENDPOINT)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": [
+                        {"categoryName": "Failed", "monitors": []},
+                        {
+                            "categoryName": "Healthy",
+                            "monitors": [
+                                {"name": "OpenAI", "status": 1, "uptime": 1.0}
+                            ],
+                        },
+                    ],
+                },
+            )
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            monitor_only=True,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.channel_monitors_status, "error")
+        self.assertEqual(len(result.channel_monitors), 1)
+        self.assertIn("incomplete data", result.channel_monitors_message)
+
+    def test_newapi_duplicate_uptime_monitors_merge_with_stable_id(self) -> None:
+        duplicate_monitors = [
+            {"name": "OpenAI", "group": "Primary", "status": 1, "uptime": 0.99},
+            {"name": "OpenAI", "group": "Primary", "status": 0, "uptime": 0.75},
+        ]
+
+        def discover(monitors: list[dict[str, object]]) -> DiscoveryResult:
+            return self.run_discovery(
+                lambda _request: httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": [{"categoryName": "Models", "monitors": monitors}],
+                    },
+                ),
+                upstream_type="newapi",
+                monitor_only=True,
+            )
+
+        forward = discover(duplicate_monitors)
+        reversed_result = discover(list(reversed(duplicate_monitors)))
+
+        self.assertTrue(forward.ok)
+        self.assertEqual(forward.channel_monitors_total, 1)
+        self.assertEqual(len(forward.channel_monitors), 1)
+        self.assertEqual(
+            forward.channel_monitors[0]["id"],
+            reversed_result.channel_monitors[0]["id"],
+        )
+        self.assertEqual(forward.channel_monitors[0]["primary_status"], "unavailable")
+        self.assertEqual(reversed_result.channel_monitors[0]["primary_status"], "unavailable")
+        self.assertEqual(forward.channel_monitors[0]["availability_7d"], 0.75)
+        self.assertEqual(reversed_result.channel_monitors[0]["availability_7d"], 0.75)
+
+    def test_channel_monitor_available_status_aliases_are_normalized(self) -> None:
+        for status in ("ok", "success", "active", "enabled"):
+            with self.subTest(status=status):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "items": [
+                                        {
+                                            "id": 17,
+                                            "name": "Summary",
+                                            "primary_status": status,
+                                        }
+                                    ]
+                                },
+                            },
                         )
                     return httpx.Response(404)
 
                 result = self.run_discovery(
                     handler,
                     upstream_type="sub2api",
-                    account_api_keys={11: "sk-invalid-usage"},
+                    access_token="sub2api-login-token",
+                    monitor_only=True,
                 )
-                self.assertIsNone(result.account_upstream_states[11].usage_amount)
+                self.assertEqual(
+                    result.channel_monitors[0]["primary_status"],
+                    "available",
+                )
 
-    def test_sub2api_orphaned_key_group_is_unavailable_even_without_a_rate(self) -> None:
+    def test_monitor_only_401_marks_sub2api_auth_rejected(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, SUB2API_CHANNEL_MONITORS_ENDPOINT)
+            return httpx.Response(401)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="expired-access-token",
+            include_channel_monitor_details=True,
+            monitor_only=True,
+        )
+
+        self.assertEqual(result.status, "error")
+        self.assertTrue(result.sub2api_auth_rejected)
+        self.assertEqual(result.channel_monitors_status, "credentials_rejected")
+
+    def test_sub2api_channel_monitors_merge_summary_and_status_details(self) -> None:
+        secret = "monitor-detail-secret"
+        detail_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request_target(request) == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 17,
+                                    "name": "Summary name",
+                                    "provider": "openai",
+                                    "group_name": "Primary",
+                                    "primary_model": "gpt-summary",
+                                    "primary_status": "degraded",
+                                    "primary_latency_ms": 999,
+                                },
+                                {
+                                    "id": 18,
+                                    "name": "Fallback summary",
+                                    "provider": "grok",
+                                    "group_name": "Backup",
+                                    "primary_model": "grok-summary",
+                                    "primary_status": "operational",
+                                    "primary_latency_ms": 88,
+                                },
+                            ]
+                        },
+                    },
+                )
+            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status":
+                detail_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "monitor": {
+                                "name": "Detail must not replace the summary",
+                                "provider": "injected-provider",
+                                "primary_status": "available",
+                                "availability7d": "99.75",
+                                "api_key": secret,
+                            },
+                            "result": {"primaryPingLatencyMs": 12.5},
+                            "status": {
+                                "primaryLatencyMs": 34.5,
+                                "extraModels": [
+                                    {
+                                        "name": f"gpt-detail-{secret}",
+                                        "status": "healthy",
+                                        "latencyMs": 45,
+                                    }
+                                ],
+                                "timeline": [
+                                    {
+                                        "time": "2026-07-19T12:30:00Z",
+                                        "status": "available",
+                                        "latencyMs": 36,
+                                        "pingLatencyMs": 13,
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                )
+            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/18/status":
+                detail_requests.append(request)
+                return httpx.Response(503)
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token=secret,
+            include_channel_monitor_details=True,
+        )
+
+        self.assertEqual(result.channel_monitors_status, "ok")
+        self.assertEqual(result.channel_monitors_total, 2)
+        self.assertEqual(len(detail_requests), 2)
+        self.assertEqual(
+            {request.url.path for request in detail_requests},
+            {
+                f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status",
+                f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/18/status",
+            },
+        )
+        self.assertTrue(all(request.method == "GET" for request in detail_requests))
+        self.assertTrue(
+            all(
+                request.headers.get("Authorization") == f"Bearer {secret}"
+                for request in detail_requests
+            )
+        )
+
+        detailed, fallback = result.channel_monitors
+        self.assertEqual(detailed["name"], "Summary name")
+        self.assertEqual(detailed["provider"], "openai")
+        self.assertEqual(detailed["group_name"], "Primary")
+        self.assertEqual(detailed["primary_model"], "gpt-summary")
+        self.assertEqual(detailed["primary_status"], "available")
+        self.assertEqual(detailed["primary_latency_ms"], 34.5)
+        self.assertEqual(detailed["primary_ping_latency_ms"], 12.5)
+        self.assertEqual(detailed["availability_7d"], 99.75)
+        self.assertEqual(detailed["extra_models"][0]["model"], "gpt-detail-[redacted]")
+        self.assertEqual(detailed["timeline"][0]["checked_at"], "2026-07-19T12:30:00Z")
+        self.assertEqual(fallback["name"], "Fallback summary")
+        self.assertEqual(fallback["primary_status"], "operational")
+        self.assertEqual(fallback["primary_latency_ms"], 88)
+        self.assertIn("Used list summaries for 1 monitor(s)", result.channel_monitors_message)
+        self.assertNotIn(secret, json.dumps(result.as_dict()))
+
+    def test_sub2api_channel_monitor_detail_concurrency_is_bounded(self) -> None:
+        active_details = 0
+        max_active_details = 0
+        detail_count = CHANNEL_MONITOR_DETAIL_CONCURRENCY + 5
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active_details, max_active_details
+            if request_target(request) == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": monitor_id, "name": f"Monitor {monitor_id}"}
+                                for monitor_id in range(1, detail_count + 1)
+                            ]
+                        },
+                    },
+                )
+            if (
+                request.url.path.startswith(f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/")
+                and request.url.path.endswith("/status")
+            ):
+                active_details += 1
+                max_active_details = max(max_active_details, active_details)
+                await asyncio.sleep(0.005)
+                active_details -= 1
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"primary_status": "operational"}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            include_channel_monitor_details=True,
+        )
+
+        self.assertEqual(len(result.channel_monitors), detail_count)
+        self.assertGreater(max_active_details, 1)
+        self.assertLessEqual(max_active_details, CHANNEL_MONITOR_DETAIL_CONCURRENCY)
+
+    def test_sub2api_channel_monitors_are_bounded_cleaned_and_scrubbed(self) -> None:
+        secret = "monitor-secret-token-" + ("S" * 220)
+        detail_ids: list[int] = []
+        extras = [
+            {"model": None},
+            *(
+                {
+                    "model": f"model-{index}-{secret if index == 0 else 'safe'}",
+                    "status": "operational",
+                    "latency_ms": index,
+                }
+                for index in range(MAX_CHANNEL_MONITOR_EXTRA_MODELS + 5)
+            ),
+        ]
+        timeline = [
+            {"checked_at": "not-a-timestamp"},
+            *(
+                {
+                    "status": "degraded",
+                    "latency_ms": index,
+                    "ping_latency_ms": index + 1,
+                    "checked_at": f"2026-07-18T00:{index % 60:02d}:00Z",
+                }
+                for index in range(MAX_CHANNEL_MONITOR_TIMELINE_POINTS + 5)
+            ),
+        ]
+        monitors = [
+            {"id": 0, "name": "invalid"},
+            {
+                "id": 1,
+                "name": f"Status {secret}",
+                "provider": "OpenAI injected value",
+                "group_name": "Primary",
+                "primary_model": "gpt-test",
+                "primary_status": "compromised",
+                "primary_latency_ms": -1,
+                "primary_ping_latency_ms": "12.5",
+                "availability_7d": 101,
+                "extra_models": extras,
+                "timeline": timeline,
+                "api_key": secret,
+            },
+            *(
+                {
+                    "id": index,
+                    "name": f"Monitor {index}",
+                    "provider": "grok",
+                    "primary_model": "grok-test",
+                    "primary_status": "operational",
+                    "availability_7d": 99.5,
+                }
+                for index in range(2, MAX_CHANNEL_MONITORS + 6)
+            ),
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request_target(request) == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"items": monitors}},
+                )
+            if (
+                request.url.path.startswith(f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/")
+                and request.url.path.endswith("/status")
+            ):
+                monitor_id = int(request.url.path.rsplit("/", 2)[-2])
+                detail_ids.append(monitor_id)
+                return httpx.Response(404)
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token=secret,
+            include_channel_monitor_details=True,
+        )
+
+        self.assertEqual(result.channel_monitors_status, "ok")
+        self.assertEqual(len(result.channel_monitors), MAX_CHANNEL_MONITORS)
+        self.assertEqual(result.channel_monitors_total, MAX_CHANNEL_MONITORS + 5)
+        self.assertEqual(len(detail_ids), MAX_CHANNEL_MONITORS)
+        self.assertEqual(set(detail_ids), set(range(1, MAX_CHANNEL_MONITORS + 1)))
+        first = result.channel_monitors[0]
+        self.assertEqual(first["name"], "Status [redacted]")
+        self.assertEqual(first["provider"], "unknown")
+        self.assertEqual(first["primary_status"], "unknown")
+        self.assertIsNone(first["primary_latency_ms"])
+        self.assertEqual(first["primary_ping_latency_ms"], 12.5)
+        self.assertIsNone(first["availability_7d"])
+        self.assertEqual(len(first["extra_models"]), MAX_CHANNEL_MONITOR_EXTRA_MODELS)
+        self.assertEqual(len(first["timeline"]), MAX_CHANNEL_MONITOR_TIMELINE_POINTS)
+        serialized = json.dumps(result.as_dict())
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(secret[:160], serialized)
+        self.assertNotIn('"api_key"', serialized)
+
+    def test_sub2api_channel_monitor_failures_are_explicit(self) -> None:
+        for status_code, expected_status in (
+            (401, "credentials_rejected"),
+            (404, "unsupported"),
+            (405, "unsupported"),
+            (500, "error"),
+        ):
+            with self.subTest(status_code=status_code):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    if request_target(request) == "/api/v1/groups/available":
+                        return httpx.Response(200, json={"code": 0, "data": []})
+                    if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                        return httpx.Response(status_code)
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    access_token="sub2api-login-token",
+                )
+                self.assertEqual(result.channel_monitors, [])
+                self.assertEqual(result.channel_monitors_status, expected_status)
+
+    def test_channel_monitor_scrubbing_tolerates_non_list_collections(self) -> None:
+        result = _scrub_discovery_result(
+            DiscoveryResult(
+                upstream_type="sub2api",
+                source="https://upstream.example",
+                status="ok",
+                channel_monitors=[
+                    {
+                        "id": 1,
+                        "name": "Monitor",
+                        "extra_models": "not-a-list",
+                        "timeline": {"status": "operational"},
+                    }
+                ],
+            ),
+            ("secret",),
+        )
+
+        self.assertEqual(result.channel_monitors[0]["extra_models"], [])
+        self.assertEqual(result.channel_monitors[0]["timeline"], [])
+
+    def test_channel_monitor_scrubbing_reapplies_a_strict_field_allowlist(self) -> None:
+        secret = "manually-constructed-monitor-secret"
+        result = _scrub_discovery_result(
+            DiscoveryResult(
+                upstream_type="sub2api",
+                source="https://upstream.example",
+                status="ok",
+                channel_monitors=[
+                    {
+                        "id": 1,
+                        "name": "Monitor",
+                        "raw_secret": secret,
+                        "extra_models": [
+                            {
+                                "model": "model-a",
+                                "status": "operational",
+                                "latency_ms": 1,
+                                "api_key": secret,
+                            }
+                        ],
+                        "timeline": [
+                            {
+                                "status": "operational",
+                                "latency_ms": 1,
+                                "ping_latency_ms": 2,
+                                "checked_at": "2026-07-18T00:00:00Z",
+                                "raw_secret": secret,
+                            }
+                        ],
+                    }
+                ],
+            ),
+            (secret,),
+        )
+
+        monitor = result.channel_monitors[0]
+        self.assertNotIn("raw_secret", monitor)
+        self.assertNotIn("api_key", monitor["extra_models"][0])
+        self.assertNotIn("raw_secret", monitor["timeline"][0])
+        self.assertNotIn(secret, json.dumps(result.as_dict()))
+
+    def test_sub2api_orphaned_key_group_is_deleted_even_without_a_rate(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             target = request_target(request)
             if target == "/api/v1/groups/available":
@@ -1772,7 +3792,7 @@ class UpstreamClientTests(unittest.TestCase):
 
         state = result.account_upstream_states[8]
         self.assertEqual(state.key_status, "active")
-        self.assertEqual(state.group_status, "unavailable")
+        self.assertEqual(state.group_status, "deleted")
         self.assertEqual(state.group_id, "99")
         self.assertNotIn(8, result.account_group_matches)
 

@@ -33,6 +33,9 @@ def _runtime(**overrides):
         "get_upstream_sync_interval_seconds": AsyncMock(return_value=3600),
         "get_upstream_sync_enabled": AsyncMock(return_value=True),
         "get_upstream_sync_max_concurrency": AsyncMock(return_value=2),
+        "get_upstream_priority_sync_enabled": AsyncMock(return_value=True),
+        "get_account_model_whitelist_sync_interval_seconds": AsyncMock(return_value=3600),
+        "get_account_model_whitelist_sync_enabled": AsyncMock(return_value=True),
         "get_upstream_rate_log_retention_days": AsyncMock(return_value=45),
         "get_automation_paused": AsyncMock(return_value=False),
     }
@@ -41,12 +44,118 @@ def _runtime(**overrides):
 
 
 class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_priority_run_is_independent_of_upstream_probe_switch(self) -> None:
+        session = object()
+        result = SimpleNamespace(considered=3, updated=2, unchanged=1, failed=0)
+        priority_service = SimpleNamespace(rebalance=AsyncMock(return_value=result))
+        channel_service = SimpleNamespace(
+            _priority_service=Mock(return_value=priority_service),
+        )
+        runtime = _runtime(
+            get_upstream_sync_enabled=AsyncMock(return_value=False),
+        )
+        service = UpstreamRateSyncService(runtime, channel_service)
+
+        with (
+            patch(
+                "app.services.upstream_rate_sync.AsyncSessionLocal",
+                return_value=_SessionContext(session),
+            ),
+            patch.object(service, "_record_event", new=AsyncMock()) as record,
+        ):
+            await service._run_priority_once()
+
+        priority_service.rebalance.assert_awaited_once_with(session)
+        record.assert_awaited_once()
+        self.assertEqual(record.await_args.kwargs["details"]["updated"], 2)
+
+        priority_service.rebalance.reset_mock()
+        runtime.get_upstream_priority_sync_enabled = AsyncMock(return_value=False)
+        await service._run_priority_once()
+        priority_service.rebalance.assert_not_awaited()
+
+    async def test_model_whitelist_run_refreshes_cached_oauth_and_api_key_rows(self) -> None:
+        oauth = SimpleNamespace(
+            sub2api_account_id="1",
+            available_models=None,
+            available_models_status="not_checked",
+            available_models_checked_at=None,
+        )
+        api_key = SimpleNamespace(
+            sub2api_account_id=2,
+            available_models=[{"id": "old", "display_name": "Old"}],
+            available_models_status="ok",
+            available_models_checked_at=None,
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(scalars=lambda: [oauth]),
+                    SimpleNamespace(scalars=lambda: [api_key]),
+                ]
+            ),
+            commit=AsyncMock(),
+        )
+        sub2api = SimpleNamespace(
+            get_account_models=AsyncMock(
+                side_effect=lambda account_id: [
+                    {"id": f"model-{account_id}", "display_name": f"Model {account_id}"}
+                ]
+            )
+        )
+        service = UpstreamRateSyncService(_runtime(), SimpleNamespace(), sub2api)
+
+        with patch(
+            "app.services.upstream_rate_sync.AsyncSessionLocal",
+            return_value=_SessionContext(db),
+        ), patch.object(service, "_record_event", new=AsyncMock()):
+            await service._run_model_whitelist_once()
+
+        self.assertEqual(sub2api.get_account_models.await_count, 2)
+        self.assertEqual(oauth.available_models, [{"id": "model-1", "display_name": "Model 1"}])
+        self.assertEqual(api_key.available_models, [{"id": "model-2", "display_name": "Model 2"}])
+        self.assertEqual(oauth.available_models_status, "ok")
+        self.assertEqual(api_key.available_models_status, "ok")
+        db.commit.assert_awaited_once_with()
+
+    async def test_model_whitelist_run_keeps_last_good_rows_on_failure(self) -> None:
+        row = SimpleNamespace(
+            sub2api_account_id="1",
+            available_models=[{"id": "old", "display_name": "Old"}],
+            available_models_status="ok",
+            available_models_checked_at=None,
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(scalars=lambda: [row]),
+                    SimpleNamespace(scalars=lambda: []),
+                ]
+            ),
+            commit=AsyncMock(),
+        )
+        sub2api = SimpleNamespace(
+            get_account_models=AsyncMock(side_effect=RuntimeError("upstream unavailable"))
+        )
+        service = UpstreamRateSyncService(_runtime(), SimpleNamespace(), sub2api)
+
+        with patch(
+            "app.services.upstream_rate_sync.AsyncSessionLocal",
+            return_value=_SessionContext(db),
+        ), patch.object(service, "_record_event", new=AsyncMock()):
+            await service._run_model_whitelist_once()
+
+        self.assertEqual(row.available_models, [{"id": "old", "display_name": "Old"}])
+        self.assertEqual(row.available_models_status, "error")
+        db.commit.assert_awaited_once_with()
+
     async def test_upstream_run_discovers_only_when_enabled_and_not_paused(self) -> None:
         session = object()
         channel_service = SimpleNamespace(discover_all=AsyncMock(), sync_inventory=AsyncMock())
         runtime_config = _runtime()
         service = UpstreamRateSyncService(runtime_config, channel_service)
         prune = AsyncMock(return_value=0)
+        prune_changes = AsyncMock()
 
         with (
             patch(
@@ -56,6 +165,10 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.upstream_rate_sync.prune_upstream_rate_change_logs",
                 new=prune,
+            ),
+            patch(
+                "app.services.upstream_rate_sync.prune_change_logs",
+                new=prune_changes,
             ),
         ):
             await service._run_once()
@@ -68,20 +181,28 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
             force=True,
         )
         prune.assert_awaited_once_with(session, retention_days=45)
+        prune_changes.assert_awaited_once_with(session, retention_days=45)
 
         for enabled, paused in ((False, False), (True, True)):
             with self.subTest(enabled=enabled, paused=paused):
                 channel_service.discover_all.reset_mock()
                 runtime_config.get_upstream_sync_enabled = AsyncMock(return_value=enabled)
                 runtime_config.get_automation_paused = AsyncMock(return_value=paused)
-                with patch(
-                    "app.services.upstream_rate_sync.prune_upstream_rate_change_logs",
-                    new=prune,
+                with (
+                    patch(
+                        "app.services.upstream_rate_sync.prune_upstream_rate_change_logs",
+                        new=prune,
+                    ),
+                    patch(
+                        "app.services.upstream_rate_sync.prune_change_logs",
+                        new=prune_changes,
+                    ),
                 ):
                     await service._run_once()
                 channel_service.discover_all.assert_not_awaited()
 
         self.assertEqual(prune.await_count, 3)
+        self.assertEqual(prune_changes.await_count, 3)
 
     async def test_inventory_run_has_an_independent_switch(self) -> None:
         session = object()
@@ -146,6 +267,10 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.upstream_rate_sync.prune_upstream_rate_change_logs",
                 new=AsyncMock(return_value=0),
             ),
+            patch(
+                "app.services.upstream_rate_sync.prune_change_logs",
+                new=AsyncMock(),
+            ),
         ):
             service.start()
             service.wake_upstream()
@@ -201,6 +326,10 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.upstream_rate_sync.prune_upstream_rate_change_logs",
                 new=AsyncMock(return_value=0),
             ),
+            patch(
+                "app.services.upstream_rate_sync.prune_change_logs",
+                new=AsyncMock(),
+            ),
         ):
             service.start()
             service.wake_upstream()
@@ -251,6 +380,7 @@ class UpstreamRateSyncWiringTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings_api, "get_usage_refresh_service", return_value=usage_refresh),
             patch.object(settings_api, "get_refresh_service", return_value=refresh),
             patch.object(settings_api, "get_account_liveness_limiter", return_value=liveness),
+            patch.object(settings_api, "_available_test_models", new=AsyncMock(return_value=[])),
             patch.object(settings_api, "AppSettingsOut", side_effect=lambda **values: values),
             patch.object(settings_api, "Sub2ApiPortScanResult", side_effect=lambda **values: values),
         ):

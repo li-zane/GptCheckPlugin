@@ -377,6 +377,8 @@ class DashboardSummary(BaseModel):
     mailbox_count: int
     recent_success: int
     recent_failed: int
+    low_balance_channel_count: int = 0
+    low_balance_channels: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ManualRefreshRequest(BaseModel):
@@ -540,7 +542,46 @@ class AppSettingsOut(BaseModel):
     upstream_sync_max_concurrency: int
     upstream_rate_sync_enabled: bool
     upstream_priority_sync_enabled: bool
+    manual_upstream_sync_rate_enabled: bool = True
+    manual_upstream_sync_priority_enabled: bool = True
+    manual_upstream_sync_upstream_health_enabled: bool = True
+    manual_upstream_sync_channel_monitors_enabled: bool = True
+    manual_upstream_sync_account_availability_enabled: bool = False
+    manual_upstream_sync_balance_guard_enabled: bool = True
+    manual_upstream_sync_rate_pause_enabled: bool = True
     api_key_auto_disable_on_upstream_unavailable: bool
+    api_key_auto_pause_on_channel_monitor_unavailable_enabled: bool = False
+    channel_monitor_auto_probe_enabled: bool = True
+    account_model_whitelist_sync_enabled: bool = False
+    account_model_whitelist_sync_interval_seconds: int = 3600
+    account_model_whitelist_sync_each_time: bool = False
+    channel_monitor_fallback_without_monitor_enabled: bool = False
+    channel_monitor_fallback_test_models: list[str] = Field(default_factory=list)
+    channel_monitor_fallback_test_model: str = ""
+    channel_monitor_fallback_test_attempts: int = 1
+    channel_monitor_recovery_test_attempts: int = 1
+    available_test_models: list[AccountLivenessModelOut] = Field(default_factory=list)
+    api_key_auto_pause_on_upstream_rate_increase_enabled: bool = False
+    upstream_rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = (
+        "increase_percent"
+    )
+    upstream_rate_increase_threshold_percent: float = 20.0
+    upstream_rate_absolute_threshold: float = 1.0
+    api_key_auto_pause_on_negative_balance_enabled: bool = False
+    upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] = "wallet"
+    upstream_balance_pause_threshold: float = 0.0
+    show_stale_negative_balance_alert: bool = True
+    priority_assign_disabled_api_key_accounts: bool = False
+    priority_share_same_composite_multiplier: bool = False
+    discord_bot_notifications_enabled: bool = False
+    discord_bot_token_set: bool = False
+    discord_bot_token_hint: str | None = None
+    discord_bot_channel_id: str = ""
+    notify_oauth_account_disabled: bool = False
+    notify_account_enabled: bool = False
+    notify_api_key_rate_changed: bool = False
+    notify_upstream_group_changed: bool = False
+    notify_upstream_balance_low: bool = False
     upstream_rate_log_retention_days: int
     usage_limit_sample_five_hour_threshold_percent: float
     usage_limit_sample_seven_day_threshold_percent: float
@@ -557,6 +598,9 @@ class AppSettingsOut(BaseModel):
     last_scan_message: str | None
     display_timezone: str
     site_name: str
+    site_logo_url: str = "/logo.png"
+    site_logo_custom: bool = False
+    site_logo_updated_at: datetime | None = None
 
 
 class AppSettingsUpdate(BaseModel):
@@ -580,7 +624,76 @@ class AppSettingsUpdate(BaseModel):
     upstream_sync_max_concurrency: int | None = Field(default=None, ge=0, le=50)
     upstream_rate_sync_enabled: bool | None = None
     upstream_priority_sync_enabled: bool | None = None
+    manual_upstream_sync_rate_enabled: bool | None = None
+    manual_upstream_sync_priority_enabled: bool | None = None
+    manual_upstream_sync_upstream_health_enabled: bool | None = None
+    manual_upstream_sync_channel_monitors_enabled: bool | None = None
+    manual_upstream_sync_account_availability_enabled: bool | None = None
+    manual_upstream_sync_balance_guard_enabled: bool | None = None
+    manual_upstream_sync_rate_pause_enabled: bool | None = None
     api_key_auto_disable_on_upstream_unavailable: bool | None = None
+    api_key_auto_pause_on_channel_monitor_unavailable_enabled: bool | None = None
+    channel_monitor_auto_probe_enabled: bool | None = None
+    account_model_whitelist_sync_enabled: bool | None = None
+    account_model_whitelist_sync_interval_seconds: int | None = Field(
+        default=None,
+        ge=60,
+        le=86_400,
+    )
+    account_model_whitelist_sync_each_time: bool | None = None
+    channel_monitor_fallback_without_monitor_enabled: bool | None = None
+    channel_monitor_fallback_test_models: list[str] | None = Field(
+        default=None,
+        max_length=10,
+    )
+    channel_monitor_fallback_test_model: str | None = Field(
+        default=None,
+        max_length=160,
+    )
+    channel_monitor_fallback_test_attempts: int | None = Field(
+        default=None,
+        ge=1,
+        le=5,
+    )
+    channel_monitor_recovery_test_attempts: int | None = Field(
+        default=None,
+        ge=1,
+        le=5,
+    )
+    api_key_auto_pause_on_upstream_rate_increase_enabled: bool | None = None
+    upstream_rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] | None = None
+    upstream_rate_increase_threshold_percent: float | None = Field(
+        default=None,
+        gt=0,
+        le=100_000,
+        allow_inf_nan=False,
+    )
+    upstream_rate_absolute_threshold: float | None = Field(
+        default=None,
+        gt=0,
+        le=1000,
+        allow_inf_nan=False,
+    )
+    api_key_auto_pause_on_negative_balance_enabled: bool | None = None
+    upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] | None = None
+    upstream_balance_pause_threshold: float | None = Field(
+        default=None,
+        ge=-1_000_000_000,
+        le=1_000_000_000,
+        allow_inf_nan=False,
+    )
+    show_stale_negative_balance_alert: bool | None = None
+    priority_assign_disabled_api_key_accounts: bool | None = None
+    priority_share_same_composite_multiplier: bool | None = None
+    discord_bot_notifications_enabled: bool | None = None
+    discord_bot_token: str | None = Field(default=None, max_length=500)
+    clear_discord_bot_token: bool = False
+    discord_bot_channel_id: str | None = Field(default=None, max_length=64, pattern=r"^[0-9]*$")
+    notify_oauth_account_disabled: bool | None = None
+    notify_account_enabled: bool | None = None
+    notify_api_key_rate_changed: bool | None = None
+    notify_upstream_group_changed: bool | None = None
+    notify_upstream_balance_low: bool | None = None
     upstream_rate_log_retention_days: int | None = Field(default=None, ge=1, le=3650)
     usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
@@ -594,6 +707,29 @@ class AppSettingsUpdate(BaseModel):
     account_liveness_max_concurrency: int | None = Field(default=None, ge=0, le=50)
     display_timezone: str | None = Field(default=None, min_length=1, max_length=80)
     site_name: str | None = Field(default=None, min_length=1, max_length=80)
+    site_logo_data_url: str | None = Field(default=None, max_length=1_500_000)
+    clear_site_logo: bool = False
+
+    @field_validator("channel_monitor_fallback_test_models")
+    @classmethod
+    def validate_channel_monitor_fallback_test_models(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            model = str(item or "").strip()
+            if not model:
+                continue
+            if len(model) > 160:
+                raise ValueError("Fallback test model ids must not exceed 160 characters.")
+            if model not in seen:
+                seen.add(model)
+                normalized.append(model)
+        return normalized
 
     @field_validator("sub2api_base_url")
     @classmethod
@@ -633,6 +769,12 @@ class Sub2ApiPortScanResult(BaseModel):
     applied: bool
 
 
+class SiteLogoUpdateResult(BaseModel):
+    site_logo_url: str | None = None
+    site_logo_updated_at: datetime | None = None
+    message: str | None = None
+
+
 class UpstreamGroupOptionOut(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=200)
@@ -644,6 +786,14 @@ class PriorityIntervalCreate(BaseModel):
     start_priority: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX - 1)
     end_priority: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
     step: int = Field(default=1, ge=1, le=JS_SAFE_INTEGER_MAX)
+    rate_pause_enabled: bool = False
+    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = "increase_percent"
+    rate_increase_threshold_percent: float = Field(
+        default=20.0, gt=0, le=100_000, allow_inf_nan=False
+    )
+    rate_absolute_threshold: float = Field(
+        default=1.0, gt=0, le=1000, allow_inf_nan=False
+    )
 
     @field_validator("name", mode="before")
     @classmethod
@@ -675,6 +825,15 @@ class PriorityIntervalAssignment(BaseModel):
     confirm_identity_rebind: bool = False
 
 
+class PriorityTieMoveRequest(BaseModel):
+    expected_identity_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    direction: Literal["up", "down"]
+
+
 class PriorityIntervalOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -683,6 +842,10 @@ class PriorityIntervalOut(BaseModel):
     start_priority: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX - 1)
     end_priority: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
     step: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    rate_pause_enabled: bool = False
+    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = "increase_percent"
+    rate_increase_threshold_percent: float = Field(gt=0, le=100_000, allow_inf_nan=False)
+    rate_absolute_threshold: float = Field(gt=0, le=1000, allow_inf_nan=False)
     account_count: int = Field(default=0, ge=0)
     effective_step: int = Field(default=1, ge=1, le=JS_SAFE_INTEGER_MAX)
     created_at: datetime | None = None
@@ -714,8 +877,27 @@ class UpstreamAccountUpdate(BaseModel):
     clear_access_token: bool = False
     confirm_credential_rebind: bool = False
     confirm_identity_rebind: bool = False
+    confirm_upstream_identity_rebind: bool = False
     manual_group_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
     manual_recharge_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
+    priority_assignment_when_disabled: bool | None = None
+    rate_pause_policy: Literal["inherit", "disabled", "custom"] = "inherit"
+    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = "increase_percent"
+    rate_increase_threshold_percent: float | None = Field(
+        default=None, gt=0, le=100_000, allow_inf_nan=False
+    )
+    rate_absolute_threshold: float | None = Field(
+        default=None, gt=0, le=1000, allow_inf_nan=False
+    )
+    availability_check_mode: Literal["channel_monitor", "independent_model", "disabled"] = (
+        "channel_monitor"
+    )
+    availability_monitor_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=JS_SAFE_INTEGER_MAX,
+    )
+    availability_test_model: str | None = Field(default=None, max_length=160)
 
     @field_validator("remote_name", mode="before")
     @classmethod
@@ -733,6 +915,7 @@ class UpstreamAccountUpdate(BaseModel):
         "selected_group_name",
         "api_key",
         "access_token",
+        "availability_test_model",
         mode="before",
     )
     @classmethod
@@ -765,6 +948,7 @@ class UpstreamChannelUpdate(BaseModel):
     clear_refresh_token: bool = False
     confirm_credential_rebind: bool = False
     manual_recharge_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
+    channel_monitor_test_models: dict[str, str] | None = None
 
     @field_validator(
         "display_name",
@@ -791,6 +975,29 @@ class UpstreamChannelUpdate(BaseModel):
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 
+    @field_validator("channel_monitor_test_models", mode="before")
+    @classmethod
+    def validate_channel_monitor_test_models(
+        cls,
+        value: Any,
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict) or len(value) > 100:
+            raise ValueError("channel_monitor_test_models must contain at most 100 entries")
+        normalized: dict[str, str] = {}
+        for raw_id, raw_model in value.items():
+            monitor_id = str(raw_id).strip()
+            if not monitor_id.isdigit() or int(monitor_id) < 1:
+                raise ValueError("channel monitor ids must be positive integers")
+            model = str(raw_model or "").strip()
+            if not model:
+                continue
+            if len(model) > 160:
+                raise ValueError("channel monitor test models must not exceed 160 characters")
+            normalized[str(int(monitor_id))] = model
+        return normalized
+
 
 class UpstreamLegacyIdentityBinding(BaseModel):
     sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
@@ -807,6 +1014,7 @@ class UpstreamChannelDiscoverAllRequest(BaseModel):
         default_factory=list,
         max_length=10_000,
     )
+    skip_channel_ids: list[int] = Field(default_factory=list, max_length=10_000)
 
     @field_validator("account_bindings")
     @classmethod
@@ -817,6 +1025,15 @@ class UpstreamChannelDiscoverAllRequest(BaseModel):
         account_ids = [item.sub2api_account_id for item in value]
         if len(account_ids) != len(set(account_ids)):
             raise ValueError("account_bindings must contain unique sub2api account ids")
+        return value
+
+    @field_validator("skip_channel_ids")
+    @classmethod
+    def validate_skip_channel_ids(cls, value: list[int]) -> list[int]:
+        if any(isinstance(item, bool) or item < 1 or item > JS_SAFE_INTEGER_MAX for item in value):
+            raise ValueError("skip_channel_ids must contain positive safe integer channel ids")
+        if len(value) != len(set(value)):
+            raise ValueError("skip_channel_ids must contain unique channel ids")
         return value
 
 class UpstreamApplyRequest(BaseModel):
@@ -852,6 +1069,10 @@ class UpstreamRateChangeLogOut(BaseModel):
     channel_name: str | None = None
     group_id: str | None = None
     group_name: str | None = None
+    old_group_id: str | None = None
+    new_group_id: str | None = None
+    old_group_name: str | None = None
+    new_group_name: str | None = None
     old_group_multiplier: float | None = None
     new_group_multiplier: float | None = None
     old_upstream_multiplier: float | None = None
@@ -876,12 +1097,101 @@ class UpstreamRateChangeLogOut(BaseModel):
     created_at: datetime
 
 
+class UpstreamChannelChangeEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_name: str | None = None
+    event_type: Literal[
+        "channel_multiplier_changed",
+        "group_multiplier_changed",
+        "group_removed",
+        "group_added",
+        "group_name_changed",
+        "account_rate_changed",
+        "upstream_key_status_changed",
+        "upstream_group_status_changed",
+    ]
+    group_id: str | None = None
+    group_name: str | None = None
+    old_value: float | None = None
+    new_value: float | None = None
+    old_status: str | None = None
+    new_status: str | None = None
+    details: dict[str, Any] | None = None
+    created_at: datetime
+    unread: bool = False
+
+
+class AccountSchedulingChangeLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    account_name: str | None = None
+    channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_name: str | None = None
+    event_type: Literal["paused", "restored", "pause_failed", "restore_failed"]
+    reason: str | None = None
+    active_reasons: list[str] = Field(default_factory=list)
+    evidence: dict[str, Any] | None = None
+    old_schedulable: bool | None = None
+    new_schedulable: bool | None = None
+    status: str
+    safe_error: str | None = None
+    created_at: datetime
+    unread: bool = False
+
+
+class UpstreamChannelChangePageOut(BaseModel):
+    items: list[UpstreamChannelChangeEventOut] = Field(default_factory=list)
+    unread_count: int = Field(default=0, ge=0)
+    last_read_id: int = Field(default=0, ge=0, le=JS_SAFE_INTEGER_MAX)
+
+
+class AccountSchedulingChangePageOut(BaseModel):
+    items: list[AccountSchedulingChangeLogOut] = Field(default_factory=list)
+    unread_count: int = Field(default=0, ge=0)
+    last_read_id: int = Field(default=0, ge=0, le=JS_SAFE_INTEGER_MAX)
+
+
+class ChangeLogUnreadCountsOut(BaseModel):
+    upstream_changes: int = Field(default=0, ge=0)
+    account_rate_changes: int = Field(default=0, ge=0)
+    account_scheduling_changes: int = Field(default=0, ge=0)
+
+
+class ChangeLogMarkReadRequest(BaseModel):
+    through_id: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX)
+
+
+class UpstreamAccountPauseHoldOut(BaseModel):
+    reason: Literal[
+        "upstream_balance_negative",
+        "upstream_key_unavailable",
+        "upstream_group_unavailable",
+        "channel_monitor_unavailable",
+        "upstream_rate_increase",
+    ]
+    triggered_at: datetime | None = None
+    recovery_mode: str | None = None
+    scope_channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    evidence: dict[str, Any] | None = None
+
+
 class UpstreamAccountOut(BaseModel):
     sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
     identity_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     identity_binding_status: Literal["unmanaged", "unbound", "bound", "mismatch"] = "unmanaged"
     identity_rebind_required: bool = False
     api_key_origin_rebind_required: bool = False
+    upstream_identity_rebind_required: bool = False
+    upstream_api_key_record_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=JS_SAFE_INTEGER_MAX,
+    )
     channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
     channel_name: str | None = None
     remote_name: str
@@ -890,11 +1200,24 @@ class UpstreamAccountOut(BaseModel):
     remote_status: str | None = None
     remote_schedulable: bool | None = None
     priority: int | None = Field(default=None, ge=0, le=JS_SAFE_INTEGER_MAX)
+    remote_present: bool = True
+    remote_snapshot_updated_at: datetime | None = None
+    remote_missing_at: datetime | None = None
     desired_priority: int | None = Field(default=None, ge=0, le=JS_SAFE_INTEGER_MAX)
     priority_interval_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
     priority_interval_name: str | None = None
     priority_sync_status: str = "unassigned"
     priority_sync_error: str | None = None
+    priority_tiebreak_order: int | None = Field(default=None, ge=0, le=JS_SAFE_INTEGER_MAX)
+    priority_tiebreak_multiplier: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    priority_assignment_when_disabled: bool | None = None
+    priority_assignment_when_disabled_effective: bool = False
+    rate_pause_policy: Literal["inherit", "disabled", "custom"] = "inherit"
+    rate_pause_effective_enabled: bool = False
+    rate_pause_effective_source: Literal["account", "priority_interval", "disabled"] = "disabled"
+    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] | None = None
+    rate_increase_threshold_percent: float | None = None
+    rate_absolute_threshold: float | None = None
     composite_multiplier: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     managed: bool
     base_url: str | None = None
@@ -908,8 +1231,35 @@ class UpstreamAccountOut(BaseModel):
     upstream_health_invalid_count: int = Field(default=0, ge=0, le=2)
     upstream_key_checked_at: datetime | None = None
     upstream_group_checked_at: datetime | None = None
+    availability_check_mode: Literal["channel_monitor", "independent_model", "disabled"] = (
+        "channel_monitor"
+    )
+    availability_monitor_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=JS_SAFE_INTEGER_MAX,
+    )
+    availability_test_model: str | None = None
+    available_models: list[AccountLivenessModelOut] = Field(default_factory=list)
+    available_models_status: str = "not_checked"
+    available_models_checked_at: datetime | None = None
+    availability_status: str = "not_checked"
+    availability_unavailable_count: int = Field(default=0, ge=0, le=100)
+    availability_recovery_count: int = Field(default=0, ge=0, le=100)
+    availability_checked_at: datetime | None = None
+    availability_source: str | None = None
+    availability_message: str | None = None
     auto_disabled_reason: str | None = None
     last_auto_disabled_at: datetime | None = None
+    active_pause_holds: list[UpstreamAccountPauseHoldOut] = Field(default_factory=list)
+    pause_owned_by_plugin: bool = False
+    auto_restore_eligible: bool = False
+    auto_pause_episode_id: str | None = None
+    auto_pause_channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    auto_paused_at: datetime | None = None
+    balance_guard_restore_eligible: bool = False
+    balance_guard_channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    balance_guard_paused_at: datetime | None = None
     api_key_set: bool = False
     api_key_hint: str | None = None
     access_token_set: bool = False
@@ -935,11 +1285,17 @@ class UpstreamAccountOut(BaseModel):
     balance_used: float | None = None
     balance_unit: str | None = None
     balance_status: str | None = None
+    balance_source: str | None = None
     balance_message: str | None = None
     balance_checked_at: datetime | None = None
     upstream_usage_amount: float | None = None
     upstream_usage_unit: str | None = None
     upstream_usage_checked_at: datetime | None = None
+    today_upstream_usage_amount: float | None = None
+    today_upstream_usage_unit: str | None = None
+    today_upstream_usage_status: str = "not_checked"
+    today_upstream_usage_source: str | None = None
+    today_upstream_usage_checked_at: datetime | None = None
     last_error: str | None = None
     last_discovered_at: datetime | None = None
     last_applied_at: datetime | None = None
@@ -947,8 +1303,27 @@ class UpstreamAccountOut(BaseModel):
     updated_at: datetime | None = None
 
 
+class UpstreamAccountAvailabilityTestOut(BaseModel):
+    account: UpstreamAccountOut
+    policy_action: Literal["hold", "clear"] | None = None
+    policy_status: str | None = None
+    policy_error: str | None = None
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpstreamAccountConnectionTestOut(BaseModel):
+    """Result of an explicitly requested direct Sub2API connection test."""
+
+    account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    success: bool
+    model: str
+    error: str | None = None
+    attempts: int = Field(default=1, ge=1, le=1)
+
+
 class UpstreamChannelOut(BaseModel):
     id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    background_discovery_pending: bool = False
     display_name: str
     canonical_base_url: str
     base_url: str
@@ -970,8 +1345,15 @@ class UpstreamChannelOut(BaseModel):
     balance_used: float | None = None
     balance_unit: str | None = None
     balance_status: str | None = None
+    balance_source: str | None = None
     balance_message: str | None = None
     balance_checked_at: datetime | None = None
+    recharge_adjusted_balance: float | None = None
+    balance_guard_state: str = "not_checked"
+    balance_guard_basis: str | None = None
+    balance_guard_value: float | None = None
+    balance_guard_checked_at: datetime | None = None
+    balance_guard_paused_count: int = Field(default=0, ge=0)
     today_balance_used: float | None = None
     today_balance_unit: str | None = None
     today_balance_status: str | None = None
@@ -980,12 +1362,31 @@ class UpstreamChannelOut(BaseModel):
     yesterday_balance_unit: str | None = None
     yesterday_balance_status: str | None = None
     yesterday_balance_checked_at: datetime | None = None
+    channel_monitors: list[dict[str, Any]] = Field(default_factory=list)
+    channel_monitor_test_models: dict[str, str] = Field(default_factory=dict)
+    channel_monitor_count: int = Field(default=0, ge=0)
+    channel_monitor_status: str = "not_checked"
+    channel_monitor_message: str | None = None
+    channel_monitor_checked_at: datetime | None = None
+    channel_monitor_guard_state: str = "not_checked"
+    channel_monitor_unavailable_count: int = Field(default=0, ge=0, le=100)
+    channel_monitor_recovery_count: int = Field(default=0, ge=0, le=100)
+    channel_monitor_guard_checked_at: datetime | None = None
     last_error: str | None = None
     last_discovered_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     account_count: int = Field(default=0, ge=0)
     accounts: list["UpstreamAccountOut"] = Field(default_factory=list)
+
+
+class UpstreamChannelMonitorsOut(BaseModel):
+    channel_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_monitors: list[dict[str, Any]] = Field(default_factory=list)
+    channel_monitor_count: int = Field(default=0, ge=0)
+    channel_monitor_status: str = "not_checked"
+    channel_monitor_message: str | None = None
+    channel_monitor_checked_at: datetime | None = None
 
 
 class UpstreamOverviewOut(BaseModel):

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
+from io import BytesIO
 import json
 import re
 from dataclasses import dataclass
@@ -11,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +30,7 @@ from app.core.sub2api_urls import (
     replace_sub2api_port,
 )
 from app.services.upstream_rate_logs import delete_expired_upstream_rate_change_logs
+from app.services.change_logs import delete_expired_change_logs
 
 
 KEY_SUB2API_BASE_URL = "sub2api_base_url"
@@ -43,9 +49,74 @@ KEY_UPSTREAM_SYNC_INTERVAL_SECONDS = "upstream_sync_interval_seconds"
 KEY_UPSTREAM_SYNC_MAX_CONCURRENCY = "upstream_sync_max_concurrency"
 KEY_UPSTREAM_RATE_SYNC_ENABLED = "upstream_rate_sync_enabled"
 KEY_UPSTREAM_PRIORITY_SYNC_ENABLED = "upstream_priority_sync_enabled"
+KEY_MANUAL_UPSTREAM_SYNC_RATE_ENABLED = "manual_upstream_sync_rate_enabled"
+KEY_MANUAL_UPSTREAM_SYNC_PRIORITY_ENABLED = "manual_upstream_sync_priority_enabled"
+KEY_MANUAL_UPSTREAM_SYNC_UPSTREAM_HEALTH_ENABLED = (
+    "manual_upstream_sync_upstream_health_enabled"
+)
+KEY_MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED = (
+    "manual_upstream_sync_channel_monitors_enabled"
+)
+KEY_MANUAL_UPSTREAM_SYNC_ACCOUNT_AVAILABILITY_ENABLED = (
+    "manual_upstream_sync_account_availability_enabled"
+)
+KEY_MANUAL_UPSTREAM_SYNC_BALANCE_GUARD_ENABLED = (
+    "manual_upstream_sync_balance_guard_enabled"
+)
+KEY_MANUAL_UPSTREAM_SYNC_RATE_PAUSE_ENABLED = (
+    "manual_upstream_sync_rate_pause_enabled"
+)
 KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE = (
     "api_key_auto_disable_on_upstream_unavailable"
 )
+KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED = (
+    "api_key_auto_pause_on_channel_monitor_unavailable_enabled"
+)
+KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED = "channel_monitor_auto_probe_enabled"
+KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED = "account_model_whitelist_sync_enabled"
+KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS = "account_model_whitelist_sync_interval_seconds"
+KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME = "account_model_whitelist_sync_each_time"
+KEY_CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD = (
+    "channel_monitor_unavailable_consecutive_threshold"
+)
+KEY_CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD = (
+    "channel_monitor_recovery_consecutive_threshold"
+)
+KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED = (
+    "channel_monitor_fallback_without_monitor_enabled"
+)
+KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS = "channel_monitor_fallback_test_models"
+KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL = "channel_monitor_fallback_test_model"
+KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS = "channel_monitor_fallback_test_attempts"
+KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS = "channel_monitor_recovery_test_attempts"
+KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED = (
+    "api_key_auto_pause_on_upstream_rate_increase_enabled"
+)
+KEY_UPSTREAM_RATE_PAUSE_MODE = "upstream_rate_pause_mode"
+KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT = (
+    "upstream_rate_increase_threshold_percent"
+)
+KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD = "upstream_rate_absolute_threshold"
+KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED = (
+    "api_key_auto_pause_on_negative_balance_enabled"
+)
+KEY_UPSTREAM_NEGATIVE_BALANCE_BASIS = "upstream_negative_balance_basis"
+KEY_UPSTREAM_BALANCE_PAUSE_THRESHOLD = "upstream_balance_pause_threshold"
+KEY_SHOW_STALE_NEGATIVE_BALANCE_ALERT = "show_stale_negative_balance_alert"
+KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS = (
+    "priority_assign_disabled_api_key_accounts"
+)
+KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER = (
+    "priority_share_same_composite_multiplier"
+)
+KEY_DISCORD_BOT_NOTIFICATIONS_ENABLED = "discord_bot_notifications_enabled"
+KEY_DISCORD_BOT_TOKEN = "discord_bot_token"
+KEY_DISCORD_BOT_CHANNEL_ID = "discord_bot_channel_id"
+KEY_NOTIFY_OAUTH_ACCOUNT_DISABLED = "notify_oauth_account_disabled"
+KEY_NOTIFY_ACCOUNT_ENABLED = "notify_account_enabled"
+KEY_NOTIFY_API_KEY_RATE_CHANGED = "notify_api_key_rate_changed"
+KEY_NOTIFY_UPSTREAM_GROUP_CHANGED = "notify_upstream_group_changed"
+KEY_NOTIFY_UPSTREAM_BALANCE_LOW = "notify_upstream_balance_low"
 KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS = "upstream_rate_log_retention_days"
 KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
@@ -63,10 +134,16 @@ KEY_LAST_SCAN_STATUS = "sub2api_last_scan_status"
 KEY_LAST_SCAN_MESSAGE = "sub2api_last_scan_message"
 KEY_DISPLAY_TIMEZONE = "display_timezone"
 KEY_SITE_NAME = "site_name"
+KEY_SITE_LOGO_DATA = "site_logo_data"
+KEY_SITE_LOGO_MIME = "site_logo_mime"
+KEY_SITE_LOGO_UPDATED_AT = "site_logo_updated_at"
 KEY_AUTOMATION_PAUSED = "automation_paused"
 
 MAX_CONFIGURED_PROBE_RESPONSE_BYTES = 512 * 1024
 COMMON_SUB2API_PORTS = (8080, 18080, 18090)
+MAX_SITE_LOGO_BYTES = 1024 * 1024
+MAX_SITE_LOGO_DIMENSION = 2048
+MAX_SITE_LOGO_PIXELS = MAX_SITE_LOGO_DIMENSION * MAX_SITE_LOGO_DIMENSION
 
 
 class RuntimeConfigServiceError(RuntimeError):
@@ -234,6 +311,312 @@ class RuntimeConfigService:
             self.settings.api_key_auto_disable_on_upstream_unavailable,
         )
 
+    async def get_api_key_auto_pause_on_channel_monitor_unavailable_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED),
+            bool(
+                getattr(
+                    self.settings,
+                    "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                    False,
+                )
+            ),
+        )
+
+    async def get_channel_monitor_auto_probe_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED),
+            bool(getattr(self.settings, "channel_monitor_auto_probe_enabled", True)),
+        )
+
+    async def get_account_model_whitelist_sync_enabled(self) -> bool:
+        values = await self._load_values()
+        legacy_value = _bool_or_default(
+            values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME),
+            bool(getattr(self.settings, "account_model_whitelist_sync_each_time", False)),
+        )
+        configured_default = bool(
+            getattr(self.settings, "account_model_whitelist_sync_enabled", False)
+        )
+        if KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED not in values:
+            configured_default = legacy_value
+        return _bool_or_default(
+            values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED),
+            configured_default,
+        )
+
+    async def get_account_model_whitelist_sync_interval_seconds(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS),
+            int(getattr(self.settings, "account_model_whitelist_sync_interval_seconds", 3600)),
+            60,
+            86_400,
+        )
+
+    async def get_account_model_whitelist_sync_each_time(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME),
+            bool(getattr(self.settings, "account_model_whitelist_sync_each_time", False)),
+        )
+
+    async def get_channel_monitor_unavailable_consecutive_threshold(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD),
+            int(
+                getattr(
+                    self.settings,
+                    "channel_monitor_unavailable_consecutive_threshold",
+                    2,
+                )
+            ),
+            1,
+            100,
+        )
+
+    async def get_channel_monitor_recovery_consecutive_threshold(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD),
+            int(
+                getattr(
+                    self.settings,
+                    "channel_monitor_recovery_consecutive_threshold",
+                    2,
+                )
+            ),
+            1,
+            100,
+        )
+
+    async def get_channel_monitor_fallback_test_model(self) -> str:
+        models = await self.get_channel_monitor_fallback_test_models()
+        return models[0] if models else ""
+
+    async def get_channel_monitor_fallback_without_monitor_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED),
+            bool(
+                getattr(
+                    self.settings,
+                    "channel_monitor_fallback_without_monitor_enabled",
+                    False,
+                )
+            ),
+        )
+
+    async def get_channel_monitor_fallback_test_models(self) -> list[str]:
+        values = await self._load_values()
+        stored = values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS)
+        configured = getattr(self.settings, "channel_monitor_fallback_test_models", [])
+        models = _normalize_model_chain(stored if stored is not None else configured)
+        if models:
+            return models
+        legacy = (
+            values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL)
+            or getattr(self.settings, "channel_monitor_fallback_test_model", "")
+            or ""
+        )
+        return _normalize_model_chain(legacy)
+
+    async def get_channel_monitor_fallback_test_attempts(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS),
+            int(getattr(self.settings, "channel_monitor_fallback_test_attempts", 1)),
+            1,
+            5,
+        )
+
+    async def get_channel_monitor_recovery_test_attempts(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS),
+            int(getattr(self.settings, "channel_monitor_recovery_test_attempts", 1)),
+            1,
+            5,
+        )
+
+    async def get_api_key_auto_pause_on_upstream_rate_increase_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED),
+            bool(
+                getattr(
+                    self.settings,
+                    "api_key_auto_pause_on_upstream_rate_increase_enabled",
+                    False,
+                )
+            ),
+        )
+
+    async def get_upstream_rate_increase_threshold_percent(self) -> float:
+        values = await self._load_values()
+        return _positive_bounded_float_or_default(
+            values.get(KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT),
+            float(
+                getattr(
+                    self.settings,
+                    "upstream_rate_increase_threshold_percent",
+                    20.0,
+                )
+            ),
+            100_000.0,
+        )
+
+    async def get_upstream_rate_pause_mode(self) -> str:
+        values = await self._load_values()
+        value = str(
+            values.get(KEY_UPSTREAM_RATE_PAUSE_MODE)
+            or getattr(self.settings, "upstream_rate_pause_mode", "increase_percent")
+        ).strip()
+        return value if value in {"increase_percent", "absolute_multiplier"} else "increase_percent"
+
+    async def get_upstream_rate_absolute_threshold(self) -> float:
+        values = await self._load_values()
+        return _positive_bounded_float_or_default(
+            values.get(KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD),
+            float(getattr(self.settings, "upstream_rate_absolute_threshold", 1.0)),
+            1000.0,
+        )
+
+    async def get_api_key_auto_pause_on_negative_balance_enabled(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED),
+            bool(getattr(self.settings, "api_key_auto_pause_on_negative_balance_enabled", False)),
+        )
+
+    async def get_upstream_negative_balance_basis(self) -> str:
+        values = await self._load_values()
+        value = str(
+            values.get(KEY_UPSTREAM_NEGATIVE_BALANCE_BASIS)
+            or getattr(self.settings, "upstream_negative_balance_basis", "wallet")
+        ).strip()
+        return value if value in {"wallet", "recharge_adjusted"} else "wallet"
+
+    async def get_upstream_balance_pause_threshold(self) -> float:
+        values = await self._load_values()
+        return _bounded_float_or_default(
+            values.get(KEY_UPSTREAM_BALANCE_PAUSE_THRESHOLD),
+            float(getattr(self.settings, "upstream_balance_pause_threshold", 0.0)),
+            -1_000_000_000.0,
+            1_000_000_000.0,
+        )
+
+    async def get_show_stale_negative_balance_alert(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_SHOW_STALE_NEGATIVE_BALANCE_ALERT),
+            bool(getattr(self.settings, "show_stale_negative_balance_alert", True)),
+        )
+
+    async def get_priority_assign_disabled_api_key_accounts(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS),
+            bool(getattr(self.settings, "priority_assign_disabled_api_key_accounts", False)),
+        )
+
+    async def get_priority_share_same_composite_multiplier(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER),
+            bool(
+                getattr(
+                    self.settings,
+                    "priority_share_same_composite_multiplier",
+                    False,
+                )
+            ),
+        )
+
+    async def get_notification_config(self) -> dict[str, Any]:
+        values = await self._load_values()
+        if KEY_DISCORD_BOT_TOKEN in values:
+            token = decrypt_text(values.get(KEY_DISCORD_BOT_TOKEN)) or ""
+        else:
+            token = str(getattr(self.settings, "discord_bot_token", "") or "").strip()
+        account_disabled_enabled = _bool_or_default(
+            values.get(KEY_NOTIFY_OAUTH_ACCOUNT_DISABLED),
+            bool(getattr(self.settings, "notify_oauth_account_disabled", False)),
+        )
+        return {
+            "enabled": _bool_or_default(
+                values.get(KEY_DISCORD_BOT_NOTIFICATIONS_ENABLED),
+                bool(getattr(self.settings, "discord_bot_notifications_enabled", False)),
+            ),
+            "oauth_account_disabled_enabled": account_disabled_enabled,
+            "account_disabled_enabled": account_disabled_enabled,
+            "account_enabled_enabled": _bool_or_default(
+                values.get(KEY_NOTIFY_ACCOUNT_ENABLED),
+                bool(getattr(self.settings, "notify_account_enabled", False)),
+            ),
+            "api_key_rate_changed_enabled": _bool_or_default(
+                values.get(KEY_NOTIFY_API_KEY_RATE_CHANGED),
+                bool(getattr(self.settings, "notify_api_key_rate_changed", False)),
+            ),
+            "upstream_group_changed_enabled": _bool_or_default(
+                values.get(KEY_NOTIFY_UPSTREAM_GROUP_CHANGED),
+                _bool_or_default(
+                    values.get(KEY_NOTIFY_API_KEY_RATE_CHANGED),
+                    bool(getattr(self.settings, "notify_upstream_group_changed", False)),
+                ),
+            ),
+            "upstream_balance_low_enabled": _bool_or_default(
+                values.get(KEY_NOTIFY_UPSTREAM_BALANCE_LOW),
+                bool(getattr(self.settings, "notify_upstream_balance_low", False)),
+            ),
+            "discord_bot_token": token,
+            "discord_channel_id": (
+                values.get(KEY_DISCORD_BOT_CHANNEL_ID)
+                if KEY_DISCORD_BOT_CHANNEL_ID in values
+                else getattr(self.settings, "discord_bot_channel_id", "")
+            ) or "",
+        }
+
+    async def get_site_logo(self) -> tuple[bytes, str] | None:
+        values = await self._load_values()
+        encoded = values.get(KEY_SITE_LOGO_DATA)
+        mime = values.get(KEY_SITE_LOGO_MIME)
+        if not encoded or mime not in {"image/png", "image/jpeg", "image/webp"}:
+            return None
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            return None
+        if not _valid_logo_bytes(raw, mime):
+            return None
+        return raw, mime
+
+    async def set_site_logo(self, raw: bytes, mime: str) -> dict[str, Any]:
+        normalized_mime = mime.split(";", 1)[0].strip().lower()
+        if normalized_mime not in {"image/png", "image/jpeg", "image/webp"}:
+            raise RuntimeConfigServiceError(
+                "The site logo must be a PNG, JPEG, or WebP image."
+            )
+        raw = _normalize_logo_bytes(raw, normalized_mime)
+        updated_at = utcnow().isoformat()
+        async with AsyncSessionLocal() as db:
+            await self._put(db, KEY_SITE_LOGO_DATA, base64.b64encode(raw).decode("ascii"))
+            await self._put(db, KEY_SITE_LOGO_MIME, normalized_mime)
+            await self._put(db, KEY_SITE_LOGO_UPDATED_AT, updated_at)
+            await db.commit()
+        return await self.get_public_settings()
+
+    async def clear_site_logo(self) -> dict[str, Any]:
+        async with AsyncSessionLocal() as db:
+            await self._put(db, KEY_SITE_LOGO_DATA, None)
+            await self._put(db, KEY_SITE_LOGO_MIME, None)
+            await self._put(db, KEY_SITE_LOGO_UPDATED_AT, None)
+            await db.commit()
+        return await self.get_public_settings()
+
     async def get_upstream_rate_log_retention_days(self) -> int:
         values = await self._load_values()
         return _bounded_int_or_default(
@@ -324,6 +707,9 @@ class RuntimeConfigService:
         runtime_key = decrypt_text(values.get(KEY_SUB2API_X_API_KEY))
         env_x_api_key = self._env_x_api_key()
         effective_x_api_key = runtime_key if KEY_SUB2API_X_API_KEY in values else env_x_api_key
+        notification = await self.get_notification_config()
+        logo_data = values.get(KEY_SITE_LOGO_DATA)
+        logo_version = hashlib.sha256(logo_data.encode("ascii")).hexdigest()[:12] if logo_data else None
         return {
             "sub2api_base_url": base_url,
             "sub2api_port": _port_from_url(base_url),
@@ -403,10 +789,247 @@ class RuntimeConfigService:
                 values.get(KEY_UPSTREAM_PRIORITY_SYNC_ENABLED),
                 self.settings.upstream_priority_sync_enabled,
             ),
+            "manual_upstream_sync_rate_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_SYNC_RATE_ENABLED),
+                bool(getattr(self.settings, "manual_upstream_sync_rate_enabled", True)),
+            ),
+            "manual_upstream_sync_priority_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_SYNC_PRIORITY_ENABLED),
+                bool(getattr(self.settings, "manual_upstream_sync_priority_enabled", True)),
+            ),
+            "manual_upstream_sync_upstream_health_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_SYNC_UPSTREAM_HEALTH_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "manual_upstream_sync_upstream_health_enabled",
+                        True,
+                    )
+                ),
+            ),
+            "manual_upstream_sync_channel_monitors_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "manual_upstream_sync_channel_monitors_enabled",
+                        True,
+                    )
+                ),
+            ),
+            "manual_upstream_sync_account_availability_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_SYNC_ACCOUNT_AVAILABILITY_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "manual_upstream_sync_account_availability_enabled",
+                        False,
+                    )
+                ),
+            ),
+            "manual_upstream_sync_balance_guard_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_SYNC_BALANCE_GUARD_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "manual_upstream_sync_balance_guard_enabled",
+                        True,
+                    )
+                ),
+            ),
+            "manual_upstream_sync_rate_pause_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_SYNC_RATE_PAUSE_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "manual_upstream_sync_rate_pause_enabled",
+                        True,
+                    )
+                ),
+            ),
             "api_key_auto_disable_on_upstream_unavailable": _bool_or_default(
                 values.get(KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE),
                 self.settings.api_key_auto_disable_on_upstream_unavailable,
             ),
+            "api_key_auto_pause_on_channel_monitor_unavailable_enabled": _bool_or_default(
+                values.get(KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                        False,
+                    )
+                ),
+            ),
+            "channel_monitor_auto_probe_enabled": _bool_or_default(
+                values.get(KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED),
+                bool(getattr(self.settings, "channel_monitor_auto_probe_enabled", True)),
+            ),
+            "account_model_whitelist_sync_enabled": _bool_or_default(
+                values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED),
+                (
+                    _bool_or_default(
+                        values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME),
+                        bool(getattr(self.settings, "account_model_whitelist_sync_each_time", False)),
+                    )
+                    if KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED not in values
+                    else bool(getattr(self.settings, "account_model_whitelist_sync_enabled", False))
+                ),
+            ),
+            "account_model_whitelist_sync_interval_seconds": _bounded_int_or_default(
+                values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS),
+                int(getattr(self.settings, "account_model_whitelist_sync_interval_seconds", 3600)),
+                60,
+                86_400,
+            ),
+            "account_model_whitelist_sync_each_time": _bool_or_default(
+                values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME),
+                bool(
+                    getattr(
+                        self.settings,
+                        "account_model_whitelist_sync_each_time",
+                        False,
+                    )
+                ),
+            ),
+            "channel_monitor_unavailable_consecutive_threshold": _bounded_int_or_default(
+                values.get(KEY_CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD),
+                int(
+                    getattr(
+                        self.settings,
+                        "channel_monitor_unavailable_consecutive_threshold",
+                        2,
+                    )
+                ),
+                1,
+                100,
+            ),
+            "channel_monitor_recovery_consecutive_threshold": _bounded_int_or_default(
+                values.get(KEY_CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD),
+                int(
+                    getattr(
+                        self.settings,
+                        "channel_monitor_recovery_consecutive_threshold",
+                        2,
+                    )
+                ),
+                1,
+                100,
+            ),
+            "channel_monitor_fallback_without_monitor_enabled": _bool_or_default(
+                values.get(KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "channel_monitor_fallback_without_monitor_enabled",
+                        False,
+                    )
+                ),
+            ),
+            "channel_monitor_fallback_test_models": _normalize_model_chain(
+                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS)
+                if values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS) is not None
+                else getattr(self.settings, "channel_monitor_fallback_test_models", [])
+            ) or _normalize_model_chain(
+                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL)
+                or getattr(self.settings, "channel_monitor_fallback_test_model", "")
+                or ""
+            ),
+            "channel_monitor_fallback_test_model": str(
+                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL)
+                or getattr(self.settings, "channel_monitor_fallback_test_model", "")
+                or ""
+            ).strip()[:160],
+            "channel_monitor_fallback_test_attempts": _bounded_int_or_default(
+                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS),
+                int(getattr(self.settings, "channel_monitor_fallback_test_attempts", 1)),
+                1,
+                5,
+            ),
+            "channel_monitor_recovery_test_attempts": _bounded_int_or_default(
+                values.get(KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS),
+                int(getattr(self.settings, "channel_monitor_recovery_test_attempts", 1)),
+                1,
+                5,
+            ),
+            "api_key_auto_pause_on_upstream_rate_increase_enabled": _bool_or_default(
+                values.get(KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "api_key_auto_pause_on_upstream_rate_increase_enabled",
+                        False,
+                    )
+                ),
+            ),
+            "upstream_rate_pause_mode": (
+                values.get(KEY_UPSTREAM_RATE_PAUSE_MODE)
+                if values.get(KEY_UPSTREAM_RATE_PAUSE_MODE)
+                in {"increase_percent", "absolute_multiplier"}
+                else getattr(self.settings, "upstream_rate_pause_mode", "increase_percent")
+            ),
+            "upstream_rate_increase_threshold_percent": _positive_bounded_float_or_default(
+                values.get(KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT),
+                float(
+                    getattr(
+                        self.settings,
+                        "upstream_rate_increase_threshold_percent",
+                        20.0,
+                    )
+                ),
+                100_000.0,
+            ),
+            "upstream_rate_absolute_threshold": _positive_bounded_float_or_default(
+                values.get(KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD),
+                float(getattr(self.settings, "upstream_rate_absolute_threshold", 1.0)),
+                1000.0,
+            ),
+            "api_key_auto_pause_on_negative_balance_enabled": _bool_or_default(
+                values.get(KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED),
+                bool(getattr(self.settings, "api_key_auto_pause_on_negative_balance_enabled", False)),
+            ),
+            "upstream_negative_balance_basis": (
+                values.get(KEY_UPSTREAM_NEGATIVE_BALANCE_BASIS)
+                if values.get(KEY_UPSTREAM_NEGATIVE_BALANCE_BASIS) in {"wallet", "recharge_adjusted"}
+                else getattr(self.settings, "upstream_negative_balance_basis", "wallet")
+            ),
+            "upstream_balance_pause_threshold": _bounded_float_or_default(
+                values.get(KEY_UPSTREAM_BALANCE_PAUSE_THRESHOLD),
+                float(getattr(self.settings, "upstream_balance_pause_threshold", 0.0)),
+                -1_000_000_000.0,
+                1_000_000_000.0,
+            ),
+            "show_stale_negative_balance_alert": _bool_or_default(
+                values.get(KEY_SHOW_STALE_NEGATIVE_BALANCE_ALERT),
+                bool(getattr(self.settings, "show_stale_negative_balance_alert", True)),
+            ),
+            "priority_assign_disabled_api_key_accounts": _bool_or_default(
+                values.get(KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS),
+                bool(getattr(self.settings, "priority_assign_disabled_api_key_accounts", False)),
+            ),
+            "priority_share_same_composite_multiplier": _bool_or_default(
+                values.get(KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER),
+                bool(
+                    getattr(
+                        self.settings,
+                        "priority_share_same_composite_multiplier",
+                        False,
+                    )
+                ),
+            ),
+            "discord_bot_notifications_enabled": notification["enabled"],
+            "discord_bot_token_set": bool(notification["discord_bot_token"]),
+            "discord_bot_token_hint": (
+                redact(notification["discord_bot_token"])
+                if notification["discord_bot_token"]
+                else None
+            ),
+            "discord_bot_channel_id": notification["discord_channel_id"],
+            "notify_oauth_account_disabled": notification["oauth_account_disabled_enabled"],
+            "notify_account_enabled": notification["account_enabled_enabled"],
+            "notify_api_key_rate_changed": notification["api_key_rate_changed_enabled"],
+            "notify_upstream_group_changed": notification["upstream_group_changed_enabled"],
+            "notify_upstream_balance_low": notification["upstream_balance_low_enabled"],
             "upstream_rate_log_retention_days": _bounded_int_or_default(
                 values.get(KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS),
                 self.settings.upstream_rate_log_retention_days,
@@ -471,9 +1094,24 @@ class RuntimeConfigService:
             "last_scan_message": values.get(KEY_LAST_SCAN_MESSAGE),
             "display_timezone": _clean_timezone(values.get(KEY_DISPLAY_TIMEZONE) or self.settings.display_timezone),
             "site_name": _clean_site_name(values.get(KEY_SITE_NAME) or self.settings.app_name, self.settings.app_name),
+            "site_logo_url": f"/api/settings/logo?v={logo_version}" if logo_version else "/logo.png",
+            "site_logo_custom": bool(logo_version),
+            "site_logo_updated_at": _datetime_or_none(
+                values.get(KEY_SITE_LOGO_UPDATED_AT)
+            ),
         }
 
     async def update_public_settings(self, payload: dict) -> dict:
+        if payload.get("clear_discord_bot_token") and str(
+            payload.get("discord_bot_token") or ""
+        ).strip():
+            raise RuntimeConfigServiceError(
+                "A Discord bot token cannot be set and cleared in the same request."
+            )
+        if payload.get("clear_site_logo") and payload.get("site_logo_data_url"):
+            raise RuntimeConfigServiceError(
+                "A site logo cannot be set and cleared in the same request."
+            )
         current_values = await self._load_values()
         current_base_url = _normalize_base_url(
             current_values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url
@@ -605,6 +1243,110 @@ class RuntimeConfigService:
                     else "false",
                 )
 
+            bool_setting_keys = {
+                "manual_upstream_sync_rate_enabled": KEY_MANUAL_UPSTREAM_SYNC_RATE_ENABLED,
+                "manual_upstream_sync_priority_enabled": KEY_MANUAL_UPSTREAM_SYNC_PRIORITY_ENABLED,
+                "manual_upstream_sync_upstream_health_enabled": KEY_MANUAL_UPSTREAM_SYNC_UPSTREAM_HEALTH_ENABLED,
+                "manual_upstream_sync_channel_monitors_enabled": KEY_MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED,
+                "manual_upstream_sync_account_availability_enabled": KEY_MANUAL_UPSTREAM_SYNC_ACCOUNT_AVAILABILITY_ENABLED,
+                "manual_upstream_sync_balance_guard_enabled": KEY_MANUAL_UPSTREAM_SYNC_BALANCE_GUARD_ENABLED,
+                "manual_upstream_sync_rate_pause_enabled": KEY_MANUAL_UPSTREAM_SYNC_RATE_PAUSE_ENABLED,
+                "api_key_auto_pause_on_channel_monitor_unavailable_enabled": KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED,
+                "channel_monitor_auto_probe_enabled": KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED,
+                "account_model_whitelist_sync_enabled": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED,
+                "account_model_whitelist_sync_each_time": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME,
+                "channel_monitor_fallback_without_monitor_enabled": KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED,
+                "api_key_auto_pause_on_upstream_rate_increase_enabled": KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED,
+                "api_key_auto_pause_on_negative_balance_enabled": KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED,
+                "show_stale_negative_balance_alert": KEY_SHOW_STALE_NEGATIVE_BALANCE_ALERT,
+                "priority_assign_disabled_api_key_accounts": KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS,
+                "priority_share_same_composite_multiplier": KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER,
+                "discord_bot_notifications_enabled": KEY_DISCORD_BOT_NOTIFICATIONS_ENABLED,
+                "notify_oauth_account_disabled": KEY_NOTIFY_OAUTH_ACCOUNT_DISABLED,
+                "notify_account_enabled": KEY_NOTIFY_ACCOUNT_ENABLED,
+                "notify_api_key_rate_changed": KEY_NOTIFY_API_KEY_RATE_CHANGED,
+                "notify_upstream_group_changed": KEY_NOTIFY_UPSTREAM_GROUP_CHANGED,
+                "notify_upstream_balance_low": KEY_NOTIFY_UPSTREAM_BALANCE_LOW,
+            }
+            for payload_key, setting_key in bool_setting_keys.items():
+                if payload.get(payload_key) is not None:
+                    await self._put(
+                        db,
+                        setting_key,
+                        "true" if payload[payload_key] else "false",
+                    )
+
+            int_setting_keys = {
+                "account_model_whitelist_sync_interval_seconds": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS,
+                "channel_monitor_fallback_test_attempts": KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS,
+                "channel_monitor_recovery_test_attempts": KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS,
+            }
+            for payload_key, setting_key in int_setting_keys.items():
+                if payload.get(payload_key) is not None:
+                    await self._put(db, setting_key, str(int(payload[payload_key])))
+
+            if payload.get("channel_monitor_fallback_test_model") is not None:
+                await self._put(
+                    db,
+                    KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL,
+                    str(payload["channel_monitor_fallback_test_model"]).strip()[:160],
+                )
+
+            if payload.get("channel_monitor_fallback_test_models") is not None:
+                models = _normalize_model_chain(payload["channel_monitor_fallback_test_models"])
+                await self._put(
+                    db,
+                    KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS,
+                    json.dumps(models, ensure_ascii=False),
+                )
+
+            if payload.get("upstream_rate_increase_threshold_percent") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT,
+                    _format_number(float(payload["upstream_rate_increase_threshold_percent"])),
+                )
+
+            if payload.get("upstream_rate_pause_mode") is not None:
+                mode = str(payload["upstream_rate_pause_mode"])
+                if mode not in {"increase_percent", "absolute_multiplier"}:
+                    raise RuntimeConfigServiceError("The upstream rate pause mode is invalid.")
+                await self._put(db, KEY_UPSTREAM_RATE_PAUSE_MODE, mode)
+
+            if payload.get("upstream_rate_absolute_threshold") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD,
+                    _format_number(float(payload["upstream_rate_absolute_threshold"])),
+                )
+
+            if payload.get("upstream_negative_balance_basis") is not None:
+                basis = str(payload["upstream_negative_balance_basis"])
+                if basis not in {"wallet", "recharge_adjusted"}:
+                    raise RuntimeConfigServiceError("The upstream balance basis is invalid.")
+                await self._put(db, KEY_UPSTREAM_NEGATIVE_BALANCE_BASIS, basis)
+
+            if payload.get("upstream_balance_pause_threshold") is not None:
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_BALANCE_PAUSE_THRESHOLD,
+                    _format_number(float(payload["upstream_balance_pause_threshold"])),
+                )
+
+            if payload.get("discord_bot_channel_id") is not None:
+                await self._put(
+                    db,
+                    KEY_DISCORD_BOT_CHANNEL_ID,
+                    str(payload["discord_bot_channel_id"]).strip(),
+                )
+
+            if payload.get("clear_discord_bot_token"):
+                await self._put(db, KEY_DISCORD_BOT_TOKEN, "")
+            else:
+                raw_token = payload.get("discord_bot_token")
+                if isinstance(raw_token, str) and raw_token.strip():
+                    await self._put(db, KEY_DISCORD_BOT_TOKEN, encrypt_text(raw_token.strip()))
+
             if payload.get("upstream_rate_log_retention_days") is not None:
                 retention_days = int(payload["upstream_rate_log_retention_days"])
                 await self._put(
@@ -613,6 +1355,10 @@ class RuntimeConfigService:
                     str(retention_days),
                 )
                 await delete_expired_upstream_rate_change_logs(
+                    db,
+                    retention_days=retention_days,
+                )
+                await delete_expired_change_logs(
                     db,
                     retention_days=retention_days,
                 )
@@ -694,6 +1440,16 @@ class RuntimeConfigService:
 
             if payload.get("site_name") is not None:
                 await self._put(db, KEY_SITE_NAME, _clean_site_name(str(payload["site_name"]), self.settings.app_name))
+
+            if payload.get("clear_site_logo"):
+                await self._put(db, KEY_SITE_LOGO_DATA, None)
+                await self._put(db, KEY_SITE_LOGO_MIME, None)
+                await self._put(db, KEY_SITE_LOGO_UPDATED_AT, None)
+            elif payload.get("site_logo_data_url") is not None:
+                raw, mime = _parse_logo_data_url(str(payload["site_logo_data_url"]))
+                await self._put(db, KEY_SITE_LOGO_DATA, base64.b64encode(raw).decode("ascii"))
+                await self._put(db, KEY_SITE_LOGO_MIME, mime)
+                await self._put(db, KEY_SITE_LOGO_UPDATED_AT, utcnow().isoformat())
 
             if payload.get("clear_sub2api_x_api_key"):
                 # An explicit empty marker prevents the in-memory environment
@@ -971,8 +1727,111 @@ class RuntimeConfigService:
             "UPSTREAM_PRIORITY_SYNC_ENABLED": _env_bool(
                 bool(settings["upstream_priority_sync_enabled"])
             ),
+            "MANUAL_UPSTREAM_SYNC_RATE_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_sync_rate_enabled", True))
+            ),
+            "MANUAL_UPSTREAM_SYNC_PRIORITY_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_sync_priority_enabled", True))
+            ),
+            "MANUAL_UPSTREAM_SYNC_UPSTREAM_HEALTH_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_sync_upstream_health_enabled", True))
+            ),
+            "MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_sync_channel_monitors_enabled", True))
+            ),
+            "MANUAL_UPSTREAM_SYNC_ACCOUNT_AVAILABILITY_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_sync_account_availability_enabled", False))
+            ),
+            "MANUAL_UPSTREAM_SYNC_BALANCE_GUARD_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_sync_balance_guard_enabled", True))
+            ),
+            "MANUAL_UPSTREAM_SYNC_RATE_PAUSE_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_sync_rate_pause_enabled", True))
+            ),
             "API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE": _env_bool(
                 bool(settings["api_key_auto_disable_on_upstream_unavailable"])
+            ),
+            "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED": _env_bool(
+                bool(settings["api_key_auto_pause_on_channel_monitor_unavailable_enabled"])
+            ),
+            "CHANNEL_MONITOR_AUTO_PROBE_ENABLED": _env_bool(
+                bool(settings.get("channel_monitor_auto_probe_enabled", True))
+            ),
+            "ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED": _env_bool(
+                bool(settings.get("account_model_whitelist_sync_enabled", False))
+            ),
+            "ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS": str(
+                int(settings.get("account_model_whitelist_sync_interval_seconds", 3600))
+            ),
+            "ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME": _env_bool(
+                bool(settings.get("account_model_whitelist_sync_each_time", False))
+            ),
+            # Legacy confirmation thresholds are read for migration only. The
+            # current policy uses per-round pause and recovery test counts.
+            "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD": None,
+            "CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD": None,
+            "CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED": _env_bool(
+                bool(settings.get("channel_monitor_fallback_without_monitor_enabled", False))
+            ),
+            "CHANNEL_MONITOR_FALLBACK_TEST_MODELS": json.dumps(
+                settings.get("channel_monitor_fallback_test_models", []),
+                ensure_ascii=False,
+            ),
+            "CHANNEL_MONITOR_FALLBACK_TEST_MODEL": str(
+                settings.get("channel_monitor_fallback_test_model", "")
+            ),
+            "CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS": str(
+                int(settings.get("channel_monitor_fallback_test_attempts", 1))
+            ),
+            "CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS": str(
+                int(settings.get("channel_monitor_recovery_test_attempts", 1))
+            ),
+            "API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED": _env_bool(
+                bool(settings["api_key_auto_pause_on_upstream_rate_increase_enabled"])
+            ),
+            "UPSTREAM_RATE_PAUSE_MODE": str(
+                settings.get("upstream_rate_pause_mode", "increase_percent")
+            ),
+            "UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT": _format_number(
+                float(settings["upstream_rate_increase_threshold_percent"])
+            ),
+            "UPSTREAM_RATE_ABSOLUTE_THRESHOLD": _format_number(
+                float(settings.get("upstream_rate_absolute_threshold", 1.0))
+            ),
+            "API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED": _env_bool(
+                bool(settings.get("api_key_auto_pause_on_negative_balance_enabled", False))
+            ),
+            "UPSTREAM_NEGATIVE_BALANCE_BASIS": str(settings.get("upstream_negative_balance_basis", "wallet")),
+            "UPSTREAM_BALANCE_PAUSE_THRESHOLD": _format_number(
+                float(settings.get("upstream_balance_pause_threshold", 0.0))
+            ),
+            "SHOW_STALE_NEGATIVE_BALANCE_ALERT": _env_bool(
+                bool(settings.get("show_stale_negative_balance_alert", True))
+            ),
+            "PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS": _env_bool(
+                bool(settings.get("priority_assign_disabled_api_key_accounts", False))
+            ),
+            "PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER": _env_bool(
+                bool(settings.get("priority_share_same_composite_multiplier", False))
+            ),
+            "DISCORD_BOT_NOTIFICATIONS_ENABLED": _env_bool(
+                bool(settings.get("discord_bot_notifications_enabled", False))
+            ),
+            "DISCORD_BOT_CHANNEL_ID": str(settings.get("discord_bot_channel_id", "")),
+            "NOTIFY_OAUTH_ACCOUNT_DISABLED": _env_bool(
+                bool(settings.get("notify_oauth_account_disabled", False))
+            ),
+            "NOTIFY_ACCOUNT_ENABLED": _env_bool(
+                bool(settings.get("notify_account_enabled", False))
+            ),
+            "NOTIFY_API_KEY_RATE_CHANGED": _env_bool(
+                bool(settings.get("notify_api_key_rate_changed", False))
+            ),
+            "NOTIFY_UPSTREAM_GROUP_CHANGED": _env_bool(
+                bool(settings.get("notify_upstream_group_changed", False))
+            ),
+            "NOTIFY_UPSTREAM_BALANCE_LOW": _env_bool(
+                bool(settings.get("notify_upstream_balance_low", False))
             ),
             "UPSTREAM_RATE_LOG_RETENTION_DAYS": str(int(settings["upstream_rate_log_retention_days"])),
             "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(
@@ -1096,6 +1955,15 @@ def _bounded_float_or_default(value: str | None, default: float, minimum: float,
     return result
 
 
+def _positive_bounded_float_or_default(value: str | None, default: float, maximum: float) -> float:
+    result = _float_or_default(value, default)
+    if not result > 0:
+        return float(default)
+    if result > maximum:
+        return maximum
+    return result
+
+
 def _threshold_or_settings_default(value: str | None, settings_default: float) -> float:
     if value is None:
         return _bounded_float_or_default(None, settings_default, 0.0, 100.0)
@@ -1110,6 +1978,38 @@ def _bool_or_default(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_model_chain(value: Any) -> list[str]:
+    raw_items: list[Any]
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, tuple):
+        raw_items = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            raw_items = parsed
+        else:
+            raw_items = re.split(r"\s*(?:->|→|,|\r?\n)\s*", text)
+    else:
+        return []
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        model = str(item or "").strip()[:160]
+        if model and model not in seen:
+            seen.add(model)
+            models.append(model)
+        if len(models) >= 10:
+            break
+    return models
 
 
 def _env_bool(value: bool) -> str:
@@ -1213,6 +2113,99 @@ def _clean_site_name(value: str | None, default: str) -> str:
     if not text:
         return default
     return text[:80]
+
+
+def _parse_logo_data_url(value: str) -> tuple[bytes, str]:
+    match = re.fullmatch(
+        r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\r\n]+)",
+        value.strip(),
+    )
+    if not match:
+        raise RuntimeConfigServiceError("The site logo must be a PNG, JPEG, or WebP image.")
+    mime, encoded = match.groups()
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise RuntimeConfigServiceError("The site logo data is invalid.") from exc
+    return _normalize_logo_bytes(raw, mime), mime
+
+
+def _valid_logo_bytes(raw: bytes, mime: str) -> bool:
+    try:
+        image = _decode_logo(raw, mime)
+    except RuntimeConfigServiceError:
+        return False
+    image.close()
+    return True
+
+
+def _decode_logo(raw: bytes, mime: str) -> Image.Image:
+    if not raw or len(raw) > MAX_SITE_LOGO_BYTES:
+        raise RuntimeConfigServiceError("The site logo must not exceed 1 MB.")
+    expected_format = {
+        "image/png": "PNG",
+        "image/jpeg": "JPEG",
+        "image/webp": "WEBP",
+    }.get(mime)
+    if expected_format is None:
+        raise RuntimeConfigServiceError("The site logo must be a PNG, JPEG, or WebP image.")
+    try:
+        with Image.open(BytesIO(raw)) as source:
+            if source.format != expected_format:
+                raise RuntimeConfigServiceError("The site logo content does not match its media type.")
+            width, height = source.size
+            if (
+                width < 1
+                or height < 1
+                or width > MAX_SITE_LOGO_DIMENSION
+                or height > MAX_SITE_LOGO_DIMENSION
+                or width * height > MAX_SITE_LOGO_PIXELS
+            ):
+                raise RuntimeConfigServiceError(
+                    f"The site logo must be no larger than {MAX_SITE_LOGO_DIMENSION} x "
+                    f"{MAX_SITE_LOGO_DIMENSION} pixels."
+                )
+            if bool(getattr(source, "is_animated", False)) or int(getattr(source, "n_frames", 1)) != 1:
+                raise RuntimeConfigServiceError("Animated site logos are not supported.")
+            source.load()
+            return source.copy()
+    except RuntimeConfigServiceError:
+        raise
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
+        raise RuntimeConfigServiceError("The site logo is not a valid decodable image.") from exc
+
+
+def _normalize_logo_bytes(raw: bytes, mime: str) -> bytes:
+    image = _decode_logo(raw, mime)
+    try:
+        has_alpha = "A" in image.getbands() or "transparency" in image.info
+        if mime == "image/jpeg":
+            normalized = image.convert("RGB")
+            save_options: dict[str, Any] = {
+                "format": "JPEG",
+                "quality": 88,
+                "optimize": True,
+                "progressive": True,
+            }
+        elif mime == "image/png":
+            normalized = image.convert("RGBA" if has_alpha else "RGB")
+            save_options = {"format": "PNG", "optimize": True, "compress_level": 9}
+        else:
+            normalized = image.convert("RGBA" if has_alpha else "RGB")
+            save_options = {"format": "WEBP", "quality": 88, "method": 4}
+        try:
+            output = BytesIO()
+            normalized.save(output, **save_options)
+            encoded = output.getvalue()
+        finally:
+            normalized.close()
+    except (OSError, ValueError) as exc:
+        raise RuntimeConfigServiceError("The site logo could not be normalized.") from exc
+    finally:
+        image.close()
+    if not encoded or len(encoded) > MAX_SITE_LOGO_BYTES:
+        raise RuntimeConfigServiceError("The normalized site logo must not exceed 1 MB.")
+    return encoded
 
 
 def _looks_like_sub2api_accounts_response(response: httpx.Response) -> bool:

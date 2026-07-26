@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator
+import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -140,6 +141,23 @@ async def _ensure_upstream_channel_reference_guards(conn: AsyncConnection) -> No
 
 
 async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
+    result = await conn.execute(text("PRAGMA table_info(upstream_priority_intervals)"))
+    priority_interval_columns = {str(row[1]) for row in result.fetchall()}
+    optional_priority_interval_columns = {
+        "rate_pause_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+        "rate_pause_mode": "VARCHAR(32) NOT NULL DEFAULT 'increase_percent'",
+        "rate_increase_threshold_percent": "FLOAT NOT NULL DEFAULT 20",
+        "rate_absolute_threshold": "FLOAT NOT NULL DEFAULT 1",
+    }
+    for column, column_type in optional_priority_interval_columns.items():
+        if priority_interval_columns and column not in priority_interval_columns:
+            await conn.execute(
+                text(
+                    f"ALTER TABLE upstream_priority_intervals ADD COLUMN {column} {column_type}"
+                )
+            )
+            priority_interval_columns.add(column)
+
     result = await conn.execute(text("PRAGMA table_info(upstream_channels)"))
     channel_columns = {str(row[1]) for row in result.fetchall()}
     if channel_columns and "probe_enabled" not in channel_columns:
@@ -158,6 +176,7 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
             text("ALTER TABLE upstream_channels ADD COLUMN encrypted_refresh_token TEXT")
         )
     optional_channel_columns = {
+        "last_known_recharge_multiplier": "FLOAT",
         "today_balance_used": "FLOAT",
         "today_balance_unit": "VARCHAR(32)",
         "today_balance_status": "VARCHAR(32)",
@@ -166,6 +185,26 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "yesterday_balance_unit": "VARCHAR(32)",
         "yesterday_balance_status": "VARCHAR(32)",
         "yesterday_balance_checked_at": "DATETIME",
+        "balance_source": "VARCHAR(64)",
+        "balance_guard_state": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "balance_guard_basis": "VARCHAR(32)",
+        "balance_guard_value": "FLOAT",
+        "balance_guard_checked_at": "DATETIME",
+        "balance_guard_episode_id": "VARCHAR(64)",
+        "balance_guard_paused_count": "INTEGER NOT NULL DEFAULT 0",
+        "channel_monitors": "JSON",
+        "channel_monitor_test_models": "JSON",
+        "channel_monitor_count": "INTEGER NOT NULL DEFAULT 0",
+        "channel_monitor_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "channel_monitor_message": "TEXT",
+        "channel_monitor_checked_at": "DATETIME",
+        "channel_monitor_guard_state": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "channel_monitor_unavailable_count": "INTEGER NOT NULL DEFAULT 0",
+        "channel_monitor_recovery_count": "INTEGER NOT NULL DEFAULT 0",
+        "channel_monitor_guard_checked_at": "DATETIME",
+        "pending_group_options": "JSON",
+        "pending_group_removal_count": "INTEGER NOT NULL DEFAULT 0",
+        "pending_group_removal_checked_at": "DATETIME",
     }
     for column, column_type in optional_channel_columns.items():
         if channel_columns and column not in channel_columns:
@@ -173,6 +212,29 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
                 text(f"ALTER TABLE upstream_channels ADD COLUMN {column} {column_type}")
             )
             channel_columns.add(column)
+
+    recharge_multiplier_columns = [
+        column
+        for column in (
+            "effective_recharge_multiplier",
+            "discovered_recharge_multiplier",
+        )
+        if column in channel_columns
+    ]
+    if channel_columns and "last_known_recharge_multiplier" in channel_columns and recharge_multiplier_columns:
+        recharge_expression = (
+            f"COALESCE({', '.join(recharge_multiplier_columns)})"
+            if len(recharge_multiplier_columns) > 1
+            else recharge_multiplier_columns[0]
+        )
+        await conn.execute(
+            text(
+                "UPDATE upstream_channels SET last_known_recharge_multiplier = "
+                f"{recharge_expression} "
+                "WHERE last_known_recharge_multiplier IS NULL "
+                f"AND {recharge_expression} IS NOT NULL"
+            )
+        )
 
     result = await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
     columns = {str(row[1]) for row in result.fetchall()}
@@ -193,11 +255,27 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "priority_sync_status": "VARCHAR(32) NOT NULL DEFAULT 'unassigned'",
         "priority_sync_error": "TEXT",
         "last_priority_applied_at": "DATETIME",
+        "priority_tiebreak_order": "INTEGER",
+        "priority_tiebreak_multiplier": "FLOAT",
+        "priority_assignment_when_disabled": "BOOLEAN",
+        "rate_pause_policy": "VARCHAR(16) NOT NULL DEFAULT 'inherit'",
+        "rate_pause_mode": "VARCHAR(32)",
+        "rate_increase_threshold_percent": "FLOAT",
+        "rate_absolute_threshold": "FLOAT",
         "remote_identity_fingerprint": "VARCHAR(64)",
+        "upstream_api_key_record_id": "INTEGER",
+        "upstream_identity_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "api_key_origin_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "remote_name": "VARCHAR(200)",
         "remote_platform": "VARCHAR(64)",
         "remote_account_type": "VARCHAR(32)",
+        "remote_status": "VARCHAR(64)",
+        "remote_schedulable": "BOOLEAN",
+        "remote_priority": "INTEGER",
+          "remote_snapshot": "JSON",
+          "remote_snapshot_updated_at": "DATETIME",
+          "remote_present": "BOOLEAN NOT NULL DEFAULT 1",
+          "remote_missing_at": "DATETIME",
         "base_url": "VARCHAR(500)",
         "encrypted_api_key": "TEXT",
         "encrypted_access_token": "TEXT",
@@ -209,8 +287,29 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "upstream_health_invalid_count": "INTEGER NOT NULL DEFAULT 0",
         "upstream_key_checked_at": "DATETIME",
         "upstream_group_checked_at": "DATETIME",
+        "availability_check_mode": "VARCHAR(32) NOT NULL DEFAULT 'disabled'",
+        "availability_monitor_id": "INTEGER",
+        "availability_test_model": "VARCHAR(160)",
+        "available_models": "JSON",
+        "available_models_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "available_models_checked_at": "DATETIME",
+        "availability_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "availability_unavailable_count": "INTEGER NOT NULL DEFAULT 0",
+        "availability_recovery_count": "INTEGER NOT NULL DEFAULT 0",
+        "availability_checked_at": "DATETIME",
+        "availability_source": "VARCHAR(32)",
+        "availability_message": "TEXT",
         "auto_disabled_reason": "VARCHAR(64)",
         "last_auto_disabled_at": "DATETIME",
+        "balance_guard_restore_eligible": "BOOLEAN NOT NULL DEFAULT 0",
+        "balance_guard_channel_id": "INTEGER",
+        "balance_guard_paused_at": "DATETIME",
+        "balance_guard_operation": "VARCHAR(32)",
+        "auto_pause_episode_id": "VARCHAR(64)",
+        "pause_owned_by_plugin": "BOOLEAN NOT NULL DEFAULT 0",
+        "auto_pause_channel_id": "INTEGER",
+        "auto_paused_at": "DATETIME",
+        "pause_operation": "VARCHAR(32)",
         "manual_group_multiplier": "FLOAT",
         "manual_recharge_multiplier": "FLOAT",
         "group_options": "JSON",
@@ -232,11 +331,17 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "balance_used": "FLOAT",
         "balance_unit": "VARCHAR(32)",
         "balance_status": "VARCHAR(32)",
+        "balance_source": "VARCHAR(64)",
         "balance_message": "TEXT",
         "balance_checked_at": "DATETIME",
         "upstream_usage_amount": "FLOAT",
         "upstream_usage_unit": "VARCHAR(32)",
         "upstream_usage_checked_at": "DATETIME",
+        "today_upstream_usage_amount": "FLOAT",
+        "today_upstream_usage_unit": "VARCHAR(32)",
+        "today_upstream_usage_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "today_upstream_usage_source": "VARCHAR(64)",
+        "today_upstream_usage_checked_at": "DATETIME",
         "last_error": "TEXT",
         "last_discovered_at": "DATETIME",
         "last_applied_at": "DATETIME",
@@ -251,8 +356,66 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
             columns.add(column)
     await conn.execute(
         text(
+            "DROP INDEX IF EXISTS "
+            "uq_upstream_account_configs_channel_record_id"
+        )
+    )
+    await conn.execute(
+        text(
+            "UPDATE upstream_account_configs SET "
+            "availability_monitor_id = NULL, "
+            "availability_test_model = NULL, "
+            "availability_status = 'disabled', "
+            "availability_unavailable_count = 0, "
+            "availability_recovery_count = 0, "
+            "availability_checked_at = NULL, "
+            "availability_source = NULL, "
+            "availability_message = NULL "
+            "WHERE availability_check_mode = 'disabled'"
+        )
+    )
+    await conn.execute(
+        text(
             "CREATE INDEX IF NOT EXISTS ix_upstream_account_configs_channel_id "
             "ON upstream_account_configs (channel_id)"
+        )
+    )
+    await conn.execute(
+        text(
+            "UPDATE upstream_account_configs SET "
+            "pause_owned_by_plugin = 1, "
+            "auto_pause_episode_id = COALESCE(auto_pause_episode_id, lower(hex(randomblob(16)))), "
+            "auto_pause_channel_id = COALESCE(auto_pause_channel_id, balance_guard_channel_id, channel_id), "
+            "auto_paused_at = COALESCE(auto_paused_at, balance_guard_paused_at, last_auto_disabled_at), "
+            "pause_operation = COALESCE(pause_operation, balance_guard_operation, 'paused') "
+            "WHERE COALESCE(balance_guard_restore_eligible, 0) = 1 "
+            "OR auto_disabled_reason IN "
+            "('upstream_key_unavailable', 'upstream_group_unavailable')"
+        )
+    )
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO upstream_account_pause_holds "
+            "(account_config_id, reason, active, scope_channel_id, triggered_at, "
+            "resolved_at, recovery_mode, evidence_json, created_at, updated_at) "
+            "SELECT id, 'upstream_balance_negative', 1, balance_guard_channel_id, "
+            "COALESCE(balance_guard_paused_at, last_auto_disabled_at, CURRENT_TIMESTAMP), "
+            "NULL, 'balance_positive', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP "
+            "FROM upstream_account_configs "
+            "WHERE COALESCE(balance_guard_restore_eligible, 0) = 1"
+        )
+    )
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO upstream_account_pause_holds "
+            "(account_config_id, reason, active, scope_channel_id, triggered_at, "
+            "resolved_at, recovery_mode, evidence_json, created_at, updated_at) "
+            "SELECT id, auto_disabled_reason, 1, channel_id, "
+            "COALESCE(last_auto_disabled_at, CURRENT_TIMESTAMP), NULL, "
+            "'upstream_healthy', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP "
+            "FROM upstream_account_configs "
+            "WHERE auto_disabled_reason IN "
+            "('upstream_key_unavailable', 'upstream_group_unavailable')"
         )
     )
     await _ensure_upstream_channel_reference_guards(conn)
@@ -423,6 +586,44 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
                 {"channel_id": channel_id, "account_config_id": row["id"]},
             )
 
+    duplicate_upstream_identity = (
+        await conn.execute(
+            text(
+                "SELECT channel_id, upstream_api_key_record_id "
+                "FROM upstream_account_configs "
+                "WHERE channel_id IS NOT NULL "
+                "AND upstream_api_key_record_id IS NOT NULL "
+                "GROUP BY channel_id, upstream_api_key_record_id "
+                "HAVING COUNT(*) > 1"
+            )
+        )
+    ).mappings().all()
+    for duplicate in duplicate_upstream_identity:
+        await conn.execute(
+            text(
+                "UPDATE upstream_account_configs SET "
+                "upstream_api_key_record_id = NULL, "
+                "upstream_identity_rebind_required = 1, "
+                "last_error = 'Multiple local accounts used the same upstream API key "
+                "record ID; explicit identity confirmation is required.' "
+                "WHERE channel_id = :channel_id "
+                "AND upstream_api_key_record_id = :record_id"
+            ),
+            {
+                "channel_id": duplicate["channel_id"],
+                "record_id": duplicate["upstream_api_key_record_id"],
+            },
+        )
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_upstream_account_configs_channel_record_id "
+            "ON upstream_account_configs (channel_id, upstream_api_key_record_id) "
+            "WHERE channel_id IS NOT NULL "
+            "AND upstream_api_key_record_id IS NOT NULL"
+        )
+    )
+
 
 async def _migrate_upstream_rate_change_logs(conn: AsyncConnection) -> None:
     result = await conn.execute(text("PRAGMA table_info(upstream_rate_change_logs)"))
@@ -442,6 +643,10 @@ async def _migrate_upstream_rate_change_logs(conn: AsyncConnection) -> None:
     result = await conn.execute(text("PRAGMA table_info(upstream_rate_change_logs)"))
     columns = {str(row[1]) for row in result.fetchall()}
     extra_columns = {
+        "old_group_id": "VARCHAR(128)",
+        "new_group_id": "VARCHAR(128)",
+        "old_group_name": "VARCHAR(200)",
+        "new_group_name": "VARCHAR(200)",
         "old_upstream_key_status": "VARCHAR(32)",
         "new_upstream_key_status": "VARCHAR(32)",
         "old_upstream_group_status": "VARCHAR(32)",
@@ -454,6 +659,35 @@ async def _migrate_upstream_rate_change_logs(conn: AsyncConnection) -> None:
             await conn.execute(
                 text(f"ALTER TABLE upstream_rate_change_logs ADD COLUMN {column} {column_type}")
             )
+
+
+async def _migrate_notification_outbox(conn: AsyncConnection) -> None:
+    result = await conn.execute(text("PRAGMA table_info(notification_outbox)"))
+    columns = {str(row[1]) for row in result.fetchall()}
+    if not columns:
+        return
+    optional_columns = {
+        "claim_token": "VARCHAR(64)",
+        "claimed_at": "DATETIME",
+        "claim_expires_at": "DATETIME",
+    }
+    for column, column_type in optional_columns.items():
+        if column not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE notification_outbox ADD COLUMN {column} {column_type}")
+            )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_notification_outbox_claim_token "
+            "ON notification_outbox (claim_token)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_notification_outbox_claim_expires_at "
+            "ON notification_outbox (claim_expires_at)"
+        )
+    )
 
 
 async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
@@ -479,24 +713,14 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
             "ON upstream_priority_intervals (name)"
         )
     )
+    # Older databases created triggers that globally rejected overlapping
+    # ranges. Ranges are intentionally allowed to overlap because different
+    # account types can use the same priority band independently.
     await conn.execute(
-        text(
-            "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_no_overlap_insert "
-            "BEFORE INSERT ON upstream_priority_intervals "
-            "WHEN EXISTS (SELECT 1 FROM upstream_priority_intervals "
-            "WHERE NEW.start_priority < end_priority AND NEW.end_priority > start_priority) "
-            "BEGIN SELECT RAISE(ABORT, 'overlapping upstream priority interval'); END"
-        )
+        text("DROP TRIGGER IF EXISTS trg_upstream_priority_interval_no_overlap_insert")
     )
     await conn.execute(
-        text(
-            "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_no_overlap_update "
-            "BEFORE UPDATE OF start_priority, end_priority ON upstream_priority_intervals "
-            "WHEN EXISTS (SELECT 1 FROM upstream_priority_intervals "
-            "WHERE id != OLD.id AND NEW.start_priority < end_priority "
-            "AND NEW.end_priority > start_priority) "
-            "BEGIN SELECT RAISE(ABORT, 'overlapping upstream priority interval'); END"
-        )
+        text("DROP TRIGGER IF EXISTS trg_upstream_priority_interval_no_overlap_update")
     )
 
     result = await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
@@ -509,6 +733,8 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
         "priority_sync_status": "VARCHAR(32) NOT NULL DEFAULT 'unassigned'",
         "priority_sync_error": "TEXT",
         "last_priority_applied_at": "DATETIME",
+        "priority_tiebreak_order": "INTEGER",
+        "priority_tiebreak_multiplier": "FLOAT",
     }
     for column, column_type in priority_columns.items():
         if column not in columns:
@@ -538,11 +764,15 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
     # A real ON DELETE SET NULL foreign key only clears the reference. Run the
     # complete state cleanup before either the FK or the legacy AFTER trigger.
     await conn.execute(
+        text("DROP TRIGGER IF EXISTS trg_upstream_priority_interval_cleanup_delete")
+    )
+    await conn.execute(
         text(
             "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_cleanup_delete "
             "BEFORE DELETE ON upstream_priority_intervals "
             "BEGIN UPDATE upstream_account_configs SET priority_interval_id = NULL, "
-            "desired_priority = NULL, priority_sync_status = 'unassigned', "
+            "desired_priority = NULL, priority_tiebreak_order = NULL, "
+            "priority_tiebreak_multiplier = NULL, priority_sync_status = 'unassigned', "
             "priority_sync_error = NULL WHERE priority_interval_id = OLD.id; END"
         )
     )
@@ -551,11 +781,13 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
     await conn.execute(
         text(
             "UPDATE upstream_account_configs SET priority_interval_id = NULL, "
-            "desired_priority = NULL, priority_sync_status = 'unassigned', "
+            "desired_priority = NULL, priority_tiebreak_order = NULL, "
+            "priority_tiebreak_multiplier = NULL, priority_sync_status = 'unassigned', "
             "priority_sync_error = NULL WHERE priority_interval_id IS NOT NULL "
             "AND priority_interval_id NOT IN (SELECT id FROM upstream_priority_intervals)"
         )
     )
+    await conn.execute(text("DROP TRIGGER IF EXISTS trg_upstream_priority_interval_delete"))
     await conn.execute(
         text(
             "CREATE TRIGGER IF NOT EXISTS trg_upstream_account_priority_interval_insert "
@@ -579,7 +811,8 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
             "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_delete "
             "AFTER DELETE ON upstream_priority_intervals "
             "BEGIN UPDATE upstream_account_configs SET priority_interval_id = NULL, "
-            "desired_priority = NULL, priority_sync_status = 'unassigned', "
+            "desired_priority = NULL, priority_tiebreak_order = NULL, "
+            "priority_tiebreak_multiplier = NULL, priority_sync_status = 'unassigned', "
             "priority_sync_error = NULL WHERE priority_interval_id = OLD.id; END"
         )
     )
@@ -676,6 +909,211 @@ async def _scrub_upstream_plaintext_secret_copies(conn: AsyncConnection) -> None
             )
 
 
+async def _migrate_legacy_rate_logs_to_change_events(conn: AsyncConnection) -> None:
+    """Expose pre-ledger rate history without turning it into new unread activity."""
+    result = await conn.execute(text("PRAGMA table_info(upstream_channel_change_events)"))
+    columns = {str(row[1]) for row in result.fetchall()}
+    if "legacy_imported" not in columns:
+        await conn.execute(
+            text(
+                "ALTER TABLE upstream_channel_change_events "
+                "ADD COLUMN legacy_imported BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_upstream_channel_change_events_legacy_imported "
+            "ON upstream_channel_change_events (legacy_imported)"
+        )
+    )
+
+    migration_key = "migration.legacy_rate_logs_to_change_events.v1"
+    completed = await conn.execute(
+        text("SELECT value FROM app_settings WHERE key = :key"),
+        {"key": migration_key},
+    )
+    if completed.scalar_one_or_none() is not None:
+        return
+
+    cutoff_result = await conn.execute(
+        text(
+            "SELECT MIN(created_at) FROM upstream_channel_change_events "
+            "WHERE legacy_imported = 0"
+        )
+    )
+    cutoff = cutoff_result.scalar_one_or_none()
+    statement = (
+        "SELECT * FROM upstream_rate_change_logs "
+        + ("WHERE created_at < :cutoff " if cutoff is not None else "")
+        + "ORDER BY created_at, id"
+    )
+    legacy_logs = (
+        await conn.execute(text(statement), {"cutoff": cutoff} if cutoff is not None else {})
+    ).mappings().all()
+
+    def changed(old_value: object, new_value: object) -> bool:
+        return old_value is not None and new_value is not None and old_value != new_value
+
+    for row in legacy_logs:
+        base_details = {
+            "account_id": row["sub2api_account_id"],
+            "account_name": row["account_name"],
+            "legacy_rate_log_id": row["id"],
+            "reason": row["reason"],
+            "status": row["status"],
+        }
+        events: list[dict[str, object | None]] = []
+        if changed(row["old_current_rate"], row["new_current_rate"]):
+            events.append(
+                {
+                    "event_type": "account_rate_changed",
+                    "old_value": row["old_current_rate"],
+                    "new_value": row["new_current_rate"],
+                    "details": base_details,
+                }
+            )
+        if changed(row["old_group_multiplier"], row["new_group_multiplier"]):
+            events.append(
+                {
+                    "event_type": "group_multiplier_changed",
+                    "old_value": row["old_group_multiplier"],
+                    "new_value": row["new_group_multiplier"],
+                    "details": base_details,
+                }
+            )
+        if changed(
+            row["old_upstream_recharge_multiplier"],
+            row["new_upstream_recharge_multiplier"],
+        ):
+            events.append(
+                {
+                    "event_type": "channel_multiplier_changed",
+                    "old_value": row["old_upstream_recharge_multiplier"],
+                    "new_value": row["new_upstream_recharge_multiplier"],
+                    "details": base_details,
+                }
+            )
+        if changed(row["old_group_name"], row["new_group_name"]):
+            events.append(
+                {
+                    "event_type": "group_name_changed",
+                    "details": {
+                        **base_details,
+                        "old_name": row["old_group_name"],
+                        "new_name": row["new_group_name"],
+                    },
+                }
+            )
+        for event_type, old_field, new_field in (
+            (
+                "upstream_key_status_changed",
+                "old_upstream_key_status",
+                "new_upstream_key_status",
+            ),
+            (
+                "upstream_group_status_changed",
+                "old_upstream_group_status",
+                "new_upstream_group_status",
+            ),
+        ):
+            if changed(row[old_field], row[new_field]):
+                events.append(
+                    {
+                        "event_type": event_type,
+                        "old_status": row[old_field],
+                        "new_status": row[new_field],
+                        "details": base_details,
+                    }
+                )
+
+        for event_values in events:
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_channel_change_events ("
+                    "channel_id, channel_name, event_type, group_id, group_name, "
+                    "old_value, new_value, old_status, new_status, details, "
+                    "legacy_imported, created_at"
+                    ") VALUES ("
+                    ":channel_id, :channel_name, :event_type, :group_id, :group_name, "
+                    ":old_value, :new_value, :old_status, :new_status, :details, 1, :created_at"
+                    ")"
+                ),
+                {
+                    "channel_id": row["channel_id"],
+                    "channel_name": row["channel_name"],
+                    "group_id": row["group_id"],
+                    "group_name": row["group_name"],
+                    "old_value": event_values.get("old_value"),
+                    "new_value": event_values.get("new_value"),
+                    "old_status": event_values.get("old_status"),
+                    "new_status": event_values.get("new_status"),
+                    "details": json.dumps(event_values["details"], ensure_ascii=True),
+                    "created_at": row["created_at"],
+                    "event_type": event_values["event_type"],
+                },
+            )
+
+    await conn.execute(
+        text(
+            "INSERT INTO app_settings (key, value, updated_at) "
+            "VALUES (:key, :value, CURRENT_TIMESTAMP)"
+        ),
+        {"key": migration_key, "value": "1"},
+    )
+
+
+async def _migrate_recharge_multiplier_change_baselines(conn: AsyncConnection) -> None:
+    """Keep failed probes from turning a retained multiplier into a fake change."""
+    columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_channels)"))
+        ).fetchall()
+    }
+    if "last_known_recharge_multiplier" not in columns:
+        return
+
+    # Some pre-baseline rows were already in a failed state when this upgrade
+    # first ran. Recover their last known multiplier from the legacy ledger.
+    await conn.execute(
+        text(
+            "UPDATE upstream_channels SET last_known_recharge_multiplier = ("
+            "SELECT legacy.upstream_recharge_multiplier "
+            "FROM upstream_rate_change_logs AS legacy "
+            "WHERE legacy.channel_id = upstream_channels.id "
+            "AND legacy.upstream_recharge_multiplier IS NOT NULL "
+            "ORDER BY legacy.created_at DESC, legacy.id DESC LIMIT 1"
+            ") WHERE last_known_recharge_multiplier IS NULL"
+        )
+    )
+
+    migration_key = "migration.remove_recharge_baseline_events.v1"
+    completed = await conn.execute(
+        text("SELECT value FROM app_settings WHERE key = :key"),
+        {"key": migration_key},
+    )
+    if completed.scalar_one_or_none() is not None:
+        return
+
+    # A first observed multiplier establishes a baseline; it is not a change.
+    # Remove the entries created while failed discovery cleared that baseline.
+    await conn.execute(
+        text(
+            "DELETE FROM upstream_channel_change_events "
+            "WHERE event_type = 'channel_multiplier_changed' "
+            "AND old_value IS NULL AND new_value IS NOT NULL "
+            "AND COALESCE(legacy_imported, 0) = 0"
+        )
+    )
+    await conn.execute(
+        text(
+            "INSERT INTO app_settings (key, value, updated_at) "
+            "VALUES (:key, :value, CURRENT_TIMESTAMP)"
+        ),
+        {"key": migration_key, "value": "1"},
+    )
+
+
 async def init_db() -> None:
     from app import models  # noqa: F401
 
@@ -686,6 +1124,9 @@ async def init_db() -> None:
         if is_sqlite:
             await _migrate_upstream_channels(conn)
             await _migrate_upstream_rate_change_logs(conn)
+            await _migrate_legacy_rate_logs_to_change_events(conn)
+            await _migrate_recharge_multiplier_change_baselines(conn)
+            await _migrate_notification_outbox(conn)
             await _migrate_upstream_priority_intervals(conn)
             await _scrub_upstream_plaintext_secret_copies(conn)
             result = await conn.execute(text("PRAGMA table_info(mailbox_credentials)"))
@@ -779,6 +1220,9 @@ async def init_db() -> None:
                 "subscription_plan": "VARCHAR(128)",
                 "has_active_subscription": "BOOLEAN",
                 "subscription_checked_at": "DATETIME",
+                "available_models": "JSON",
+                "available_models_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+                "available_models_checked_at": "DATETIME",
                 "phone_note_sync_marker": "VARCHAR(64)",
                 "encrypted_openai_refresh_token": "TEXT",
                 "encrypted_openai_access_token": "TEXT",

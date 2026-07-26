@@ -6,10 +6,14 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from app.services.monitor import MonitorService
 from app.services.sub2api import Sub2ApiClient
+from app.core.database import Base
 from app.core.crypto import decrypt_text, encrypt_text
-from app.models import AccountSnapshot
+from app.models import AccountSnapshot, MailboxCredential
 
 
 class _SessionContext:
@@ -24,6 +28,136 @@ class _SessionContext:
 
 
 class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_remote_account_cleanup_deletes_snapshot_and_mailbox(self) -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                db.add_all(
+                    [
+                        AccountSnapshot(email="keep@example.com"),
+                        AccountSnapshot(email="stale@example.com"),
+                        MailboxCredential(
+                            gpt_email="keep@example.com",
+                            mailbox_email="keep-mail@example.com",
+                        ),
+                        MailboxCredential(
+                            gpt_email="stale@example.com",
+                            mailbox_email="stale-mail@example.com",
+                        ),
+                    ]
+                )
+                await db.commit()
+                service = object.__new__(MonitorService)
+
+                deleted_accounts, deleted_mailboxes = await service._delete_missing_remote_accounts(
+                    {"keep@example.com"},
+                    db=db,
+                )
+                await db.commit()
+
+                remaining_accounts = list((await db.execute(select(AccountSnapshot.email))).scalars())
+                remaining_mailboxes = list((await db.execute(select(MailboxCredential.gpt_email))).scalars())
+            self.assertEqual((deleted_accounts, deleted_mailboxes), (1, 1))
+            self.assertEqual(remaining_accounts, ["keep@example.com"])
+            self.assertEqual(remaining_mailboxes, ["keep@example.com"])
+        finally:
+            await engine.dispose()
+
+    async def test_oauth_model_whitelist_syncs_when_missing_and_respects_force(self) -> None:
+        snapshot = AccountSnapshot(
+            email="oauth@example.com",
+            sub2api_account_id="1",
+            available_models=None,
+        )
+        account = {"id": 1, "email": "oauth@example.com"}
+        service = object.__new__(MonitorService)
+        service.sub2api = Sub2ApiClient()
+        service.sub2api.get_account_models = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {"id": " model-a ", "display_name": " Model A "},
+                {"id": "model-a", "display_name": "duplicate"},
+                {"id": "model-b", "display_name": ""},
+                {"id": "bad\nmodel", "display_name": "bad"},
+            ]
+        )
+        result = MagicMock()
+        result.scalars.return_value = [snapshot]
+        db = AsyncMock()
+        db.execute.return_value = result
+
+        synchronized = await service._sync_oauth_available_models(
+            db,
+            [account],
+            force=False,
+        )
+
+        self.assertEqual(synchronized, 1)
+        self.assertEqual(
+            snapshot.available_models,
+            [
+                {"id": "model-a", "display_name": "Model A"},
+                {"id": "model-b", "display_name": "model-b"},
+            ],
+        )
+        self.assertEqual(snapshot.available_models_status, "ok")
+        service.sub2api.get_account_models.assert_awaited_once_with(account)  # type: ignore[attr-defined]
+
+        service.sub2api.get_account_models.reset_mock()  # type: ignore[attr-defined]
+        skipped = await service._sync_oauth_available_models(
+            db,
+            [account],
+            force=False,
+        )
+        self.assertEqual(skipped, 0)
+        service.sub2api.get_account_models.assert_not_awaited()  # type: ignore[attr-defined]
+
+        service.sub2api.get_account_models.return_value = [  # type: ignore[attr-defined]
+            {"id": "model-c", "display_name": "Model C"}
+        ]
+        refreshed = await service._sync_oauth_available_models(
+            db,
+            [account],
+            force=True,
+        )
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(
+            snapshot.available_models,
+            [{"id": "model-c", "display_name": "Model C"}],
+        )
+
+    async def test_oauth_model_whitelist_failure_keeps_last_good_models(self) -> None:
+        snapshot = AccountSnapshot(
+            email="oauth@example.com",
+            sub2api_account_id="1",
+            available_models=[{"id": "model-a", "display_name": "Model A"}],
+        )
+        service = object.__new__(MonitorService)
+        service.sub2api = Sub2ApiClient()
+        service.sub2api.get_account_models = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("models unavailable")
+        )
+        result = MagicMock()
+        result.scalars.return_value = [snapshot]
+        db = AsyncMock()
+        db.execute.return_value = result
+
+        synchronized = await service._sync_oauth_available_models(
+            db,
+            [{"id": 1, "email": "oauth@example.com"}],
+            force=True,
+        )
+
+        self.assertEqual(synchronized, 0)
+        self.assertEqual(
+            snapshot.available_models,
+            [{"id": "model-a", "display_name": "Model A"}],
+        )
+        self.assertEqual(snapshot.available_models_status, "error")
+        self.assertIsNotNone(snapshot.available_models_checked_at)
+
     async def test_sync_once_excludes_openai_api_key_accounts(self) -> None:
         oauth_account = {
             "id": 1,
@@ -60,6 +194,7 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
         service._delete_missing_remote_accounts = AsyncMock(  # type: ignore[method-assign]
             return_value=(0, 0)
         )
+        service._sync_oauth_available_models = AsyncMock(return_value=0)  # type: ignore[method-assign]
         service._dispatch_initial_subscription_refresh = MagicMock()  # type: ignore[method-assign]
         db = AsyncMock()
 
@@ -107,6 +242,7 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
         service._ensure_routed_mailbox = AsyncMock()  # type: ignore[method-assign]
         service._clear_account_exceptions = AsyncMock()  # type: ignore[method-assign]
         service._delete_missing_remote_accounts = AsyncMock(return_value=(0, 0))  # type: ignore[method-assign]
+        service._sync_oauth_available_models = AsyncMock(return_value=0)  # type: ignore[method-assign]
         service._dispatch_initial_subscription_refresh = MagicMock()  # type: ignore[method-assign]
         db = AsyncMock()
 
@@ -277,6 +413,46 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(repeated, (False, False, False))
         self.assertEqual(snapshot.subscription_checked_at, first_checked_at)
+
+    async def test_upsert_snapshot_notifies_when_oauth_account_recovers(self) -> None:
+        account = {
+            "id": 7,
+            "email": "oauth@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "status": "active",
+            "schedulable": True,
+            "credentials": {},
+        }
+        snapshot = AccountSnapshot(
+            email="oauth@example.com",
+            deactive=True,
+            last_error="account deactive",
+        )
+        service = object.__new__(MonitorService)
+        service.sub2api = Sub2ApiClient()
+        service._sync_phone_from_account_note = AsyncMock()  # type: ignore[method-assign]
+        db = SimpleNamespace(scalar=AsyncMock(return_value=snapshot), add=MagicMock())
+
+        with patch(
+            "app.services.monitor.enqueue_oauth_account_enabled",
+            new=AsyncMock(),
+        ) as notify_enabled:
+            await service._upsert_snapshot(
+                "oauth@example.com",
+                account,
+                is_error=False,
+                is_deactive=False,
+                db=db,
+            )
+
+        self.assertFalse(snapshot.deactive)
+        notify_enabled.assert_awaited_once_with(
+            db,
+            "oauth@example.com",
+            "Sub2API reported the OAuth account as enabled again.",
+            account_id="7",
+        )
 
     async def test_initial_subscription_refresh_preserves_unlimited_concurrency(self) -> None:
         accounts = [{"id": 7, "email": "oauth@example.com"}]

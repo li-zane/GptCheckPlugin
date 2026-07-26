@@ -7,12 +7,15 @@ import {
   ArrowUpDown,
   ChevronDown,
   CheckCircle2,
+  CircleHelp,
   Clock3,
   Copy,
   Database,
   ExternalLink,
   Globe2,
+  History,
   Inbox,
+  Image as ImageIcon,
   KeyRound,
   Link2,
   LogOut,
@@ -26,6 +29,7 @@ import {
   RefreshCcw,
   Save,
   Search,
+  Send,
   Settings2,
   ShieldAlert,
   ShieldCheck,
@@ -34,33 +38,41 @@ import {
   Sun,
   TimerReset,
   Trash2,
+  Upload,
   UserRoundX,
   UsersRound,
   X,
+  ZoomIn,
   type LucideIcon,
 } from "lucide-react";
-import { createContext, FormEvent, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, FormEvent, lazy, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { api, AUTH_EXPIRED_EVENT, upstreamLegacyBindingCounts } from "./api";
-import { ApiKeyAccountsView } from "./ApiKeyAccountsView";
+import { HelpPopover } from "./HelpPopover";
 import { oauthUsageBackgroundRefreshIntervals } from "./oauthUsageRefresh";
 import {
-  eventDurationBreakdown,
-  eventDurationMs,
-  formatElapsedDuration,
-  timestampDurationMs,
-} from "./durationPresentation";
+  persistOverviewBalanceAlertDismissed,
+  readOverviewBalanceAlertDismissed,
+} from "./overviewBalanceAlertPreference";
 import {
   accountCanBeLivenessTested,
   livenessAccountIds,
   MAX_LIVENESS_ACCOUNTS,
 } from "./accountLiveness";
 import { accountFilterFacetCandidates } from "./accountFilterFacets";
+import { sortAccountsForTable } from "./accountTableSort";
+import {
+  firstUnusedFallbackModel,
+  MAX_FALLBACK_TEST_MODELS,
+  moveFallbackModel,
+  normalizeFallbackModelChain,
+} from "./fallbackModelChain";
 import {
   apiAccountLegacyBindingConfirmationMessage,
   apiAccountSyncMessage,
   upstreamRateWritesAllowed,
 } from "./upstreamSyncPresentation";
+
 import {
   accountBillingRateChange,
   groupRateChange,
@@ -68,6 +80,7 @@ import {
   upstreamGroupStatusChange,
   upstreamKeyStatusChange,
   upstreamRateChange,
+  upstreamChangeSummary,
   type UpstreamStateChange,
 } from "./upstreamRatePresentation";
 import {
@@ -101,6 +114,7 @@ import type {
   AccountLivenessModel,
   AccountLivenessTestResult,
   AccountUsageEstimate,
+  ApiKeyViewOperation,
   AppEvent,
   AppSettings,
   AppSettingsUpdate,
@@ -119,13 +133,25 @@ import type {
   UsageWindowAggregate,
   UsageWindowEstimate,
   UpstreamChangeLog,
+  UpstreamChannel,
   UpstreamChannelsResponse,
 } from "./types";
+
+const loadApiKeyAccountsView = () => import("./ApiKeyAccountsView");
+const ApiKeyAccountsView = lazy(async () => ({
+  default: (await loadApiKeyAccountsView()).ApiKeyAccountsView,
+}));
+const loadHistoryView = () => import("./HistoryView");
+const HistoryView = lazy(async () => ({
+  default: (await loadHistoryView()).HistoryView,
+}));
 
 type Theme = "light" | "dark";
 type AccountCounts = { actual: number; deduped: number; duplicates: number };
 type AccountStatusFilter = "all" | "normal" | "normal-no-rate-limit" | "five-hour-rate-limited" | "seven-day-rate-limited" | "monthly-rate-limited" | "error" | "deactive";
 type UsageDetailAccountFilter = "normal" | "rate-limited";
+type AccountSortField = "account" | "imported_at";
+type SortDirection = "asc" | "desc";
 type AccountJumpTarget = { email: string | null; sub2apiAccountId: string | null; requestedAt: number };
 type ProblemUnusedQuotaSummary = { accountCount: number; fiveHour: UsageWindowAggregate; sevenDay: UsageWindowAggregate };
 
@@ -209,8 +235,41 @@ const emptySettings: AppSettings = {
   upstream_sync_max_concurrency: 10,
   upstream_rate_sync_enabled: false,
   upstream_priority_sync_enabled: true,
+  manual_upstream_sync_rate_enabled: true,
+  manual_upstream_sync_priority_enabled: true,
+  manual_upstream_sync_upstream_health_enabled: true,
+  manual_upstream_sync_channel_monitors_enabled: true,
+  manual_upstream_sync_account_availability_enabled: false,
+  manual_upstream_sync_balance_guard_enabled: true,
+  manual_upstream_sync_rate_pause_enabled: true,
   api_key_auto_disable_on_upstream_unavailable: false,
+  api_key_auto_pause_on_negative_balance_enabled: false,
+  api_key_auto_pause_on_channel_monitor_unavailable_enabled: false,
+  channel_monitor_auto_probe_enabled: true,
+  account_model_whitelist_sync_enabled: false,
+  account_model_whitelist_sync_interval_seconds: 3600,
+  account_model_whitelist_sync_each_time: false,
+  channel_monitor_fallback_without_monitor_enabled: false,
+  channel_monitor_fallback_test_models: [],
+  channel_monitor_fallback_test_model: "",
+  channel_monitor_fallback_test_attempts: 1,
+  channel_monitor_recovery_test_attempts: 1,
+  available_test_models: [],
+  upstream_negative_balance_basis: "wallet",
+  upstream_balance_pause_threshold: 0,
+  show_stale_negative_balance_alert: true,
+  priority_assign_disabled_api_key_accounts: false,
+  priority_share_same_composite_multiplier: false,
   upstream_rate_log_retention_days: 90,
+  discord_bot_notifications_enabled: false,
+  discord_bot_token_set: false,
+  discord_bot_token_hint: null,
+  discord_bot_channel_id: "",
+  notify_oauth_account_disabled: false,
+  notify_account_enabled: false,
+  notify_api_key_rate_changed: false,
+  notify_upstream_group_changed: false,
+  notify_upstream_balance_low: false,
   usage_limit_sample_five_hour_threshold_percent: 0,
   usage_limit_sample_seven_day_threshold_percent: 0,
   usage_limit_default_ranges: defaultUsageLimitRanges,
@@ -226,6 +285,8 @@ const emptySettings: AppSettings = {
   last_scan_message: null,
   display_timezone: defaultTimeZone,
   site_name: defaultSiteName,
+  site_logo_url: null,
+  site_logo_updated_at: null,
 };
 
 function App() {
@@ -252,8 +313,9 @@ function App() {
   const [apiKeyAccountsCache, setApiKeyAccountsCache] = useState<UpstreamChannelsResponse | null>(null);
   const [apiKeyRefreshVersion, setApiKeyRefreshVersion] = useState(0);
   const [apiKeyViewBusy, setApiKeyViewBusy] = useState(false);
+  const [apiKeyViewBlocking, setApiKeyViewBlocking] = useState(false);
   const apiKeyAccountsCacheBaseUrlRef = useRef<string | null>(null);
-  const apiKeyViewOperationTokensRef = useRef(new Set<symbol>());
+  const apiKeyViewOperationTokensRef = useRef(new Map<symbol, ApiKeyViewOperation>());
   const loadAllRequestSequenceRef = useRef(0);
   const settingsMutationGenerationRef = useRef(0);
   const settingsMutationPendingRef = useRef(false);
@@ -270,10 +332,12 @@ function App() {
   const [usageEstimateRefreshed, setUsageEstimateRefreshed] = useState(false);
   const [notice, setNotice] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const [pageRefreshing, setPageRefreshing] = useState(false);
   const [oauthSyncBusy, setOAuthSyncBusy] = useState(false);
   const [apiKeySyncBusy, setApiKeySyncBusy] = useState(false);
   const [settingsFormInvalid, setSettingsFormInvalid] = useState(false);
   const siteName = settings.site_name?.trim() || defaultSiteName;
+  const siteLogoUrl = settings.site_logo_url?.trim() || "/logo.png";
   const now = useRefreshClock();
   const lastOAuthSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
   const lastApiKeySyncEvent = useMemo(
@@ -290,7 +354,10 @@ function App() {
   const syncBusy = busy || oauthSyncBusy || apiKeySyncBusy || apiKeyViewBusy;
   const toggleTheme = useCallback(() => setTheme((current) => (current === "dark" ? "light" : "dark")), []);
   const navigateToView = useCallback((nextView: View) => {
-    const nextRoute: AppRoute = { view: nextView, apiKeySubview: "accounts" };
+    const nextRoute: AppRoute = {
+      view: nextView,
+      apiKeySubview: nextView === "api-keys" ? "channels" : "accounts",
+    };
     const nextPath = pathForRoute(nextRoute);
     if (window.location.pathname !== nextPath) {
       window.history.pushState(null, "", nextPath);
@@ -319,16 +386,22 @@ function App() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  const beginApiKeyViewOperation = useCallback(() => {
+  const beginApiKeyViewOperation = useCallback((operation: ApiKeyViewOperation = { kind: "blocking" }) => {
     const token = Symbol("api-key-view-operation");
-    apiKeyViewOperationTokensRef.current.add(token);
+    apiKeyViewOperationTokensRef.current.set(token, operation);
     setApiKeyViewBusy(true);
+    setApiKeyViewBlocking(
+      Array.from(apiKeyViewOperationTokensRef.current.values()).some((item) => item.kind === "blocking"),
+    );
     let released = false;
     return () => {
       if (released) return;
       released = true;
       apiKeyViewOperationTokensRef.current.delete(token);
       setApiKeyViewBusy(apiKeyViewOperationTokensRef.current.size > 0);
+      setApiKeyViewBlocking(
+        Array.from(apiKeyViewOperationTokensRef.current.values()).some((item) => item.kind === "blocking"),
+      );
     };
   }, []);
 
@@ -345,7 +418,7 @@ function App() {
     const settingsGeneration = settingsMutationGenerationRef.current;
     const phonePromise = includePhones ? api.phones().catch(() => null) : Promise.resolve<PhoneNumber[] | null>(null);
     const exceptionRecordsPromise = api.exceptionRecords().catch(() => null);
-    const [nextSummary, nextAccounts, nextMailboxes, nextPhones, nextJobs, nextEvents, nextExceptionRecords, nextSettings] = await Promise.all([
+    const [nextSummary, nextAccounts, nextMailboxes, nextPhones, nextJobs, nextEvents, nextExceptionRecords, nextSettings, nextUpstreamOverview] = await Promise.all([
       api.summary(),
       api.accounts(),
       api.mailboxes(),
@@ -354,6 +427,7 @@ function App() {
       api.events(),
       exceptionRecordsPromise,
       api.settings(),
+      api.upstreamChannels(false).catch(() => null),
     ]);
     if (
       requestSequence !== loadAllRequestSequenceRef.current
@@ -373,16 +447,23 @@ function App() {
     const previousBaseUrl = apiKeyAccountsCacheBaseUrlRef.current;
     if (!previousBaseUrl) {
       apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
-      setApiKeyAccountsCache(readUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url));
+      const cachedOverview = nextUpstreamOverview
+        ? writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url, nextUpstreamOverview)
+        : readUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url);
+      setApiKeyAccountsCache(nextUpstreamOverview || cachedOverview);
     } else if (upstreamOverviewCacheScope(previousBaseUrl) !== upstreamOverviewCacheScope(nextSettings.sub2api_base_url)) {
       clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
       apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
-      setApiKeyAccountsCache(null);
+      const safeOverview = nextUpstreamOverview
+        ? writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url, nextUpstreamOverview)
+        : null;
+      setApiKeyAccountsCache(nextUpstreamOverview || safeOverview);
     } else {
       apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+      if (nextUpstreamOverview) cacheApiKeyAccounts(nextUpstreamOverview, nextSettings.sub2api_base_url);
     }
     setSettings((current) => (appSettingsEqual(current, nextSettings) ? current : nextSettings));
-  }, []);
+  }, [cacheApiKeyAccounts]);
 
   const usageByEmail = useMemo(() => {
     const entries: Array<readonly [string, AccountUsageEstimate]> = [];
@@ -481,6 +562,64 @@ function App() {
     }
   }, []);
 
+  const refreshCurrentView = useCallback(async () => {
+    if (pageRefreshing) return;
+    setPageRefreshing(true);
+    setNotice("");
+    loadAllRequestSequenceRef.current += 1;
+    try {
+      if (view === "overview") {
+        const [nextSummary, nextAccounts, nextJobs, nextEvents, nextUpstream] = await Promise.all([
+          api.summary(),
+          api.accounts(),
+          api.jobs(),
+          api.events(),
+          api.upstreamChannels(false).catch(() => null),
+        ]);
+        setSummary(nextSummary);
+        setAccounts(nextAccounts);
+        setJobs(nextJobs);
+        setEvents(nextEvents);
+        if (nextUpstream) cacheApiKeyAccounts(nextUpstream, settings.sub2api_base_url);
+        await loadUsageEstimate(false);
+        setApiKeyRefreshVersion((current) => current + 1);
+      } else if (view === "accounts") {
+        const [nextAccounts, nextMailboxes] = await Promise.all([api.accounts(), api.mailboxes()]);
+        setAccounts(nextAccounts);
+        setMailboxes(nextMailboxes);
+        await loadUsageEstimate(false);
+      } else if (view === "api-keys") {
+        const nextUpstream = await api.upstreamChannels(false);
+        cacheApiKeyAccounts(nextUpstream, settings.sub2api_base_url);
+        setApiKeyRefreshVersion((current) => current + 1);
+      } else if (view === "usage") {
+        await loadUsageEstimate(false);
+      } else if (view === "usage-samples") {
+        await loadUsageLimitSamples();
+      } else if (view === "mailboxes") {
+        setMailboxes(await api.mailboxes());
+      } else if (view === "phones") {
+        setPhones(await api.phones());
+      } else if (view === "history") {
+        const [nextJobs, nextEvents, nextExceptionRecords] = await Promise.all([
+          api.jobs(),
+          api.events(),
+          api.exceptionRecords(),
+        ]);
+        setJobs(nextJobs);
+        setEvents(nextEvents);
+        setExceptionRecords(nextExceptionRecords);
+      } else if (view === "settings") {
+        setSettings(await api.settings());
+      }
+      setNotice("当前页面数据已刷新");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "当前页面刷新失败");
+    } finally {
+      setPageRefreshing(false);
+    }
+  }, [cacheApiKeyAccounts, loadUsageEstimate, loadUsageLimitSamples, pageRefreshing, settings.sub2api_base_url, view]);
+
   useEffect(() => {
     const handleAuthExpired = () => {
       clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
@@ -525,11 +664,12 @@ function App() {
   }, [authState, loadAll, loadUsageEstimate, view]);
 
   useEffect(() => {
+    if (authState !== "in" || view !== "usage-samples" || usageLimitSamples || usageLimitSamplesLoading) return;
+    loadUsageLimitSamples().catch(() => undefined);
+  }, [authState, loadUsageLimitSamples, usageLimitSamples, usageLimitSamplesLoading, view]);
+
+  useEffect(() => {
     if (authState !== "in" || usageLoading) return;
-    if (view === "usage-samples" && !usageLimitSamples && !usageLimitSamplesLoading) {
-      loadUsageLimitSamples().catch(() => undefined);
-      return;
-    }
     if (usageError) return;
     if (view === "overview" || view === "accounts") {
       if (usageEstimate) return;
@@ -537,12 +677,13 @@ function App() {
       return;
     }
     if (view === "usage") {
-      const needsEstimate = !(usageEstimate && usageEstimateRefreshed);
-      if (needsEstimate) {
-        loadUsageEstimate(true).catch(() => undefined);
+      if (!usageEstimate) {
+        loadUsageEstimate(false).catch(() => undefined);
+        return;
       }
+      if (!usageEstimateRefreshed) loadUsageEstimate(true).catch(() => undefined);
     }
-  }, [authState, loadUsageEstimate, loadUsageLimitSamples, usageError, usageEstimate, usageEstimateRefreshed, usageLimitSamples, usageLimitSamplesLoading, usageLoading, view]);
+  }, [authState, loadUsageEstimate, usageError, usageEstimate, usageEstimateRefreshed, usageLoading, view]);
 
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -552,6 +693,41 @@ function App() {
       // Ignore storage failures in restricted browser contexts.
     }
   }, [theme]);
+
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    const updateLayoutOffsets = () => {
+      const topbar = document.querySelector<HTMLElement>(".topbar");
+      const sidebar = document.querySelector<HTMLElement>(".sidebar");
+      if (topbar) {
+        root.style.setProperty("--app-header-height", `${topbar.getBoundingClientRect().height}px`);
+      }
+      if (sidebar) {
+        root.style.setProperty("--app-sidebar-height", `${sidebar.getBoundingClientRect().height}px`);
+      }
+    };
+
+    updateLayoutOffsets();
+    const resizeObserver = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updateLayoutOffsets);
+    const topbar = document.querySelector<HTMLElement>(".topbar");
+    const sidebar = document.querySelector<HTMLElement>(".sidebar");
+    if (resizeObserver) {
+      if (topbar) resizeObserver.observe(topbar);
+      if (sidebar) resizeObserver.observe(sidebar);
+    }
+    window.addEventListener("resize", updateLayoutOffsets);
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updateLayoutOffsets);
+    };
+  }, [authState, notice, siteName, view]);
+
+  useLayoutEffect(() => {
+    document.querySelector<HTMLElement>(".workspace")?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [route.view, route.apiKeySubview]);
 
   useEffect(() => {
     document.title = siteName;
@@ -575,7 +751,10 @@ function App() {
     }
   };
 
-  const saveSettings = async (payload: AppSettingsUpdate) => {
+  const saveSettings = async (
+    payload: AppSettingsUpdate,
+    branding?: { logoFile: File | null; resetLogo: boolean },
+  ) => {
     const previousSub2ApiBaseUrl = settings.sub2api_base_url;
     const nextSub2ApiBaseUrl = payload.sub2api_base_url || previousSub2ApiBaseUrl;
     const changesSub2ApiCredential = Boolean(
@@ -603,7 +782,20 @@ function App() {
     setBusy(true);
     setNotice("");
     try {
-      const nextSettings = await api.updateSettings(payload);
+      let nextSettings = await api.updateSettings(payload);
+      let brandingError = "";
+      try {
+        if (branding?.resetLogo) {
+          await api.resetSiteLogo();
+          nextSettings = await api.settings();
+        } else if (branding?.logoFile) {
+          await api.updateSiteLogo(branding.logoFile);
+          nextSettings = await api.settings();
+        }
+      } catch (error) {
+        brandingError = error instanceof Error ? error.message : "Logo 更新失败";
+        nextSettings = await api.settings().catch(() => nextSettings);
+      }
       settingsMutationGenerationRef.current += 1;
       loadAllRequestSequenceRef.current += 1;
       settingsMutationPendingRef.current = false;
@@ -616,9 +808,12 @@ function App() {
         apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
         setApiKeyAccountsCache(null);
       }
-      setNotice("设置已保存");
+      setNotice(brandingError ? `其他设置已保存，但 Logo 更新失败：${brandingError}` : "设置已保存");
       await loadAll().catch((error) => {
-        setNotice(error instanceof Error ? `设置已保存；刷新页面数据失败：${error.message}` : "设置已保存；刷新页面数据失败");
+        const prefix = brandingError
+          ? `其他设置已保存，但 Logo 更新失败：${brandingError}`
+          : "设置已保存";
+        setNotice(error instanceof Error ? `${prefix}；刷新页面数据失败：${error.message}` : `${prefix}；刷新页面数据失败`);
       });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "设置保存失败");
@@ -638,7 +833,9 @@ function App() {
     if (
       operationRef.current
       || busy
-      || (kind === "api-key" && apiKeyViewOperationTokensRef.current.size > 0)
+      || (kind === "api-key" && Array.from(apiKeyViewOperationTokensRef.current.values()).some(
+        (operation) => operation.kind === "blocking",
+      ))
     ) return;
     operationRef.current = true;
     if (kind === "oauth") setOAuthSyncBusy(true);
@@ -698,7 +895,16 @@ function App() {
       ) {
         return { message: "已取消 API 账号同步。", cancelled: true };
       }
-      const result = await api.syncApiKeyAccounts(liveOverview, confirmationRequired);
+      const skipChannelIds = Array.from(apiKeyViewOperationTokensRef.current.values())
+        .filter((operation): operation is Extract<ApiKeyViewOperation, { kind: "channel-discovery" }> => (
+          operation.kind === "channel-discovery"
+        ))
+        .map((operation) => operation.channelId);
+      const result = await api.syncApiKeyAccounts(
+        liveOverview,
+        confirmationRequired,
+        Array.from(new Set(skipChannelIds)),
+      );
       const overview = result.overview || {
         ...liveOverview,
         channels: result.channels || [],
@@ -731,6 +937,7 @@ function App() {
   if (authState === "out") {
     return (
       <LoginScreen
+        logoUrl={siteLogoUrl}
         siteName={siteName}
         theme={theme}
         onToggleTheme={toggleTheme}
@@ -766,11 +973,10 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">
-            <img alt="" src="/logo.png" />
+            <img alt="" onError={fallbackSiteLogo} src={siteLogoUrl} />
           </div>
           <div>
             <strong>{siteName}</strong>
-            <span>sub2api access token</span>
           </div>
         </div>
 
@@ -783,6 +989,12 @@ function App() {
                 className={view === item.id ? "nav-item active" : "nav-item"}
                 key={item.id}
                 onClick={() => navigateToView(item.id)}
+                onFocus={() => {
+                  if (item.id === "api-keys") void loadApiKeyAccountsView();
+                }}
+                onMouseEnter={() => {
+                  if (item.id === "api-keys") void loadApiKeyAccountsView();
+                }}
                 title={item.label}
                 type="button"
               >
@@ -827,15 +1039,28 @@ function App() {
             <h1>{titleFor(view)}</h1>
           </div>
           <div className="topbar-actions">
-            {notice ? <span className="notice">{notice}</span> : null}
+            {notice ? (
+              <div className="notice" role="status">
+                <span>{notice}</span>
+                <button
+                  aria-label="关闭提示"
+                  onClick={() => setNotice("")}
+                  title="关闭"
+                  type="button"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+            ) : null}
             <button
-              aria-label="刷新页面"
+              aria-label="刷新当前页面数据"
               className="icon-button toolbar-page-refresh"
-              onClick={() => window.location.reload()}
-              title="刷新页面"
+              disabled={pageRefreshing || syncBusy}
+              onClick={() => void refreshCurrentView()}
+              title="刷新当前页面数据"
               type="button"
             >
-              <RefreshCcw size={17} />
+              <RefreshCcw className={pageRefreshing ? "spin" : ""} size={17} />
             </button>
             {view === "settings" ? (
               <button
@@ -857,7 +1082,7 @@ function App() {
               time={oauthSyncActionTime}
             />
             <ToolbarTimeButton
-              disabled={busy || apiKeySyncBusy || apiKeyViewBusy}
+              disabled={busy || apiKeySyncBusy || apiKeyViewBlocking}
               icon={KeyRound}
               label="同步 API 账号"
               loading={apiKeySyncBusy}
@@ -876,8 +1101,13 @@ function App() {
             jobs={jobs}
             events={events}
             problemUnusedQuota={problemUnusedQuota}
+            showStaleNegativeBalanceAlert={settings.show_stale_negative_balance_alert ?? true}
+            balanceBasis={settings.upstream_negative_balance_basis || "wallet"}
+            balanceThreshold={settings.upstream_balance_pause_threshold ?? 0}
+            upstreamOverview={apiKeyAccountsCache}
             usageByAccountId={usageByAccountId}
             usageByEmail={usageByEmail}
+            onOpenUpstreamChannels={() => navigateToApiKeySubview("channels")}
           />
         ) : null}
         {view === "accounts" ? (
@@ -927,28 +1157,45 @@ function App() {
           />
         ) : null}
         {view === "api-keys" ? (
-          <ApiKeyAccountsView
-            cacheBaseUrl={settings.sub2api_base_url}
-            cachedData={apiKeyAccountsCache}
-            displayTimeZone={settings.display_timezone || defaultTimeZone}
-            globallyBusy={busy || apiKeySyncBusy}
-            key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
-            onCacheChange={cacheApiKeyAccounts}
-            onOperationStart={beginApiKeyViewOperation}
-            onSubviewChange={navigateToApiKeySubview}
-            rateWritesEnabled={upstreamRateWritesAllowed(
-              settings.upstream_rate_sync_enabled,
-              settings.automation_paused,
-            )}
-            refreshVersion={apiKeyRefreshVersion}
-            subview={route.apiKeySubview}
-          />
+          <Suspense fallback={<Empty label="正在加载 API Key 页面" />}>
+            <ApiKeyAccountsView
+              cacheBaseUrl={settings.sub2api_base_url}
+              cachedData={apiKeyAccountsCache}
+              channelMonitorFallbackTestModels={settings.channel_monitor_fallback_test_models?.length
+                ? settings.channel_monitor_fallback_test_models
+                : settings.channel_monitor_fallback_test_model
+                  ? [settings.channel_monitor_fallback_test_model]
+                  : []}
+              displayTimeZone={settings.display_timezone || defaultTimeZone}
+              globallyBusy={busy || apiKeySyncBusy || pageRefreshing}
+              key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
+              onCacheChange={cacheApiKeyAccounts}
+              onNotice={setNotice}
+              onOperationStart={beginApiKeyViewOperation}
+              onSubviewChange={navigateToApiKeySubview}
+              rateWritesEnabled={upstreamRateWritesAllowed(
+                settings.upstream_rate_sync_enabled,
+                settings.automation_paused,
+              )}
+              refreshVersion={apiKeyRefreshVersion}
+              shareSameCompositePriority={settings.priority_share_same_composite_multiplier ?? false}
+              subview={route.apiKeySubview}
+            />
+          </Suspense>
         ) : null}
         {view === "usage" ? (
           <UsageEstimateView
             estimate={usageEstimate}
             error={usageError}
             loading={usageLoading}
+            onLocateAccount={(account) => {
+              setAccountJumpTarget({
+                email: account.email,
+                sub2apiAccountId: account.sub2api_account_id,
+                requestedAt: Date.now(),
+              });
+              navigateToView("accounts");
+            }}
           />
         ) : null}
         {view === "usage-samples" ? (
@@ -991,30 +1238,37 @@ function App() {
           />
         ) : null}
         {view === "history" ? (
-          <HistoryView
-            busy={syncBusy}
-            exceptionRecords={exceptionRecords}
-            jobs={jobs}
-            events={events}
-            onClear={() => runAction(api.clearHistory, "历史已清空")}
-            onDeleteExceptionRecord={(id) => runAction(() => api.deleteExceptionRecord(id), "异常账号记录已删除")}
-            onLocateAccount={(record) => {
-              setAccountJumpTarget({
-                email: record.email,
-                sub2apiAccountId: record.sub2api_account_id,
-                requestedAt: Date.now(),
-              });
-              navigateToView("accounts");
-            }}
-          />
+          <Suspense fallback={<Empty label="正在加载历史页面" />}>
+            <HistoryView
+              busy={syncBusy}
+              events={events}
+              exceptionRecords={exceptionRecords}
+              formatDate={formatDate}
+              jobs={jobs}
+              now={now}
+              timeZone={settings.display_timezone || defaultTimeZone}
+              onClear={() => runAction(api.clearHistory, "历史已清空")}
+              onDeleteExceptionRecord={(id) => runAction(() => api.deleteExceptionRecord(id), "异常账号记录已删除")}
+              onLocateAccount={(record) => {
+                setAccountJumpTarget({
+                  email: record.email,
+                  sub2apiAccountId: record.sub2api_account_id,
+                  requestedAt: Date.now(),
+                });
+                navigateToView("accounts");
+              }}
+            />
+          </Suspense>
         ) : null}
         {view === "settings" ? (
           <SettingsView
             busy={syncBusy}
+            logoUrl={siteLogoUrl}
             settings={settings}
             subscriptionTypes={[...new Set(accounts.map((account) => account.subscription_type).filter(Boolean))]}
             onScan={() => runAction(api.scanSub2Api, "扫描完成")}
             onSave={saveSettings}
+            onTestNotification={() => runAction(api.testNotification, "测试通知已发送")}
             onValidityChange={setSettingsFormInvalid}
           />
         ) : null}
@@ -1026,11 +1280,13 @@ function App() {
 }
 
 function LoginScreen({
+  logoUrl,
   siteName,
   theme,
   onToggleTheme,
   onLogin,
 }: {
+  logoUrl: string;
   siteName: string;
   theme: Theme;
   onToggleTheme: () => void;
@@ -1058,7 +1314,7 @@ function LoginScreen({
       <section className="login-panel">
         <div className="login-panel-head">
           <div className="login-emblem">
-            <img alt="" src="/logo.png" />
+            <img alt="" onError={fallbackSiteLogo} src={logoUrl} />
           </div>
           <ThemeToggle compact theme={theme} onToggleTheme={onToggleTheme} />
         </div>
@@ -1161,8 +1417,13 @@ function Overview({
   jobs,
   events,
   problemUnusedQuota,
+  showStaleNegativeBalanceAlert,
+  balanceBasis,
+  balanceThreshold,
+  upstreamOverview,
   usageByAccountId,
   usageByEmail,
+  onOpenUpstreamChannels,
 }: {
   summary: Summary;
   accounts: Account[];
@@ -1171,8 +1432,13 @@ function Overview({
   jobs: RefreshJob[];
   events: AppEvent[];
   problemUnusedQuota: ProblemUnusedQuotaSummary | null;
+  showStaleNegativeBalanceAlert: boolean;
+  balanceBasis: "wallet" | "recharge_adjusted";
+  balanceThreshold: number;
+  upstreamOverview: UpstreamChannelsResponse | null;
   usageByAccountId: Map<string, AccountUsageEstimate>;
   usageByEmail: Map<string, AccountUsageEstimate>;
+  onOpenUpstreamChannels: () => void;
 }) {
   const recentAccounts = accounts.slice(0, 6);
   const latestJob = jobs[0];
@@ -1203,6 +1469,21 @@ function Overview({
   const problemUnusedQuotaTitle = problemUnusedQuota
     ? `错误/封停账号 ${problemUnusedQuota.accountCount} 个，可估 ${problemUnusedQuota.sevenDay.estimable_accounts} 个，5h 未用 ${formatAggregateMoney(problemUnusedQuota.fiveHour)}`
     : "等待额度估算数据";
+  const [lowBalanceAlertDismissed, setLowBalanceAlertDismissed] = useState(
+    () => readOverviewBalanceAlertDismissed(),
+  );
+  const lowBalanceChannels = (upstreamOverview?.channels || []).filter((channel) =>
+    channelHasLowBalance(
+      channel,
+      showStaleNegativeBalanceAlert,
+      balanceBasis,
+      balanceThreshold,
+    ),
+  );
+  const lowBalanceSignature = lowBalanceChannels
+    .map((channel) => `${channel.id}:${channel.balance_guard_state}:${channel.balance_guard_value}:${channel.balance_remaining}:${channel.balance_checked_at}`)
+    .join("|");
+  const showLowBalanceAlert = Boolean(lowBalanceSignature && !lowBalanceAlertDismissed);
   const stats: Array<{ label: string; value: number | string; icon: LucideIcon; tone: string; title?: string }> = [
     { label: "实际账号", value: actualAccounts, icon: UsersRound, tone: "ink" },
     { label: "去重账号", value: dedupedAccounts, icon: ShieldCheck, tone: "ok" },
@@ -1232,6 +1513,32 @@ function Overview({
           );
         })}
       </section>
+
+      {showLowBalanceAlert ? (
+        <section className="overview-balance-alert" role="alert">
+          <AlertTriangle size={19} />
+          <div>
+            <strong>上游渠道余额不足</strong>
+            <span>{lowBalanceChannels.map((channel) => `${channel.display_name || channel.base_url || `渠道 #${channel.id}`} ${formatBalanceGuardValue(channel, balanceBasis)}${isStaleLowBalance(channel, balanceBasis, balanceThreshold) ? "（上次结果）" : ""}`).join(" · ")}</span>
+          </div>
+          <button className="secondary-button" onClick={onOpenUpstreamChannels} type="button">
+            <span>查看渠道</span>
+            <ArrowRight size={15} />
+          </button>
+          <button
+            aria-label="关闭上游余额不足提醒"
+            className="icon-button overview-balance-alert-close"
+            onClick={() => {
+              setLowBalanceAlertDismissed(true);
+              persistOverviewBalanceAlertDismissed();
+            }}
+            title="关闭提醒"
+            type="button"
+          >
+            <X size={15} />
+          </button>
+        </section>
+      ) : null}
 
       <section className="panel rate-limit-panel">
         <div className="panel-toolbar">
@@ -1292,7 +1599,7 @@ function Overview({
         <div className="panel">
           <PanelTitle title="运行信号" icon={Activity} />
           <div className="signal-list">
-            <SignalLine label="最近任务" value={latestJob ? `${latestJob.email} · ${statusLabel(latestJob.status)}` : "暂无"} />
+            <SignalLine label="最近任务" value={latestJob ? `${latestJob.email} · ${refreshJobStatusLabel(latestJob.status)}` : "暂无"} />
             <SignalLine label="最近事件" value={latestEvent ? latestEvent.message : "暂无"} />
             <SignalLine label="24h 失败" value={`${summary.recent_failed}`} />
           </div>
@@ -1378,7 +1685,7 @@ function RecentApiKeyUpstreamChanges({ refreshVersion }: { refreshVersion: numbe
                 </span>
                 <div className="api-key-rate-log-meta">
                   <time dateTime={log.created_at}>{formatDate(log.created_at, timeZone)}</time>
-                  <span>{upstreamChangeReasonLabel(log.reason)}</span>
+                  <span>{upstreamChangeSummary(log) || upstreamChangeReasonLabel(log.reason)}</span>
                 </div>
                 <div className="api-key-upstream-state-list" aria-label="上游状态变化">
                   <OverviewUpstreamStateTransition change={upstreamKeyStatusChange(log)} kind="key" label="Key" />
@@ -1538,7 +1845,12 @@ function AccountsView({
   onToggleUsageEstimate: (id: number, enabled: boolean) => void;
 }) {
   const problemAccountCount = accounts.filter(canBulkDeleteProblemAccount).length;
-  const orderedAccounts = useMemo(() => [...accounts].sort(accountCompare), [accounts]);
+  const [accountSortField, setAccountSortField] = useState<AccountSortField>("account");
+  const [accountSortDirection, setAccountSortDirection] = useState<SortDirection>("asc");
+  const orderedAccounts = useMemo(
+    () => sortAccountsForTable(accounts, accountSortField, accountSortDirection),
+    [accountSortDirection, accountSortField, accounts],
+  );
   const [accountSearch, setAccountSearch] = useState("");
   const [accountStatusFilter, setAccountStatusFilter] = useState<AccountStatusFilter>("all");
   const [accountSubscriptionFilter, setAccountSubscriptionFilter] = useState("");
@@ -1555,6 +1867,14 @@ function AccountsView({
   const [highlightedAccountKey, setHighlightedAccountKey] = useState<string | null>(null);
   const handledJumpRequestRef = useRef<number | null>(null);
   const livenessTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const toggleAccountSort = (field: AccountSortField) => {
+    if (accountSortField === field) {
+      setAccountSortDirection((current) => current === "asc" ? "desc" : "asc");
+      return;
+    }
+    setAccountSortField(field);
+    setAccountSortDirection("asc");
+  };
   const mailboxByEmail = useMemo(() => {
     const entries = mailboxes
       .filter((mailbox) => !mailbox.disabled)
@@ -1945,9 +2265,23 @@ function AccountsView({
                     />
                   </label>
                 </th>
-                <th>账号</th>
+                <th aria-sort={accountSortField === "account" ? (accountSortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                  <AccountTableSortButton
+                    active={accountSortField === "account"}
+                    direction={accountSortDirection}
+                    label="账号"
+                    onClick={() => toggleAccountSort("account")}
+                  />
+                </th>
                 <th>sub2api ID</th>
-                <th>时间记录</th>
+                <th aria-sort={accountSortField === "imported_at" ? (accountSortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                  <AccountTableSortButton
+                    active={accountSortField === "imported_at"}
+                    direction={accountSortDirection}
+                    label="时间记录"
+                    onClick={() => toggleAccountSort("imported_at")}
+                  />
+                </th>
                 <th>绑定邮箱</th>
                 <th>参与额度</th>
                 <th>状态</th>
@@ -2004,6 +2338,31 @@ function AccountsView({
       {selectedErrorAccount ? <AccountErrorDialog account={selectedErrorAccount} onClose={() => setSelectedErrorAccount(null)} /> : null}
       {livenessAccounts ? <AccountLivenessDialog accounts={livenessAccounts} onClose={closeLivenessDialog} /> : null}
     </>
+  );
+}
+
+function AccountTableSortButton({
+  active,
+  direction,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  direction: SortDirection;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      aria-label={`按${label}${active && direction === "asc" ? "降序" : "升序"}排列`}
+      className={active ? "account-table-sort active" : "account-table-sort"}
+      onClick={onClick}
+      title={`切换${label}排序`}
+      type="button"
+    >
+      <span>{label}</span>
+      {!active ? <ArrowUpDown size={14} /> : direction === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+    </button>
   );
 }
 
@@ -2642,10 +3001,12 @@ function UsageEstimateView({
   estimate,
   loading,
   error,
+  onLocateAccount,
 }: {
   estimate: UsageEstimate | null;
   loading: boolean;
   error: string;
+  onLocateAccount: (account: AccountUsageEstimate) => void;
 }) {
   const timeZone = useDisplayTimeZone();
   const now = useNow();
@@ -2861,6 +3222,7 @@ function UsageEstimateView({
             <div className="table-wrap">
               <table className="usage-account-table">
                 <colgroup>
+                  <col className="usage-account-col-locate" />
                   <col className="usage-account-col-email" />
                   <col className="usage-account-col-tags" />
                   <col className="usage-account-col-subscription" />
@@ -2872,6 +3234,7 @@ function UsageEstimateView({
                 </colgroup>
                 <thead>
                   <tr>
+                    <th aria-label="定位账号" />
                     <th>账号</th>
                     <th>标签</th>
                     <th>订阅类型</th>
@@ -2885,6 +3248,17 @@ function UsageEstimateView({
                 <tbody>
                   {detailAccounts.map((account, index) => (
                     <tr key={`${account.email}:${account.sub2api_account_id || index}`}>
+                      <td>
+                        <button
+                          aria-label={`在账号页查看 ${account.account_name || account.email}`}
+                          className="icon-button usage-account-locate"
+                          onClick={() => onLocateAccount(account)}
+                          title="在账号页查看"
+                          type="button"
+                        >
+                          <ArrowRight size={15} />
+                        </button>
+                      </td>
                       <td>
                         <StackedAccountIdentity accountName={account.account_name} email={account.email} />
                       </td>
@@ -3938,14 +4312,18 @@ function PhoneBindingDialog({
 
 function AutomationSettingRow({
   checked,
+  description,
   interval,
   label,
+  manual,
   onChange,
   threads,
 }: {
   checked: boolean;
+  description?: string;
   interval: ReactNode;
   label: string;
+  manual?: ReactNode;
   onChange: (checked: boolean) => void;
   threads: ReactNode;
 }) {
@@ -3953,7 +4331,12 @@ function AutomationSettingRow({
     <div className="automation-setting-row" role="group" aria-label={label}>
       <label className="automation-setting-toggle">
         <input checked={checked} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
-        <strong>{label}</strong>
+        <span className="automation-setting-label">
+          <span className="settings-label-with-help">
+            <strong>{label}</strong>
+            {description ? <HelpPopover label={`查看${label}说明`}>{description}</HelpPopover> : null}
+          </span>
+        </span>
       </label>
       <div className="automation-setting-cell">
         <span className="automation-setting-mobile-label">线程数</span>
@@ -3963,22 +4346,55 @@ function AutomationSettingRow({
         <span className="automation-setting-mobile-label">自动执行间隔</span>
         {interval}
       </div>
+      <div className="automation-setting-cell automation-setting-cell--manual">
+        <span className="automation-setting-mobile-label">手动同步</span>
+        {manual ?? <AutomationSettingInherited>不适用</AutomationSettingInherited>}
+      </div>
     </div>
+  );
+}
+
+function AutomationSettingManualCheckbox({
+  checked,
+  disabled = false,
+  label,
+  onChange,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="automation-setting-manual" title={label}>
+      <input
+        aria-label={label}
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+        type="checkbox"
+      />
+      <span>{checked ? "执行" : "跳过"}</span>
+    </label>
   );
 }
 
 function AutomationSettingNumber({
   ariaLabel,
+  disabled = false,
   max,
   min,
   onChange,
+  step,
   suffix,
   value,
 }: {
   ariaLabel: string;
+  disabled?: boolean;
   max: number;
   min: number;
   onChange: (value: string) => void;
+  step?: number | "any";
   suffix?: string;
   value: string;
 }) {
@@ -3986,9 +4402,11 @@ function AutomationSettingNumber({
     <div className="automation-setting-number">
       <input
         aria-label={ariaLabel}
+        disabled={disabled}
         max={max}
         min={min}
         onChange={(event) => onChange(event.target.value)}
+        step={step}
         type="number"
         value={value}
       />
@@ -4005,19 +4423,423 @@ function AutomationSettingInherited({ children }: { children: ReactNode }) {
   );
 }
 
+function scrollToSettingsSection(sectionId: string) {
+  document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function FallbackModelChainDialog({
+  availableModels,
+  enabled,
+  models,
+  onChange,
+  onClose,
+}: {
+  availableModels: AccountLivenessModel[];
+  enabled: boolean;
+  models: string[];
+  onChange: (models: string[]) => void;
+  onClose: () => void;
+}) {
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const availableModelIds = useMemo(
+    () => Array.from(new Set(availableModels.map((model) => model.id.trim()).filter(Boolean))),
+    [availableModels],
+  );
+  const nextModel = firstUnusedFallbackModel(availableModelIds, models);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const frame = window.requestAnimationFrame(() => closeButtonRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      } else if (!dialogRef.current.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      className="modal-backdrop settings-model-chain-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      role="presentation"
+    >
+      <section aria-labelledby="fallback-model-chain-title" aria-modal="true" className="mail-dialog settings-model-chain-dialog" ref={dialogRef} role="dialog">
+        <header className="mail-dialog-head">
+          <div>
+            <p className="eyebrow">API Key 可用性检测</p>
+            <h2 id="fallback-model-chain-title">配置回退测试模型链</h2>
+          </div>
+          <button aria-label="关闭回退测试模型链配置" className="icon-button" onClick={onClose} ref={closeButtonRef} title="关闭" type="button">
+            <X size={17} />
+          </button>
+        </header>
+
+        <p className="settings-model-chain-dialog-copy">
+          按从上到下的顺序选择账号白名单中第一个存在的模型。最多可配置 {MAX_FALLBACK_TEST_MODELS} 个模型。
+        </p>
+
+        <div className="settings-model-chain-list settings-model-chain-dialog-list">
+          {models.length ? models.map((selectedModel, index) => {
+            const configuredModel = availableModels.find((model) => model.id === selectedModel);
+            const options = configuredModel
+              ? availableModels
+              : [{ id: selectedModel, display_name: `${selectedModel}（当前配置）` }, ...availableModels];
+            return (
+              <div className="settings-model-chain-row" key={selectedModel}>
+                <span className="settings-model-chain-order" aria-hidden="true">{index + 1}</span>
+                <select
+                  aria-label={`回退测试模型 ${index + 1}`}
+                  disabled={!enabled}
+                  onChange={(event) => {
+                    const model = event.target.value;
+                    onChange(models.map((item, itemIndex) => itemIndex === index ? model : item));
+                  }}
+                  value={selectedModel}
+                >
+                  {options.map((model) => (
+                    <option
+                      disabled={model.id !== selectedModel && models.includes(model.id)}
+                      key={model.id}
+                      value={model.id}
+                    >
+                      {model.display_name || model.id}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  aria-label={`上移回退测试模型 ${selectedModel}`}
+                  className="icon-button settings-model-chain-action"
+                  disabled={!enabled || index === 0}
+                  onClick={() => onChange(moveFallbackModel(models, index, -1))}
+                  title="上移"
+                  type="button"
+                >
+                  <ArrowUp size={15} />
+                </button>
+                <button
+                  aria-label={`下移回退测试模型 ${selectedModel}`}
+                  className="icon-button settings-model-chain-action"
+                  disabled={!enabled || index === models.length - 1}
+                  onClick={() => onChange(moveFallbackModel(models, index, 1))}
+                  title="下移"
+                  type="button"
+                >
+                  <ArrowDown size={15} />
+                </button>
+                <button
+                  aria-label={`删除回退测试模型 ${selectedModel}`}
+                  className="icon-button danger settings-model-chain-action"
+                  disabled={!enabled}
+                  onClick={() => onChange(models.filter((_, itemIndex) => itemIndex !== index))}
+                  title="删除"
+                  type="button"
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            );
+          }) : (
+            <span className="settings-model-chain-empty">尚未配置回退测试模型</span>
+          )}
+        </div>
+
+        <div className="settings-model-chain-dialog-actions">
+          <button
+            className="secondary-button settings-model-chain-add"
+            disabled={!enabled || !nextModel || models.length >= MAX_FALLBACK_TEST_MODELS}
+            onClick={() => {
+              if (nextModel) onChange([...models, nextModel]);
+            }}
+            type="button"
+          >
+            <Plus size={15} />
+            新增模型
+          </button>
+          <button className="primary-button" onClick={onClose} type="button">完成</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+type DiscordSetupScreenshot = {
+  alt: string;
+  src: string;
+  title: string;
+};
+
+function DiscordBotSetupScreenshotPreviewDialog({
+  onClose,
+  screenshot,
+}: {
+  onClose: () => void;
+  screenshot: DiscordSetupScreenshot;
+}) {
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => closeButtonRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      } else if (!dialogRef.current.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      className="modal-backdrop discord-bot-screenshot-preview-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      role="presentation"
+    >
+      <section aria-labelledby="discord-bot-screenshot-preview-title" aria-modal="true" className="mail-dialog discord-bot-screenshot-preview-dialog" ref={dialogRef} role="dialog">
+        <header className="mail-dialog-head">
+          <h2 id="discord-bot-screenshot-preview-title">{screenshot.title}</h2>
+          <button aria-label="关闭截图预览" className="icon-button" onClick={onClose} ref={closeButtonRef} title="关闭" type="button">
+            <X size={17} />
+          </button>
+        </header>
+        <div className="discord-bot-screenshot-preview-body">
+          <img alt={screenshot.alt} src={screenshot.src} />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DiscordBotSetupGuideDialog({ onClose }: { onClose: () => void }) {
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const screenshotTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const [previewScreenshot, setPreviewScreenshot] = useState<DiscordSetupScreenshot | null>(null);
+  const screenshotPreviewOpenRef = useRef(false);
+  screenshotPreviewOpenRef.current = previewScreenshot !== null;
+  const closeScreenshotPreview = useCallback(() => {
+    setPreviewScreenshot(null);
+    window.requestAnimationFrame(() => screenshotTriggerRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const frame = window.requestAnimationFrame(() => closeButtonRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (screenshotPreviewOpenRef.current) return;
+      if (event.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+      ));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      } else if (!dialogRef.current.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      className="modal-backdrop settings-model-chain-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      role="presentation"
+    >
+      <section aria-labelledby="discord-bot-setup-guide-title" aria-modal="true" className="mail-dialog discord-bot-setup-dialog" ref={dialogRef} role="dialog">
+        <header className="mail-dialog-head">
+          <div>
+            <p className="eyebrow">Discord Bot 通知</p>
+            <h2 id="discord-bot-setup-guide-title">配置指南</h2>
+          </div>
+          <button aria-label="关闭 Discord Bot 配置指南" className="icon-button" onClick={onClose} ref={closeButtonRef} title="关闭" type="button">
+            <X size={17} />
+          </button>
+        </header>
+        <div className="discord-bot-setup-guide-body">
+          <p className="discord-bot-setup-guide-intro">按以下顺序完成配置。步骤卡片可在此弹框内滚动查看；带箭头的按钮会打开 Discord 官方页面。</p>
+          <ol className="discord-bot-setup-guide-steps">
+            <li className="discord-bot-setup-step">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">1</span>
+                <div>
+                  <strong>创建 Bot 并取得 Token</strong>
+                  <p>创建或选择应用，进入“机器人”页创建 Bot。复制 Token 后填入本页的 Bot Token 输入框；重新生成 Token 后必须同步更新此处的值。</p>
+                  <a className="discord-bot-setup-link" href="https://discord.com/developers/applications" rel="noreferrer" target="_blank">
+                    打开 Developer Portal <ExternalLink size={14} />
+                  </a>
+                </div>
+              </div>
+              <button
+                aria-label="打开创建 Bot 并取得 Token 的截图"
+                className="discord-bot-setup-screenshot-button"
+                onClick={(event) => {
+                  screenshotTriggerRef.current = event.currentTarget;
+                  setPreviewScreenshot({
+                    alt: "Discord Developer Portal 的机器人页面，令牌区域位于用户名下方",
+                    src: "/discord-bot-token-guide.png",
+                    title: "创建 Bot 并取得 Token",
+                  });
+                }}
+                type="button"
+              >
+                <img alt="Discord Developer Portal 的机器人页面，令牌区域位于用户名下方" className="discord-bot-setup-screenshot" loading="lazy" src="/discord-bot-token-guide.png" />
+                <span aria-hidden="true" className="discord-bot-setup-screenshot-action"><ZoomIn size={16} />点击查看原图</span>
+              </button>
+            </li>
+            <li className="discord-bot-setup-step">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">2</span>
+                <div>
+                  <strong>设置安装与命令范围</strong>
+                  <p>进入“安装”页，启用用户安装，选择 Discord 提供的安装链接，并为用户安装保留 <code>applications.commands</code>。安装后即可在 Bot 私信中使用 <code>/balance</code> 与 <code>/quota</code>。</p>
+                  <a className="discord-bot-setup-link" href="https://discord.com/developers/docs/tutorials/setting-up-a-bot-application" rel="noreferrer" target="_blank">
+                    打开官方安装说明 <ExternalLink size={14} />
+                  </a>
+                </div>
+              </div>
+              <button
+                aria-label="打开设置安装与命令范围的截图"
+                className="discord-bot-setup-screenshot-button"
+                onClick={(event) => {
+                  screenshotTriggerRef.current = event.currentTarget;
+                  setPreviewScreenshot({
+                    alt: "Discord Developer Portal 的安装页面，用户安装范围包含 applications.commands",
+                    src: "/discord-install-guide.png",
+                    title: "设置安装与命令范围",
+                  });
+                }}
+                type="button"
+              >
+                <img alt="Discord Developer Portal 的安装页面，用户安装范围包含 applications.commands" className="discord-bot-setup-screenshot" loading="lazy" src="/discord-install-guide.png" />
+                <span aria-hidden="true" className="discord-bot-setup-screenshot-action"><ZoomIn size={16} />点击查看原图</span>
+              </button>
+            </li>
+            <li className="discord-bot-setup-step discord-bot-setup-step--compact">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">3</span>
+                <div>
+                  <strong>复制通知频道 ID</strong>
+                  <p>在 Discord 客户端的高级设置中启用开发者模式，再右键通知目标频道并选择“复制频道 ID”。也可使用与 Bot 的私信频道 ID。</p>
+                  <a className="discord-bot-setup-link" href="https://support.discord.com/hc/en-us/articles/206346498-Where-can-I-find-my-User-Server-Message-ID" rel="noreferrer" target="_blank">
+                    打开官方开发者模式说明 <ExternalLink size={14} />
+                  </a>
+                </div>
+              </div>
+            </li>
+            <li className="discord-bot-setup-step discord-bot-setup-step--compact">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">4</span>
+                <div>
+                  <strong>保存并发送测试通知</strong>
+                  <p>回到本页填写 Token 与频道 ID，选中需要的通知事件并保存。保存成功后点击“发送测试通知”，确认通知到达指定频道。</p>
+                  <a className="discord-bot-setup-link" href="https://discord.com/developers/docs/quick-start/getting-started" rel="noreferrer" target="_blank">
+                    打开 Discord Quick Start <ExternalLink size={14} />
+                  </a>
+                </div>
+              </div>
+            </li>
+          </ol>
+          <p className="discord-bot-setup-guide-note">不要把 Bot Token 发到聊天、截图或提交到代码仓库。命令仅显示本插件已缓存的数据，不会触发上游余额或额度刷新。</p>
+        </div>
+      </section>
+      {previewScreenshot ? <DiscordBotSetupScreenshotPreviewDialog onClose={closeScreenshotPreview} screenshot={previewScreenshot} /> : null}
+    </div>
+  );
+}
+
 function SettingsView({
   settings,
+  logoUrl,
   subscriptionTypes,
   busy,
   onSave,
   onScan,
+  onTestNotification,
   onValidityChange,
 }: {
   settings: AppSettings;
+  logoUrl: string;
   subscriptionTypes: string[];
   busy: boolean;
-  onSave: (payload: AppSettingsUpdate) => Promise<void> | void;
+  onSave: (
+    payload: AppSettingsUpdate,
+    branding?: { logoFile: File | null; resetLogo: boolean },
+  ) => Promise<void> | void;
   onScan: () => Promise<void> | void;
+  onTestNotification: () => Promise<void> | void;
   onValidityChange: (invalid: boolean) => void;
 }) {
   const [siteName, setSiteName] = useState(settings.site_name || defaultSiteName);
@@ -4047,9 +4869,99 @@ function SettingsView({
   const [upstreamPrioritySyncEnabled, setUpstreamPrioritySyncEnabled] = useState(
     settings.upstream_priority_sync_enabled ?? true,
   );
+  const [manualUpstreamRateEnabled, setManualUpstreamRateEnabled] = useState(
+    settings.manual_upstream_sync_rate_enabled ?? true,
+  );
+  const [manualUpstreamPriorityEnabled, setManualUpstreamPriorityEnabled] = useState(
+    settings.manual_upstream_sync_priority_enabled ?? true,
+  );
+  const [manualUpstreamHealthEnabled, setManualUpstreamHealthEnabled] = useState(
+    settings.manual_upstream_sync_upstream_health_enabled ?? true,
+  );
+  const [manualChannelMonitorsEnabled, setManualChannelMonitorsEnabled] = useState(
+    settings.manual_upstream_sync_channel_monitors_enabled ?? true,
+  );
+  const [manualAccountAvailabilityEnabled, setManualAccountAvailabilityEnabled] = useState(
+    settings.manual_upstream_sync_account_availability_enabled ?? false,
+  );
+  const [manualBalanceGuardEnabled, setManualBalanceGuardEnabled] = useState(
+    settings.manual_upstream_sync_balance_guard_enabled ?? true,
+  );
+  const [manualRatePauseEnabled, setManualRatePauseEnabled] = useState(
+    settings.manual_upstream_sync_rate_pause_enabled ?? true,
+  );
   const [apiKeyAutoDisableEnabled, setApiKeyAutoDisableEnabled] = useState(
     settings.api_key_auto_disable_on_upstream_unavailable ?? false,
   );
+  const [apiKeyNegativeBalancePauseEnabled, setApiKeyNegativeBalancePauseEnabled] = useState(
+    settings.api_key_auto_pause_on_negative_balance_enabled ?? false,
+  );
+  const [apiKeyChannelMonitorPauseEnabled, setApiKeyChannelMonitorPauseEnabled] = useState(
+    settings.api_key_auto_pause_on_channel_monitor_unavailable_enabled ?? false,
+  );
+  const [channelMonitorAutoProbeEnabled, setChannelMonitorAutoProbeEnabled] = useState(
+    settings.channel_monitor_auto_probe_enabled ?? true,
+  );
+  const [accountModelWhitelistSyncEnabled, setAccountModelWhitelistSyncEnabled] = useState(
+    settings.account_model_whitelist_sync_enabled ?? settings.account_model_whitelist_sync_each_time ?? false,
+  );
+  const [accountModelWhitelistSyncInterval, setAccountModelWhitelistSyncInterval] = useState(
+    String(settings.account_model_whitelist_sync_interval_seconds ?? 3600),
+  );
+  const [channelMonitorFallbackWithoutMonitorEnabled, setChannelMonitorFallbackWithoutMonitorEnabled] = useState(
+    settings.channel_monitor_fallback_without_monitor_enabled ?? false,
+  );
+  const [channelMonitorFallbackTestModels, setChannelMonitorFallbackTestModels] = useState<string[]>(() =>
+    normalizeFallbackModelChain(
+      settings.channel_monitor_fallback_test_models,
+      settings.channel_monitor_fallback_test_model,
+    ),
+  );
+  const [fallbackModelDialogOpen, setFallbackModelDialogOpen] = useState(false);
+  const fallbackModelDialogTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeFallbackModelDialog = useCallback(() => {
+    setFallbackModelDialogOpen(false);
+    window.requestAnimationFrame(() => fallbackModelDialogTriggerRef.current?.focus());
+  }, []);
+  const [channelMonitorFallbackTestAttempts, setChannelMonitorFallbackTestAttempts] = useState(
+    String(settings.channel_monitor_fallback_test_attempts ?? 1),
+  );
+  const [channelMonitorRecoveryTestAttempts, setChannelMonitorRecoveryTestAttempts] = useState(
+    String(settings.channel_monitor_recovery_test_attempts ?? 1),
+  );
+  const [negativeBalanceBasis, setNegativeBalanceBasis] = useState<"wallet" | "recharge_adjusted">(
+    settings.upstream_negative_balance_basis || "wallet",
+  );
+  const [balancePauseThreshold, setBalancePauseThreshold] = useState(
+    String(settings.upstream_balance_pause_threshold ?? 0),
+  );
+  const [showStaleNegativeBalanceAlert, setShowStaleNegativeBalanceAlert] = useState(
+    settings.show_stale_negative_balance_alert ?? true,
+  );
+  const [priorityAssignDisabledAccounts, setPriorityAssignDisabledAccounts] = useState(
+    settings.priority_assign_disabled_api_key_accounts ?? false,
+  );
+  const [priorityShareSameCompositeMultiplier, setPriorityShareSameCompositeMultiplier] = useState(
+    settings.priority_share_same_composite_multiplier ?? false,
+  );
+  const [discordNotificationsEnabled, setDiscordNotificationsEnabled] = useState(
+    settings.discord_bot_notifications_enabled ?? false,
+  );
+  const [discordSetupGuideOpen, setDiscordSetupGuideOpen] = useState(false);
+  const discordSetupGuideTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeDiscordSetupGuide = useCallback(() => {
+    setDiscordSetupGuideOpen(false);
+    window.requestAnimationFrame(() => discordSetupGuideTriggerRef.current?.focus());
+  }, []);
+  const [discordBotToken, setDiscordBotToken] = useState("");
+  const [clearDiscordBotToken, setClearDiscordBotToken] = useState(false);
+  const [discordChannelId, setDiscordChannelId] = useState(settings.discord_bot_channel_id || "");
+  const [notifyAccountScheduling, setNotifyAccountScheduling] = useState(
+    (settings.notify_oauth_account_disabled ?? false) || (settings.notify_account_enabled ?? false),
+  );
+  const [notifyApiKeyRateChanged, setNotifyApiKeyRateChanged] = useState(settings.notify_api_key_rate_changed ?? false);
+  const [notifyUpstreamGroupChanged, setNotifyUpstreamGroupChanged] = useState(settings.notify_upstream_group_changed ?? false);
+  const [notifyUpstreamBalanceLow, setNotifyUpstreamBalanceLow] = useState(settings.notify_upstream_balance_low ?? false);
   const [upstreamRateLogRetentionDays, setUpstreamRateLogRetentionDays] = useState(
     String(settings.upstream_rate_log_retention_days || 90),
   );
@@ -4085,6 +4997,20 @@ function SettingsView({
   const [displayTimeZone, setDisplayTimeZone] = useState(settings.display_timezone || defaultTimeZone);
   const [xApiKey, setXApiKey] = useState("");
   const [clearXApiKey, setClearXApiKey] = useState(false);
+  const [logoFile, setLogoFile] = useState<File | null>(null);
+  const [logoPreviewUrl, setLogoPreviewUrl] = useState<string | null>(null);
+  const [resetLogo, setResetLogo] = useState(false);
+  const [logoError, setLogoError] = useState("");
+
+  useEffect(() => {
+    if (!logoFile) {
+      setLogoPreviewUrl(null);
+      return;
+    }
+    const previewUrl = URL.createObjectURL(logoFile);
+    setLogoPreviewUrl(previewUrl);
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [logoFile]);
 
   useEffect(() => {
     setSiteName(settings.site_name || defaultSiteName);
@@ -4104,7 +5030,51 @@ function SettingsView({
     setUpstreamSyncMaxConcurrency(String(settings.upstream_sync_max_concurrency ?? 10));
     setUpstreamRateSyncEnabled(settings.upstream_rate_sync_enabled ?? false);
     setUpstreamPrioritySyncEnabled(settings.upstream_priority_sync_enabled ?? true);
+    setManualUpstreamRateEnabled(settings.manual_upstream_sync_rate_enabled ?? true);
+    setManualUpstreamPriorityEnabled(settings.manual_upstream_sync_priority_enabled ?? true);
+    setManualUpstreamHealthEnabled(settings.manual_upstream_sync_upstream_health_enabled ?? true);
+    setManualChannelMonitorsEnabled(settings.manual_upstream_sync_channel_monitors_enabled ?? true);
+    setManualAccountAvailabilityEnabled(
+      settings.manual_upstream_sync_account_availability_enabled ?? false,
+    );
+    setManualBalanceGuardEnabled(settings.manual_upstream_sync_balance_guard_enabled ?? true);
+    setManualRatePauseEnabled(settings.manual_upstream_sync_rate_pause_enabled ?? true);
     setApiKeyAutoDisableEnabled(settings.api_key_auto_disable_on_upstream_unavailable ?? false);
+    setApiKeyNegativeBalancePauseEnabled(settings.api_key_auto_pause_on_negative_balance_enabled ?? false);
+    setApiKeyChannelMonitorPauseEnabled(
+      settings.api_key_auto_pause_on_channel_monitor_unavailable_enabled ?? false,
+    );
+    setChannelMonitorAutoProbeEnabled(settings.channel_monitor_auto_probe_enabled ?? true);
+    setAccountModelWhitelistSyncEnabled(
+      settings.account_model_whitelist_sync_enabled ?? settings.account_model_whitelist_sync_each_time ?? false,
+    );
+    setAccountModelWhitelistSyncInterval(String(settings.account_model_whitelist_sync_interval_seconds ?? 3600));
+    setChannelMonitorFallbackWithoutMonitorEnabled(
+      settings.channel_monitor_fallback_without_monitor_enabled ?? false,
+    );
+    setChannelMonitorFallbackTestModels(normalizeFallbackModelChain(
+      settings.channel_monitor_fallback_test_models,
+      settings.channel_monitor_fallback_test_model,
+    ));
+    setChannelMonitorFallbackTestAttempts(String(settings.channel_monitor_fallback_test_attempts ?? 1));
+    setChannelMonitorRecoveryTestAttempts(String(settings.channel_monitor_recovery_test_attempts ?? 1));
+    setNegativeBalanceBasis(settings.upstream_negative_balance_basis || "wallet");
+    setBalancePauseThreshold(String(settings.upstream_balance_pause_threshold ?? 0));
+    setShowStaleNegativeBalanceAlert(settings.show_stale_negative_balance_alert ?? true);
+    setPriorityAssignDisabledAccounts(settings.priority_assign_disabled_api_key_accounts ?? false);
+    setPriorityShareSameCompositeMultiplier(
+      settings.priority_share_same_composite_multiplier ?? false,
+    );
+    setDiscordNotificationsEnabled(settings.discord_bot_notifications_enabled ?? false);
+    setDiscordBotToken("");
+    setClearDiscordBotToken(false);
+    setDiscordChannelId(settings.discord_bot_channel_id || "");
+    setNotifyAccountScheduling(
+      (settings.notify_oauth_account_disabled ?? false) || (settings.notify_account_enabled ?? false),
+    );
+    setNotifyApiKeyRateChanged(settings.notify_api_key_rate_changed ?? false);
+    setNotifyUpstreamGroupChanged(settings.notify_upstream_group_changed ?? false);
+    setNotifyUpstreamBalanceLow(settings.notify_upstream_balance_low ?? false);
     setUpstreamRateLogRetentionDays(String(settings.upstream_rate_log_retention_days || 90));
     setUsageLimitSampleFiveHourThreshold(String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0));
     setUsageLimitSampleSevenDayThreshold(String(settings.usage_limit_sample_seven_day_threshold_percent ?? 0));
@@ -4121,12 +5091,47 @@ function SettingsView({
     setDisplayTimeZone(settings.display_timezone || defaultTimeZone);
     setXApiKey("");
     setClearXApiKey(false);
+    setLogoFile(null);
+    setResetLogo(false);
+    setLogoError("");
   }, [
     settings.automation_paused,
     settings.account_liveness_max_concurrency,
     settings.api_key_account_sync_enabled,
     settings.api_key_account_sync_interval_seconds,
     settings.api_key_auto_disable_on_upstream_unavailable,
+    settings.api_key_auto_pause_on_negative_balance_enabled,
+    settings.api_key_auto_pause_on_channel_monitor_unavailable_enabled,
+    settings.channel_monitor_auto_probe_enabled,
+    settings.manual_upstream_sync_rate_enabled,
+    settings.manual_upstream_sync_priority_enabled,
+    settings.manual_upstream_sync_upstream_health_enabled,
+    settings.manual_upstream_sync_channel_monitors_enabled,
+    settings.manual_upstream_sync_account_availability_enabled,
+    settings.manual_upstream_sync_balance_guard_enabled,
+    settings.manual_upstream_sync_rate_pause_enabled,
+    settings.account_model_whitelist_sync_enabled,
+    settings.account_model_whitelist_sync_interval_seconds,
+    settings.account_model_whitelist_sync_each_time,
+    settings.channel_monitor_fallback_without_monitor_enabled,
+    settings.channel_monitor_fallback_test_models,
+    settings.channel_monitor_fallback_test_model,
+    settings.channel_monitor_fallback_test_attempts,
+    settings.channel_monitor_recovery_test_attempts,
+    settings.upstream_negative_balance_basis,
+    settings.upstream_balance_pause_threshold,
+    settings.show_stale_negative_balance_alert,
+    settings.priority_assign_disabled_api_key_accounts,
+    settings.priority_share_same_composite_multiplier,
+    settings.discord_bot_notifications_enabled,
+    settings.discord_bot_token_hint,
+    settings.discord_bot_token_set,
+    settings.discord_bot_channel_id,
+    settings.notify_oauth_account_disabled,
+    settings.notify_account_enabled,
+    settings.notify_api_key_rate_changed,
+    settings.notify_upstream_group_changed,
+    settings.notify_upstream_balance_low,
     settings.browser_min_available_memory_mb,
     settings.browser_refresh_max_concurrency,
     settings.display_timezone,
@@ -4135,6 +5140,8 @@ function SettingsView({
     settings.protocol_refresh_max_concurrency,
     settings.recovery_enabled,
     settings.site_name,
+    settings.site_logo_url,
+    settings.site_logo_updated_at,
     settings.subscription_refresh_batch_size,
     settings.subscription_refresh_max_concurrency,
     settings.sub2api_auto_recover_state,
@@ -4160,8 +5167,10 @@ function SettingsView({
   const usageRefreshIntervalNumber = Number(usageRefreshInterval);
   const usageRefreshMaxConcurrencyNumber = Number(usageRefreshMaxConcurrency);
   const apiKeyAccountSyncIntervalNumber = Number(apiKeyAccountSyncInterval);
+  const accountModelWhitelistSyncIntervalNumber = Number(accountModelWhitelistSyncInterval);
   const upstreamSyncIntervalNumber = Number(upstreamSyncInterval);
   const upstreamSyncMaxConcurrencyNumber = Number(upstreamSyncMaxConcurrency);
+  const balancePauseThresholdNumber = Number(balancePauseThreshold);
   const upstreamRateLogRetentionDaysNumber = Number(upstreamRateLogRetentionDays);
   const usageLimitSampleFiveHourThresholdNumber = Number(usageLimitSampleFiveHourThreshold);
   const usageLimitSampleSevenDayThresholdNumber = Number(usageLimitSampleSevenDayThreshold);
@@ -4172,6 +5181,12 @@ function SettingsView({
   const subscriptionRefreshMaxConcurrencyNumber = Number(subscriptionRefreshMaxConcurrency);
   const accountLivenessMaxConcurrencyNumber = Number(accountLivenessMaxConcurrency);
   const cleanSiteName = siteName.trim();
+  const cleanDiscordChannelId = discordChannelId.trim();
+  const discordConfigurationInvalid = discordNotificationsEnabled && (
+    !cleanDiscordChannelId
+    || cleanDiscordChannelId.length > 64
+    || ((!settings.discord_bot_token_set || clearDiscordBotToken) && !discordBotToken.trim())
+  );
   const usageLimitDefaultRangesInvalid =
     !usageLimitDefaultRanges.unknown ||
     Object.keys(usageLimitDefaultRanges).length > 100 ||
@@ -4197,12 +5212,18 @@ function SettingsView({
     !Number.isInteger(apiKeyAccountSyncIntervalNumber) ||
     apiKeyAccountSyncIntervalNumber < 30 ||
     apiKeyAccountSyncIntervalNumber > 86_400 ||
+    !Number.isInteger(accountModelWhitelistSyncIntervalNumber) ||
+    accountModelWhitelistSyncIntervalNumber < 60 ||
+    accountModelWhitelistSyncIntervalNumber > 86_400 ||
     !Number.isInteger(upstreamSyncIntervalNumber) ||
     upstreamSyncIntervalNumber < 60 ||
     upstreamSyncIntervalNumber > 86_400 ||
     !Number.isInteger(upstreamSyncMaxConcurrencyNumber) ||
     upstreamSyncMaxConcurrencyNumber < 0 ||
     upstreamSyncMaxConcurrencyNumber > 50 ||
+    !Number.isFinite(balancePauseThresholdNumber) ||
+    balancePauseThresholdNumber < -1_000_000_000 ||
+    balancePauseThresholdNumber > 1_000_000_000 ||
     !Number.isInteger(upstreamRateLogRetentionDaysNumber) ||
     upstreamRateLogRetentionDaysNumber < 1 ||
     upstreamRateLogRetentionDaysNumber > 3650 ||
@@ -4230,7 +5251,9 @@ function SettingsView({
     !Number.isInteger(accountLivenessMaxConcurrencyNumber) ||
     accountLivenessMaxConcurrencyNumber < 0 ||
     accountLivenessMaxConcurrencyNumber > 50 ||
-    usageLimitDefaultRangesInvalid;
+    usageLimitDefaultRangesInvalid ||
+    discordConfigurationInvalid ||
+    Boolean(logoError);
 
   useEffect(() => {
     onValidityChange(invalid);
@@ -4269,9 +5292,31 @@ function SettingsView({
     });
   };
 
+  const selectLogoFile = (file: File | null) => {
+    if (!file) {
+      setLogoFile(null);
+      setLogoError("");
+      return;
+    }
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      setLogoFile(null);
+      setLogoError("Logo 仅支持 PNG、JPEG 或 WebP");
+      return;
+    }
+    if (file.size > 1024 * 1024) {
+      setLogoFile(null);
+      setLogoError("Logo 文件不能超过 1 MB");
+      return;
+    }
+    setLogoError("");
+    setResetLogo(false);
+    setLogoFile(file);
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (invalid) return;
+    const fallbackTestModels = normalizeFallbackModelChain(channelMonitorFallbackTestModels);
     const payload: AppSettingsUpdate = {
       site_name: cleanSiteName,
       sub2api_base_url: toSub2ApiInstanceUrl(instanceUrl),
@@ -4290,8 +5335,37 @@ function SettingsView({
       upstream_sync_max_concurrency: upstreamSyncMaxConcurrencyNumber,
       upstream_rate_sync_enabled: upstreamRateSyncEnabled,
       upstream_priority_sync_enabled: upstreamPrioritySyncEnabled,
+      manual_upstream_sync_rate_enabled: manualUpstreamRateEnabled,
+      manual_upstream_sync_priority_enabled: manualUpstreamPriorityEnabled,
+      manual_upstream_sync_upstream_health_enabled: manualUpstreamHealthEnabled,
+      manual_upstream_sync_channel_monitors_enabled: manualChannelMonitorsEnabled,
+      manual_upstream_sync_account_availability_enabled: manualAccountAvailabilityEnabled,
+      manual_upstream_sync_balance_guard_enabled: manualBalanceGuardEnabled,
+      manual_upstream_sync_rate_pause_enabled: manualRatePauseEnabled,
       api_key_auto_disable_on_upstream_unavailable: apiKeyAutoDisableEnabled,
+      api_key_auto_pause_on_negative_balance_enabled: apiKeyNegativeBalancePauseEnabled,
+      api_key_auto_pause_on_channel_monitor_unavailable_enabled: apiKeyChannelMonitorPauseEnabled,
+      channel_monitor_auto_probe_enabled: channelMonitorAutoProbeEnabled,
+      account_model_whitelist_sync_enabled: accountModelWhitelistSyncEnabled,
+      account_model_whitelist_sync_interval_seconds: accountModelWhitelistSyncIntervalNumber,
+      channel_monitor_fallback_without_monitor_enabled: channelMonitorFallbackWithoutMonitorEnabled,
+      channel_monitor_fallback_test_models: fallbackTestModels,
+      channel_monitor_fallback_test_model: fallbackTestModels[0] || "",
+      channel_monitor_fallback_test_attempts: Math.max(1, Math.min(5, Number(channelMonitorFallbackTestAttempts) || 1)),
+      channel_monitor_recovery_test_attempts: Math.max(1, Math.min(5, Number(channelMonitorRecoveryTestAttempts) || 1)),
+      upstream_negative_balance_basis: negativeBalanceBasis,
+      upstream_balance_pause_threshold: balancePauseThresholdNumber,
+      show_stale_negative_balance_alert: showStaleNegativeBalanceAlert,
+      priority_assign_disabled_api_key_accounts: priorityAssignDisabledAccounts,
+      priority_share_same_composite_multiplier: priorityShareSameCompositeMultiplier,
       upstream_rate_log_retention_days: upstreamRateLogRetentionDaysNumber,
+      discord_bot_notifications_enabled: discordNotificationsEnabled,
+      discord_bot_channel_id: cleanDiscordChannelId,
+      notify_oauth_account_disabled: notifyAccountScheduling,
+      notify_account_enabled: notifyAccountScheduling,
+      notify_api_key_rate_changed: notifyApiKeyRateChanged,
+      notify_upstream_group_changed: notifyUpstreamGroupChanged,
+      notify_upstream_balance_low: notifyUpstreamBalanceLow,
       usage_limit_sample_five_hour_threshold_percent: usageLimitSampleFiveHourThresholdNumber,
       usage_limit_sample_seven_day_threshold_percent: usageLimitSampleSevenDayThresholdNumber,
       usage_limit_default_ranges: usageLimitDefaultRanges,
@@ -4309,27 +5383,46 @@ function SettingsView({
     if (clearXApiKey) {
       payload.clear_sub2api_x_api_key = true;
     }
-    await onSave(payload);
+    if (discordBotToken.trim()) payload.discord_bot_token = discordBotToken.trim();
+    if (clearDiscordBotToken) payload.clear_discord_bot_token = true;
+    await onSave(payload, { logoFile, resetLogo });
   };
   const enabledAutomationCount = [
-    settings.oauth_account_sync_enabled ?? true,
-    settings.api_key_account_sync_enabled ?? true,
-    settings.recovery_enabled,
-    settings.upstream_sync_enabled,
-    settings.upstream_rate_sync_enabled,
-    settings.upstream_priority_sync_enabled,
-    settings.api_key_auto_disable_on_upstream_unavailable,
-    settings.usage_refresh_enabled,
+    oauthAccountSyncEnabled,
+    apiKeyAccountSyncEnabled,
+    recoveryEnabled,
+    upstreamSyncEnabled,
+    upstreamRateSyncEnabled,
+    upstreamPrioritySyncEnabled,
+    apiKeyAutoDisableEnabled,
+    apiKeyNegativeBalancePauseEnabled,
+    apiKeyChannelMonitorPauseEnabled,
+    channelMonitorAutoProbeEnabled,
+    accountModelWhitelistSyncEnabled,
+    usageRefreshEnabled,
   ].filter(Boolean).length;
 
   return (
-    <div className="stack">
-      <section className="panel">
+    <div className="stack settings-page">
+      <nav aria-label="设置页面导航" className="settings-local-nav">
+        <button onClick={() => scrollToSettingsSection("settings-connection")} type="button"><Link2 size={15} /><span>站点连接</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-automation")} type="button"><RefreshCcw size={15} /><span>自动任务</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-resources")} type="button"><TimerReset size={15} /><span>资源限制</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-usage")} type="button"><Database size={15} /><span>用量额度</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-upstream-log")} type="button"><History size={15} /><span>上游记录</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-notifications")} type="button"><Activity size={15} /><span>通知</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-display-security")} type="button"><ShieldCheck size={15} /><span>显示安全</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-scan")} type="button"><Radar size={15} /><span>端口扫描</span></button>
+      </nav>
+
+      <section className="settings-form-shell">
         <div className="settings-save-header">
           <PanelTitle title="运行设置" icon={Link2} />
         </div>
         <form className="settings-form" id="runtime-settings-form" onSubmit={submit}>
-          <div className="settings-grid settings-main-grid settings-connection-grid">
+          <fieldset className="settings-section settings-section--connection" id="settings-connection">
+            <legend>站点与连接</legend>
+            <div className="settings-grid settings-main-grid settings-connection-grid">
             <label className="site-name-label">
               站点名
               <input
@@ -4351,25 +5444,68 @@ function SettingsView({
                 <span className="url-suffix">{sub2ApiApiPrefix}</span>
               </div>
             </label>
-          </div>
+            <div className="site-logo-setting">
+              <div className="site-logo-preview">
+                <img alt="站点 Logo 预览" onError={fallbackSiteLogo} src={resetLogo ? "/logo.png" : logoPreviewUrl || logoUrl} />
+              </div>
+              <div className="site-logo-controls">
+                <span><ImageIcon size={15} />站点 Logo</span>
+                <div>
+                  <label className="secondary-button site-logo-upload">
+                    <Upload size={16} />
+                    <span>选择图片</span>
+                    <input
+                      accept="image/png,image/jpeg,image/webp"
+                      onChange={(event) => selectLogoFile(event.target.files?.[0] || null)}
+                      type="file"
+                    />
+                  </label>
+                  <button
+                    className="icon-button"
+                    onClick={() => {
+                      setLogoFile(null);
+                      setLogoError("");
+                      setResetLogo(true);
+                    }}
+                    title="恢复默认 Logo"
+                    type="button"
+                  >
+                    <RefreshCcw size={16} />
+                  </button>
+                </div>
+                {logoFile ? <small>{logoFile.name}</small> : resetLogo ? <small>保存后恢复默认 Logo</small> : null}
+                {logoError ? <small className="form-error">{logoError}</small> : null}
+              </div>
+            </div>
+            </div>
+          </fieldset>
 
-          <label className="checkbox-line settings-toggle settings-global-toggle">
-            <input
-              checked={automationPaused}
-              onChange={(event) => setAutomationPaused(event.target.checked)}
-              type="checkbox"
-            />
-            <span>暂停全部自动任务</span>
-          </label>
-
-          <fieldset className="settings-section settings-section--automation">
-            <legend>自动任务</legend>
-            <p className="settings-section-note">线程数填 0 表示本批任务不限并发，拿到账号或渠道清单后会同时发起。</p>
+          <fieldset className="settings-section settings-section--automation" id="settings-automation">
+            <legend>自动任务与策略</legend>
+            <label className="checkbox-line settings-toggle settings-global-toggle">
+              <input
+                checked={automationPaused}
+                onChange={(event) => setAutomationPaused(event.target.checked)}
+                type="checkbox"
+              />
+              <span>暂停全部自动任务</span>
+            </label>
             <div className="automation-settings-table">
-              <div aria-hidden="true" className="automation-settings-head">
+              <div className="automation-settings-head">
                 <span>功能开关</span>
-                <span>线程数</span>
+                <span className="settings-label-with-help">
+                  线程数
+                  <HelpPopover label="查看线程数说明">
+                    填 0 表示本批任务不限并发，取得账号或渠道清单后会同时发起。
+                  </HelpPopover>
+                </span>
                 <span>自动执行间隔</span>
+                <span className="settings-label-with-help">
+                  手动同步
+                  <HelpPopover label="查看手动同步说明">
+                    勾选后，点击“同步 API Key 账号”或上游卡片的同步按钮时会执行该项；取消勾选可只刷新基础上游数据，减少等待和连接测试消耗。
+                  </HelpPopover>
+                </span>
               </div>
               <AutomationSettingRow
                 checked={oauthAccountSyncEnabled}
@@ -4401,6 +5537,23 @@ function SettingsView({
                 )}
                 label="同步 sub2api API Key 账号"
                 onChange={setApiKeyAccountSyncEnabled}
+                threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={accountModelWhitelistSyncEnabled}
+                description="开启后按独立间隔刷新已导入账号的可用模型白名单；关闭时仍会在首次导入或本地缺失白名单时补齐。"
+                interval={(
+                  <AutomationSettingNumber
+                    ariaLabel="账号可用模型白名单刷新间隔"
+                    max={86_400}
+                    min={60}
+                    onChange={setAccountModelWhitelistSyncInterval}
+                    suffix="秒"
+                    value={accountModelWhitelistSyncInterval}
+                  />
+                )}
+                label="自动刷新账号可用模型白名单"
+                onChange={setAccountModelWhitelistSyncEnabled}
                 threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
               />
               <AutomationSettingRow
@@ -4463,21 +5616,94 @@ function SettingsView({
                 checked={upstreamRateSyncEnabled}
                 interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
                 label="修改 API Key 账号计费倍率"
+                manual={(
+                  <AutomationSettingManualCheckbox
+                    checked={manualUpstreamRateEnabled}
+                    disabled={!upstreamRateSyncEnabled}
+                    label="手动同步时修改 API Key 账号计费倍率"
+                    onChange={setManualUpstreamRateEnabled}
+                  />
+                )}
                 onChange={setUpstreamRateSyncEnabled}
+                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={channelMonitorAutoProbeEnabled}
+                description="关闭后保留上次已保存的渠道监控结果；打开渠道状态弹窗不会触发请求。"
+                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+                label="自动探测上游渠道监控"
+                manual={(
+                  <AutomationSettingManualCheckbox
+                    checked={manualChannelMonitorsEnabled}
+                    disabled={!channelMonitorAutoProbeEnabled}
+                    label="手动同步时探测上游渠道监控"
+                    onChange={setManualChannelMonitorsEnabled}
+                  />
+                )}
+                onChange={setChannelMonitorAutoProbeEnabled}
+                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={apiKeyChannelMonitorPauseEnabled}
+                description="自动检测与策略判定跟随上游同步任务执行；手动检测不受自动任务暂停或其他暂停原因限制。"
+                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+                label="API Key 账号可用性监测与自动暂停"
+                manual={(
+                  <AutomationSettingManualCheckbox
+                    checked={manualAccountAvailabilityEnabled}
+                    disabled={!apiKeyChannelMonitorPauseEnabled}
+                    label="手动同步时检测 API Key 账号可用性"
+                    onChange={setManualAccountAvailabilityEnabled}
+                  />
+                )}
+                onChange={setApiKeyChannelMonitorPauseEnabled}
                 threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
               />
               <AutomationSettingRow
                 checked={upstreamPrioritySyncEnabled}
                 interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
                 label="修改 API Key 账号优先级"
+                manual={(
+                  <AutomationSettingManualCheckbox
+                    checked={manualUpstreamPriorityEnabled}
+                    disabled={!upstreamPrioritySyncEnabled}
+                    label="手动同步时修改 API Key 账号优先级"
+                    onChange={setManualUpstreamPriorityEnabled}
+                  />
+                )}
                 onChange={setUpstreamPrioritySyncEnabled}
                 threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
               />
               <AutomationSettingRow
                 checked={apiKeyAutoDisableEnabled}
+                description="按每次上游同步的当前 Key / 分组状态即时判断；上游恢复后，仅自动恢复由本插件暂停的账号。"
                 interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
-                label="上游失效时禁用 API Key 账号"
+                label="上游 Key / 分组不可用时自动停用 API Key 账号"
+                manual={(
+                  <AutomationSettingManualCheckbox
+                    checked={manualUpstreamHealthEnabled}
+                    disabled={!apiKeyAutoDisableEnabled}
+                    label="手动同步时执行上游 Key 和分组状态暂停判定"
+                    onChange={setManualUpstreamHealthEnabled}
+                  />
+                )}
                 onChange={setApiKeyAutoDisableEnabled}
+                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={apiKeyNegativeBalancePauseEnabled}
+                description="仅暂停探测时已启用的账号；余额达到或高于阈值且其他暂停原因均解除后自动恢复。"
+                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+                label="上游余额低于阈值时自动暂停 API Key 账号"
+                manual={(
+                  <AutomationSettingManualCheckbox
+                    checked={manualBalanceGuardEnabled}
+                    disabled={!apiKeyNegativeBalancePauseEnabled}
+                    label="手动同步时执行上游余额暂停判定"
+                    onChange={setManualBalanceGuardEnabled}
+                  />
+                )}
+                onChange={setApiKeyNegativeBalancePauseEnabled}
                 threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
               />
               <AutomationSettingRow
@@ -4505,6 +5731,188 @@ function SettingsView({
                 )}
               />
             </div>
+            <div className="settings-automation-policies">
+              <div
+                className="settings-auto-pause-policy"
+                role="group"
+                aria-label="渠道监控不可用自动暂停策略"
+              >
+                <div className="settings-policy-heading">
+                  <span className="settings-label-with-help">
+                    <strong>API Key 账号可用性监测策略</strong>
+                    <HelpPopover label="查看 API Key 可用性监测策略说明">
+                      仅处理已绑定具体监控面板或已启用独立模型测试的账号。监控面板代表上游的单个分组或模型路由，不代表上游站点整体状态；面板明确可用时不直连账号测试，面板缺失、读取失败、状态未知或不可用时按账号白名单模型回退测试。自动检测跟随上游同步；存在余额、上游 Key、分组或倍率等其他暂停原因时保留上次结果并暂停自动连接测试，手动检测仍会先刷新监控面板及其状态详情并执行。启用账号的暂停判定使用“暂停判定测试次数”，因可用性监测而暂停的账号使用独立的“恢复判定测试次数”；任意一次连接成功即判定可用，全部失败才暂停或保持暂停。没有可用回退模型时不会据此暂停账号。
+                    </HelpPopover>
+                  </span>
+                  <span className={`api-key-chip api-key-chip--${apiKeyChannelMonitorPauseEnabled ? "success" : "muted"}`}>
+                    {apiKeyChannelMonitorPauseEnabled ? "已启用" : "已关闭"}
+                  </span>
+                </div>
+                <div className="settings-auto-pause-thresholds">
+                  <div className="settings-model-chain-field settings-model-chain-summary">
+                    <span className="settings-label-with-help">
+                      回退测试模型链
+                      <HelpPopover label="查看回退测试模型链说明">
+                        按从上到下的顺序选择账号白名单中第一个存在的模型。账号单独配置的测试模型优先于全局模型链，最多可配置 10 个模型。
+                      </HelpPopover>
+                    </span>
+                    <span className="settings-model-chain-summary-value">
+                      {channelMonitorFallbackTestModels.length
+                        ? `已配置 ${channelMonitorFallbackTestModels.length} 个模型`
+                        : "尚未配置"}
+                    </span>
+                    <button
+                      className="secondary-button settings-model-chain-configure"
+                      onClick={() => setFallbackModelDialogOpen(true)}
+                      ref={fallbackModelDialogTriggerRef}
+                      type="button"
+                    >
+                      <Settings2 size={15} />
+                      配置
+                    </button>
+                  </div>
+                  <label className="checkbox-line settings-toggle settings-fallback-without-monitor">
+                    <input
+                      checked={channelMonitorFallbackWithoutMonitorEnabled}
+                      disabled={!apiKeyChannelMonitorPauseEnabled}
+                      onChange={(event) => setChannelMonitorFallbackWithoutMonitorEnabled(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span className="settings-toggle-copy">
+                      <span className="settings-label-with-help">
+                        <strong>未绑定监控面板时使用回退模型链</strong>
+                        <HelpPopover label="查看未绑定面板回退说明">
+                          关闭时，选择“绑定监控面板”但未选择具体面板的账号会显示为未配置，不发起连接测试，也不会因此自动暂停。已绑定面板被删除或报告不可用时仍会回退测试。
+                        </HelpPopover>
+                      </span>
+                    </span>
+                  </label>
+                  <label>
+                    <span className="settings-label-with-help">
+                      暂停判定测试次数
+                      <HelpPopover label="查看暂停判定测试次数说明">
+                        对当前未被可用性监测暂停的账号，最多发起 1 至 5 次连接测试；任意一次成功即判定可用，全部失败则立即暂停账号。
+                      </HelpPopover>
+                    </span>
+                    <AutomationSettingNumber
+                      ariaLabel="账号暂停判定测试次数"
+                      max={5}
+                      min={1}
+                      onChange={setChannelMonitorFallbackTestAttempts}
+                      value={channelMonitorFallbackTestAttempts}
+                    />
+                  </label>
+                  <label>
+                    <span className="settings-label-with-help">
+                      恢复判定测试次数
+                      <HelpPopover label="查看恢复判定测试次数说明">
+                        对因可用性监测而自动暂停的账号，最多发起 1 至 5 次连接测试；任意一次成功即恢复账号，全部失败则保持暂停。
+                      </HelpPopover>
+                    </span>
+                    <AutomationSettingNumber
+                      ariaLabel="账号恢复判定测试次数"
+                      max={5}
+                      min={1}
+                      onChange={setChannelMonitorRecoveryTestAttempts}
+                      value={channelMonitorRecoveryTestAttempts}
+                    />
+                  </label>
+                </div>
+              </div>
+              <label className="checkbox-line settings-toggle settings-automation-policy">
+                <input
+                  checked={priorityAssignDisabledAccounts}
+                  onChange={(event) => setPriorityAssignDisabledAccounts(event.target.checked)}
+                  type="checkbox"
+                />
+                <span className="settings-toggle-copy">
+                  <span className="settings-label-with-help">
+                    <strong>停用的 API Key 账号也参与优先级分配</strong>
+                    <HelpPopover label="查看停用账号优先级说明">
+                      仅控制优先级计算，与上游状态停用、余额暂停及自动恢复无关。
+                    </HelpPopover>
+                  </span>
+                </span>
+              </label>
+              <label className="checkbox-line settings-toggle settings-automation-policy">
+                <input
+                  checked={priorityShareSameCompositeMultiplier}
+                  onChange={(event) => setPriorityShareSameCompositeMultiplier(event.target.checked)}
+                  type="checkbox"
+                />
+                <span className="settings-toggle-copy">
+                  <span className="settings-label-with-help">
+                    <strong>同综合倍率账号使用相同优先级</strong>
+                    <HelpPopover label="查看同倍率账号优先级说明">
+                      开启后，同一优先级区间内综合倍率相同的账号共用一个调度优先级；不同倍率档位仍按区间步长递增，账号卡片不再提供同倍率排位按钮。
+                    </HelpPopover>
+                  </span>
+                </span>
+              </label>
+              <label className="checkbox-line settings-toggle settings-automation-policy">
+                <input
+                  checked={manualRatePauseEnabled}
+                  onChange={(event) => setManualRatePauseEnabled(event.target.checked)}
+                  type="checkbox"
+                />
+                <span className="settings-toggle-copy">
+                  <span className="settings-label-with-help">
+                    <strong>手动同步时执行账号倍率暂停判定</strong>
+                    <HelpPopover label="查看手动倍率暂停判定说明">
+                      关闭后，手动同步仍会刷新分组倍率和综合倍率，但不会新增或解除账号的倍率暂停原因；自动上游同步不受影响。
+                    </HelpPopover>
+                  </span>
+                </span>
+              </label>
+              <div className="settings-balance-basis" aria-disabled={!apiKeyNegativeBalancePauseEnabled}>
+                <span>余额暂停判断口径与阈值</span>
+                <div className="api-key-segmented" role="group" aria-label="上游负余额判断口径">
+                  <button
+                    aria-pressed={negativeBalanceBasis === "wallet"}
+                    className={negativeBalanceBasis === "wallet" ? "active" : ""}
+                    disabled={!apiKeyNegativeBalancePauseEnabled}
+                    onClick={() => setNegativeBalanceBasis("wallet")}
+                    type="button"
+                  >上游钱包余额</button>
+                  <button
+                    aria-pressed={negativeBalanceBasis === "recharge_adjusted"}
+                    className={negativeBalanceBasis === "recharge_adjusted" ? "active" : ""}
+                    disabled={!apiKeyNegativeBalancePauseEnabled}
+                    onClick={() => setNegativeBalanceBasis("recharge_adjusted")}
+                    type="button"
+                  >充值倍率后余额</button>
+                </div>
+                <label className="settings-balance-threshold">
+                  <span>暂停阈值</span>
+                  <input
+                    aria-label="上游余额暂停阈值"
+                    disabled={!apiKeyNegativeBalancePauseEnabled}
+                    max={1_000_000_000}
+                    min={-1_000_000_000}
+                    onChange={(event) => setBalancePauseThreshold(event.target.value)}
+                    step="any"
+                    type="number"
+                    value={balancePauseThreshold}
+                  />
+                  <b>{negativeBalanceBasis === "recharge_adjusted" ? "¥" : "$"}</b>
+                </label>
+              </div>
+              <label className="checkbox-line settings-toggle settings-automation-policy">
+                <input
+                  checked={showStaleNegativeBalanceAlert}
+                  onChange={(event) => setShowStaleNegativeBalanceAlert(event.target.checked)}
+                  type="checkbox"
+                />
+                <span className="settings-toggle-copy">
+                  <span className="settings-label-with-help">
+                    <strong>首页显示上次已知低余额提醒</strong>
+                    <HelpPopover label="查看历史余额提醒说明">
+                      最新探测失败时，继续按当前口径和阈值展示上次成功余额；不会使用过期余额暂停账号。
+                    </HelpPopover>
+                  </span>
+                </span>
+              </label>
+            </div>
             <label className="checkbox-line settings-toggle settings-automation-policy">
               <input
                 checked={autoRecoverState}
@@ -4515,7 +5923,7 @@ function SettingsView({
             </label>
           </fieldset>
 
-          <fieldset className="settings-section">
+          <fieldset className="settings-section" id="settings-resources">
             <legend>手动任务资源限制</legend>
             <div className="settings-grid settings-section-grid settings-resource-grid">
               <label>
@@ -4542,7 +5950,7 @@ function SettingsView({
             </div>
           </fieldset>
 
-          <fieldset className="settings-section">
+          <fieldset className="settings-section" id="settings-usage">
             <legend>用量与订阅规则</legend>
             <div className="settings-grid settings-section-grid">
             <label>
@@ -4592,7 +6000,7 @@ function SettingsView({
             </div>
           </fieldset>
 
-          <fieldset className="quota-range-settings">
+          <fieldset className="quota-range-settings settings-section" id="settings-quota-ranges">
             <legend>订阅默认额度区间</legend>
             <div className="quota-range-list">
               {Object.entries(usageLimitDefaultRanges)
@@ -4678,7 +6086,7 @@ function SettingsView({
             </div>
           </fieldset>
 
-          <fieldset className="settings-section settings-section--api-key">
+          <fieldset className="settings-section settings-section--api-key" id="settings-upstream-log">
             <legend>上游变化记录</legend>
             <div className="settings-grid settings-section-grid">
               <label>
@@ -4694,54 +6102,150 @@ function SettingsView({
             </div>
           </fieldset>
 
-          <div className="settings-grid time-zone-grid">
-            <label>
-              显示时区
-              <select onChange={(event) => setDisplayTimeZone(event.target.value)} value={displayTimeZone}>
-                {timeZoneOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="time-zone-preview">
-              <Globe2 size={16} />
-              <span>{formatDate(new Date().toISOString(), displayTimeZone)}</span>
-            </div>
-          </div>
-
-          <div className="settings-grid secret-grid">
-            <label>
-              x-api 密钥
+          <fieldset className="settings-section settings-section--notifications" id="settings-notifications">
+            <legend>
+              <span>Discord Bot 通知</span>
+              <button
+                aria-label="查看 Discord Bot 配置指南"
+                className="icon-button discord-bot-setup-guide-trigger"
+                onClick={() => setDiscordSetupGuideOpen(true)}
+                ref={discordSetupGuideTriggerRef}
+                title="查看 Discord Bot 的创建、安装和通知频道配置步骤"
+                type="button"
+              >
+                <CircleHelp size={16} />
+              </button>
+            </legend>
+            <label className="checkbox-line settings-toggle settings-global-toggle">
               <input
-                autoComplete="new-password"
-                onChange={(event) => setXApiKey(event.target.value)}
-                placeholder={settings.sub2api_x_api_key_set ? "留空保持当前密钥" : "输入 sub2api x-api-key"}
-                type="password"
-                value={xApiKey}
-              />
-            </label>
-            <label className="checkbox-line">
-              <input
-                checked={clearXApiKey}
-                onChange={(event) => setClearXApiKey(event.target.checked)}
+                checked={discordNotificationsEnabled}
+                onChange={(event) => setDiscordNotificationsEnabled(event.target.checked)}
                 type="checkbox"
               />
-              <span>清空已保存密钥</span>
+              <span>启用 Discord Bot 通知</span>
             </label>
-          </div>
-
-          <div className="settings-actions">
-            <div className="key-state">
-              <KeyRound size={16} />
-              <span>{settings.sub2api_x_api_key_set ? `已保存 ${settings.sub2api_x_api_key_hint || ""}` : "未设置"}</span>
+            <div className="settings-grid settings-section-grid notification-channel-grid">
+              <label>
+                Bot Token
+                <input
+                  autoComplete="new-password"
+                  disabled={clearDiscordBotToken}
+                  onChange={(event) => setDiscordBotToken(event.target.value)}
+                  placeholder={settings.discord_bot_token_set ? `已保存 ${settings.discord_bot_token_hint || ""}` : "输入 Discord Bot Token"}
+                  type="password"
+                  value={discordBotToken}
+                />
+              </label>
+              <label>
+                Channel ID
+                <input
+                  maxLength={64}
+                  onChange={(event) => setDiscordChannelId(event.target.value)}
+                  placeholder="Discord 频道 ID"
+                  value={discordChannelId}
+                />
+              </label>
             </div>
-          </div>
+            <label className="checkbox-line settings-toggle">
+              <input
+                checked={clearDiscordBotToken}
+                disabled={!settings.discord_bot_token_set && !discordBotToken}
+                onChange={(event) => {
+                  setClearDiscordBotToken(event.target.checked);
+                  if (event.target.checked) setDiscordBotToken("");
+                }}
+                type="checkbox"
+              />
+              <span>清空已保存 Bot Token</span>
+            </label>
+            <div className="settings-notification-events">
+              <label className="checkbox-line settings-toggle">
+                <input checked={notifyAccountScheduling} onChange={(event) => setNotifyAccountScheduling(event.target.checked)} type="checkbox" />
+                <span className="settings-label-with-help">
+                  <span>账号调度</span>
+                  <HelpPopover label="查看账号调度通知范围">
+                    包含 OAuth 与 API Key 账号的停用、启用和自动恢复；自动恢复会保留此前的暂停原因。
+                  </HelpPopover>
+                </span>
+              </label>
+              <label className="checkbox-line settings-toggle">
+                <input checked={notifyApiKeyRateChanged} onChange={(event) => setNotifyApiKeyRateChanged(event.target.checked)} type="checkbox" />
+                <span>倍率变化</span>
+              </label>
+              <label className="checkbox-line settings-toggle">
+                <input checked={notifyUpstreamGroupChanged} onChange={(event) => setNotifyUpstreamGroupChanged(event.target.checked)} type="checkbox" />
+                <span>上游分组变化</span>
+              </label>
+              <label className="checkbox-line settings-toggle">
+                <input checked={notifyUpstreamBalanceLow} onChange={(event) => setNotifyUpstreamBalanceLow(event.target.checked)} type="checkbox" />
+                <span>上游余额不足</span>
+              </label>
+            </div>
+            <div className="settings-notification-actions">
+              <button
+                className="secondary-button"
+                disabled={busy || !discordNotificationsEnabled || !settings.discord_bot_token_set || !cleanDiscordChannelId}
+                onClick={onTestNotification}
+                title="使用已保存的 Discord 配置发送测试消息"
+                type="button"
+              >
+                <Send size={16} />
+                <span>发送测试通知</span>
+              </button>
+            </div>
+          </fieldset>
+
+          <fieldset className="settings-section settings-section--display-security" id="settings-display-security">
+            <legend>显示与安全</legend>
+            <div className="settings-grid time-zone-grid">
+              <label>
+                显示时区
+                <select onChange={(event) => setDisplayTimeZone(event.target.value)} value={displayTimeZone}>
+                  {timeZoneOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="time-zone-preview">
+                <Globe2 size={16} />
+                <span>{formatDate(new Date().toISOString(), displayTimeZone)}</span>
+              </div>
+            </div>
+
+            <div className="settings-grid secret-grid">
+              <label>
+                x-api 密钥
+                <input
+                  autoComplete="new-password"
+                  onChange={(event) => setXApiKey(event.target.value)}
+                  placeholder={settings.sub2api_x_api_key_set ? "留空保持当前密钥" : "输入 sub2api x-api-key"}
+                  type="password"
+                  value={xApiKey}
+                />
+              </label>
+              <label className="checkbox-line">
+                <input
+                  checked={clearXApiKey}
+                  onChange={(event) => setClearXApiKey(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>清空已保存密钥</span>
+              </label>
+            </div>
+
+            <div className="settings-actions">
+              <div className="key-state">
+                <KeyRound size={16} />
+                <span>{settings.sub2api_x_api_key_set ? `已保存 ${settings.sub2api_x_api_key_hint || ""}` : "未设置"}</span>
+              </div>
+            </div>
+          </fieldset>
         </form>
       </section>
 
-      <section className="panel">
+      <section className="panel settings-scan-panel" id="settings-scan">
         <PanelTitle title="端口扫描" icon={Radar} />
         <div className="settings-status">
           <SignalLine label="配置来源" value={sourceLabel(settings.sub2api_base_url_source)} />
@@ -4753,7 +6257,7 @@ function SettingsView({
           <div className="key-state">
             <TimerReset size={16} />
             <span>
-              {settings.automation_paused ? "自动任务已暂停" : "自动任务运行中"} · 已开启 {enabledAutomationCount}/8 ·
+              {settings.automation_paused ? "自动任务已暂停" : "自动任务运行中"} · 已开启 {enabledAutomationCount}/13 ·
               上游线程 {settings.upstream_sync_max_concurrency ?? 2} · 测活线程 {settings.account_liveness_max_concurrency ?? 3} ·
               上游变化保留 {settings.upstream_rate_log_retention_days} 天
             </span>
@@ -4764,229 +6268,17 @@ function SettingsView({
           </button>
         </div>
       </section>
-    </div>
-  );
-}
 
-function HistoryView({
-  jobs,
-  events,
-  exceptionRecords,
-  busy,
-  onClear,
-  onDeleteExceptionRecord,
-  onLocateAccount,
-}: {
-  jobs: RefreshJob[];
-  events: AppEvent[];
-  exceptionRecords: AccountExceptionRecord[];
-  busy: boolean;
-  onClear: () => void;
-  onDeleteExceptionRecord: (id: number) => void;
-  onLocateAccount: (record: AccountExceptionRecord) => void;
-}) {
-  const timeZone = useDisplayTimeZone();
-  const now = useRefreshClock();
-  const [subview, setSubview] = useState<"exceptions" | "jobs" | "events">("exceptions");
-  const hasHistory = jobs.length > 0 || events.length > 0;
-  const clearHistory = () => {
-    if (!hasHistory || busy) return;
-    if (window.confirm("确定要清空刷新任务和事件历史吗？")) {
-      onClear();
-    }
-  };
-
-  return (
-    <div className="stack">
-      <div className="history-toolbar">
-        <div className="history-counts">
-          <span>
-            <AlertTriangle size={14} />
-            {exceptionRecords.length} 条异常
-          </span>
-          <span>
-            <RefreshCcw size={14} />
-            {jobs.length} 条任务
-          </span>
-          <span>
-            <Activity size={14} />
-            {events.length} 条事件
-          </span>
-        </div>
-        <button className="danger-button" disabled={busy || !hasHistory} onClick={clearHistory} type="button">
-          <Trash2 size={17} />
-          <span>清空历史</span>
-        </button>
-      </div>
-
-      <div className="history-tabs" role="tablist" aria-label="历史子界面">
-        <button
-          aria-selected={subview === "exceptions"}
-          className={subview === "exceptions" ? "history-tab active" : "history-tab"}
-          onClick={() => setSubview("exceptions")}
-          role="tab"
-          type="button"
-        >
-          <AlertTriangle size={16} />
-          <span>异常账号</span>
-          <strong>{exceptionRecords.length}</strong>
-        </button>
-        <button
-          aria-selected={subview === "jobs"}
-          className={subview === "jobs" ? "history-tab active" : "history-tab"}
-          onClick={() => setSubview("jobs")}
-          role="tab"
-          type="button"
-        >
-          <RefreshCcw size={16} />
-          <span>刷新任务</span>
-          <strong>{jobs.length}</strong>
-        </button>
-        <button
-          aria-selected={subview === "events"}
-          className={subview === "events" ? "history-tab active" : "history-tab"}
-          onClick={() => setSubview("events")}
-          role="tab"
-          type="button"
-        >
-          <Activity size={16} />
-          <span>事件</span>
-          <strong>{events.length}</strong>
-        </button>
-      </div>
-
-      {subview === "exceptions" ? (
-        <section className="panel">
-          <PanelTitle title="异常账号记录" icon={AlertTriangle} />
-          <div className="history-list">
-            {exceptionRecords.map((record) => {
-              const relatedJob = latestErrorRefreshJobForRecord(record, jobs);
-              const relatedJobDurationMs = relatedJob
-                ? timestampDurationMs(relatedJob.started_at, relatedJob.finished_at, now)
-                : null;
-              const displayMessage = relatedJob?.reason || record.message || "-";
-              const displayTime = relatedJob?.created_at ?? record.updated_at;
-              const protocolSummary = relatedJob ? refreshJobProtocolSummary(relatedJob, events) : null;
-              return (
-                <article className="history-item exception-record-item" key={record.id}>
-                  <div className="history-item-head">
-                    <div className="history-meta">
-                      <Badge tone={exceptionStatusTone(record.status)}>{exceptionStatusLabel(record.status)}</Badge>
-                      <Badge tone="ink">{exceptionSourceLabel(record.source)}</Badge>
-                      <strong className="mono history-email">{record.email || "unknown"}</strong>
-                      {record.sub2api_account_id ? <span className="memory-pill mono">{record.sub2api_account_id}</span> : null}
-                      {relatedJobDurationMs !== null ? (
-                        <span className="memory-pill">耗时 {formatElapsedDuration(relatedJobDurationMs)}</span>
-                      ) : null}
-                    </div>
-                    <div className="history-record-actions">
-                      <time>{formatDate(displayTime, timeZone)}</time>
-                      <button
-                        aria-label="在账号界面定位此账号"
-                        className="icon-button"
-                        disabled={busy || (!record.email && !record.sub2api_account_id)}
-                        onClick={() => onLocateAccount(record)}
-                        title="在账号界面定位此账号"
-                        type="button"
-                      >
-                        <ExternalLink size={16} />
-                      </button>
-                      <button
-                        aria-label="删除异常账号记录"
-                        className="icon-button history-dismiss-button"
-                        disabled={busy}
-                        onClick={() => onDeleteExceptionRecord(record.id)}
-                        title="删除这条异常账号记录"
-                        type="button"
-                      >
-                        <X size={16} />
-                      </button>
-                    </div>
-                  </div>
-                  <p className="history-message">{displayMessage}</p>
-                  {protocolSummary ? <p className="history-message">{`协议链路：${protocolSummary}`}</p> : null}
-                </article>
-              );
-            })}
-            {!exceptionRecords.length ? <Empty label="暂无异常账号记录" /> : null}
-          </div>
-        </section>
+      {fallbackModelDialogOpen ? (
+        <FallbackModelChainDialog
+          availableModels={settings.available_test_models || []}
+          enabled={apiKeyChannelMonitorPauseEnabled}
+          models={channelMonitorFallbackTestModels}
+          onChange={setChannelMonitorFallbackTestModels}
+          onClose={closeFallbackModelDialog}
+        />
       ) : null}
-
-      {subview === "jobs" ? (
-        <section className="panel">
-          <PanelTitle title="刷新任务" icon={RefreshCcw} />
-          <div className="history-list">
-            {jobs.map((job) => {
-              const protocolSummary = refreshJobProtocolSummary(job, events);
-              const durationMs = timestampDurationMs(job.started_at, job.finished_at, now);
-              return (
-                <article className="history-item" key={job.id}>
-                  <div className="history-item-head">
-                    <div className="history-meta">
-                      <Badge tone={job.status === "succeeded" ? "ok" : job.status === "running" ? "running" : "error"}>
-                        {statusLabel(job.status)}
-                      </Badge>
-                      <strong className="mono history-email">{job.email}</strong>
-                      {job.memory_peak_rss_bytes ? (
-                        <span className="memory-pill">内存峰值 {formatBytes(job.memory_peak_rss_bytes)}</span>
-                      ) : null}
-                      {durationMs !== null ? (
-                        <span className="memory-pill">耗时 {formatElapsedDuration(durationMs)}</span>
-                      ) : null}
-                    </div>
-                    <time>{formatDate(job.created_at, timeZone)}</time>
-                  </div>
-                  <p className="history-message">{job.reason || "-"}</p>
-                  {protocolSummary ? <p className="history-message">{`协议链路：${protocolSummary}`}</p> : null}
-                </article>
-              );
-            })}
-            {!jobs.length ? <Empty label="暂无刷新任务" /> : null}
-          </div>
-        </section>
-      ) : null}
-
-      {subview === "events" ? (
-        <section className="panel">
-          <PanelTitle title="事件" icon={Activity} />
-          <div className="history-list">
-            {events.map((event) => {
-              const reasonLabel = eventReasonLabel(event);
-              const modeLabel = eventModeLabel(event);
-              const syncErrorCount = eventSyncErrorCount(event);
-              const durationMs = eventDurationMs(event.details);
-              const durationBreakdown = eventDurationBreakdown(event.details);
-              return (
-                <article className="history-item event-history-item" key={event.id}>
-                  <div className="history-item-head">
-                    <div className="history-meta">
-                      <Badge tone={eventTone(event.kind)}>{eventKindLabel(event.kind)}</Badge>
-                      {reasonLabel ? <Badge tone="ink">{reasonLabel}</Badge> : null}
-                      {modeLabel ? <Badge tone="ink">{modeLabel}</Badge> : null}
-                      {syncErrorCount !== null ? (
-                        <Badge tone={syncErrorCount > 0 ? "error" : "ok"}>{`错误账号 ${syncErrorCount}`}</Badge>
-                      ) : null}
-                      {durationMs !== null ? (
-                        <Badge tone="ink">{`耗时 ${formatElapsedDuration(durationMs)}`}</Badge>
-                      ) : null}
-                      <strong className="history-email">{event.email || "system"}</strong>
-                    </div>
-                    <time>{formatDate(event.created_at, timeZone)}</time>
-                  </div>
-                  <p className="history-message">{event.message}</p>
-                  {durationBreakdown.length ? (
-                    <p className="history-message">
-                      阶段耗时：{durationBreakdown.map((item) => `${item.label} ${formatElapsedDuration(item.durationMs)}`).join(" · ")}
-                    </p>
-                  ) : null}
-                </article>
-              );
-            })}
-            {!events.length ? <Empty label="暂无事件" /> : null}
-          </div>
-        </section>
-      ) : null}
+      {discordSetupGuideOpen ? <DiscordBotSetupGuideDialog onClose={closeDiscordSetupGuide} /> : null}
     </div>
   );
 }
@@ -5237,6 +6529,78 @@ function formatMoney(value: number | null | undefined) {
     return "-";
   }
   return `$${value.toFixed(2)}`;
+}
+
+function formatBalanceGuardValue(
+  channel: UpstreamChannel,
+  balanceBasis: "wallet" | "recharge_adjusted",
+) {
+  if (String(channel.balance_guard_state || "").toLowerCase() === "insufficient") {
+    const value = Number(channel.balance_guard_value);
+    if (Number.isFinite(value)) {
+      const formatted = value.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      return channel.balance_guard_basis === "recharge_adjusted" ? `¥${formatted}` : `$${formatted}`;
+    }
+  }
+  const value = historicalBalanceValue(channel, balanceBasis);
+  if (value === null) return "待确认";
+  const formatted = value.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (balanceBasis === "recharge_adjusted") return `¥${formatted}`;
+  const unit = String(channel.balance_unit || "USD").trim().toUpperCase();
+  return unit === "USD" ? `$${formatted}` : `${unit} ${formatted}`;
+}
+
+function channelHasLowBalance(
+  channel: UpstreamChannel,
+  includeStale: boolean,
+  balanceBasis: "wallet" | "recharge_adjusted",
+  threshold: number,
+) {
+  const activeGuard = ["insufficient", "negative", "paused"].includes(
+    String(channel.balance_guard_state || "").toLowerCase(),
+  );
+  return activeGuard || (includeStale && hasKnownLowBalance(channel, balanceBasis, threshold));
+}
+
+function isStaleLowBalance(
+  channel: UpstreamChannel,
+  balanceBasis: "wallet" | "recharge_adjusted",
+  threshold: number,
+) {
+  return hasKnownLowBalance(channel, balanceBasis, threshold)
+    && !["insufficient", "negative", "paused"].includes(
+      String(channel.balance_guard_state || "").toLowerCase(),
+    );
+}
+
+function hasKnownLowBalance(
+  channel: UpstreamChannel,
+  balanceBasis: "wallet" | "recharge_adjusted",
+  threshold: number,
+) {
+  const balance = historicalBalanceValue(channel, balanceBasis);
+  return balance !== null && balance < threshold;
+}
+
+function historicalBalanceValue(
+  channel: UpstreamChannel,
+  balanceBasis: "wallet" | "recharge_adjusted",
+) {
+  const balance = Number(channel.balance_remaining);
+  if (
+    channel.balance_source !== "upstream_wallet"
+    || !channel.balance_checked_at
+    || !Number.isFinite(balance)
+  ) return null;
+  if (balanceBasis === "wallet") return balance;
+  const multiplier = Number(channel.effective_recharge_multiplier);
+  return Number.isFinite(multiplier) && multiplier > 0 ? balance * multiplier : null;
+}
+
+function fallbackSiteLogo(event: { currentTarget: HTMLImageElement }) {
+  const image = event.currentTarget;
+  if (image.getAttribute("src") === "/logo.png") return;
+  image.src = "/logo.png";
 }
 
 function formatTokenCount(value: number | null | undefined) {
@@ -5770,6 +7134,15 @@ function accountIsManuallyPaused(
   if (account.deactive || remoteError || accountRateLimited(account as Account, usage)) return false;
   const status = String(account.status || "").trim().toLowerCase();
   return account.schedulable === false && status === "active";
+}
+
+function refreshJobStatusLabel(status: string) {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "completed" || normalized === "success") return "完成";
+  if (normalized === "failed" || normalized === "error") return "失败";
+  if (normalized === "running") return "运行中";
+  if (normalized === "queued" || normalized === "pending") return "等待中";
+  return status || "未知";
 }
 
 function accountStatusTone(account: Account, usage?: AccountUsageEstimate) {
@@ -6403,206 +7776,6 @@ function statusLabel(status: string) {
   );
 }
 
-function latestErrorRefreshJobForRecord(record: AccountExceptionRecord, jobs: RefreshJob[]) {
-  const accountId = normalizeHistoryAccountId(record.sub2api_account_id);
-  if (accountId) {
-    for (const job of jobs) {
-      if (!refreshJobHasErrorReason(job)) continue;
-      if (normalizeHistoryAccountId(job.sub2api_account_id) === accountId) {
-        return job;
-      }
-    }
-  }
-
-  const email = normalizeHistoryEmail(record.email);
-  if (email) {
-    for (const job of jobs) {
-      if (!refreshJobHasErrorReason(job)) continue;
-      if (normalizeHistoryEmail(job.email) === email) {
-        return job;
-      }
-    }
-  }
-
-  return null;
-}
-
-function refreshJobHasErrorReason(job: RefreshJob) {
-  return Boolean(job.reason && (job.status === "failed" || job.status === "deactive"));
-}
-
-function refreshJobProtocolSummary(job: RefreshJob, events: AppEvent[]) {
-  const relatedEvents = events
-    .filter((event) => parseEventJobId(event) === job.id)
-    .filter((event) => Boolean(protocolEventSummary(event)))
-    .reverse();
-
-  if (!relatedEvents.length) return null;
-
-  const summaries = relatedEvents
-    .map((event) => protocolEventSummary(event))
-    .filter((summary, index, list): summary is string => Boolean(summary) && list.indexOf(summary) === index);
-
-  return summaries.length ? summaries.join(" -> ") : null;
-}
-
-function parseEventJobId(event: AppEvent) {
-  const value = event.details?.job_id;
-  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
-  if (typeof value === "string") {
-    const parsed = Number(value.trim());
-    if (Number.isFinite(parsed)) return Math.trunc(parsed);
-  }
-  return null;
-}
-
-function protocolEventSummary(event: AppEvent) {
-  switch (event.kind) {
-    case "sub2api_protocol_refresh_failed":
-      return protocolErrorHttpSummary(event, "/refresh", "sub2api /refresh 失败");
-    case "sub2api_check_status_unavailable":
-      return "sub2api /check-status 无结果";
-    case "runtime_access_token_missing":
-      return "只有 AT 标记，缺少真实 access_token";
-    case "access_token_status_check_failed":
-      return protocolErrorHttpSummary(event, "access_token 状态检查", "access_token 状态检查失败");
-    case "chatgpt_protocol_refresh_failed":
-      return protocolErrorHttpSummary(event, "ChatGPT 协议刷新", "ChatGPT 协议刷新失败");
-    default:
-      return null;
-  }
-}
-
-function protocolErrorHttpSummary(event: AppEvent, fallbackLabel: string, defaultLabel: string) {
-  const errorText = String(event.details?.error || "");
-  const match = errorText.match(/\bHTTP\s+(\d{3})\b/i);
-  if (match) {
-    return `${fallbackLabel} 返回 ${match[1]}`;
-  }
-  return defaultLabel;
-}
-
-function normalizeHistoryEmail(value: string | null | undefined) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return normalized || null;
-}
-
-function normalizeHistoryAccountId(value: string | null | undefined) {
-  const normalized = String(value || "").trim();
-  return normalized || null;
-}
-
-function exceptionSourceLabel(source: string) {
-  return (
-    {
-      sync: "当前账号",
-      refresh: "刷新任务",
-      usage_refresh: "额度刷新",
-      subscription_refresh: "订阅刷新",
-    }[source] || source
-  );
-}
-
-function exceptionStatusLabel(status: string) {
-  return (
-    {
-      failed: "失败",
-      skipped: "已跳过",
-      deactive: "封禁",
-      error: "错误",
-      missing_mailbox: "缺邮箱",
-      recovery_disabled: "恢复关闭",
-      auto_refresh_locked: "刷新锁定",
-    }[status] || status
-  );
-}
-
-function exceptionStatusTone(status: string) {
-  return (
-    {
-      failed: "error",
-      deactive: "deactive",
-      error: "error",
-      missing_mailbox: "warn",
-      recovery_disabled: "warn",
-      auto_refresh_locked: "error",
-      skipped: "warn",
-    }[status] || "ink"
-  );
-}
-
-function eventReasonLabel(event: AppEvent) {
-  const reason = event.details?.reason;
-  if (reason === "scheduled") return "自动";
-  if (reason === "manual") return "手动";
-  return null;
-}
-
-function eventModeLabel(event: AppEvent) {
-  const force = event.details?.force;
-  if (force === true) return "强制刷新";
-  if (force === false) return "缓存优先";
-  return null;
-}
-
-function eventKindLabel(kind: string) {
-  return (
-    {
-      sub2api_protocol_refresh_failed: "sub2api /refresh",
-      sub2api_check_status_unavailable: "sub2api /check-status",
-      runtime_access_token_missing: "运行态 AT",
-      access_token_status_check_failed: "AT 状态检查",
-      chatgpt_protocol_refresh_failed: "ChatGPT 协议",
-      openai_oauth_refresh_token_failed: "OpenAI OAuth",
-      refresh_failed: "刷新失败",
-      refresh_started: "刷新开始",
-      refresh_succeeded: "刷新成功",
-      refresh_deactive: "刷新封禁",
-      refresh_skipped_missing_mailbox: "缺少邮箱",
-      manual_sync: "OAuth 账号同步",
-      monitor_sync: "OAuth 账号清单同步",
-      monitor_failed: "OAuth 账号清单同步失败",
-      usage_refresh: "OAuth 用量窗口",
-      usage_refresh_failed: "OAuth 用量窗口失败",
-      usage_statistics_refresh: "用量窗口手动刷新",
-      subscription_refresh: "订阅信息刷新",
-      manual_upstream_sync: "API 账号同步",
-      manual_api_key_inventory_sync: "API Key 账号清单同步",
-      api_key_inventory_sync: "API Key 账号清单自动同步",
-      api_key_inventory_sync_failed: "API Key 账号清单自动同步失败",
-      upstream_sync: "上游自动探测",
-      upstream_rate_sync_failed: "上游自动探测失败",
-    }[kind] || kind
-  );
-}
-
-function eventTone(kind: string) {
-  if (kind.includes("failed")) return "error";
-  if (kind === "sub2api_check_status_unavailable" || kind === "runtime_access_token_missing") return "warn";
-  if (kind.includes("succeeded")) return "ok";
-  if (kind.includes("started")) return "running";
-  return "ink";
-}
-
-function eventSyncErrorCount(event: AppEvent) {
-  const directCount = parseEventCount(event.details?.error_seen);
-  if (directCount !== null) return directCount;
-  return parseEventCount(event.details?.sync_error_seen);
-}
-
-function parseEventCount(value: unknown) {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.max(0, Math.trunc(value));
-  }
-  if (typeof value === "string") {
-    const parsed = Number(value.trim());
-    if (Number.isFinite(parsed)) {
-      return Math.max(0, Math.trunc(parsed));
-    }
-  }
-  return null;
-}
-
 function formatDate(value: string, timeZone = defaultTimeZone) {
   const date = parseApiDate(value);
   try {
@@ -6688,14 +7861,6 @@ function formatShortDate(value: string, timeZone = defaultTimeZone) {
 function parseApiDate(value: string) {
   const hasTimeZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
   return new Date(hasTimeZone ? value : `${value}Z`);
-}
-
-function formatBytes(value: number) {
-  const mib = value / 1024 / 1024;
-  if (mib < 1024) {
-    return `${mib.toFixed(1)} MiB`;
-  }
-  return `${(mib / 1024).toFixed(2)} GiB`;
 }
 
 export default App;

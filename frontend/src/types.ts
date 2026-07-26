@@ -418,8 +418,45 @@ export type AppSettings = {
   upstream_sync_max_concurrency: number;
   upstream_rate_sync_enabled: boolean;
   upstream_priority_sync_enabled: boolean;
+  manual_upstream_sync_rate_enabled: boolean;
+  manual_upstream_sync_priority_enabled: boolean;
+  manual_upstream_sync_upstream_health_enabled: boolean;
+  manual_upstream_sync_channel_monitors_enabled: boolean;
+  manual_upstream_sync_account_availability_enabled: boolean;
+  manual_upstream_sync_balance_guard_enabled: boolean;
+  manual_upstream_sync_rate_pause_enabled: boolean;
   api_key_auto_disable_on_upstream_unavailable: boolean;
+  api_key_auto_pause_on_negative_balance_enabled: boolean;
+  api_key_auto_pause_on_channel_monitor_unavailable_enabled: boolean;
+  channel_monitor_auto_probe_enabled: boolean;
+  account_model_whitelist_sync_enabled: boolean;
+  account_model_whitelist_sync_interval_seconds: number;
+  account_model_whitelist_sync_each_time: boolean;
+  channel_monitor_fallback_without_monitor_enabled: boolean;
+  channel_monitor_fallback_test_models: string[];
+  channel_monitor_fallback_test_model: string;
+  channel_monitor_fallback_test_attempts: number;
+  channel_monitor_recovery_test_attempts: number;
+  available_test_models: AccountLivenessModel[];
+  api_key_auto_pause_on_upstream_rate_increase_enabled?: boolean;
+  upstream_rate_pause_mode?: "increase_percent" | "absolute_multiplier";
+  upstream_rate_increase_threshold_percent?: number;
+  upstream_rate_absolute_threshold?: number;
+  upstream_negative_balance_basis: "wallet" | "recharge_adjusted";
+  upstream_balance_pause_threshold: number;
+  show_stale_negative_balance_alert: boolean;
+  priority_assign_disabled_api_key_accounts: boolean;
+  priority_share_same_composite_multiplier: boolean;
   upstream_rate_log_retention_days: number;
+  discord_bot_notifications_enabled: boolean;
+  discord_bot_token_set: boolean;
+  discord_bot_token_hint: string | null;
+  discord_bot_channel_id: string;
+  notify_oauth_account_disabled: boolean;
+  notify_account_enabled: boolean;
+  notify_api_key_rate_changed: boolean;
+  notify_upstream_group_changed: boolean;
+  notify_upstream_balance_low: boolean;
   usage_limit_sample_five_hour_threshold_percent: number;
   usage_limit_sample_seven_day_threshold_percent: number;
   usage_limit_default_ranges: UsageLimitDefaultRanges;
@@ -435,6 +472,8 @@ export type AppSettings = {
   last_scan_message: string | null;
   display_timezone: string;
   site_name: string;
+  site_logo_url: string | null;
+  site_logo_updated_at: string | null;
 };
 
 export type AppSettingsUpdate = {
@@ -458,8 +497,44 @@ export type AppSettingsUpdate = {
   upstream_sync_max_concurrency?: number;
   upstream_rate_sync_enabled?: boolean;
   upstream_priority_sync_enabled?: boolean;
+  manual_upstream_sync_rate_enabled?: boolean;
+  manual_upstream_sync_priority_enabled?: boolean;
+  manual_upstream_sync_upstream_health_enabled?: boolean;
+  manual_upstream_sync_channel_monitors_enabled?: boolean;
+  manual_upstream_sync_account_availability_enabled?: boolean;
+  manual_upstream_sync_balance_guard_enabled?: boolean;
+  manual_upstream_sync_rate_pause_enabled?: boolean;
   api_key_auto_disable_on_upstream_unavailable?: boolean;
+  api_key_auto_pause_on_negative_balance_enabled?: boolean;
+  api_key_auto_pause_on_channel_monitor_unavailable_enabled?: boolean;
+  channel_monitor_auto_probe_enabled?: boolean;
+  account_model_whitelist_sync_enabled?: boolean;
+  account_model_whitelist_sync_interval_seconds?: number;
+  account_model_whitelist_sync_each_time?: boolean;
+  channel_monitor_fallback_without_monitor_enabled?: boolean;
+  channel_monitor_fallback_test_models?: string[];
+  channel_monitor_fallback_test_model?: string;
+  channel_monitor_fallback_test_attempts?: number;
+  channel_monitor_recovery_test_attempts?: number;
+  api_key_auto_pause_on_upstream_rate_increase_enabled?: boolean;
+  upstream_rate_pause_mode?: "increase_percent" | "absolute_multiplier";
+  upstream_rate_increase_threshold_percent?: number;
+  upstream_rate_absolute_threshold?: number;
+  upstream_negative_balance_basis?: "wallet" | "recharge_adjusted";
+  upstream_balance_pause_threshold?: number;
+  show_stale_negative_balance_alert?: boolean;
+  priority_assign_disabled_api_key_accounts?: boolean;
+  priority_share_same_composite_multiplier?: boolean;
   upstream_rate_log_retention_days?: number;
+  discord_bot_notifications_enabled?: boolean;
+  discord_bot_token?: string;
+  clear_discord_bot_token?: boolean;
+  discord_bot_channel_id?: string;
+  notify_oauth_account_disabled?: boolean;
+  notify_account_enabled?: boolean;
+  notify_api_key_rate_changed?: boolean;
+  notify_upstream_group_changed?: boolean;
+  notify_upstream_balance_low?: boolean;
   usage_limit_sample_five_hour_threshold_percent?: number;
   usage_limit_sample_seven_day_threshold_percent?: number;
   usage_limit_default_ranges?: UsageLimitDefaultRanges;
@@ -472,6 +547,12 @@ export type AppSettingsUpdate = {
   account_liveness_max_concurrency?: number;
   display_timezone?: string;
   site_name?: string;
+};
+
+export type SiteLogoUpdateResult = {
+  site_logo_url: string | null;
+  site_logo_updated_at: string | null;
+  message?: string;
 };
 
 export type Sub2ApiPortScanResult = {
@@ -501,6 +582,10 @@ export type PriorityInterval = {
   step: number;
   account_count?: number;
   effective_step?: number;
+  rate_pause_enabled: boolean;
+  rate_pause_mode: "increase_percent" | "absolute_multiplier";
+  rate_increase_threshold_percent: number;
+  rate_absolute_threshold: number;
   created_at?: string | null;
   updated_at?: string | null;
 };
@@ -510,12 +595,21 @@ export type PriorityIntervalInput = {
   start_priority: number;
   end_priority: number;
   step: number;
+  rate_pause_enabled: boolean;
+  rate_pause_mode: "increase_percent" | "absolute_multiplier";
+  rate_increase_threshold_percent: number;
+  rate_absolute_threshold: number;
 };
 
 export type PriorityIntervalAssignment = {
   priority_interval_id: number | string | null;
   expected_identity_fingerprint: string;
   confirm_identity_rebind?: boolean;
+};
+
+export type PriorityTieMoveInput = {
+  direction: "up" | "down";
+  expected_identity_fingerprint: string;
 };
 
 export type PriorityRebalanceResult = {
@@ -532,6 +626,33 @@ export type PriorityRebalanceResult = {
  * management state. Most enrichment fields are optional so an unmanaged or
  * not-yet-discovered account remains renderable.
  */
+export type UpstreamAccountPauseHold = {
+  reason: string;
+  triggered_at?: string | null;
+  recovery_mode?: string | null;
+  scope_channel_id?: number | string | null;
+  evidence?: {
+    balance?: number;
+    basis?: string;
+    threshold?: number;
+    unit?: string;
+    key_status?: string;
+    group_status?: string;
+    monitor_status?: string;
+    unavailable_count?: number;
+    test_status?: string;
+    test_purpose?: string;
+    test_attempts?: number;
+    max_test_attempts?: number;
+    baseline_multiplier?: number;
+    mode?: string;
+    observed_multiplier?: number;
+    absolute_threshold?: number;
+    increase_percent?: number;
+    threshold_percent?: number;
+  } | null;
+};
+
 export type UpstreamAccount = {
   sub2api_account_id: number | string;
   /** Stable, non-secret identity used to reject stale mutations after a remote ID is reused. */
@@ -539,6 +660,8 @@ export type UpstreamAccount = {
   identity_binding_status?: "unmanaged" | "unbound" | "bound" | "mismatch";
   identity_rebind_required?: boolean;
   api_key_origin_rebind_required?: boolean;
+  upstream_identity_rebind_required?: boolean;
+  upstream_api_key_record_id?: number | string | null;
   channel_id?: number | string | null;
   remote_name?: string | null;
   remote_platform?: string | null;
@@ -546,11 +669,24 @@ export type UpstreamAccount = {
   remote_status?: string | null;
   remote_schedulable?: boolean | null;
   priority?: number | null;
+  remote_present?: boolean;
+  remote_snapshot_updated_at?: string | null;
+  remote_missing_at?: string | null;
   desired_priority?: number | null;
   priority_interval_id?: number | string | null;
   priority_interval_name?: string | null;
   priority_sync_status?: string | null;
   priority_sync_error?: string | null;
+  priority_tiebreak_order?: number | null;
+  priority_tiebreak_multiplier?: number | null;
+  priority_assignment_when_disabled?: boolean | null;
+  priority_assignment_when_disabled_effective?: boolean;
+  rate_pause_policy?: "inherit" | "disabled" | "custom";
+  rate_pause_effective_enabled?: boolean;
+  rate_pause_effective_source?: "account" | "priority_interval" | "disabled";
+  rate_pause_mode?: "increase_percent" | "absolute_multiplier" | null;
+  rate_increase_threshold_percent?: number | null;
+  rate_absolute_threshold?: number | null;
   composite_multiplier?: number | null;
   managed?: boolean;
   base_url?: string | null;
@@ -578,8 +714,29 @@ export type UpstreamAccount = {
   upstream_health_checked_at?: string | null;
   upstream_key_checked_at?: string | null;
   upstream_group_checked_at?: string | null;
+  availability_check_mode?: "channel_monitor" | "independent_model" | "disabled";
+  availability_monitor_id?: number | string | null;
+  availability_test_model?: string | null;
+  available_models?: AccountLivenessModel[] | null;
+  available_models_status?: string | null;
+  available_models_checked_at?: string | null;
+  availability_status?: string | null;
+  availability_unavailable_count?: number;
+  availability_recovery_count?: number;
+  availability_checked_at?: string | null;
+  availability_source?: string | null;
+  availability_message?: string | null;
   auto_disabled_reason?: string | null;
   last_auto_disabled_at?: string | null;
+  active_pause_holds?: UpstreamAccountPauseHold[];
+  pause_owned_by_plugin?: boolean;
+  auto_restore_eligible?: boolean;
+  auto_pause_episode_id?: string | null;
+  auto_pause_channel_id?: number | string | null;
+  auto_paused_at?: string | null;
+  balance_guard_restore_eligible?: boolean;
+  balance_guard_channel_id?: number | string | null;
+  balance_guard_paused_at?: string | null;
   discovered_recharge_multiplier?: number | null;
   effective_recharge_multiplier?: number | null;
   recharge_multiplier_source?: string | null;
@@ -595,11 +752,17 @@ export type UpstreamAccount = {
   balance_used?: number | null;
   balance_unit?: string | null;
   balance_status?: string | null;
+  balance_source?: string | null;
   balance_message?: string | null;
   balance_checked_at?: string | null;
   upstream_usage_amount?: number | null;
   upstream_usage_unit?: string | null;
   upstream_usage_checked_at?: string | null;
+  today_upstream_usage_amount?: number | null;
+  today_upstream_usage_unit?: string | null;
+  today_upstream_usage_status?: string | null;
+  today_upstream_usage_source?: string | null;
+  today_upstream_usage_checked_at?: string | null;
   last_error?: string | null;
   last_discovered_at?: string | null;
   last_applied_at?: string | null;
@@ -621,12 +784,77 @@ export type UpstreamAccountUpdate = {
   clear_access_token?: boolean;
   confirm_credential_rebind?: boolean;
   confirm_identity_rebind?: boolean;
+  confirm_upstream_identity_rebind?: boolean;
   manual_group_multiplier?: number | null;
   manual_recharge_multiplier?: number | null;
+  priority_assignment_when_disabled?: boolean | null;
+  rate_pause_policy?: "inherit" | "disabled" | "custom";
+  rate_pause_mode?: "increase_percent" | "absolute_multiplier";
+  rate_increase_threshold_percent?: number | null;
+  rate_absolute_threshold?: number | null;
+  availability_check_mode?: "channel_monitor" | "independent_model" | "disabled";
+  availability_monitor_id?: number | string | null;
+  availability_test_model?: string | null;
+};
+
+export type UpstreamAccountAvailabilityTestResult = {
+  account: UpstreamAccount;
+  policy_action?: "hold" | "clear" | null;
+  policy_status?: string | null;
+  policy_error?: string | null;
+  evidence: Record<string, unknown>;
+};
+
+export type UpstreamAccountConnectionTestResult = {
+  account_id: number | string;
+  success: boolean;
+  model: string;
+  error?: string | null;
+  attempts: number;
+};
+
+export type UpstreamChannelMonitorModel = {
+  name?: string | null;
+  model?: string | null;
+  status?: string | null;
+  latency_ms?: number | null;
+};
+
+export type UpstreamChannelMonitorTimelinePoint = {
+  time?: string | null;
+  checked_at?: string | null;
+  status?: string | null;
+  latency_ms?: number | null;
+  ping_latency_ms?: number | null;
+};
+
+export type UpstreamChannelMonitor = {
+  id: number | string;
+  name?: string | null;
+  provider?: string | null;
+  group_name?: string | null;
+  primary_model?: string | null;
+  primary_status?: string | null;
+  primary_latency_ms?: number | null;
+  primary_ping_latency_ms?: number | null;
+  availability_7d?: number | null;
+  availability_window?: "24h" | "7d" | null;
+  extra_models?: UpstreamChannelMonitorModel[] | null;
+  timeline?: UpstreamChannelMonitorTimelinePoint[] | null;
+};
+
+export type UpstreamChannelMonitorsResponse = {
+  channel_id: number | string;
+  channel_monitors: UpstreamChannelMonitor[];
+  channel_monitor_count: number;
+  channel_monitor_status: string;
+  channel_monitor_message?: string | null;
+  channel_monitor_checked_at?: string | null;
 };
 
 export type UpstreamChannel = {
   id: number | string;
+  background_discovery_pending?: boolean;
   display_name?: string | null;
   base_url?: string | null;
   canonical_base_url?: string | null;
@@ -648,8 +876,10 @@ export type UpstreamChannel = {
   balance_used?: number | null;
   balance_unit?: string | null;
   balance_status?: string | null;
+  balance_source?: string | null;
   balance_message?: string | null;
   balance_checked_at?: string | null;
+  recharge_adjusted_balance?: number | null;
   today_balance_used?: number | null;
   today_balance_unit?: string | null;
   today_balance_status?: string | null;
@@ -658,6 +888,20 @@ export type UpstreamChannel = {
   yesterday_balance_unit?: string | null;
   yesterday_balance_status?: string | null;
   yesterday_balance_checked_at?: string | null;
+  balance_guard_state?: string | null;
+  balance_guard_basis?: "wallet" | "recharge_adjusted" | null;
+  balance_guard_value?: number | null;
+  balance_guard_checked_at?: string | null;
+  balance_guard_paused_count?: number;
+  channel_monitors?: UpstreamChannelMonitor[] | null;
+  channel_monitor_count?: number;
+  channel_monitor_status?: string | null;
+  channel_monitor_message?: string | null;
+  channel_monitor_checked_at?: string | null;
+  channel_monitor_guard_state?: string | null;
+  channel_monitor_unavailable_count?: number;
+  channel_monitor_recovery_count?: number;
+  channel_monitor_guard_checked_at?: string | null;
   status?: string | null;
   message?: string | null;
   checked_at?: string | null;
@@ -700,7 +944,11 @@ export type UpstreamLegacyIdentityBinding = {
   expected_identity_fingerprint: string;
 };
 
-export type UpstreamChannelDiscoverAllRequest =
+export type ApiKeyViewOperation =
+  | { kind: "blocking" }
+  | { kind: "channel-discovery"; channelId: number };
+
+export type UpstreamChannelDiscoverAllRequest = (
   | {
       confirm_legacy_bindings: true;
       account_bindings: UpstreamLegacyIdentityBinding[];
@@ -708,7 +956,10 @@ export type UpstreamChannelDiscoverAllRequest =
   | {
       confirm_legacy_bindings?: never;
       account_bindings?: never;
-    };
+    }
+) & {
+  skip_channel_ids?: number[];
+};
 
 export type UpstreamChannelUpdate = {
   display_name?: string | null;
@@ -733,6 +984,10 @@ export type UpstreamChangeLog = {
   channel_name?: string | null;
   group_id?: string | null;
   group_name?: string | null;
+  old_group_id?: string | null;
+  new_group_id?: string | null;
+  old_group_name?: string | null;
+  new_group_name?: string | null;
   old_group_multiplier?: number | null;
   new_group_multiplier?: number | null;
   /** Group multiplier normalized to the cost of one upstream USD at a 1:1 recharge ratio. */
@@ -761,3 +1016,49 @@ export type UpstreamChangeLog = {
 
 /** Compatibility alias for integrations compiled against the earlier name. */
 export type UpstreamRateChangeLog = UpstreamChangeLog;
+
+export type UpstreamChannelChangeEvent = {
+  id: number;
+  channel_id?: number | string | null;
+  channel_name?: string | null;
+  event_type: "channel_multiplier_changed" | "group_multiplier_changed" | "group_removed" | "group_added" | "group_name_changed" | "account_rate_changed" | "upstream_key_status_changed" | "upstream_group_status_changed";
+  group_id?: string | null;
+  group_name?: string | null;
+  old_value?: number | null;
+  new_value?: number | null;
+  old_status?: string | null;
+  new_status?: string | null;
+  details?: Record<string, unknown> | null;
+  created_at: string;
+  unread: boolean;
+};
+
+export type AccountSchedulingChangeEvent = {
+  id: number;
+  sub2api_account_id: number | string;
+  account_name?: string | null;
+  channel_id?: number | string | null;
+  channel_name?: string | null;
+  event_type: "paused" | "restored" | "pause_failed" | "restore_failed";
+  reason?: string | null;
+  active_reasons: string[];
+  evidence?: Record<string, unknown> | null;
+  old_schedulable?: boolean | null;
+  new_schedulable?: boolean | null;
+  status: string;
+  safe_error?: string | null;
+  created_at: string;
+  unread: boolean;
+};
+
+export type ChangeLogPage<T> = {
+  items: T[];
+  unread_count: number;
+  last_read_id: number;
+};
+
+export type ChangeLogUnreadCounts = {
+  upstream_changes: number;
+  account_rate_changes: number;
+  account_scheduling_changes: number;
+};

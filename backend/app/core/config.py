@@ -69,8 +69,62 @@ class Settings(BaseSettings):
     upstream_sync_max_concurrency: int = 10
     upstream_rate_sync_enabled: bool = False
     upstream_priority_sync_enabled: bool = True
+    manual_upstream_sync_rate_enabled: bool = True
+    manual_upstream_sync_priority_enabled: bool = True
+    manual_upstream_sync_upstream_health_enabled: bool = True
+    manual_upstream_sync_channel_monitors_enabled: bool = True
+    manual_upstream_sync_account_availability_enabled: bool = False
+    manual_upstream_sync_balance_guard_enabled: bool = True
+    manual_upstream_sync_rate_pause_enabled: bool = True
     api_key_auto_disable_on_upstream_unavailable: bool = False
+    api_key_auto_pause_on_channel_monitor_unavailable_enabled: bool = False
+    channel_monitor_auto_probe_enabled: bool = True
+    account_model_whitelist_sync_enabled: bool = False
+    account_model_whitelist_sync_interval_seconds: int = 3600
+    account_model_whitelist_sync_each_time: bool = False
+    channel_monitor_unavailable_consecutive_threshold: int = Field(default=2, ge=1, le=100)
+    channel_monitor_recovery_consecutive_threshold: int = Field(default=2, ge=1, le=100)
+    channel_monitor_fallback_without_monitor_enabled: bool = False
+    channel_monitor_fallback_test_models: list[str] = Field(default_factory=list)
+    channel_monitor_fallback_test_model: str = ""
+    channel_monitor_fallback_test_attempts: int = Field(default=1, ge=1, le=5)
+    channel_monitor_recovery_test_attempts: int = Field(default=1, ge=1, le=5)
+    api_key_auto_pause_on_upstream_rate_increase_enabled: bool = False
+    upstream_rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = (
+        "increase_percent"
+    )
+    upstream_rate_increase_threshold_percent: float = Field(
+        default=20.0,
+        gt=0,
+        le=100_000,
+        allow_inf_nan=False,
+    )
+    upstream_rate_absolute_threshold: float = Field(
+        default=1.0,
+        gt=0,
+        le=1000,
+        allow_inf_nan=False,
+    )
+    api_key_auto_pause_on_negative_balance_enabled: bool = False
+    upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] = "wallet"
+    upstream_balance_pause_threshold: float = Field(
+        default=0.0,
+        ge=-1_000_000_000,
+        le=1_000_000_000,
+        allow_inf_nan=False,
+    )
+    show_stale_negative_balance_alert: bool = True
+    priority_assign_disabled_api_key_accounts: bool = False
+    priority_share_same_composite_multiplier: bool = False
     upstream_rate_log_retention_days: int = Field(default=90, ge=1, le=3650)
+    discord_bot_notifications_enabled: bool = False
+    discord_bot_token: str = ""
+    discord_bot_channel_id: str = ""
+    notify_oauth_account_disabled: bool = False
+    notify_account_enabled: bool = False
+    notify_api_key_rate_changed: bool = False
+    notify_upstream_group_changed: bool = False
+    notify_upstream_balance_low: bool = False
     usage_limit_sample_five_hour_threshold_percent: float = 0.0
     usage_limit_sample_seven_day_threshold_percent: float = 0.0
     usage_limit_default_ranges_json: str = ""

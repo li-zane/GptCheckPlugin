@@ -1,5 +1,6 @@
 import asyncio
 from datetime import timedelta
+from io import BytesIO
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -9,16 +10,25 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image, PngImagePlugin
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.services.runtime_config as runtime_config
-from app.api.settings import router as settings_router
+from app.api.settings import _available_test_models, router as settings_router
 from app.core.config import Settings
 from app.core.database import Base
 from app.core.security import require_admin
-from app.models import AppSetting, UpstreamRateChangeLog, utcnow
+from app.models import (
+    AccountSnapshot,
+    AccountSchedulingChangeLog,
+    AppSetting,
+    UpstreamAccountConfig,
+    UpstreamChannelChangeEvent,
+    UpstreamRateChangeLog,
+    utcnow,
+)
 from app.schemas import AppSettingsUpdate
 from app.services.runtime_config import (
     MAX_CONFIGURED_PROBE_RESPONSE_BYTES,
@@ -28,7 +38,136 @@ from app.services.runtime_config import (
 )
 
 
+def _logo_bytes(
+    image_format: str,
+    *,
+    size: tuple[int, int],
+    metadata: bool = False,
+) -> bytes:
+    output = BytesIO()
+    mode = "RGB" if image_format == "JPEG" else "RGBA"
+    color = (12, 98, 170) if mode == "RGB" else (12, 98, 170, 255)
+    with Image.new(mode, size, color) as image:
+        options = {}
+        if metadata and image_format == "PNG":
+            png_info = PngImagePlugin.PngInfo()
+            png_info.add_text("comment", "metadata-to-remove-" * 256)
+            options["pnginfo"] = png_info
+        image.save(output, format=image_format, **options)
+    return output.getvalue()
+
+
 class RuntimeConfigTests(unittest.TestCase):
+    def test_fallback_model_chain_accepts_json_arrows_and_deduplicates(self) -> None:
+        self.assertEqual(
+            runtime_config._normalize_model_chain('["gpt-5.4-mini", "grok-4.5"]'),
+            ["gpt-5.4-mini", "grok-4.5"],
+        )
+        self.assertEqual(
+            runtime_config._normalize_model_chain("gpt-5.4-mini -> grok-4.5 → gpt-5.4-mini"),
+            ["gpt-5.4-mini", "grok-4.5"],
+        )
+        payload = AppSettingsUpdate(
+            channel_monitor_fallback_test_models=[
+                " gpt-5.4-mini ",
+                "grok-4.5",
+                "gpt-5.4-mini",
+            ]
+        )
+        self.assertEqual(
+            payload.channel_monitor_fallback_test_models,
+            ["gpt-5.4-mini", "grok-4.5"],
+        )
+
+    def test_settings_available_test_models_merge_cached_account_whitelists(self) -> None:
+        asyncio.run(self._assert_settings_available_test_models_merge_cached_account_whitelists())
+
+    async def _assert_settings_available_test_models_merge_cached_account_whitelists(self) -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                db.add_all(
+                    [
+                        AccountSnapshot(
+                            email="oauth@example.com",
+                            sub2api_account_id="1",
+                            available_models=[
+                                {"id": "model-b", "display_name": "Model B"},
+                                {"id": "model-a", "display_name": "OAuth Model A"},
+                            ],
+                        ),
+                        UpstreamAccountConfig(
+                            sub2api_account_id=2,
+                            available_models=[
+                                {"id": "model-a", "display_name": "API Model A"},
+                                {"id": "model-c", "display_name": "Model C"},
+                                {"id": "", "display_name": "ignored"},
+                            ],
+                        ),
+                    ]
+                )
+                await db.commit()
+
+                models = await _available_test_models(db)
+
+            self.assertEqual(
+                models,
+                [
+                    {"id": "model-a", "display_name": "OAuth Model A"},
+                    {"id": "model-b", "display_name": "Model B"},
+                    {"id": "model-c", "display_name": "Model C"},
+                ],
+            )
+        finally:
+            await engine.dispose()
+
+    def test_logo_route_is_nosniff_and_immutable(self) -> None:
+        app = FastAPI()
+        app.include_router(settings_router, prefix="/api/settings")
+        logo = _logo_bytes("PNG", size=(8, 8))
+        service = SimpleNamespace(get_site_logo=AsyncMock(return_value=(logo, "image/png")))
+        with (
+            patch("app.api.settings.get_runtime_config_service", return_value=service),
+            TestClient(app) as client,
+        ):
+            response = client.get("/api/settings/logo")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertIn("immutable", response.headers["cache-control"])
+
+    def test_logo_validation_decodes_bounds_and_normalizes(self) -> None:
+        raw = _logo_bytes("PNG", size=(16, 16), metadata=True)
+        normalized = runtime_config._normalize_logo_bytes(raw, "image/png")
+        self.assertLess(len(normalized), len(raw))
+        self.assertTrue(runtime_config._valid_logo_bytes(normalized, "image/png"))
+        with Image.open(BytesIO(normalized)) as image:
+            self.assertEqual(image.size, (16, 16))
+            self.assertNotIn("comment", image.info)
+
+        for image_format, mime in (
+            ("PNG", "image/png"),
+            ("JPEG", "image/jpeg"),
+            ("WEBP", "image/webp"),
+        ):
+            with self.subTest(image_format=image_format):
+                encoded = runtime_config._normalize_logo_bytes(
+                    _logo_bytes(image_format, size=(12, 9)),
+                    mime,
+                )
+                self.assertTrue(runtime_config._valid_logo_bytes(encoded, mime))
+
+        with self.assertRaises(RuntimeConfigServiceError):
+            runtime_config._normalize_logo_bytes(raw, "image/jpeg")
+        with self.assertRaises(RuntimeConfigServiceError):
+            runtime_config._normalize_logo_bytes(
+                _logo_bytes("PNG", size=(2049, 1)),
+                "image/png",
+            )
+
     def test_settings_route_maps_credential_rebind_conflict_to_409(self) -> None:
         app = FastAPI()
         app.include_router(settings_router, prefix="/api/settings")
@@ -64,10 +203,20 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["site_name"], "Renamed App")
+        self.assertNotIn(
+            "channel_monitor_unavailable_consecutive_threshold",
+            response.json(),
+        )
+        self.assertNotIn(
+            "channel_monitor_recovery_consecutive_threshold",
+            response.json(),
+        )
+        self.assertEqual(response.json()["channel_monitor_recovery_test_attempts"], 1)
         services.monitor.wake.assert_not_called()
         services.upstream.wake.assert_not_called()
         services.upstream.wake_inventory.assert_not_called()
         services.upstream.wake_upstream.assert_not_called()
+        services.upstream.wake_priority.assert_not_called()
         services.usage.wake.assert_not_called()
         services.refresh.wake_concurrency.assert_not_awaited()
         services.liveness.wake.assert_not_awaited()
@@ -85,6 +234,7 @@ class RuntimeConfigTests(unittest.TestCase):
         services.upstream.wake_inventory.assert_called_once_with()
         services.upstream.wake.assert_not_called()
         services.upstream.wake_upstream.assert_not_called()
+        services.upstream.wake_priority.assert_not_called()
         services.monitor.wake.assert_not_called()
         services.usage.wake.assert_not_called()
 
@@ -101,8 +251,69 @@ class RuntimeConfigTests(unittest.TestCase):
         services.upstream.wake_upstream.assert_called_once_with()
         services.upstream.wake.assert_not_called()
         services.upstream.wake_inventory.assert_not_called()
+        services.upstream.wake_priority.assert_not_called()
         services.monitor.wake.assert_not_called()
         services.usage.wake.assert_not_called()
+
+    def test_settings_route_wakes_upstream_loop_for_policy_guard_changes(self) -> None:
+        changes = {
+            "api_key_auto_pause_on_channel_monitor_unavailable_enabled": True,
+            "channel_monitor_auto_probe_enabled": False,
+            "channel_monitor_fallback_test_attempts": 3,
+            "channel_monitor_recovery_test_attempts": 5,
+            "api_key_auto_pause_on_upstream_rate_increase_enabled": True,
+            "upstream_rate_increase_threshold_percent": 25.5,
+        }
+        for field_name, value in changes.items():
+            with self.subTest(field_name=field_name):
+                before = _route_public_settings_fixture()
+                after = {**before, field_name: value}
+                response, services = _put_settings_route(
+                    before,
+                    after,
+                    {field_name: value},
+                )
+
+                self.assertEqual(response.status_code, 200, response.text)
+                services.upstream.wake_upstream.assert_called_once_with()
+                services.upstream.wake.assert_not_called()
+                services.upstream.wake_inventory.assert_not_called()
+                services.upstream.wake_priority.assert_not_called()
+                services.monitor.wake.assert_not_called()
+                services.usage.wake.assert_not_called()
+
+    def test_settings_route_wakes_only_model_whitelist_loop_for_model_whitelist_change(self) -> None:
+        before = _route_public_settings_fixture()
+        after = {**before, "account_model_whitelist_sync_enabled": True}
+        response, services = _put_settings_route(
+            before,
+            after,
+            {"account_model_whitelist_sync_enabled": True},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        services.upstream.wake_model_whitelist.assert_called_once_with()
+        services.monitor.wake.assert_not_called()
+        services.upstream.wake_inventory.assert_not_called()
+        services.upstream.wake_upstream.assert_not_called()
+        services.upstream.wake_priority.assert_not_called()
+        services.upstream.wake.assert_not_called()
+        services.usage.wake.assert_not_called()
+
+    def test_settings_route_wakes_priority_loop_without_upstream_probe(self) -> None:
+        before = _route_public_settings_fixture()
+        after = {**before, "priority_share_same_composite_multiplier": True}
+        response, services = _put_settings_route(
+            before,
+            after,
+            {"priority_share_same_composite_multiplier": True},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        services.upstream.wake_priority.assert_called_once_with()
+        services.upstream.wake_upstream.assert_not_called()
+        services.upstream.wake_inventory.assert_not_called()
+        services.upstream.wake.assert_not_called()
 
     def test_test_environment_never_persists_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -435,12 +646,41 @@ class RuntimeConfigTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 AppSettingsUpdate(upstream_rate_log_retention_days=value)
 
+    def test_policy_guard_thresholds_reject_out_of_range_values(self) -> None:
+        invalid_values = {
+            "channel_monitor_fallback_test_attempts": (0, 6),
+            "channel_monitor_recovery_test_attempts": (0, 6),
+            "upstream_rate_increase_threshold_percent": (0, -1, 100_001, float("inf")),
+            "upstream_rate_absolute_threshold": (0, -1, 1001, float("inf")),
+            "upstream_balance_pause_threshold": (
+                -1_000_000_001,
+                1_000_000_001,
+                float("inf"),
+            ),
+        }
+        for field_name, values in invalid_values.items():
+            for value in values:
+                with (
+                    self.subTest(field_name=field_name, value=value),
+                    self.assertRaises(ValidationError),
+                ):
+                    AppSettingsUpdate(**{field_name: value})
+
     def test_upstream_rate_defaults_load_from_env_when_database_has_no_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"
             env_path.write_text(
                 "UPSTREAM_RATE_SYNC_ENABLED=true\n"
-                "UPSTREAM_RATE_LOG_RETENTION_DAYS=180\n",
+                "UPSTREAM_RATE_LOG_RETENTION_DAYS=180\n"
+                "SHOW_STALE_NEGATIVE_BALANCE_ALERT=false\n"
+                "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED=true\n"
+                "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD=3\n"
+                "CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD=4\n"
+                "API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED=true\n"
+                "UPSTREAM_RATE_PAUSE_MODE=absolute_multiplier\n"
+                "UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT=37.5\n"
+                "UPSTREAM_RATE_ABSOLUTE_THRESHOLD=2.75\n"
+                "UPSTREAM_BALANCE_PAUSE_THRESHOLD=12.5\n",
                 encoding="utf-8",
             )
             settings = Settings(_env_file=env_path)
@@ -450,14 +690,57 @@ class RuntimeConfigTests(unittest.TestCase):
                 enabled = asyncio.run(service.get_upstream_rate_sync_enabled())
                 upstream_enabled = asyncio.run(service.get_upstream_sync_enabled())
                 retention_days = asyncio.run(service.get_upstream_rate_log_retention_days())
+                show_stale_alert = asyncio.run(
+                    service.get_show_stale_negative_balance_alert()
+                )
+                auto_pause_on_monitor = asyncio.run(
+                    service.get_api_key_auto_pause_on_channel_monitor_unavailable_enabled()
+                )
+                monitor_unavailable_threshold = asyncio.run(
+                    service.get_channel_monitor_unavailable_consecutive_threshold()
+                )
+                monitor_recovery_threshold = asyncio.run(
+                    service.get_channel_monitor_recovery_consecutive_threshold()
+                )
+                auto_pause_on_rate_increase = asyncio.run(
+                    service.get_api_key_auto_pause_on_upstream_rate_increase_enabled()
+                )
+                rate_increase_threshold = asyncio.run(
+                    service.get_upstream_rate_increase_threshold_percent()
+                )
+                rate_pause_mode = asyncio.run(service.get_upstream_rate_pause_mode())
+                rate_absolute_threshold = asyncio.run(
+                    service.get_upstream_rate_absolute_threshold()
+                )
+                balance_pause_threshold = asyncio.run(
+                    service.get_upstream_balance_pause_threshold()
+                )
                 public = asyncio.run(service.get_public_settings())
 
         self.assertTrue(enabled)
         self.assertTrue(upstream_enabled)
         self.assertEqual(retention_days, 180)
+        self.assertFalse(show_stale_alert)
+        self.assertTrue(auto_pause_on_monitor)
+        self.assertEqual(monitor_unavailable_threshold, 3)
+        self.assertEqual(monitor_recovery_threshold, 4)
+        self.assertTrue(auto_pause_on_rate_increase)
+        self.assertEqual(rate_pause_mode, "absolute_multiplier")
+        self.assertEqual(rate_increase_threshold, 37.5)
+        self.assertEqual(rate_absolute_threshold, 2.75)
+        self.assertEqual(balance_pause_threshold, 12.5)
         self.assertTrue(public["upstream_sync_enabled"])
         self.assertTrue(public["upstream_rate_sync_enabled"])
         self.assertEqual(public["upstream_rate_log_retention_days"], 180)
+        self.assertFalse(public["show_stale_negative_balance_alert"])
+        self.assertTrue(public["api_key_auto_pause_on_channel_monitor_unavailable_enabled"])
+        self.assertEqual(public["channel_monitor_unavailable_consecutive_threshold"], 3)
+        self.assertEqual(public["channel_monitor_recovery_consecutive_threshold"], 4)
+        self.assertTrue(public["api_key_auto_pause_on_upstream_rate_increase_enabled"])
+        self.assertEqual(public["upstream_rate_pause_mode"], "absolute_multiplier")
+        self.assertEqual(public["upstream_rate_increase_threshold_percent"], 37.5)
+        self.assertEqual(public["upstream_rate_absolute_threshold"], 2.75)
+        self.assertEqual(public["upstream_balance_pause_threshold"], 12.5)
 
     def test_upstream_rate_settings_are_persisted(self) -> None:
         asyncio.run(self._assert_upstream_rate_settings_are_persisted())
@@ -466,6 +749,11 @@ class RuntimeConfigTests(unittest.TestCase):
         original_sessionmaker = runtime_config.AsyncSessionLocal
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir)
+            (project_root / ".env").write_text(
+                "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD=3\n"
+                "CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD=4\n",
+                encoding="utf-8",
+            )
             db_path = project_root / "settings.db"
             engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}", future=True)
             runtime_config.AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -477,6 +765,23 @@ class RuntimeConfigTests(unittest.TestCase):
                 defaults = await service.get_public_settings()
                 self.assertFalse(defaults["upstream_rate_sync_enabled"])
                 self.assertEqual(defaults["upstream_rate_log_retention_days"], 90)
+                self.assertFalse(
+                    defaults["api_key_auto_pause_on_channel_monitor_unavailable_enabled"]
+                )
+                self.assertTrue(defaults["channel_monitor_auto_probe_enabled"])
+                self.assertFalse(defaults["account_model_whitelist_sync_enabled"])
+                self.assertEqual(defaults["account_model_whitelist_sync_interval_seconds"], 3600)
+                self.assertFalse(defaults["account_model_whitelist_sync_each_time"])
+                self.assertEqual(
+                    defaults["channel_monitor_unavailable_consecutive_threshold"], 2
+                )
+                self.assertEqual(defaults["channel_monitor_recovery_consecutive_threshold"], 2)
+                self.assertEqual(defaults["channel_monitor_recovery_test_attempts"], 1)
+                self.assertFalse(defaults["api_key_auto_pause_on_upstream_rate_increase_enabled"])
+                self.assertEqual(defaults["upstream_rate_pause_mode"], "increase_percent")
+                self.assertEqual(defaults["upstream_rate_increase_threshold_percent"], 20.0)
+                self.assertEqual(defaults["upstream_rate_absolute_threshold"], 1.0)
+                self.assertEqual(defaults["upstream_balance_pause_threshold"], 0.0)
 
                 settings = await service.update_public_settings(
                     {
@@ -489,6 +794,19 @@ class RuntimeConfigTests(unittest.TestCase):
                         "upstream_rate_sync_enabled": True,
                         "upstream_priority_sync_enabled": False,
                         "api_key_auto_disable_on_upstream_unavailable": True,
+                        "api_key_auto_pause_on_channel_monitor_unavailable_enabled": True,
+                        "channel_monitor_auto_probe_enabled": False,
+                        "account_model_whitelist_sync_enabled": True,
+                        "account_model_whitelist_sync_interval_seconds": 1800,
+                        "account_model_whitelist_sync_each_time": True,
+                        "channel_monitor_recovery_test_attempts": 5,
+                        "api_key_auto_pause_on_upstream_rate_increase_enabled": True,
+                        "upstream_rate_pause_mode": "absolute_multiplier",
+                        "upstream_rate_increase_threshold_percent": 37.5,
+                        "upstream_rate_absolute_threshold": 2.75,
+                        "upstream_balance_pause_threshold": 12.5,
+                        "show_stale_negative_balance_alert": False,
+                        "notify_account_enabled": True,
                         "upstream_rate_log_retention_days": 180,
                         "account_liveness_max_concurrency": 4,
                     }
@@ -503,12 +821,59 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertTrue(settings["upstream_rate_sync_enabled"])
                 self.assertFalse(settings["upstream_priority_sync_enabled"])
                 self.assertTrue(settings["api_key_auto_disable_on_upstream_unavailable"])
+                self.assertTrue(
+                    settings["api_key_auto_pause_on_channel_monitor_unavailable_enabled"]
+                )
+                self.assertFalse(settings["channel_monitor_auto_probe_enabled"])
+                self.assertTrue(settings["account_model_whitelist_sync_enabled"])
+                self.assertEqual(settings["account_model_whitelist_sync_interval_seconds"], 1800)
+                self.assertTrue(settings["account_model_whitelist_sync_each_time"])
+                self.assertEqual(
+                    settings["channel_monitor_unavailable_consecutive_threshold"], 2
+                )
+                self.assertEqual(settings["channel_monitor_recovery_consecutive_threshold"], 2)
+                self.assertEqual(settings["channel_monitor_recovery_test_attempts"], 5)
+                self.assertTrue(settings["api_key_auto_pause_on_upstream_rate_increase_enabled"])
+                self.assertEqual(settings["upstream_rate_pause_mode"], "absolute_multiplier")
+                self.assertEqual(settings["upstream_rate_increase_threshold_percent"], 37.5)
+                self.assertEqual(settings["upstream_rate_absolute_threshold"], 2.75)
+                self.assertEqual(settings["upstream_balance_pause_threshold"], 12.5)
+                self.assertFalse(settings["show_stale_negative_balance_alert"])
+                self.assertTrue(settings["notify_account_enabled"])
                 self.assertEqual(settings["account_liveness_max_concurrency"], 4)
                 self.assertEqual(settings["upstream_rate_log_retention_days"], 180)
                 self.assertTrue(await service.get_upstream_sync_enabled())
                 self.assertTrue(await service.get_upstream_rate_sync_enabled())
                 self.assertFalse(await service.get_upstream_priority_sync_enabled())
                 self.assertTrue(await service.get_api_key_auto_disable_on_upstream_unavailable())
+                self.assertTrue(
+                    await service.get_api_key_auto_pause_on_channel_monitor_unavailable_enabled()
+                )
+                self.assertFalse(await service.get_channel_monitor_auto_probe_enabled())
+                self.assertTrue(await service.get_account_model_whitelist_sync_enabled())
+                self.assertEqual(await service.get_account_model_whitelist_sync_interval_seconds(), 1800)
+                self.assertTrue(await service.get_account_model_whitelist_sync_each_time())
+                self.assertEqual(
+                    await service.get_channel_monitor_unavailable_consecutive_threshold(), 2
+                )
+                self.assertEqual(
+                    await service.get_channel_monitor_recovery_consecutive_threshold(), 2
+                )
+                self.assertEqual(
+                    await service.get_channel_monitor_recovery_test_attempts(), 5
+                )
+                self.assertTrue(
+                    await service.get_api_key_auto_pause_on_upstream_rate_increase_enabled()
+                )
+                self.assertEqual(
+                    await service.get_upstream_rate_pause_mode(), "absolute_multiplier"
+                )
+                self.assertEqual(
+                    await service.get_upstream_rate_increase_threshold_percent(), 37.5
+                )
+                self.assertEqual(await service.get_upstream_rate_absolute_threshold(), 2.75)
+                self.assertEqual(await service.get_upstream_balance_pause_threshold(), 12.5)
+                self.assertFalse(await service.get_show_stale_negative_balance_alert())
                 self.assertEqual(await service.get_upstream_rate_log_retention_days(), 180)
 
                 async with runtime_config.AsyncSessionLocal() as db:
@@ -525,6 +890,18 @@ class RuntimeConfigTests(unittest.TestCase):
                                     "upstream_rate_sync_enabled",
                                     "upstream_priority_sync_enabled",
                                     "api_key_auto_disable_on_upstream_unavailable",
+                                    "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                                    "channel_monitor_auto_probe_enabled",
+                                    "account_model_whitelist_sync_enabled",
+                                    "account_model_whitelist_sync_interval_seconds",
+                                    "account_model_whitelist_sync_each_time",
+                                    "api_key_auto_pause_on_upstream_rate_increase_enabled",
+                                    "upstream_rate_pause_mode",
+                                    "upstream_rate_increase_threshold_percent",
+                                    "upstream_rate_absolute_threshold",
+                                    "upstream_balance_pause_threshold",
+                                    "show_stale_negative_balance_alert",
+                                    "notify_account_enabled",
                                     "upstream_rate_log_retention_days",
                                     "account_liveness_max_concurrency",
                                 ]
@@ -539,12 +916,48 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertEqual(values["upstream_rate_sync_enabled"], "true")
                 self.assertEqual(values["upstream_priority_sync_enabled"], "false")
                 self.assertEqual(values["api_key_auto_disable_on_upstream_unavailable"], "true")
+                self.assertEqual(
+                    values["api_key_auto_pause_on_channel_monitor_unavailable_enabled"],
+                    "true",
+                )
+                self.assertEqual(values["channel_monitor_auto_probe_enabled"], "false")
+                self.assertEqual(values["account_model_whitelist_sync_enabled"], "true")
+                self.assertEqual(values["account_model_whitelist_sync_interval_seconds"], "1800")
+                self.assertEqual(values["account_model_whitelist_sync_each_time"], "true")
+                self.assertNotIn("channel_monitor_unavailable_consecutive_threshold", values)
+                self.assertNotIn("channel_monitor_recovery_consecutive_threshold", values)
+                self.assertEqual(
+                    values["api_key_auto_pause_on_upstream_rate_increase_enabled"], "true"
+                )
+                self.assertEqual(values["upstream_rate_pause_mode"], "absolute_multiplier")
+                self.assertEqual(values["upstream_rate_increase_threshold_percent"], "37.5")
+                self.assertEqual(values["upstream_rate_absolute_threshold"], "2.75")
+                self.assertEqual(values["upstream_balance_pause_threshold"], "12.5")
+                self.assertEqual(values["show_stale_negative_balance_alert"], "false")
+                self.assertEqual(values["notify_account_enabled"], "true")
                 self.assertEqual(values["upstream_rate_log_retention_days"], "180")
                 env_text = (project_root / ".env").read_text(encoding="utf-8")
                 self.assertIn("UPSTREAM_SYNC_ENABLED=true", env_text)
                 self.assertIn("UPSTREAM_RATE_SYNC_ENABLED=true", env_text)
                 self.assertIn("UPSTREAM_PRIORITY_SYNC_ENABLED=false", env_text)
                 self.assertIn("API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE=true", env_text)
+                self.assertIn(
+                    "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED=true",
+                    env_text,
+                )
+                self.assertIn("CHANNEL_MONITOR_AUTO_PROBE_ENABLED=false", env_text)
+                self.assertIn("ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME=true", env_text)
+                self.assertNotIn("CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD", env_text)
+                self.assertNotIn("CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD", env_text)
+                self.assertIn(
+                    "API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED=true", env_text
+                )
+                self.assertIn("UPSTREAM_RATE_PAUSE_MODE=absolute_multiplier", env_text)
+                self.assertIn("UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT=37.5", env_text)
+                self.assertIn("UPSTREAM_RATE_ABSOLUTE_THRESHOLD=2.75", env_text)
+                self.assertIn("UPSTREAM_BALANCE_PAUSE_THRESHOLD=12.5", env_text)
+                self.assertIn("SHOW_STALE_NEGATIVE_BALANCE_ALERT=false", env_text)
+                self.assertIn("NOTIFY_ACCOUNT_ENABLED=true", env_text)
                 self.assertIn("ACCOUNT_LIVENESS_MAX_CONCURRENCY=4", env_text)
                 self.assertIn("UPSTREAM_RATE_LOG_RETENTION_DAYS=180", env_text)
             finally:
@@ -580,6 +993,30 @@ class RuntimeConfigTests(unittest.TestCase):
                                 status="observed",
                                 created_at=utcnow() - timedelta(days=29),
                             ),
+                            UpstreamChannelChangeEvent(
+                                channel_id=1,
+                                event_type="group_removed",
+                                group_id="expired",
+                                created_at=utcnow() - timedelta(days=31),
+                            ),
+                            UpstreamChannelChangeEvent(
+                                channel_id=1,
+                                event_type="group_added",
+                                group_id="recent",
+                                created_at=utcnow() - timedelta(days=29),
+                            ),
+                            AccountSchedulingChangeLog(
+                                sub2api_account_id=3,
+                                event_type="paused",
+                                status="success",
+                                created_at=utcnow() - timedelta(days=31),
+                            ),
+                            AccountSchedulingChangeLog(
+                                sub2api_account_id=4,
+                                event_type="restored",
+                                status="success",
+                                created_at=utcnow() - timedelta(days=29),
+                            ),
                         ]
                     )
                     await db.commit()
@@ -596,9 +1033,25 @@ class RuntimeConfigTests(unittest.TestCase):
                         )
                     )
                     account_ids = list(result.scalars().all())
+                    channel_event_ids = list(
+                        (
+                            await db.scalars(
+                                select(UpstreamChannelChangeEvent.group_id)
+                            )
+                        ).all()
+                    )
+                    scheduling_account_ids = list(
+                        (
+                            await db.scalars(
+                                select(AccountSchedulingChangeLog.sub2api_account_id)
+                            )
+                        ).all()
+                    )
                     retention = await db.get(AppSetting, "upstream_rate_log_retention_days")
 
                 self.assertEqual(account_ids, [2])
+                self.assertEqual(channel_event_ids, ["recent"])
+                self.assertEqual(scheduling_account_ids, [4])
                 self.assertIsNotNone(retention)
                 self.assertEqual(retention.value, "30")
             finally:
@@ -734,7 +1187,25 @@ class _FakeSettings:
         self.upstream_sync_max_concurrency = 1
         self.upstream_rate_sync_enabled = False
         self.upstream_priority_sync_enabled = True
+        self.priority_assign_disabled_api_key_accounts = False
+        self.priority_share_same_composite_multiplier = False
         self.api_key_auto_disable_on_upstream_unavailable = False
+        self.api_key_auto_pause_on_channel_monitor_unavailable_enabled = False
+        self.channel_monitor_auto_probe_enabled = True
+        self.account_model_whitelist_sync_enabled = False
+        self.account_model_whitelist_sync_interval_seconds = 3600
+        self.account_model_whitelist_sync_each_time = False
+        self.channel_monitor_unavailable_consecutive_threshold = 2
+        self.channel_monitor_recovery_consecutive_threshold = 2
+        self.channel_monitor_recovery_test_attempts = 1
+        self.api_key_auto_pause_on_upstream_rate_increase_enabled = False
+        self.upstream_rate_pause_mode = "increase_percent"
+        self.upstream_rate_increase_threshold_percent = 20.0
+        self.upstream_rate_absolute_threshold = 1.0
+        self.api_key_auto_pause_on_negative_balance_enabled = False
+        self.upstream_negative_balance_basis = "wallet"
+        self.upstream_balance_pause_threshold = 0.0
+        self.show_stale_negative_balance_alert = True
         self.upstream_rate_log_retention_days = 90
         self.usage_limit_sample_five_hour_threshold_percent = 0.0
         self.usage_limit_sample_seven_day_threshold_percent = 0.0
@@ -779,7 +1250,25 @@ def _public_settings_fixture() -> dict:
         "upstream_sync_max_concurrency": 1,
         "upstream_rate_sync_enabled": False,
         "upstream_priority_sync_enabled": True,
+        "priority_assign_disabled_api_key_accounts": False,
+        "priority_share_same_composite_multiplier": False,
         "api_key_auto_disable_on_upstream_unavailable": False,
+        "api_key_auto_pause_on_channel_monitor_unavailable_enabled": False,
+        "channel_monitor_auto_probe_enabled": True,
+        "account_model_whitelist_sync_enabled": False,
+        "account_model_whitelist_sync_interval_seconds": 3600,
+        "account_model_whitelist_sync_each_time": False,
+        "channel_monitor_unavailable_consecutive_threshold": 2,
+        "channel_monitor_recovery_consecutive_threshold": 2,
+        "channel_monitor_recovery_test_attempts": 1,
+        "api_key_auto_pause_on_upstream_rate_increase_enabled": False,
+        "upstream_rate_pause_mode": "increase_percent",
+        "upstream_rate_increase_threshold_percent": 20.0,
+        "upstream_rate_absolute_threshold": 1.0,
+        "api_key_auto_pause_on_negative_balance_enabled": False,
+        "upstream_negative_balance_basis": "wallet",
+        "upstream_balance_pause_threshold": 0.0,
+        "show_stale_negative_balance_alert": True,
         "upstream_rate_log_retention_days": 90,
         "usage_limit_sample_five_hour_threshold_percent": 0.0,
         "usage_limit_sample_seven_day_threshold_percent": 0.0,
@@ -834,6 +1323,7 @@ def _put_settings_route(
         patch("app.api.settings.get_usage_refresh_service", return_value=services.usage),
         patch("app.api.settings.get_refresh_service", return_value=services.refresh),
         patch("app.api.settings.get_account_liveness_limiter", return_value=services.liveness),
+        patch("app.api.settings._available_test_models", new=AsyncMock(return_value=[])),
         TestClient(app) as client,
     ):
         response = client.put("/api/settings", json=payload)

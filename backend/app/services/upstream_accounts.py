@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +20,10 @@ from app.core.config import get_settings
 from app.core.crypto import decrypt_text, encrypt_text
 from app.core.upstream_urls import canonicalize_upstream_url, upstream_url_origin
 from app.models import (
+    AccountSchedulingChangeLog,
+    UpstreamAccountDataArchive,
     UpstreamAccountConfig,
+    UpstreamAccountPauseHold,
     UpstreamChannel,
     UpstreamPriorityInterval,
     UpstreamRateChangeLog,
@@ -31,6 +35,10 @@ from app.schemas import (
     UpstreamGroupOptionOut,
 )
 from app.services.sub2api import Sub2ApiClient, Sub2ApiRequestError
+from app.services.notifications import (
+    enqueue_api_key_account_state_changed,
+    enqueue_api_key_rate_changed,
+)
 from app.services.runtime_config import get_runtime_config_service
 from app.services.upstream_client import discover_upstream
 
@@ -40,8 +48,95 @@ MAX_MULTIPLIER = Decimal("1000")
 DEFAULT_ENCRYPTION_KEY = "change-me-encryption-key"
 JS_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 INVALID_UPSTREAM_KEY_STATUSES = frozenset({"disabled", "expired", "quota_exhausted"})
-INVALID_UPSTREAM_GROUP_STATUSES = frozenset({"unavailable", "unassigned"})
+INVALID_UPSTREAM_GROUP_STATUSES = frozenset({"unavailable", "unassigned", "deleted"})
+AUTO_PAUSE_REASON_BALANCE = "upstream_balance_negative"
+AUTO_PAUSE_REASON_KEY = "upstream_key_unavailable"
+AUTO_PAUSE_REASON_GROUP = "upstream_group_unavailable"
+AUTO_PAUSE_REASON_MONITOR = "channel_monitor_unavailable"
+AUTO_PAUSE_REASON_RATE = "upstream_rate_increase"
+AUTO_PAUSE_REASON_ORDER = (
+    AUTO_PAUSE_REASON_BALANCE,
+    AUTO_PAUSE_REASON_KEY,
+    AUTO_PAUSE_REASON_GROUP,
+    AUTO_PAUSE_REASON_MONITOR,
+    AUTO_PAUSE_REASON_RATE,
+)
 logger = logging.getLogger(__name__)
+
+
+def resolve_rate_pause_policy(
+    config: UpstreamAccountConfig | None,
+    interval: UpstreamPriorityInterval | None = None,
+) -> dict[str, Any]:
+    """Resolve account override > priority interval > disabled."""
+    if config is None:
+        return {
+            "enabled": False,
+            "source": "disabled",
+            "mode": None,
+            "threshold_percent": None,
+            "absolute_threshold": None,
+        }
+    policy = str(config.rate_pause_policy or "inherit").strip().lower()
+    if policy == "custom":
+        mode = config.rate_pause_mode or "increase_percent"
+        return {
+            "enabled": True,
+            "source": "account",
+            "mode": mode,
+            "threshold_percent": float(config.rate_increase_threshold_percent or 20.0),
+            "absolute_threshold": float(config.rate_absolute_threshold or 1.0),
+        }
+    if policy == "disabled":
+        return {
+            "enabled": False,
+            "source": "disabled",
+            "mode": None,
+            "threshold_percent": None,
+            "absolute_threshold": None,
+        }
+    if interval is not None and bool(interval.rate_pause_enabled):
+        return {
+            "enabled": True,
+            "source": "priority_interval",
+            "mode": interval.rate_pause_mode or "increase_percent",
+            "threshold_percent": float(interval.rate_increase_threshold_percent or 20.0),
+            "absolute_threshold": float(interval.rate_absolute_threshold or 1.0),
+        }
+    if interval is not None:
+        return {
+            "enabled": False,
+            "source": "disabled",
+            "mode": None,
+            "threshold_percent": None,
+            "absolute_threshold": None,
+        }
+    return {
+        "enabled": False,
+        "source": "disabled",
+        "mode": None,
+        "threshold_percent": None,
+        "absolute_threshold": None,
+    }
+
+
+def _normalize_available_models(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value[:1000]:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()[:160]
+        if not model_id or model_id in seen or any(ord(character) < 32 for character in model_id):
+            continue
+        display_name = str(item.get("display_name") or model_id).strip()[:200]
+        seen.add(model_id)
+        result.append({"id": model_id, "display_name": display_name or model_id})
+        if len(result) >= 500:
+            break
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +147,8 @@ class UpstreamHealthTransition:
     new_group_status: str
     previous_invalid_count: int
     confirmed_invalid: bool
+    key_observed: bool = False
+    group_observed: bool = False
     observed_group_id: str | None = None
     observed_group_name: str | None = None
 
@@ -181,6 +278,64 @@ def _safe_text(value: Any, *, secrets: tuple[str | None, ...] = (), limit: int =
     for secret in sorted(secret_values, key=len, reverse=True):
         text = text.replace(secret, "[redacted]")
     return text[:limit]
+
+
+def _datetime_text(value: datetime | None) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _latest_datetime(*values: datetime | None) -> datetime | None:
+    candidates = [value for value in values if isinstance(value, datetime)]
+    if not candidates:
+        return None
+
+    def as_timestamp(value: datetime) -> float:
+        normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return normalized.timestamp()
+
+    return max(candidates, key=as_timestamp)
+
+
+def _safe_pause_evidence(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        "balance",
+        "basis",
+        "threshold",
+        "unit",
+        "key_status",
+        "group_status",
+        "monitor_status",
+        "unavailable_count",
+        "test_status",
+        "test_purpose",
+        "test_attempts",
+        "max_test_attempts",
+        "baseline_multiplier",
+        "mode",
+        "observed_multiplier",
+        "absolute_threshold",
+        "increase_percent",
+        "threshold_percent",
+    }
+    result: dict[str, Any] = {}
+    for key in allowed:
+        raw = value.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bool):
+            result[key] = raw
+            continue
+        if isinstance(raw, (int, float, Decimal)):
+            parsed = _balance_number(raw)
+            if parsed is not None:
+                result[key] = parsed
+            continue
+        text = _safe_text(raw, limit=128)
+        if text is not None:
+            result[key] = text
+    return result or None
 
 
 def _normalize_base_url(value: Any) -> str | None:
@@ -331,6 +486,8 @@ class UpstreamAccountService:
             new_group_status=config.upstream_group_status or "not_checked",
             previous_invalid_count=previous_invalid_count,
             confirmed_invalid=confirmed_invalid,
+            key_observed=observed_key_status is not None,
+            group_observed=observed_group_status is not None,
             observed_group_id=observed_group_id,
             observed_group_name=observed_group_name,
         )
@@ -340,6 +497,112 @@ class UpstreamAccountService:
         config.upstream_usage_amount = None
         config.upstream_usage_unit = None
         config.upstream_usage_checked_at = None
+        config.today_upstream_usage_amount = None
+        config.today_upstream_usage_unit = None
+        config.today_upstream_usage_status = "not_checked"
+        config.today_upstream_usage_source = None
+        config.today_upstream_usage_checked_at = None
+
+    def archive_data_before_invalidation(
+        self,
+        db: AsyncSession,
+        config: UpstreamAccountConfig,
+        *,
+        reason: str,
+        channel: UpstreamChannel | None = None,
+    ) -> None:
+        """Keep a safe, dated snapshot when a deliberate identity reset clears data.
+
+        A failed probe must never call this method: the live record remains the
+        authoritative last-known result in that case. Archives only separate
+        data that can no longer be attributed safely after a rebind.
+        """
+        known_secrets = (
+            (
+                decrypt_text(config.encrypted_api_key)
+                if not config.api_key_origin_rebind_required
+                else None
+            ),
+            decrypt_text(config.encrypted_access_token),
+        )
+        account_name = _safe_text(
+            config.remote_name,
+            secrets=known_secrets,
+            limit=200,
+        )
+        snapshot = {
+            "remote": {
+                "id": config.sub2api_account_id,
+                "name": account_name,
+                "platform": _safe_text(config.remote_platform, limit=64),
+                "type": _safe_text(config.remote_account_type, limit=32),
+                "status": _safe_text(config.remote_status, limit=64),
+                "schedulable": config.remote_schedulable,
+                "priority": config.remote_priority,
+                "snapshot_updated_at": _datetime_text(config.remote_snapshot_updated_at),
+            },
+            "upstream": {
+                "base_url": _safe_text(config.base_url, secrets=known_secrets, limit=500),
+                "type": _safe_text(config.resolved_upstream_type or config.upstream_type, limit=32),
+                "api_key_record_id": config.upstream_api_key_record_id,
+                "group_id": _safe_text(config.selected_group_id, limit=128),
+                "group_name": _safe_text(config.selected_group_name, limit=200),
+                "group_multiplier": config.effective_group_multiplier,
+                "recharge_multiplier": config.effective_recharge_multiplier,
+                "balance_remaining": config.balance_remaining,
+                "balance_unit": _safe_text(config.balance_unit, limit=32),
+                "balance_checked_at": _datetime_text(config.balance_checked_at),
+                "today_usage_amount": config.today_upstream_usage_amount,
+                "today_usage_unit": _safe_text(config.today_upstream_usage_unit, limit=32),
+                "today_usage_status": _safe_text(config.today_upstream_usage_status, limit=32),
+                "today_usage_checked_at": _datetime_text(config.today_upstream_usage_checked_at),
+                "upstream_usage_amount": config.upstream_usage_amount,
+                "upstream_usage_unit": _safe_text(config.upstream_usage_unit, limit=32),
+                "upstream_usage_checked_at": _datetime_text(config.upstream_usage_checked_at),
+                "key_status": _safe_text(config.upstream_key_status, limit=32),
+                "group_status": _safe_text(config.upstream_group_status, limit=32),
+                "last_discovered_at": _datetime_text(config.last_discovered_at),
+            },
+        }
+        # Do not create empty rows for configurations that never held a remote
+        # snapshot or an upstream reading.
+        has_observed_data = any(
+            value is not None
+            for value in (
+                config.remote_snapshot_updated_at,
+                config.balance_checked_at,
+                config.today_upstream_usage_checked_at,
+                config.upstream_usage_checked_at,
+                config.last_discovered_at,
+                config.last_applied_at,
+            )
+        )
+        if not has_observed_data:
+            return
+        observed_at = _latest_datetime(
+            config.remote_snapshot_updated_at,
+            config.balance_checked_at,
+            config.today_upstream_usage_checked_at,
+            config.upstream_usage_checked_at,
+            config.last_discovered_at,
+            config.last_applied_at,
+        )
+        db.add(
+            UpstreamAccountDataArchive(
+                sub2api_account_id=config.sub2api_account_id,
+                remote_identity_fingerprint=config.remote_identity_fingerprint,
+                account_name=account_name,
+                channel_id=config.channel_id,
+                channel_name=(
+                    _safe_text(channel.display_name, limit=200)
+                    if channel is not None
+                    else None
+                ),
+                reason=reason[:64],
+                snapshot=snapshot,
+                observed_at=observed_at,
+            )
+        )
 
     @staticmethod
     def apply_upstream_usage_state(
@@ -349,13 +612,46 @@ class UpstreamAccountService:
         now: datetime,
         secrets: tuple[str | None, ...] = (),
     ) -> None:
+        def retain_last_usage() -> bool:
+            """Keep a dated successful value when this probe cannot confirm usage."""
+            current_amount = _balance_number(config.today_upstream_usage_amount)
+            if current_amount is not None and current_amount >= 0:
+                config.today_upstream_usage_status = "stale"
+                config.today_upstream_usage_source = (
+                    config.today_upstream_usage_source
+                    or "upstream_api_key_actual_cost"
+                )
+                return True
+
+            legacy_amount = _balance_number(config.upstream_usage_amount)
+            if legacy_amount is None or legacy_amount < 0:
+                return False
+            config.today_upstream_usage_amount = legacy_amount
+            config.today_upstream_usage_unit = config.upstream_usage_unit or "USD"
+            config.today_upstream_usage_status = "stale"
+            config.today_upstream_usage_source = "upstream_api_key_actual_cost"
+            config.today_upstream_usage_checked_at = config.upstream_usage_checked_at
+            return True
+
         if state is None:
-            UpstreamAccountService.clear_upstream_usage_state(config)
+            if not retain_last_usage():
+                config.today_upstream_usage_status = "not_available"
+                config.today_upstream_usage_checked_at = now
             return
         usage_amount = _balance_number(_value(state, "usage_amount"))
         if usage_amount is None or usage_amount < 0:
-            UpstreamAccountService.clear_upstream_usage_state(config)
+            if not retain_last_usage():
+                config.today_upstream_usage_status = "not_available"
+                config.today_upstream_usage_checked_at = now
             return
+        config.today_upstream_usage_amount = usage_amount
+        config.today_upstream_usage_unit = (
+            _safe_text(_value(state, "usage_unit"), secrets=secrets, limit=32) or "USD"
+        )
+        config.today_upstream_usage_status = "ok"
+        config.today_upstream_usage_source = "upstream_api_key_actual_cost"
+        config.today_upstream_usage_checked_at = now
+        # Populate legacy fields until older clients migrate their label.
         config.upstream_usage_amount = usage_amount
         config.upstream_usage_unit = (
             _safe_text(_value(state, "usage_unit"), secrets=secrets, limit=32) or "USD"
@@ -363,65 +659,453 @@ class UpstreamAccountService:
         config.upstream_usage_checked_at = now
 
     @staticmethod
-    async def automatic_upstream_disable_allowed() -> bool:
-        try:
-            runtime = get_runtime_config_service()
-            return bool(
-                await runtime.get_api_key_auto_disable_on_upstream_unavailable()
-                and not await runtime.get_automation_paused()
-            )
-        except Exception:
+    def apply_local_today_usage_fallback(
+        config: UpstreamAccountConfig,
+        local_cost: Any,
+        current_rate: Any,
+        *,
+        now: datetime,
+    ) -> bool:
+        if config.today_upstream_usage_status == "ok":
             return False
+        cost_value = _balance_number(local_cost)
+        group = _decimal_multiplier(config.effective_group_multiplier)
+        rate = _decimal_multiplier(current_rate)
+        if cost_value is None or cost_value < 0 or group is None or rate is None:
+            return False
+        try:
+            converted = Decimal(str(cost_value)) * group / rate
+        except DecimalException:
+            return False
+        converted_value = _balance_number(converted)
+        if converted_value is None or converted_value < 0:
+            return False
+        config.today_upstream_usage_amount = converted_value
+        config.today_upstream_usage_unit = "USD"
+        config.today_upstream_usage_status = "estimated"
+        config.today_upstream_usage_source = "local_sub2api_today_cost_converted"
+        config.today_upstream_usage_checked_at = now
+        config.upstream_usage_amount = converted_value
+        config.upstream_usage_unit = "USD"
+        config.upstream_usage_checked_at = now
+        return True
 
-    async def maybe_disable_for_upstream_state(
+    @staticmethod
+    def active_pause_holds(
+        config: UpstreamAccountConfig,
+    ) -> list[UpstreamAccountPauseHold]:
+        order = {reason: index for index, reason in enumerate(AUTO_PAUSE_REASON_ORDER)}
+        return sorted(
+            (hold for hold in config.pause_holds if hold.active),
+            key=lambda hold: (
+                order.get(hold.reason, len(order)),
+                _parse_datetime(hold.triggered_at)
+                or datetime.min.replace(tzinfo=timezone.utc),
+                hold.id or 0,
+            ),
+        )
+
+    @staticmethod
+    def pause_episode_reasons(config: UpstreamAccountConfig) -> list[str]:
+        episode_started_at = _parse_datetime(config.auto_paused_at)
+        reasons = {
+            hold.reason
+            for hold in config.pause_holds
+            if hold.active
+            or (
+                episode_started_at is not None
+                and (_parse_datetime(hold.resolved_at) or datetime.min.replace(tzinfo=timezone.utc))
+                >= episode_started_at
+            )
+        }
+        if config.auto_disabled_reason:
+            reasons.add(config.auto_disabled_reason)
+        return [reason for reason in AUTO_PAUSE_REASON_ORDER if reason in reasons]
+
+    @staticmethod
+    def _pause_hold(
+        config: UpstreamAccountConfig,
+        reason: str,
+    ) -> UpstreamAccountPauseHold | None:
+        return next((hold for hold in config.pause_holds if hold.reason == reason), None)
+
+    @staticmethod
+    def set_pause_hold(
+        config: UpstreamAccountConfig,
+        reason: str,
+        *,
+        active: bool,
+        scope_channel_id: int | None,
+        recovery_mode: str,
+        now: datetime,
+        evidence: dict[str, Any] | None = None,
+    ) -> bool:
+        if reason not in AUTO_PAUSE_REASON_ORDER:
+            raise ValueError("Unsupported automatic pause reason.")
+        hold = UpstreamAccountService._pause_hold(config, reason)
+        safe_evidence = _safe_pause_evidence(evidence)
+        if active:
+            if hold is None:
+                config.pause_holds.append(
+                    UpstreamAccountPauseHold(
+                        reason=reason,
+                        active=True,
+                        scope_channel_id=scope_channel_id,
+                        triggered_at=now,
+                        recovery_mode=recovery_mode,
+                        evidence_json=safe_evidence,
+                    )
+                )
+                return True
+            changed = not hold.active
+            if not hold.active:
+                hold.active = True
+                hold.triggered_at = now
+                hold.resolved_at = None
+            if hold.scope_channel_id != scope_channel_id:
+                hold.scope_channel_id = scope_channel_id
+                changed = True
+            if hold.recovery_mode != recovery_mode:
+                hold.recovery_mode = recovery_mode
+                changed = True
+            if safe_evidence is not None and hold.evidence_json != safe_evidence:
+                hold.evidence_json = safe_evidence
+                changed = True
+            return changed
+        if hold is None or not hold.active:
+            return False
+        hold.active = False
+        hold.resolved_at = now
+        if safe_evidence is not None:
+            hold.evidence_json = safe_evidence
+        return True
+
+    @staticmethod
+    def resolve_all_pause_holds(
+        config: UpstreamAccountConfig,
+        *,
+        now: datetime,
+        clear_ownership: bool = True,
+    ) -> None:
+        for hold in config.pause_holds:
+            if hold.active:
+                hold.active = False
+                hold.resolved_at = now
+        if clear_ownership:
+            UpstreamAccountService.clear_pause_ownership(config)
+        else:
+            # Preserve ownership until an authoritative probe can restore the
+            # remote account after its upstream identity changes.
+            UpstreamAccountService.sync_pause_compatibility_fields(config)
+
+    @staticmethod
+    def clear_pause_ownership(config: UpstreamAccountConfig) -> None:
+        config.auto_pause_episode_id = None
+        config.pause_owned_by_plugin = False
+        config.auto_pause_channel_id = None
+        config.auto_paused_at = None
+        config.pause_operation = None
+        config.auto_disabled_reason = None
+        config.last_auto_disabled_at = None
+        config.balance_guard_restore_eligible = False
+        config.balance_guard_channel_id = None
+        config.balance_guard_paused_at = None
+        config.balance_guard_operation = None
+
+    @staticmethod
+    def sync_pause_compatibility_fields(config: UpstreamAccountConfig) -> None:
+        holds = UpstreamAccountService.active_pause_holds(config)
+        primary = holds[0] if holds else None
+        if config.pause_owned_by_plugin and primary is not None:
+            config.auto_disabled_reason = primary.reason
+            config.last_auto_disabled_at = config.auto_paused_at or primary.triggered_at
+        else:
+            config.auto_disabled_reason = None
+            config.last_auto_disabled_at = None
+
+        balance_hold = next(
+            (hold for hold in holds if hold.reason == AUTO_PAUSE_REASON_BALANCE),
+            None,
+        )
+        owns_balance_pause = bool(config.pause_owned_by_plugin and balance_hold is not None)
+        config.balance_guard_restore_eligible = owns_balance_pause
+        config.balance_guard_channel_id = (
+            balance_hold.scope_channel_id if owns_balance_pause else None
+        )
+        config.balance_guard_paused_at = config.auto_paused_at if owns_balance_pause else None
+        config.balance_guard_operation = config.pause_operation if owns_balance_pause else None
+
+    def update_upstream_health_pause_holds(
         self,
-        remote: dict[str, Any],
         config: UpstreamAccountConfig,
         transition: UpstreamHealthTransition,
         *,
-        allowed: bool,
-    ) -> tuple[dict[str, Any], bool | None, bool | None, str | None, str | None]:
-        old_schedulable = self.sub2api.account_schedulable(remote)
-        if (
-            not allowed
-            or not transition.confirmed_invalid
-            or config.upstream_health_invalid_count < 2
-        ):
-            return remote, old_schedulable, old_schedulable, None, None
-        if old_schedulable is False:
-            status = "already_disabled" if transition.previous_invalid_count < 2 else None
-            return remote, old_schedulable, old_schedulable, status, None
-        if old_schedulable is not True:
-            return remote, old_schedulable, old_schedulable, None, None
+        enabled: bool | None,
+        automation_paused: bool,
+        channel_id: int | None,
+        now: datetime,
+    ) -> None:
+        if automation_paused or enabled is None:
+            return
+        if not enabled:
+            self.set_pause_hold(
+                config,
+                AUTO_PAUSE_REASON_KEY,
+                active=False,
+                scope_channel_id=channel_id,
+                recovery_mode="upstream_healthy",
+                now=now,
+            )
+            self.set_pause_hold(
+                config,
+                AUTO_PAUSE_REASON_GROUP,
+                active=False,
+                scope_channel_id=channel_id,
+                recovery_mode="upstream_healthy",
+                now=now,
+            )
+            return
 
+        confirmed = config.upstream_health_invalid_count >= 2
+        if transition.key_observed:
+            key_invalid = transition.new_key_status in INVALID_UPSTREAM_KEY_STATUSES
+            if confirmed or not key_invalid:
+                self.set_pause_hold(
+                    config,
+                    AUTO_PAUSE_REASON_KEY,
+                    active=key_invalid,
+                    scope_channel_id=channel_id,
+                    recovery_mode="upstream_healthy",
+                    now=now,
+                    evidence={"key_status": transition.new_key_status},
+                )
+        if transition.group_observed:
+            group_invalid = transition.new_group_status in INVALID_UPSTREAM_GROUP_STATUSES
+            if confirmed or not group_invalid:
+                self.set_pause_hold(
+                    config,
+                    AUTO_PAUSE_REASON_GROUP,
+                    active=group_invalid,
+                    scope_channel_id=channel_id,
+                    recovery_mode="upstream_healthy",
+                    now=now,
+                    evidence={"group_status": transition.new_group_status},
+                )
+
+    async def _automatic_pause_readback(
+        self,
+        config: UpstreamAccountConfig,
+    ) -> dict[str, Any]:
         try:
-            self._require_config_binding(remote, config)
-            await self.sub2api.set_account_schedulable(
-                config.sub2api_account_id,
-                False,
-            )
-            readback = await self._remote_account(config.sub2api_account_id)
-            self._require_config_binding(readback, config)
-            new_schedulable = self.sub2api.account_schedulable(readback)
-            if new_schedulable is not False:
-                raise ValueError("schedulable readback mismatch")
-            config.auto_disabled_reason = (
-                "upstream_key_unavailable"
-                if transition.new_key_status in INVALID_UPSTREAM_KEY_STATUSES
-                else "upstream_group_unavailable"
-            )
-            config.last_auto_disabled_at = _utcnow()
-            return readback, old_schedulable, new_schedulable, "account_disabled", None
+            remote = await self.sub2api.get_account_by_id(config.sub2api_account_id)
         except Exception as exc:
             if isinstance(exc, asyncio.CancelledError):
                 raise
+            raise UpstreamAccountServiceError(
+                "Unable to read the sub2api API key account."
+            ) from None
+        if remote is None:
+            raise UpstreamAccountServiceError(
+                "The sub2api API key account was not found.",
+                status_code=404,
+            )
+        self._require_config_binding(remote, config)
+        return remote
+
+    async def reconcile_automatic_pause(
+        self,
+        db: AsyncSession,
+        remote: dict[str, Any],
+        config: UpstreamAccountConfig,
+        *,
+        channel_id: int | None,
+        channel_name: str | None = None,
+        pause_action_reason: str | None = None,
+        mutations_allowed: bool,
+    ) -> tuple[dict[str, Any], bool | None, bool | None, str | None, str | None]:
+        old_schedulable = self.sub2api.account_schedulable(remote)
+        holds = self.active_pause_holds(config)
+        active_reasons = [hold.reason for hold in holds]
+        primary_reason = holds[0].reason if holds else pause_action_reason
+        primary_evidence = (
+            holds[0].evidence_json
+            if holds and isinstance(holds[0].evidence_json, dict)
+            else None
+        )
+        pause_episode_reasons = self.pause_episode_reasons(config)
+        if pause_action_reason and pause_action_reason not in pause_episode_reasons:
+            pause_episode_reasons.append(pause_action_reason)
+        self.sync_pause_compatibility_fields(config)
+        if not mutations_allowed:
+            return remote, old_schedulable, old_schedulable, None, None
+
+        if holds:
+            if old_schedulable is False:
+                if config.pause_owned_by_plugin:
+                    config.pause_operation = "paused"
+                    self.sync_pause_compatibility_fields(config)
+                return remote, old_schedulable, old_schedulable, None, None
+            if old_schedulable is not True:
+                return remote, old_schedulable, old_schedulable, None, None
+
+            if not config.pause_owned_by_plugin:
+                config.auto_pause_episode_id = uuid4().hex
+                config.pause_owned_by_plugin = True
+                config.auto_pause_channel_id = channel_id
+                config.auto_paused_at = _utcnow()
+            config.pause_operation = "pause_pending"
+            self.sync_pause_compatibility_fields(config)
+            # Persist ownership before mutating the remote account. A later
+            # probe can reconcile pause_pending after a process interruption.
+            await db.flush()
+            await db.commit()
+            try:
+                self._require_config_binding(remote, config)
+                await self.sub2api.set_account_schedulable(
+                    config.sub2api_account_id,
+                    False,
+                )
+                readback = await self._automatic_pause_readback(config)
+                if self.sub2api.account_schedulable(readback) is not False:
+                    raise ValueError("schedulable readback mismatch")
+            except Exception as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                db.add(
+                    AccountSchedulingChangeLog(
+                        sub2api_account_id=config.sub2api_account_id,
+                        account_name=(config.remote_name or "")[:200] or None,
+                        channel_id=channel_id,
+                        channel_name=(channel_name or "")[:200] or None,
+                        event_type="pause_failed",
+                        reason=primary_reason,
+                        active_reasons=active_reasons,
+                        evidence=primary_evidence,
+                        old_schedulable=old_schedulable,
+                        new_schedulable=self.sub2api.account_schedulable(remote),
+                        status="failed",
+                        safe_error="Unable to disable/pause and verify the API key account for an active automatic policy.",
+                    )
+                )
+                return (
+                    remote,
+                    old_schedulable,
+                    self.sub2api.account_schedulable(remote),
+                    "disable_failed",
+                    "Unable to disable/pause and verify the API key account for an active automatic policy.",
+                )
+            config.pause_operation = "paused"
+            self.sync_pause_compatibility_fields(config)
+            await enqueue_api_key_account_state_changed(
+                db,
+                enabled=False,
+                account_id=config.sub2api_account_id,
+                account_name=config.remote_name,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                reason=holds[0].reason,
+                reason_details=primary_evidence,
+                observed_at=config.auto_paused_at,
+            )
+            db.add(
+                AccountSchedulingChangeLog(
+                    sub2api_account_id=config.sub2api_account_id,
+                    account_name=(config.remote_name or "")[:200] or None,
+                    channel_id=channel_id,
+                    channel_name=(channel_name or "")[:200] or None,
+                    event_type="paused",
+                    reason=primary_reason,
+                    active_reasons=active_reasons,
+                    evidence=primary_evidence,
+                    old_schedulable=old_schedulable,
+                    new_schedulable=False,
+                    status="success",
+                )
+            )
+            return readback, old_schedulable, False, "account_disabled", None
+
+        if not config.pause_owned_by_plugin:
+            self.sync_pause_compatibility_fields(config)
+            return remote, old_schedulable, old_schedulable, None, None
+        if old_schedulable not in {True, False}:
+            return remote, old_schedulable, old_schedulable, None, None
+
+        config.pause_operation = "restore_pending"
+        self.sync_pause_compatibility_fields(config)
+        await db.flush()
+        await db.commit()
+        readback = remote
+        try:
+            if old_schedulable is False:
+                self._require_config_binding(remote, config)
+                await self.sub2api.set_account_schedulable(
+                    config.sub2api_account_id,
+                    True,
+                )
+                readback = await self._automatic_pause_readback(config)
+                if self.sub2api.account_schedulable(readback) is not True:
+                    raise ValueError("schedulable readback mismatch")
+        except Exception as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            db.add(
+                AccountSchedulingChangeLog(
+                    sub2api_account_id=config.sub2api_account_id,
+                    account_name=(config.remote_name or "")[:200] or None,
+                    channel_id=channel_id,
+                    channel_name=(channel_name or "")[:200] or None,
+                    event_type="restore_failed",
+                    reason=primary_reason,
+                    active_reasons=[],
+                    old_schedulable=old_schedulable,
+                    new_schedulable=self.sub2api.account_schedulable(remote),
+                    status="failed",
+                    safe_error="Unable to restore and verify the API key account after all automatic holds cleared.",
+                )
+            )
             return (
                 remote,
                 old_schedulable,
                 self.sub2api.account_schedulable(remote),
-                "disable_failed",
-                "Unable to disable and verify the sub2api account after confirmed upstream unavailability.",
+                "restore_failed",
+                "Unable to restore and verify the API key account after all automatic holds cleared.",
             )
+        restored_at = _utcnow()
+        self.clear_pause_ownership(config)
+        if old_schedulable is False:
+            await enqueue_api_key_account_state_changed(
+                db,
+                enabled=True,
+                account_id=config.sub2api_account_id,
+                account_name=config.remote_name,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                reason="All automatic pause conditions cleared.",
+                reason_details={"previous_pause_reasons": pause_episode_reasons},
+                observed_at=restored_at,
+            )
+            db.add(
+                AccountSchedulingChangeLog(
+                    sub2api_account_id=config.sub2api_account_id,
+                    account_name=(config.remote_name or "")[:200] or None,
+                    channel_id=channel_id,
+                    channel_name=(channel_name or "")[:200] or None,
+                    event_type="restored",
+                    reason=primary_reason,
+                    active_reasons=[],
+                    old_schedulable=False,
+                    new_schedulable=True,
+                    status="success",
+                    created_at=restored_at,
+                )
+            )
+        return (
+            readback,
+            old_schedulable,
+            self.sub2api.account_schedulable(readback),
+            "account_restored" if old_schedulable is False else None,
+            None,
+        )
 
     def record_upstream_health_change(
         self,
@@ -438,6 +1122,7 @@ class UpstreamAccountService:
         previous_recharge_multiplier: float | None,
         previous_target_rate: float | None,
         previous_current_rate: float | None,
+        pause_action_reason: str | None = None,
     ) -> None:
         key_changed = transition.old_key_status != transition.new_key_status
         group_changed = transition.old_group_status != transition.new_group_status
@@ -459,7 +1144,13 @@ class UpstreamAccountService:
             return
 
         reason = (
-            "upstream_auto_disable"
+            f"{pause_action_reason}_recovered"
+            if action_status == "account_restored" and pause_action_reason
+            else pause_action_reason
+            if action_status is not None and pause_action_reason
+            else "automatic_pause_restored"
+            if action_status == "account_restored"
+            else "upstream_auto_disable"
             if action_status is not None
             else "upstream_key_recovered"
             if key_changed
@@ -542,6 +1233,7 @@ class UpstreamAccountService:
         *,
         secrets: tuple[str | None, ...] = (),
     ) -> UpstreamAccountConfig:
+        snapshot = self._safe_remote_snapshot(remote, secrets=secrets)
         return UpstreamAccountConfig(
             sub2api_account_id=account_id,
             remote_identity_fingerprint=self._remote_binding_fingerprint(remote),
@@ -560,6 +1252,12 @@ class UpstreamAccountService:
                 secrets=secrets,
                 limit=32,
             ),
+            remote_status=_safe_text(self.sub2api.account_status(remote), limit=64),
+            remote_schedulable=self.sub2api.account_schedulable(remote),
+            remote_priority=self.sub2api.account_priority(remote),
+            remote_snapshot=snapshot,
+            remote_snapshot_updated_at=_utcnow(),
+            remote_present=True,
             base_url=_safe_text(
                 _remote_base_url(remote),
                 secrets=secrets,
@@ -570,12 +1268,107 @@ class UpstreamAccountService:
             recharge_multiplier_status="not_discovered",
             local_recharge_status="not_checked",
             balance_status="not_checked",
+            availability_check_mode="channel_monitor",
+            availability_status="not_configured",
             current_rate=self._remote_current_rate(remote),
         )
 
+    def _safe_remote_snapshot(
+        self,
+        remote: dict[str, Any],
+        *,
+        secrets: tuple[str | None, ...] = (),
+    ) -> dict[str, Any]:
+        account_id = self._numeric_remote_id(remote)
+        if account_id is None:
+            raise UpstreamAccountServiceError("sub2api returned an invalid API key account id.")
+        created_at = _safe_text(_value(remote, "created_at", "createdAt"), limit=80)
+        return {
+            "id": account_id,
+            "name": _safe_text(self.sub2api.account_name(remote), secrets=secrets, limit=200) or f"Account #{account_id}",
+            "platform": _safe_text(self.sub2api.account_platform(remote), secrets=secrets, limit=64),
+            "type": _safe_text(self.sub2api.account_type(remote), secrets=secrets, limit=32),
+            "status": _safe_text(self.sub2api.account_status(remote), secrets=secrets, limit=64),
+            "schedulable": self.sub2api.account_schedulable(remote),
+            "priority": self.sub2api.account_priority(remote),
+            "rate_multiplier": self._remote_current_rate(remote),
+            "created_at": created_at,
+            "base_url": _safe_text(_remote_base_url(remote), secrets=secrets, limit=500),
+            "_cached": True,
+            "_identity_fingerprint": self._remote_identity_fingerprint(remote),
+            "_binding_fingerprint": self._remote_binding_fingerprint(remote),
+        }
+
+    def apply_remote_snapshot(
+        self,
+        config: UpstreamAccountConfig,
+        remote: dict[str, Any],
+        *,
+        now: datetime | None = None,
+        secrets: tuple[str | None, ...] = (),
+        include_stored_secrets: bool = True,
+    ) -> None:
+        snapshot = self._safe_remote_snapshot(
+            remote,
+            secrets=(
+                (*self._known_local_secrets(config), *secrets)
+                if include_stored_secrets
+                else secrets
+            ),
+        )
+        config.remote_snapshot = snapshot
+        config.remote_snapshot_updated_at = now or _utcnow()
+        config.remote_name = snapshot["name"]
+        config.remote_platform = snapshot["platform"]
+        config.remote_account_type = snapshot["type"]
+        config.remote_status = snapshot["status"]
+        config.remote_schedulable = snapshot["schedulable"]
+        config.remote_priority = snapshot["priority"]
+        if snapshot["rate_multiplier"] is not None:
+            config.current_rate = snapshot["rate_multiplier"]
+
+    async def cached_remote_accounts(self, db: AsyncSession) -> list[dict[str, Any]]:
+        result = await db.execute(
+            select(UpstreamAccountConfig)
+            .where(UpstreamAccountConfig.remote_present.is_(True))
+            .order_by(UpstreamAccountConfig.sub2api_account_id)
+        )
+        accounts: list[dict[str, Any]] = []
+        for config in result.scalars().all():
+            snapshot = config.remote_snapshot
+            if not isinstance(snapshot, dict):
+                snapshot = {
+                    "id": config.sub2api_account_id,
+                    "name": config.remote_name or f"Account #{config.sub2api_account_id}",
+                    "platform": config.remote_platform,
+                    "type": config.remote_account_type,
+                    "status": config.remote_status,
+                    "schedulable": config.remote_schedulable,
+                    "priority": config.remote_priority,
+                    "rate_multiplier": config.current_rate,
+                    "created_at": (
+                        config.created_at.isoformat() if config.created_at is not None else None
+                    ),
+                    "base_url": config.base_url,
+                    "_cached": True,
+                    "_identity_fingerprint": hashlib.sha256(
+                        f"cached:{config.sub2api_account_id}:{config.remote_identity_fingerprint or ''}".encode("utf-8")
+                    ).hexdigest(),
+                    "_binding_fingerprint": config.remote_identity_fingerprint,
+                }
+            accounts.append(dict(snapshot))
+        return accounts
+
     @staticmethod
-    def _invalidate_preview(config: UpstreamAccountConfig) -> None:
-        config.resolved_upstream_type = None
+    def _invalidate_preview(
+        config: UpstreamAccountConfig,
+        *,
+        clear_upstream_identity: bool = False,
+    ) -> None:
+        if clear_upstream_identity:
+            config.upstream_api_key_record_id = None
+            config.upstream_identity_rebind_required = False
+            config.resolved_upstream_type = None
         config.group_options = []
         config.discovered_group_multiplier = None
         config.effective_group_multiplier = None
@@ -597,6 +1390,73 @@ class UpstreamAccountService:
             config.desired_priority = None
             config.priority_sync_status = "multiplier_unavailable"
             config.priority_sync_error = None
+
+    @staticmethod
+    def _upstream_record_id(state: Any) -> int | None:
+        raw_id = _value(state, "key_record_id")
+        if isinstance(raw_id, bool):
+            return None
+        try:
+            parsed = int(raw_id) if raw_id is not None else 0
+        except (TypeError, ValueError):
+            return None
+        return parsed if 0 < parsed <= JS_SAFE_INTEGER_MAX else None
+
+    async def apply_upstream_record_identity(
+        self,
+        db: AsyncSession,
+        config: UpstreamAccountConfig,
+        state: Any,
+        *,
+        record_owners: dict[int, int] | None = None,
+        ambiguous_unbound_record_ids: set[int] | None = None,
+    ) -> bool:
+        """Bind a verified upstream key row without silently replacing it."""
+        observed_id = self._upstream_record_id(state)
+        if observed_id is None:
+            return not bool(config.upstream_identity_rebind_required)
+
+        owner_id: int | None = None
+        if record_owners is not None:
+            owner_id = record_owners.get(observed_id)
+        elif config.channel_id is not None:
+            with db.no_autoflush:
+                owner_id = await db.scalar(
+                    select(UpstreamAccountConfig.id)
+                    .where(
+                        UpstreamAccountConfig.channel_id == config.channel_id,
+                        UpstreamAccountConfig.upstream_api_key_record_id == observed_id,
+                        UpstreamAccountConfig.id != config.id,
+                    )
+                    .limit(1)
+                )
+
+        stored_id = config.upstream_api_key_record_id
+        ambiguous = bool(
+            ambiguous_unbound_record_ids
+            and observed_id in ambiguous_unbound_record_ids
+            and stored_id is None
+        )
+        if (owner_id is not None and owner_id != config.id) or ambiguous:
+            config.upstream_identity_rebind_required = True
+            config.last_error = (
+                f"Upstream API key record #{observed_id} matches more than one local "
+                "account on this channel; explicit rebind is required."
+            )
+            return False
+        if stored_id is not None and stored_id != observed_id:
+            config.upstream_identity_rebind_required = True
+            config.last_error = (
+                f"The upstream API key record ID changed from #{stored_id} to "
+                f"#{observed_id}; explicit rebind is required."
+            )
+            return False
+
+        config.upstream_api_key_record_id = observed_id
+        config.upstream_identity_rebind_required = False
+        if record_owners is not None:
+            record_owners[observed_id] = config.id
+        return True
 
     def _numeric_remote_id(self, account: dict[str, Any]) -> int | None:
         raw_id = self.sub2api.account_id(account)
@@ -624,6 +1484,56 @@ class UpstreamAccountService:
             seen_ids.add(account_id)
         return accounts
 
+    async def sync_available_models(
+        self,
+        db: AsyncSession,
+        configs: dict[int, UpstreamAccountConfig],
+        remote_by_id: dict[int, dict[str, Any]],
+        *,
+        force: bool | None = None,
+    ) -> int:
+        if force is None:
+            # Full whitelist refreshes are handled by the independent model
+            # whitelist scheduler. Inventory sync only repairs missing data.
+            force = False
+        targets = [
+            (account_id, config, remote_by_id[account_id])
+            for account_id, config in configs.items()
+            if account_id in remote_by_id
+            and (force or config.available_models is None)
+        ]
+        if not targets:
+            return 0
+
+        semaphore = asyncio.Semaphore(8)
+
+        async def fetch(
+            account_id: int,
+            config: UpstreamAccountConfig,
+            remote: dict[str, Any],
+        ) -> bool:
+            async with semaphore:
+                try:
+                    models = _normalize_available_models(
+                        await self.sub2api.get_account_models(remote)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    config.available_models_status = "error"
+                    config.available_models_checked_at = _utcnow()
+                    return False
+            config.available_models = models
+            config.available_models_status = "ok"
+            config.available_models_checked_at = _utcnow()
+            return True
+
+        results = await asyncio.gather(
+            *(fetch(account_id, config, remote) for account_id, config, remote in targets)
+        )
+        await db.commit()
+        return sum(results)
+
     async def _remote_account(
         self,
         account_id: int,
@@ -643,13 +1553,29 @@ class UpstreamAccountService:
         raise UpstreamAccountServiceError("The sub2api API key account was not found.", status_code=404)
 
     def _remote_identity_fingerprint(self, account: dict[str, Any]) -> str:
+        cached = str(account.get("_identity_fingerprint") or "").strip().lower()
+        if account.get("_cached") is True and len(cached) == 64:
+            return cached
         fingerprint = self._remote_fingerprint(account, include_endpoint=True)
         if fingerprint is None:
             raise UpstreamAccountServiceError("sub2api returned an invalid API key account identity.")
         return fingerprint
 
     def _remote_binding_fingerprint(self, account: dict[str, Any]) -> str | None:
-        return self._remote_fingerprint(account, include_endpoint=False)
+        # Persistent ownership follows the immutable Sub2API account row, not
+        # mutable presentation fields such as its name or API key.
+        return self._remote_fingerprint(
+            account,
+            include_endpoint=False,
+            include_name=False,
+        )
+
+    def _legacy_remote_binding_fingerprint(self, account: dict[str, Any]) -> str | None:
+        return self._remote_fingerprint(
+            account,
+            include_endpoint=False,
+            include_name=True,
+        )
 
     def _known_local_secrets(
         self,
@@ -756,10 +1682,16 @@ class UpstreamAccountService:
         stored = (config.remote_identity_fingerprint or "").strip().lower()
         if not stored:
             return "unbound"
+        cached_binding = str(account.get("_binding_fingerprint") or "").strip().lower()
+        if account.get("_cached") is True and len(cached_binding) == 64:
+            return "bound" if stored == cached_binding else "mismatch"
         current = self._remote_binding_fingerprint(account)
         if current is None:
             return "mismatch"
-        return "bound" if stored == current else "mismatch"
+        if stored == current:
+            return "bound"
+        legacy = self._legacy_remote_binding_fingerprint(account)
+        return "bound" if legacy is not None and stored == legacy else "mismatch"
 
     def _config_binding_differs_only_by_remote_name(
         self,
@@ -792,7 +1724,7 @@ class UpstreamAccountService:
                 continue
             previous_name_view = dict(account)
             previous_name_view["name"] = previous_name
-            if self._remote_binding_fingerprint(previous_name_view) == stored_fingerprint:
+            if self._legacy_remote_binding_fingerprint(previous_name_view) == stored_fingerprint:
                 return True
         return False
 
@@ -843,6 +1775,7 @@ class UpstreamAccountService:
         extra_secrets: tuple[str | None, ...] = (),
         channel_name: str | None = None,
         priority_interval_name: str | None = None,
+        priority_interval: UpstreamPriorityInterval | None = None,
     ) -> UpstreamAccountOut:
         account_id = self._numeric_remote_id(account)
         if account_id is None:
@@ -852,6 +1785,9 @@ class UpstreamAccountService:
         identity_rebind_required = binding_status in {"unbound", "mismatch"}
         api_key_origin_rebind_required = bool(
             config is not None and config.api_key_origin_rebind_required
+        )
+        upstream_identity_rebind_required = bool(
+            config is not None and config.upstream_identity_rebind_required
         )
         if binding_status != "bound":
             config = None
@@ -871,6 +1807,8 @@ class UpstreamAccountService:
         discovered_recharge = config.discovered_recharge_multiplier if config is not None else None
         if recharge_source == "default":
             discovered_recharge = None
+        active_pause_holds = self.active_pause_holds(config) if config is not None else []
+        rate_pause_policy = resolve_rate_pause_policy(config, priority_interval)
 
         return UpstreamAccountOut(
             sub2api_account_id=account_id,
@@ -878,6 +1816,10 @@ class UpstreamAccountService:
             identity_binding_status=binding_status,
             identity_rebind_required=identity_rebind_required,
             api_key_origin_rebind_required=api_key_origin_rebind_required,
+            upstream_identity_rebind_required=upstream_identity_rebind_required,
+            upstream_api_key_record_id=(
+                config.upstream_api_key_record_id if config is not None else None
+            ),
             remote_name=(
                 _safe_text(
                     self._remote_name(account, account_id, secrets=secrets),
@@ -897,6 +1839,11 @@ class UpstreamAccountService:
             remote_status=_safe_text(self.sub2api.account_status(account), secrets=secrets, limit=32),
             remote_schedulable=self.sub2api.account_schedulable(account),
             priority=self.sub2api.account_priority(account),
+            remote_present=bool(config.remote_present) if config is not None else True,
+            remote_snapshot_updated_at=(
+                config.remote_snapshot_updated_at if config is not None else None
+            ),
+            remote_missing_at=config.remote_missing_at if config is not None else None,
             desired_priority=config.desired_priority if config is not None else None,
             priority_interval_id=config.priority_interval_id if config is not None else None,
             priority_interval_name=(
@@ -912,6 +1859,21 @@ class UpstreamAccountService:
                 if config is not None
                 else None
             ),
+            priority_tiebreak_order=(
+                config.priority_tiebreak_order if config is not None else None
+            ),
+            priority_tiebreak_multiplier=(
+                config.priority_tiebreak_multiplier if config is not None else None
+            ),
+            priority_assignment_when_disabled=(
+                config.priority_assignment_when_disabled if config is not None else None
+            ),
+            rate_pause_policy=(config.rate_pause_policy if config is not None else "inherit"),
+            rate_pause_effective_enabled=bool(rate_pause_policy["enabled"]),
+            rate_pause_effective_source=rate_pause_policy["source"],
+            rate_pause_mode=rate_pause_policy["mode"],
+            rate_increase_threshold_percent=rate_pause_policy["threshold_percent"],
+            rate_absolute_threshold=rate_pause_policy["absolute_threshold"],
             composite_multiplier=(
                 _calculate_composite_multiplier(
                     config.effective_group_multiplier,
@@ -950,8 +1912,76 @@ class UpstreamAccountService:
             ),
             upstream_key_checked_at=config.upstream_key_checked_at if config else None,
             upstream_group_checked_at=config.upstream_group_checked_at if config else None,
+            availability_check_mode=(
+                config.availability_check_mode
+                if config and config.availability_check_mode in {
+                    "channel_monitor",
+                    "independent_model",
+                    "disabled",
+                }
+                else "disabled"
+            ),
+            availability_monitor_id=config.availability_monitor_id if config else None,
+            availability_test_model=(
+                _safe_text(config.availability_test_model, secrets=secrets, limit=160)
+                if config
+                else None
+            ),
+            available_models=(
+                _normalize_available_models(config.available_models)
+                if config
+                else []
+            ),
+            available_models_status=(
+                config.available_models_status or "not_checked"
+                if config
+                else "not_checked"
+            ),
+            available_models_checked_at=(
+                config.available_models_checked_at if config else None
+            ),
+            availability_status=(config.availability_status or "not_checked") if config else "not_checked",
+            availability_unavailable_count=(
+                min(100, max(0, int(config.availability_unavailable_count or 0)))
+                if config
+                else 0
+            ),
+            availability_recovery_count=(
+                min(100, max(0, int(config.availability_recovery_count or 0)))
+                if config
+                else 0
+            ),
+            availability_checked_at=config.availability_checked_at if config else None,
+            availability_source=config.availability_source if config else None,
+            availability_message=(
+                _safe_text(config.availability_message, secrets=secrets, limit=300)
+                if config
+                else None
+            ),
             auto_disabled_reason=config.auto_disabled_reason if config else None,
             last_auto_disabled_at=config.last_auto_disabled_at if config else None,
+            active_pause_holds=[
+                {
+                    "reason": hold.reason,
+                    "triggered_at": hold.triggered_at,
+                    "recovery_mode": hold.recovery_mode,
+                    "scope_channel_id": hold.scope_channel_id,
+                    "evidence": _safe_pause_evidence(hold.evidence_json),
+                }
+                for hold in active_pause_holds
+            ],
+            pause_owned_by_plugin=bool(config and config.pause_owned_by_plugin),
+            auto_restore_eligible=bool(config and config.pause_owned_by_plugin),
+            auto_pause_episode_id=config.auto_pause_episode_id if config else None,
+            auto_pause_channel_id=config.auto_pause_channel_id if config else None,
+            auto_paused_at=config.auto_paused_at if config else None,
+            balance_guard_restore_eligible=bool(
+                config and config.balance_guard_restore_eligible
+            ),
+            balance_guard_channel_id=(
+                config.balance_guard_channel_id if config else None
+            ),
+            balance_guard_paused_at=config.balance_guard_paused_at if config else None,
             api_key_set=bool(
                 not api_key_origin_rebind_required
                 and (
@@ -983,6 +2013,7 @@ class UpstreamAccountService:
             balance_used=config.balance_used if config else None,
             balance_unit=_safe_text(config.balance_unit if config else None, secrets=secrets, limit=32),
             balance_status=config.balance_status if config else "not_checked",
+            balance_source=config.balance_source if config else None,
             balance_message=_safe_text(config.balance_message if config else None, secrets=secrets, limit=300),
             balance_checked_at=config.balance_checked_at if config else None,
             upstream_usage_amount=config.upstream_usage_amount if config else None,
@@ -992,6 +2023,25 @@ class UpstreamAccountService:
                 limit=32,
             ),
             upstream_usage_checked_at=config.upstream_usage_checked_at if config else None,
+            today_upstream_usage_amount=(
+                config.today_upstream_usage_amount if config else None
+            ),
+            today_upstream_usage_unit=_safe_text(
+                config.today_upstream_usage_unit if config else None,
+                secrets=secrets,
+                limit=32,
+            ),
+            today_upstream_usage_status=(
+                config.today_upstream_usage_status if config else "not_checked"
+            ),
+            today_upstream_usage_source=_safe_text(
+                config.today_upstream_usage_source if config else None,
+                secrets=secrets,
+                limit=64,
+            ),
+            today_upstream_usage_checked_at=(
+                config.today_upstream_usage_checked_at if config else None
+            ),
             last_error=(
                 config.last_error
                 if config
@@ -1005,8 +2055,17 @@ class UpstreamAccountService:
             updated_at=config.updated_at if config else None,
         )
 
-    async def list_accounts(self, db: AsyncSession) -> list[UpstreamAccountOut]:
-        remote_accounts = await self._remote_accounts()
+    async def list_accounts(
+        self,
+        db: AsyncSession,
+        *,
+        use_cache: bool = False,
+    ) -> list[UpstreamAccountOut]:
+        remote_accounts = (
+            await self.cached_remote_accounts(db)
+            if use_cache
+            else await self._remote_accounts()
+        )
         remote_by_id = {
             account_id: account
             for account in remote_accounts
@@ -1048,6 +2107,13 @@ class UpstreamAccountService:
                 )
             )
             priority_intervals = {item.id: item for item in result.scalars().all()}
+        assign_disabled_globally = False
+        try:
+            assign_disabled_globally = bool(
+                await get_runtime_config_service().get_priority_assign_disabled_api_key_accounts()
+            )
+        except Exception:
+            pass
         accounts = [
             self._build_out(
                 remote_by_id[account_id],
@@ -1069,6 +2135,21 @@ class UpstreamAccountService:
                     and configs[account_id].priority_interval_id in priority_intervals
                     else None
                 ),
+                priority_interval=(
+                    priority_intervals[configs[account_id].priority_interval_id]
+                    if account_id in configs
+                    and configs[account_id].priority_interval_id in priority_intervals
+                    else None
+                ),
+            ).model_copy(
+                update={
+                    "priority_assignment_when_disabled_effective": (
+                        configs[account_id].priority_assignment_when_disabled
+                        if account_id in configs
+                        and configs[account_id].priority_assignment_when_disabled is not None
+                        else assign_disabled_globally
+                    )
+                }
             )
             for account_id in sorted(remote_by_id)
         ]
@@ -1255,6 +2336,15 @@ class UpstreamAccountService:
                     binding_rebound = True
 
             fields = payload.model_fields_set
+            if (
+                config.upstream_identity_rebind_required
+                and not payload.confirm_upstream_identity_rebind
+            ):
+                raise UpstreamAccountServiceError(
+                    "The upstream API key record identity changed or conflicts "
+                    "with another account; explicitly rebind it before saving.",
+                    status_code=409,
+                )
             preview_fields = {
                 "channel_id",
                 "base_url",
@@ -1267,7 +2357,7 @@ class UpstreamAccountService:
             }
             preview_invalidated = bool(fields & preview_fields) or bool(
                 payload.api_key or payload.access_token or payload.clear_access_token
-            ) or binding_rebound
+            ) or binding_rebound or payload.confirm_upstream_identity_rebind
             current_api_key = (
                 decrypt_text(config.encrypted_api_key)
                 if not config.api_key_origin_rebind_required
@@ -1299,7 +2389,19 @@ class UpstreamAccountService:
                 or (bool(payload.api_key) and payload.api_key != current_api_key)
                 or (bool(payload.access_token) and payload.access_token != current_access_token)
                 or (payload.clear_access_token and current_access_token is not None)
+                or payload.confirm_upstream_identity_rebind
             )
+            if preview_invalidated and not is_new:
+                self.archive_data_before_invalidation(
+                    db,
+                    config,
+                    reason=(
+                        "account_identity_changed"
+                        if identity_changed
+                        else "account_discovery_context_changed"
+                    ),
+                    channel=current_channel,
+                )
             known_secrets = (
                 payload.api_key,
                 current_api_key,
@@ -1318,11 +2420,22 @@ class UpstreamAccountService:
                 secrets=known_secrets,
                 limit=32,
             )
+            self.apply_remote_snapshot(
+                config,
+                remote,
+                secrets=known_secrets,
+                include_stored_secrets=False,
+            )
             if "channel_id" in fields:
                 channel_changed = payload.channel_id != config.channel_id
                 config.channel_id = payload.channel_id
                 if channel_changed:
                     config.channel_auto_assign_disabled = True
+                    self.resolve_all_pause_holds(
+                        config,
+                        now=_utcnow(),
+                        clear_ownership=binding_rebound,
+                    )
                 if selected_channel is not None:
                     config.base_url = selected_channel.canonical_base_url
                     config.upstream_type = selected_channel.upstream_type
@@ -1343,6 +2456,10 @@ class UpstreamAccountService:
                 "selected_group_name",
                 "manual_group_multiplier",
                 "manual_recharge_multiplier",
+                "rate_pause_policy",
+                "rate_pause_mode",
+                "rate_increase_threshold_percent",
+                "rate_absolute_threshold",
             ):
                 if field in fields:
                     value = getattr(payload, field)
@@ -1353,6 +2470,72 @@ class UpstreamAccountService:
                             limit=200 if field == "selected_group_name" else 128,
                         )
                     setattr(config, field, value)
+            if "rate_pause_policy" in fields and config.rate_pause_policy == "custom":
+                config.rate_pause_mode = config.rate_pause_mode or "increase_percent"
+                config.rate_increase_threshold_percent = (
+                    config.rate_increase_threshold_percent or 20.0
+                )
+                config.rate_absolute_threshold = config.rate_absolute_threshold or 1.0
+            elif "rate_pause_policy" in fields and config.rate_pause_policy != "custom":
+                config.rate_pause_mode = None
+                config.rate_increase_threshold_percent = None
+                config.rate_absolute_threshold = None
+            if "priority_assignment_when_disabled" in fields:
+                config.priority_assignment_when_disabled = payload.priority_assignment_when_disabled
+            if "channel_id" in fields and "availability_monitor_id" not in fields:
+                config.availability_monitor_id = None
+            if "availability_check_mode" in fields:
+                config.availability_check_mode = payload.availability_check_mode
+            if "availability_monitor_id" in fields:
+                config.availability_monitor_id = payload.availability_monitor_id
+            if "availability_test_model" in fields:
+                normalized_test_model = _safe_text(
+                    payload.availability_test_model,
+                    secrets=known_secrets,
+                    limit=160,
+                )
+                if normalized_test_model and config.available_models is None:
+                    raise UpstreamAccountServiceError(
+                        "Synchronize this API Key account's available model whitelist before selecting a test model.",
+                        status_code=409,
+                    )
+                if normalized_test_model and isinstance(config.available_models, list):
+                    allowed_models = {
+                        str(item.get("id") or "").strip()
+                        for item in config.available_models
+                        if isinstance(item, dict)
+                    }
+                    if normalized_test_model not in allowed_models:
+                        raise UpstreamAccountServiceError(
+                            "The selected test model is not in this API Key account's available model whitelist.",
+                            status_code=422,
+                        )
+                config.availability_test_model = normalized_test_model
+            availability_fields = {
+                "availability_check_mode",
+                "availability_monitor_id",
+                "availability_test_model",
+            }
+            availability_changed = bool(fields & availability_fields) or (
+                "channel_id" in fields
+                and config.availability_check_mode == "channel_monitor"
+                and config.availability_monitor_id is None
+            )
+            if availability_changed:
+                if config.availability_check_mode == "disabled":
+                    config.availability_monitor_id = None
+                    config.availability_test_model = None
+                elif config.availability_check_mode == "independent_model":
+                    config.availability_monitor_id = None
+                config.availability_unavailable_count = 0
+                config.availability_recovery_count = 0
+                config.availability_checked_at = None
+                config.availability_source = None
+                config.availability_message = None
+                if config.availability_check_mode == "disabled":
+                    config.availability_status = "disabled"
+                else:
+                    config.availability_status = "pending"
 
             next_origin = upstream_url_origin(config.base_url)
             if (
@@ -1414,9 +2597,17 @@ class UpstreamAccountService:
                 )
 
             if preview_invalidated and not is_new:
-                self._invalidate_preview(config)
+                self._invalidate_preview(
+                    config,
+                    clear_upstream_identity=identity_changed,
+                )
                 if identity_changed:
                     self.clear_upstream_usage_state(config)
+                    self.resolve_all_pause_holds(
+                        config,
+                        now=_utcnow(),
+                        clear_ownership=binding_rebound,
+                    )
 
             if binding_rebound:
                 config.remote_identity_fingerprint = self._require_remote_binding_fingerprint(
@@ -1430,6 +2621,12 @@ class UpstreamAccountService:
                     limit=200,
                 )
                 or f"Account #{account_id}"
+            )
+            self.apply_remote_snapshot(
+                config,
+                remote,
+                secrets=known_secrets,
+                include_stored_secrets=False,
             )
 
             remote_rate = self._remote_current_rate(remote)
@@ -1490,6 +2687,12 @@ class UpstreamAccountService:
         lock = await self._lock_for(account_id)
         async with lock:
             remote = await self._remote_account(account_id, expected_identity_fingerprint)
+            old_schedulable = self.sub2api.account_schedulable(remote)
+            old_enabled = (
+                old_schedulable
+                if old_schedulable in {True, False}
+                else self.sub2api.account_looks_healthy(remote)
+            )
             result = await db.execute(
                 select(UpstreamAccountConfig).where(
                     UpstreamAccountConfig.sub2api_account_id == account_id
@@ -1512,9 +2715,23 @@ class UpstreamAccountService:
                 raise UpstreamAccountServiceError(
                     "sub2api account state readback did not match the requested state."
                 )
-            if enabled and config is not None:
-                config.auto_disabled_reason = None
-                config.last_auto_disabled_at = None
+            if config is not None:
+                self.resolve_all_pause_holds(config, now=_utcnow())
+                self.apply_remote_snapshot(config, readback)
+            if old_enabled != enabled:
+                await enqueue_api_key_account_state_changed(
+                    db,
+                    enabled=enabled,
+                    account_id=account_id,
+                    account_name=(
+                        config.remote_name
+                        if config is not None
+                        else self.sub2api.account_name(readback)
+                    ),
+                    channel_id=config.channel_id if config is not None else None,
+                    reason="Account state changed manually.",
+                )
+            if config is not None:
                 await db.commit()
                 await db.refresh(config)
             channel = await self._channel_for_config(db, config)
@@ -1572,19 +2789,45 @@ class UpstreamAccountService:
         await self._rebalance_priorities_best_effort(db)
         return True
 
-    async def _call_upstream_discovery(self, config: UpstreamAccountConfig) -> Any:
+    @staticmethod
+    def _upstream_discovery_base_url(
+        config: UpstreamAccountConfig,
+        channel: UpstreamChannel | None,
+    ) -> str:
+        if channel is not None and channel.management_base_url:
+            return channel.management_base_url
+        return config.base_url or (channel.canonical_base_url if channel is not None else "")
+
+    async def _call_upstream_discovery(
+        self,
+        config: UpstreamAccountConfig,
+        channel: UpstreamChannel | None,
+    ) -> Any:
+        api_key = (
+            decrypt_text(config.encrypted_api_key)
+            if not config.api_key_origin_rebind_required
+            else None
+        )
         result = discover_upstream(
-            base_url=config.base_url or "",
+            base_url=self._upstream_discovery_base_url(config, channel),
             upstream_type=config.upstream_type,
-            api_key=(
-                decrypt_text(config.encrypted_api_key)
-                if not config.api_key_origin_rebind_required
-                else None
-            ),
+            api_key=api_key,
             access_token=decrypt_text(config.encrypted_access_token),
             new_api_user=config.upstream_user_id,
             selected_group_id=config.selected_group_id,
             selected_group_name=config.selected_group_name,
+            account_api_keys=(
+                {config.sub2api_account_id: api_key}
+                if api_key is not None
+                else None
+            ),
+            account_api_key_record_ids=(
+                {
+                    config.sub2api_account_id: config.upstream_api_key_record_id
+                }
+                if config.upstream_api_key_record_id is not None
+                else None
+            ),
         )
         return await result if inspect.isawaitable(result) else result
 
@@ -1652,7 +2895,8 @@ class UpstreamAccountService:
         api_key = None if config.api_key_origin_rebind_required else stored_api_key
         known_secrets = (stored_api_key, access_token, *channel_secrets)
         has_credentials = bool(api_key or access_token)
-        has_base_url = bool(config.base_url)
+        discovery_base_url = self._upstream_discovery_base_url(config, channel)
+        has_base_url = bool(discovery_base_url)
         previous_group_multiplier = config.effective_group_multiplier
         previous_recharge_multiplier = config.effective_recharge_multiplier
         previous_target_rate = config.target_rate
@@ -1664,7 +2908,7 @@ class UpstreamAccountService:
         tasks: list[Any] = [balance_task, local_recharge_task]
         upstream_attempted = has_credentials and has_base_url
         if upstream_attempted:
-            tasks.append(self._call_upstream_discovery(config))
+            tasks.append(self._call_upstream_discovery(config, channel))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         balance_result, local_recharge_result = results[0], results[1]
         upstream_result = results[2] if upstream_attempted else None
@@ -1715,6 +2959,7 @@ class UpstreamAccountService:
         fresh_recharge_source: str | None = None
         discovery_failed = False
         discovery_succeeded = False
+        upstream_identity_mismatch = False
         recharge_failed = False
         recharge_invalid = False
         if upstream_attempted:
@@ -1733,18 +2978,42 @@ class UpstreamAccountService:
                     errors.append("Upstream discovery failed.")
                 else:
                     discovery_succeeded = True
-                    upstream_state = _value(upstream_result, "matched_account_state")
-                    self.apply_upstream_usage_state(
+                    account_states = _value(
+                        upstream_result,
+                        "account_upstream_states",
+                    )
+                    upstream_state = (
+                        account_states.get(config.sub2api_account_id)
+                        if isinstance(account_states, dict)
+                        else None
+                    ) or _value(upstream_result, "matched_account_state")
+                    if not await self.apply_upstream_record_identity(
+                        db,
                         config,
                         upstream_state,
-                        now=now,
-                        secrets=known_secrets,
-                    )
+                    ):
+                        upstream_identity_mismatch = True
+                        discovery_succeeded = False
+                        upstream_state = None
+                    if upstream_identity_mismatch:
+                        config.last_discovered_at = now
+                    else:
+                        self.apply_upstream_usage_state(
+                            config,
+                            upstream_state,
+                            now=now,
+                            secrets=known_secrets,
+                        )
                     resolved_type = str(_value(upstream_result, "upstream_type") or "").strip().lower()
                     if resolved_type in {"newapi", "sub2api"}:
                         config.resolved_upstream_type = resolved_type
-                    options_value = _value(upstream_result, "groups", "group_options", "available_groups")
-                    if options_value is not None:
+                    options_value = _value(
+                        upstream_result,
+                        "groups",
+                        "group_options",
+                        "available_groups",
+                    )
+                    if options_value is not None and not upstream_identity_mismatch:
                         config.group_options = _sanitize_group_options(
                             options_value,
                             secrets=known_secrets,
@@ -1755,14 +3024,22 @@ class UpstreamAccountService:
                         "group_multiplier",
                         "selected_group_multiplier",
                     )
-                    fresh_group = _decimal_multiplier(raw_group)
+                    fresh_group = (
+                        None
+                        if upstream_identity_mismatch
+                        else _decimal_multiplier(raw_group)
+                    )
                     raw_recharge = _value(
                         upstream_result,
                         "discovered_recharge_multiplier",
                         "recharge_multiplier",
                         "balance_recharge_multiplier",
                     )
-                    fresh_recharge = _decimal_multiplier(raw_recharge)
+                    fresh_recharge = (
+                        None
+                        if upstream_identity_mismatch
+                        else _decimal_multiplier(raw_recharge)
+                    )
                     recharge_probe_status = str(
                         _value(upstream_result, "recharge_discovery_status") or "unknown"
                     ).strip().lower()
@@ -1786,7 +3063,11 @@ class UpstreamAccountService:
                         secrets=known_secrets,
                         limit=128,
                     )
-                    matched_group = _value(upstream_result, "matched_group")
+                    matched_group = (
+                        None
+                        if upstream_identity_mismatch
+                        else _value(upstream_result, "matched_group")
+                    )
                     selected_id = _value(matched_group, "id", "group_id")
                     selected_name = _value(matched_group, "name", "group_name")
                     if selected_id is not None:
@@ -1811,6 +3092,33 @@ class UpstreamAccountService:
                         config.discovered_group_multiplier = float(fresh_group)
                     if fresh_recharge is not None:
                         config.discovered_recharge_multiplier = float(fresh_recharge)
+
+        if upstream_identity_mismatch:
+            config.remote_platform = _safe_text(
+                self.sub2api.account_platform(remote),
+                secrets=known_secrets,
+                limit=64,
+            )
+            config.remote_account_type = _safe_text(
+                self.sub2api.account_type(remote),
+                secrets=known_secrets,
+                limit=32,
+            )
+            config.remote_name = (
+                _safe_text(
+                    self._remote_name(
+                        remote,
+                        config.sub2api_account_id,
+                        secrets=known_secrets,
+                    ),
+                    secrets=known_secrets,
+                    limit=200,
+                )
+                or f"Account #{config.sub2api_account_id}"
+            )
+            await db.commit()
+            await db.refresh(config)
+            return self._build_out(remote, config, extra_secrets=channel_secrets)
 
         health_transition = self.apply_authoritative_upstream_state(
             config,
@@ -1880,6 +3188,22 @@ class UpstreamAccountService:
         if current_rate is not None:
             config.current_rate = current_rate
 
+        if config.today_upstream_usage_status != "ok":
+            try:
+                local_today_costs = await self.sub2api.get_account_today_costs(
+                    [config.sub2api_account_id]
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                local_today_costs = {}
+            self.apply_local_today_usage_fallback(
+                config,
+                local_today_costs.get(config.sub2api_account_id),
+                current_rate,
+                now=now,
+            )
+
         if (
             effective_group is not None
             and effective_recharge is not None
@@ -1896,8 +3220,12 @@ class UpstreamAccountService:
 
         if health_transition.new_group_status in INVALID_UPSTREAM_GROUP_STATUSES:
             config.target_rate = None
-            config.group_multiplier_status = "group_unavailable"
-            errors.append("The synchronized upstream group is unavailable.")
+            if health_transition.new_group_status == "deleted":
+                config.group_multiplier_status = "group_deleted"
+                errors.append("The synchronized upstream group was deleted.")
+            else:
+                config.group_multiplier_status = "group_unavailable"
+                errors.append("The synchronized upstream group is unavailable.")
         elif health_transition.new_key_status in INVALID_UPSTREAM_KEY_STATUSES:
             config.target_rate = None
             errors.append("The synchronized upstream API key is unavailable.")
@@ -1928,18 +3256,48 @@ class UpstreamAccountService:
         config.last_discovered_at = now
         current_remote = await self._remote_account(config.sub2api_account_id)
         self._require_config_binding(current_remote, config)
-        auto_disable_allowed = await self.automatic_upstream_disable_allowed()
+        runtime_config = get_runtime_config_service()
+        try:
+            automation_paused = bool(await runtime_config.get_automation_paused())
+        except Exception:
+            automation_paused = True
+        try:
+            upstream_health_pause_enabled = bool(
+                await runtime_config.get_api_key_auto_disable_on_upstream_unavailable()
+            )
+        except Exception:
+            upstream_health_pause_enabled = None
+        previous_pause_holds = self.active_pause_holds(config)
+        previous_pause_reason = (
+            config.auto_disabled_reason
+            or (previous_pause_holds[0].reason if previous_pause_holds else None)
+        )
+        self.update_upstream_health_pause_holds(
+            config,
+            health_transition,
+            enabled=upstream_health_pause_enabled,
+            automation_paused=automation_paused,
+            channel_id=channel.id if channel is not None else config.channel_id,
+            now=now,
+        )
         (
             current_remote,
             old_remote_schedulable,
             new_remote_schedulable,
             health_action_status,
             health_safe_error,
-        ) = await self.maybe_disable_for_upstream_state(
+        ) = await self.reconcile_automatic_pause(
+            db,
             current_remote,
             config,
-            health_transition,
-            allowed=auto_disable_allowed,
+            channel_id=channel.id if channel is not None else config.channel_id,
+            channel_name=channel.display_name if channel is not None else None,
+            pause_action_reason=(
+                self.active_pause_holds(config)[0].reason
+                if self.active_pause_holds(config)
+                else previous_pause_reason
+            ),
+            mutations_allowed=not automation_paused,
         )
         if health_safe_error is not None:
             config.last_error = health_safe_error
@@ -1956,6 +3314,15 @@ class UpstreamAccountService:
             previous_recharge_multiplier=previous_recharge_multiplier,
             previous_target_rate=previous_target_rate,
             previous_current_rate=previous_current_rate,
+            pause_action_reason=(
+                previous_pause_reason
+                if health_action_status == "account_restored"
+                else (
+                    self.active_pause_holds(config)[0].reason
+                    if self.active_pause_holds(config)
+                    else previous_pause_reason
+                )
+            ),
         )
         await db.commit()
         await db.refresh(config)
@@ -2089,6 +3456,7 @@ class UpstreamAccountService:
 
             remote = await self._remote_account(account_id, expected_identity_fingerprint)
             self._require_config_binding(remote, config)
+            old_current_rate = self._remote_current_rate(remote)
             try:
                 await self.sub2api.update_account_rate_multiplier(account_id, float(target))
                 readback = await self.sub2api.get_account_current_rate_multiplier(account_id)
@@ -2112,6 +3480,27 @@ class UpstreamAccountService:
 
             config.last_applied_at = _utcnow()
             config.last_error = None
+            old_current_decimal = _decimal_multiplier(
+                old_current_rate,
+                allow_zero=True,
+            )
+            if (
+                old_current_decimal is not None
+                and readback_decimal is not None
+                and _quantize_rate(old_current_decimal) != _quantize_rate(readback_decimal)
+            ):
+                channel = await self._channel_for_config(db, config)
+                await enqueue_api_key_rate_changed(
+                    db,
+                    account_id=config.sub2api_account_id,
+                    account_name=config.remote_name,
+                    old_rate=old_current_rate,
+                    new_rate=readback,
+                    observed_at=config.last_applied_at,
+                    reason="manual_apply",
+                    channel_id=channel.id if channel is not None else None,
+                    channel_name=channel.display_name if channel is not None else None,
+                )
             await db.commit()
             await db.refresh(config)
             remote["rate_multiplier"] = readback

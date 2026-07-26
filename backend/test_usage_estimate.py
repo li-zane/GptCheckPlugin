@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.services.usage_estimate as usage_estimate
 from app.core.database import Base
-from app.models import UsageLimitSample
+from app.models import UsageLimitSample, UsageTokenWindow
 from app.services.usage_estimate import (
     _account_estimate,
     account_rate_limited_windows,
@@ -20,6 +20,7 @@ from app.services.usage_estimate import (
     _refreshed_window_state_values,
     _resolve_limit_calibration,
     _save_usage_limit_samples,
+    _save_usage_token_windows,
     _usage_limit_sample_updates,
     _usage_limit_sample_allowed,
     _usage_token_window_observations,
@@ -783,6 +784,191 @@ class UsageEstimateTests(unittest.TestCase):
         self.assertEqual(seven_day_values["reset_at"], "2026-07-20T03:05:32+08:00")
         self.assertEqual(seven_day_values["remaining_seconds"], 603_602)
 
+    def test_team_x1_explicit_seven_day_window_is_not_reclassified_as_monthly(self) -> None:
+        class FakeSub2Api:
+            def account_id(self, account):
+                return account.get("id")
+
+            def account_email(self, account):
+                return account.get("email")
+
+        account = {
+            "id": "x1-weekly",
+            "email": "pinnate.1.plasmid+bzbquv@icloud.com",
+            "credentials": {"plan_type": "team"},
+            "extra": {
+                "codex_5h_window_minutes": 0,
+                "codex_7d_window_minutes": 10_080,
+            },
+        }
+        usage = {
+            "five_hour": {"window_minutes": 0},
+            "seven_day": {
+                "used_percent": 100.0,
+                "window_minutes": 10_080,
+                "remaining_seconds": 529_200,
+                "resets_at": "2026-07-29T17:30:00+08:00",
+                "window_stats": {"cost": 120.0},
+            },
+        }
+
+        values, _, window_kind = _estimate_window_values(
+            account,
+            usage,
+            "seven_day",
+        )
+
+        self.assertEqual(window_kind, "seven_day")
+        self.assertEqual(values["window_minutes"], 10_080)
+        self.assertEqual(values["remaining_seconds"], 529_200)
+        self.assertEqual(account_rate_limited_windows(account, usage), ["seven_day"])
+
+        observations = _usage_token_window_observations([account], FakeSub2Api(), {"x1-weekly": usage})
+        samples = _usage_limit_sample_updates([account], FakeSub2Api(), {"x1-weekly": usage})
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["window_key"], "seven_day")
+        self.assertTrue(observations[0]["authoritative_seven_day"])
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["window_key"], "seven_day")
+        self.assertTrue(samples[0]["authoritative_seven_day"])
+
+    def test_explicit_seven_day_refresh_removes_same_cycle_misclassified_monthly_rows(self) -> None:
+        asyncio.run(self._assert_explicit_seven_day_refresh_removes_same_cycle_misclassified_monthly_rows())
+
+    def test_team_x1_without_explicit_window_duration_keeps_legacy_monthly_inference(self) -> None:
+        account = {
+            "id": "legacy-x1",
+            "email": "legacy-x1@example.com",
+            "credentials": {"plan_type": "team"},
+            "extra": {"codex_5h_window_minutes": 0},
+        }
+        usage = {
+            "five_hour": {"window_minutes": 0},
+            "seven_day": {
+                "used_percent": 100.0,
+                "remaining_seconds": 529_200,
+                "reset_at": "2026-07-29T17:30:00+08:00",
+                "window_stats": {"cost": 120.0},
+            },
+        }
+
+        _, _, window_kind = _estimate_window_values(account, usage, "seven_day")
+
+        self.assertEqual(window_kind, "monthly")
+        self.assertEqual(account_rate_limited_windows(account, usage), ["monthly"])
+
+    async def _assert_explicit_seven_day_refresh_removes_same_cycle_misclassified_monthly_rows(self) -> None:
+        class FakeSub2Api:
+            def account_id(self, account):
+                return account.get("id")
+
+            def account_email(self, account):
+                return account.get("email")
+
+        original_sessionmaker = usage_estimate.AsyncSessionLocal
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "seven-day-correction.db"
+            engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}", future=True)
+            usage_estimate.AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+            try:
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+
+                reset_at = "2026-07-29T17:30:00+08:00"
+                other_reset_at = "2026-08-29T17:30:00+08:00"
+                async with usage_estimate.AsyncSessionLocal() as db:
+                    db.add(
+                        UsageLimitSample(
+                            account_key="id:x1-weekly",
+                            email="pinnate.1.plasmid+bzbquv@icloud.com",
+                            sub2api_account_id="x1-weekly",
+                            plan_cohort="team",
+                            window_key="monthly",
+                            reset_key=f"reset:{reset_at}",
+                            reset_at=reset_at,
+                            observed_limit=120.0,
+                            raw_spent=120.0,
+                            used_percent=100.0,
+                        )
+                    )
+                    db.add(
+                        UsageTokenWindow(
+                            account_key="id:x1-weekly",
+                            email="pinnate.1.plasmid+bzbquv@icloud.com",
+                            sub2api_account_id="x1-weekly",
+                            window_key="monthly",
+                            window_reset_key="reset_date:2026-07-29",
+                            reset_at=reset_at,
+                            spent=120.0,
+                            tokens=120_000,
+                        )
+                    )
+                    db.add(
+                        UsageLimitSample(
+                            account_key="id:x1-weekly",
+                            email="pinnate.1.plasmid+bzbquv@icloud.com",
+                            sub2api_account_id="x1-weekly",
+                            plan_cohort="team",
+                            window_key="monthly",
+                            reset_key=f"reset:{other_reset_at}",
+                            reset_at=other_reset_at,
+                            observed_limit=140.0,
+                            raw_spent=140.0,
+                            used_percent=100.0,
+                        )
+                    )
+                    db.add(
+                        UsageTokenWindow(
+                            account_key="id:x1-weekly",
+                            email="pinnate.1.plasmid+bzbquv@icloud.com",
+                            sub2api_account_id="x1-weekly",
+                            window_key="monthly",
+                            window_reset_key="reset_date:2026-08-29",
+                            reset_at=other_reset_at,
+                            spent=140.0,
+                            tokens=140_000,
+                        )
+                    )
+                    await db.commit()
+
+                account = {
+                    "id": "x1-weekly",
+                    "email": "pinnate.1.plasmid+bzbquv@icloud.com",
+                    "credentials": {"plan_type": "team"},
+                    "extra": {"codex_5h_window_minutes": 0, "codex_7d_window_minutes": 10_080},
+                }
+                usage = {
+                    "five_hour": {"window_minutes": 0},
+                    "seven_day": {
+                        "used_percent": 100.0,
+                        "window_minutes": 10_080,
+                        "reset_at": reset_at,
+                        "window_stats": {"cost": 120.0, "tokens": 120_000},
+                    },
+                }
+                sub2api = FakeSub2Api()
+                usage_by_id = {"x1-weekly": usage}
+
+                await _save_usage_token_windows([account], sub2api, usage_by_id)
+                await _save_usage_limit_samples(_usage_limit_sample_updates([account], sub2api, usage_by_id))
+
+                async with usage_estimate.AsyncSessionLocal() as db:
+                    limit_rows = list((await db.execute(select(UsageLimitSample))).scalars().all())
+                    token_rows = list((await db.execute(select(UsageTokenWindow))).scalars().all())
+
+                self.assertEqual(
+                    {(row.window_key, row.reset_at) for row in limit_rows},
+                    {("seven_day", reset_at), ("monthly", other_reset_at)},
+                )
+                self.assertEqual(
+                    {(row.window_key, row.reset_at) for row in token_rows},
+                    {("seven_day", reset_at), ("monthly", other_reset_at)},
+                )
+            finally:
+                usage_estimate.AsyncSessionLocal = original_sessionmaker
+                await engine.dispose()
+
     def test_plus_without_five_hour_collects_weekly_not_monthly_sample(self) -> None:
         class FakeSub2Api:
             def account_id(self, account):
@@ -802,7 +988,7 @@ class UsageEstimateTests(unittest.TestCase):
             "seven_day": {
                 "used_percent": 100.0,
                 "window_minutes": 10_080,
-                "reset_at": "2026-07-20T03:05:32+08:00",
+                "reset_at": "2099-07-20T03:05:32+08:00",
                 "window_stats": {"cost": 120.0},
             },
         }

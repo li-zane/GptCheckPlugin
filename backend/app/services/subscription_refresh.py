@@ -17,6 +17,10 @@ from app.services.chatgpt_account import (
 from app.services.chatgpt_protocol import ChatGptProtocolRefresher
 from app.services.mail import MailAdapterRegistry
 from app.services.sub2api import Sub2ApiClient
+from app.services.notifications import (
+    enqueue_oauth_account_disabled,
+    enqueue_oauth_account_enabled,
+)
 
 
 SENSITIVE_ERROR_RE = re.compile(
@@ -276,12 +280,26 @@ async def _save_subscription_metadata(
             snapshot = AccountSnapshot(email=email)
             snapshot.usage_estimate_enabled = not sub2api.is_deactive_account(account)
             db.add(snapshot)
+        was_deactive = bool(snapshot.deactive)
         snapshot.sub2api_account_id = sub2api.account_id(account)
         snapshot.platform = sub2api.account_platform(account)
         snapshot.account_type = sub2api.account_type(account)
         snapshot.status = sub2api.account_status(account)
         snapshot.schedulable = sub2api.account_schedulable(account)
         snapshot.deactive = sub2api.is_deactive_account(account)
+        if snapshot.deactive and not was_deactive:
+            await enqueue_oauth_account_disabled(
+                db,
+                email,
+                "Subscription refresh observed a disabled OAuth account.",
+            )
+        elif was_deactive and not snapshot.deactive:
+            await enqueue_oauth_account_enabled(
+                db,
+                email,
+                "Subscription refresh observed the OAuth account enabled again.",
+                account_id=snapshot.sub2api_account_id,
+            )
         _set_if_present(snapshot, "subscription_starts_at", metadata.get("subscription_starts_at"))
         _set_if_present(snapshot, "subscription_expires_at", metadata.get("subscription_expires_at"))
         _set_if_present(snapshot, "subscription_renews_at", metadata.get("subscription_renews_at"))

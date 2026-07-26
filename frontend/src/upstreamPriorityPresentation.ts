@@ -6,12 +6,21 @@ export type UpstreamAccountEntry = {
 };
 
 export type UpstreamAccountFilters = {
+  channel: "all" | "__unassigned__" | string;
   interval: "all" | "unassigned" | string;
   platform: "all" | "__unknown__" | string;
   query: string;
 };
 
-export type UpstreamAccountStatusFilter = "all" | "pending" | "attention" | "undiscovered";
+export type UpstreamAccountStatusFilter = "all" | "enabled" | "disabled" | "pending" | "attention" | "undiscovered";
+
+export type PriorityTieMoveState = {
+  canMoveDown: boolean;
+  canMoveUp: boolean;
+  peerCount: number;
+};
+
+const PRIORITY_TIE_DECIMAL_PLACES = 13;
 
 export function accountCompositeMultiplier(account: UpstreamAccount) {
   const persisted = finiteNumber(account.composite_multiplier);
@@ -54,8 +63,44 @@ export function sortUpstreamAccountEntries(entries: UpstreamAccountEntry[]) {
     if (leftMultiplier !== null && rightMultiplier !== null && leftMultiplier !== rightMultiplier) {
       return leftMultiplier - rightMultiplier;
     }
-    return compareAccountIds(left.account.sub2api_account_id, right.account.sub2api_account_id);
+    return compareAccountNames(left.account, right.account);
   });
+}
+
+export function sortUpstreamAccountEntriesByName(entries: UpstreamAccountEntry[]) {
+  return [...entries].sort((left, right) => compareAccountNames(left.account, right.account));
+}
+
+export function priorityTieMoveOptions(accounts: UpstreamAccount[]) {
+  const groups = new Map<string, UpstreamAccount[]>();
+  for (const account of accounts) {
+    const intervalId = account.priority_interval_id;
+    const multiplier = accountCompositeMultiplier(account);
+    if (
+      intervalId === null
+      || intervalId === undefined
+      || multiplier === null
+      || finiteNumber(account.desired_priority) === null
+    ) continue;
+    const key = `${String(intervalId)}:${priorityTieMultiplierKey(multiplier)}`;
+    const group = groups.get(key) || [];
+    group.push(account);
+    groups.set(key, group);
+  }
+
+  const options = new Map<string, PriorityTieMoveState>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const ordered = [...group].sort(comparePriorityTieOrder);
+    ordered.forEach((account, index) => {
+      options.set(String(account.sub2api_account_id), {
+        canMoveDown: index > 0,
+        canMoveUp: index < ordered.length - 1,
+        peerCount: ordered.length,
+      });
+    });
+  }
+  return options;
 }
 
 export function filterUpstreamAccountEntries(
@@ -65,6 +110,12 @@ export function filterUpstreamAccountEntries(
   const query = filters.query.trim().toLowerCase();
   const platform = filters.platform.toLowerCase();
   return entries.filter(({ account, channel }) => {
+    if (filters.channel === "__unassigned__") {
+      if (channel !== null) return false;
+    } else if (filters.channel !== "all" && String(channel?.id ?? "") !== filters.channel) {
+      return false;
+    }
+
     const intervalId = account.priority_interval_id;
     if (filters.interval === "unassigned") {
       if (intervalId !== null && intervalId !== undefined && intervalId !== "") return false;
@@ -97,6 +148,34 @@ export function filterUpstreamAccountEntries(
   });
 }
 
+export function upstreamAccountChannels(entries: UpstreamAccountEntry[]) {
+  const values = new Map<string, string>();
+  let hasUnassigned = false;
+  for (const { channel } of entries) {
+    if (channel === null) {
+      hasUnassigned = true;
+      continue;
+    }
+    const value = String(channel.id);
+    if (values.has(value)) continue;
+    values.set(
+      value,
+      String(
+        channel.display_name
+        || channel.base_url
+        || channel.canonical_base_url
+        || `上游 #${value}`,
+      ).trim(),
+    );
+  }
+  return {
+    hasUnassigned,
+    channels: [...values.entries()]
+      .sort(([, left], [, right]) => left.localeCompare(right, "zh-CN"))
+      .map(([value, label]) => ({ value, label })),
+  };
+}
+
 export function upstreamAccountPlatforms(entries: UpstreamAccountEntry[]) {
   const values = new Map<string, string>();
   let hasUnknown = false;
@@ -122,6 +201,8 @@ export function upstreamAccountMatchesStatus(
   filter: UpstreamAccountStatusFilter,
 ) {
   if (filter === "all") return true;
+  if (filter === "enabled") return account.remote_schedulable === true;
+  if (filter === "disabled") return account.remote_schedulable === false;
   if (filter === "pending") return account.would_change === true;
   if (filter === "undiscovered") return !account.last_discovered_at;
   return accountNeedsAttention(account);
@@ -143,6 +224,65 @@ function accountNeedsAttention(account: UpstreamAccount) {
   ]
     .filter(Boolean)
     .some((status) => isFailureStatus(status));
+}
+
+function comparePriorityTieOrder(left: UpstreamAccount, right: UpstreamAccount) {
+  const multiplier = accountCompositeMultiplier(left);
+  const leftOrder = activePriorityTieOrder(left, multiplier);
+  const rightOrder = activePriorityTieOrder(right, multiplier);
+  if (leftOrder !== null && rightOrder !== null && leftOrder !== rightOrder) {
+    return leftOrder - rightOrder;
+  }
+  if (leftOrder !== null && rightOrder === null) return -1;
+  if (leftOrder === null && rightOrder !== null) return 1;
+  return compareAccountNames(left, right);
+}
+
+function activePriorityTieOrder(account: UpstreamAccount, multiplier: number | null) {
+  const order = finiteNumber(account.priority_tiebreak_order);
+  const storedMultiplier = finiteNumber(account.priority_tiebreak_multiplier);
+  if (
+    order === null
+    || multiplier === null
+    || storedMultiplier === null
+    || priorityTieMultiplierKey(storedMultiplier) !== priorityTieMultiplierKey(multiplier)
+  ) return null;
+  return order;
+}
+
+export function priorityTieMultiplierKey(value: number) {
+  const negative = value < 0;
+  const [coefficient, exponentText] = Math.abs(value).toString().toLowerCase().split("e");
+  const exponent = Number(exponentText || 0);
+  const [whole, fraction = ""] = coefficient.split(".");
+  const digits = `${whole}${fraction}` || "0";
+  const decimalIndex = whole.length + exponent;
+  let integerPart: string;
+  let fractionPart: string;
+  if (decimalIndex <= 0) {
+    integerPart = "0";
+    fractionPart = "0".repeat(-decimalIndex) + digits;
+  } else if (decimalIndex >= digits.length) {
+    integerPart = digits + "0".repeat(decimalIndex - digits.length);
+    fractionPart = "";
+  } else {
+    integerPart = digits.slice(0, decimalIndex);
+    fractionPart = digits.slice(decimalIndex);
+  }
+  const normalizedInteger = integerPart.replace(/^0+(?=\d)/, "") || "0";
+  const normalizedFraction = (fractionPart + "0".repeat(PRIORITY_TIE_DECIMAL_PLACES))
+    .slice(0, PRIORITY_TIE_DECIMAL_PLACES);
+  return `${negative ? "-" : ""}${normalizedInteger}.${normalizedFraction}`;
+}
+
+function compareAccountNames(left: UpstreamAccount, right: UpstreamAccount) {
+  const leftName = String(left.remote_name || "").trim();
+  const rightName = String(right.remote_name || "").trim();
+  const compared = leftName.localeCompare(rightName, "zh-CN", {
+    numeric: true,
+    sensitivity: "base",
+  });
+  return compared || compareAccountIds(left.sub2api_account_id, right.sub2api_account_id);
 }
 
 function isFailureStatus(status?: string | null) {

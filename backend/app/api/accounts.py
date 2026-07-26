@@ -81,6 +81,7 @@ from app.services.usage_estimate import (
     _usage_limit_sample_allowed,
     account_rate_limited_windows,
     build_usage_estimate,
+    get_cached_usage_estimate,
 )
 from app.services.usage_refresh import get_usage_refresh_service
 
@@ -758,14 +759,21 @@ async def list_accounts(
 
 @router.get("/usage-estimate", response_model=UsageEstimateOut)
 async def usage_estimate(
-    refresh: bool = Query(default=True),
+    refresh: bool = Query(default=False),
     _: dict = Depends(require_admin),
 ) -> UsageEstimateOut:
     try:
         usage_service = get_usage_refresh_service()
+        if not refresh:
+            cached = await get_cached_usage_estimate()
+            if cached is not None:
+                return UsageEstimateOut.model_validate(cached)
         if refresh:
             await usage_service.refresh_all(reason="usage_estimate")
-        cached_usage = usage_service.latest_usage_snapshot()
+            cached = await get_cached_usage_estimate()
+            if cached is not None:
+                return UsageEstimateOut.model_validate(cached)
+        cached_usage = usage_service.latest_usage_snapshot() or None
         return await build_usage_estimate(
             refresh=False,
             usage_by_account_id=cached_usage,
