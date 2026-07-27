@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
@@ -37,6 +38,7 @@ from app.services.sub2api import (
 )
 from app.services.upstream_accounts import (
     DEFAULT_ENCRYPTION_KEY,
+    UpstreamRecordIdentityStatus,
     UpstreamAccountService,
     UpstreamAccountServiceError,
     get_upstream_account_service,
@@ -77,6 +79,8 @@ class FakeSub2Api(Sub2ApiClient):
         self.local_error: BaseException | None = None
         self.update_calls: list[tuple[int, float]] = []
         self.name_update_calls: list[tuple[int, str]] = []
+        self.base_url_update_calls: list[tuple[int, str]] = []
+        self.base_url_update_error: BaseException | None = None
         self.schedulable_calls: list[tuple[int, bool]] = []
         self.delete_calls: list[int] = []
         self.balance_calls: list[int] = []
@@ -137,6 +141,26 @@ class FakeSub2Api(Sub2ApiClient):
             validate_current(account)
         self.name_update_calls.append((parsed_id, name))
         account["name"] = name
+        return account
+
+    async def update_account_base_url(
+        self,
+        account_id: str | int,
+        base_url: str,
+        *,
+        validate_current=None,
+    ) -> dict:
+        parsed_id = int(account_id)
+        account = await self.get_account_by_id(parsed_id)
+        if account is None:
+            raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
+        if validate_current is not None:
+            validate_current(account)
+        if self.base_url_update_error is not None:
+            raise self.base_url_update_error
+        self.base_url_update_calls.append((parsed_id, base_url))
+        credentials = account.setdefault("credentials", {})
+        credentials["base_url"] = base_url
         return account
 
     async def get_account_by_id(self, account_id: str | int, **_kwargs) -> dict | None:
@@ -690,6 +714,108 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.today_upstream_usage_amount, 12.375)
         self.assertEqual(stored.today_upstream_usage_status, "stale")
 
+    async def test_missing_usage_retains_cache_only_within_the_same_business_day(
+        self,
+    ) -> None:
+        await self._manage(api_key="sk-managed-usage")
+        config = await self._config()
+        checked_at = datetime(2026, 7, 26, 16, 30, tzinfo=timezone.utc)
+        config.today_upstream_usage_amount = 12.375
+        config.today_upstream_usage_unit = "USD"
+        config.today_upstream_usage_status = "ok"
+        config.today_upstream_usage_source = "upstream_api_key_actual_cost"
+        config.today_upstream_usage_checked_at = checked_at
+
+        self.service.apply_upstream_usage_state(
+            config,
+            None,
+            now=datetime(2026, 7, 27, 15, 59, tzinfo=timezone.utc),
+            time_zone="Asia/Shanghai",
+        )
+
+        self.assertEqual(config.today_upstream_usage_amount, 12.375)
+        self.assertEqual(config.today_upstream_usage_unit, "USD")
+        self.assertEqual(config.today_upstream_usage_status, "stale")
+        self.assertEqual(config.today_upstream_usage_checked_at, checked_at)
+
+    async def test_missing_usage_clears_cache_after_the_business_day_changes(
+        self,
+    ) -> None:
+        await self._manage(api_key="sk-managed-usage")
+        config = await self._config()
+        checked_at = datetime(2026, 7, 27, 15, 59, tzinfo=timezone.utc)
+        config.today_upstream_usage_amount = 12.375
+        config.today_upstream_usage_unit = "USD"
+        config.today_upstream_usage_status = "ok"
+        config.today_upstream_usage_source = "upstream_api_key_actual_cost"
+        config.today_upstream_usage_checked_at = checked_at
+        config.upstream_usage_amount = 12.375
+        config.upstream_usage_unit = "USD"
+        config.upstream_usage_checked_at = checked_at
+
+        self.service.apply_upstream_usage_state(
+            config,
+            None,
+            now=datetime(2026, 7, 27, 16, 1, tzinfo=timezone.utc),
+            time_zone="Asia/Shanghai",
+        )
+
+        self.assertIsNone(config.today_upstream_usage_amount)
+        self.assertIsNone(config.today_upstream_usage_unit)
+        self.assertEqual(config.today_upstream_usage_status, "not_available")
+        self.assertIsNone(config.today_upstream_usage_source)
+        self.assertIsNone(config.today_upstream_usage_checked_at)
+        self.assertIsNone(config.upstream_usage_amount)
+        self.assertIsNone(config.upstream_usage_unit)
+        self.assertIsNone(config.upstream_usage_checked_at)
+
+    async def test_single_discovery_uses_runtime_timezone_for_daily_usage(self) -> None:
+        await self._manage(api_key="sk-runtime-timezone")
+        config = await self._config()
+        checked_at = datetime(2026, 7, 27, 3, 30, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 27, 4, 30, tzinfo=timezone.utc)
+        config.today_upstream_usage_amount = 12.375
+        config.today_upstream_usage_unit = "USD"
+        config.today_upstream_usage_status = "ok"
+        config.today_upstream_usage_source = "upstream_api_key_actual_cost"
+        config.today_upstream_usage_checked_at = checked_at
+        config.upstream_usage_amount = 12.375
+        config.upstream_usage_unit = "USD"
+        config.upstream_usage_checked_at = checked_at
+        await self.db.commit()
+
+        runtime = SimpleNamespace(
+            get_public_settings=AsyncMock(
+                return_value={"display_timezone": "America/New_York"}
+            )
+        )
+        discovery = AsyncMock(
+            return_value=discovery_result(group=1.0, recharge=1.0)
+        )
+        with (
+            patch(
+                "app.services.upstream_accounts.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            patch(
+                "app.services.upstream_accounts.discover_upstream",
+                new=discovery,
+            ),
+            patch(
+                "app.services.upstream_accounts._utcnow",
+                return_value=now,
+            ),
+        ):
+            account = await self._discover()
+
+        self.assertEqual(
+            discovery.await_args.kwargs["today_timezone"],
+            "America/New_York",
+        )
+        self.assertIsNone(account.today_upstream_usage_amount)
+        self.assertEqual(account.today_upstream_usage_status, "not_available")
+        self.assertIsNone(account.upstream_usage_amount)
+
     async def test_local_today_cost_is_converted_to_upstream_balance_usage(self) -> None:
         await self._manage(api_key="sk-managed-usage")
         self.sub2api.today_costs[7] = 4.0
@@ -1223,7 +1349,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changed.group_multiplier_status, "not_discovered")
         self.assertEqual(changed.recharge_multiplier_status, "not_discovered")
         self.assertIsNone(changed.last_discovered_at)
-        self.assertEqual(changed.upstream_api_key_record_id, 41)
+        self.assertEqual(changed.upstream_api_key_record_id, "41")
         archive = await self.db.scalar(
             select(UpstreamAccountDataArchive).where(
                 UpstreamAccountDataArchive.sub2api_account_id == 7
@@ -1254,7 +1380,7 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             account = await self._discover()
 
-        self.assertEqual(account.upstream_api_key_record_id, 77)
+        self.assertEqual(account.upstream_api_key_record_id, "77")
         stored = await self._config()
         await self.db.refresh(stored)
         self.assertEqual(stored.upstream_api_key_record_id, 77)
@@ -1262,6 +1388,142 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             discovery.await_args.kwargs["account_api_keys"],
             {7: "sk-record-bound"},
         )
+
+    async def test_single_account_discovery_preserves_int64_record_id_as_string(self) -> None:
+        await self._manage(api_key="sk-record-int64")
+        record_id = 9_007_199_254_740_992
+        discovered = discovery_result(
+            group=1.0,
+            recharge=1.0,
+            account_state=AccountUpstreamState(
+                key_record_id=record_id,
+                key_status="active",
+                group_status="available",
+                group_id="gold",
+                group_name="Gold",
+            ),
+        )
+
+        with patch(
+            "app.services.upstream_accounts.discover_upstream",
+            new=AsyncMock(return_value=discovered),
+        ):
+            account = await self._discover()
+
+        self.assertEqual(account.upstream_api_key_record_id, str(record_id))
+        stored = await self._config()
+        await self.db.refresh(stored)
+        self.assertEqual(stored.upstream_api_key_record_id, record_id)
+
+    async def test_platform_change_requires_rebind_without_an_observed_record_id(
+        self,
+    ) -> None:
+        await self._manage(api_key="sk-platform-bound")
+        stored = await self._config()
+        stored.upstream_type = "auto"
+        stored.resolved_upstream_type = "newapi"
+        stored.upstream_api_key_record_id = 41
+
+        accepted = await self.service.apply_upstream_record_identity(
+            self.db,
+            stored,
+            None,
+            observed_upstream_type="sub2api",
+        )
+
+        self.assertEqual(accepted, UpstreamRecordIdentityStatus.REBIND_REQUIRED)
+        self.assertEqual(stored.upstream_api_key_record_id, 41)
+        self.assertEqual(stored.resolved_upstream_type, "newapi")
+        self.assertTrue(stored.upstream_identity_rebind_required)
+        self.assertIn(
+            "platform changed from newapi to sub2api",
+            stored.last_error or "",
+        )
+
+    async def test_missing_record_detail_is_inconclusive_and_preserves_binding(self) -> None:
+        await self._manage(api_key="sk-record-detail")
+        stored = await self._config()
+        stored.upstream_api_key_record_id = 41
+        stored.resolved_upstream_type = "sub2api"
+        stored.selected_group_id = "gold"
+        stored.selected_group_name = "Gold"
+        stored.effective_group_multiplier = 1.5
+        stored.target_rate = 0.75
+        await self.db.commit()
+
+        status = await self.service.apply_upstream_record_identity(
+            self.db,
+            stored,
+            None,
+            observed_upstream_type="sub2api",
+        )
+
+        self.assertEqual(status, UpstreamRecordIdentityStatus.INCONCLUSIVE)
+        self.assertEqual(stored.upstream_api_key_record_id, 41)
+        self.assertEqual(stored.resolved_upstream_type, "sub2api")
+        self.assertFalse(stored.upstream_identity_rebind_required)
+        self.assertEqual(stored.selected_group_id, "gold")
+        self.assertEqual(stored.selected_group_name, "Gold")
+        self.assertEqual(stored.effective_group_multiplier, 1.5)
+        self.assertEqual(stored.target_rate, 0.75)
+
+    async def test_upstream_rebind_requirement_is_sticky_until_confirmed(self) -> None:
+        await self._manage(api_key="sk-sticky-record")
+        stored = await self._config()
+        stored.upstream_api_key_record_id = None
+        stored.upstream_identity_rebind_required = True
+        stored.last_error = "Explicit upstream identity rebind is required."
+
+        status = await self.service.apply_upstream_record_identity(
+            self.db,
+            stored,
+            AccountUpstreamState(key_record_id=88),
+            observed_upstream_type="sub2api",
+        )
+
+        self.assertEqual(status, UpstreamRecordIdentityStatus.REBIND_REQUIRED)
+        self.assertIsNone(stored.upstream_api_key_record_id)
+        self.assertTrue(stored.upstream_identity_rebind_required)
+        self.assertEqual(
+            stored.last_error,
+            "Explicit upstream identity rebind is required.",
+        )
+
+    async def test_account_save_cannot_relabel_a_bound_record_to_channel_platform(
+        self,
+    ) -> None:
+        await self._manage(api_key="sk-platform-save", upstream_type="auto")
+        stored = await self._config()
+        channel = UpstreamChannel(
+            display_name="Auto upstream",
+            canonical_base_url="https://upstream.example.com",
+            upstream_type="auto",
+            resolved_upstream_type="sub2api",
+        )
+        self.db.add(channel)
+        await self.db.flush()
+        stored.channel_id = channel.id
+        stored.upstream_api_key_record_id = 41
+        stored.resolved_upstream_type = "newapi"
+        stored.selected_group_id = "legacy"
+        stored.selected_group_name = "Legacy"
+        stored.effective_group_multiplier = 1.25
+        stored.target_rate = 0.5
+        await self.db.commit()
+
+        saved = await self.service.upsert_account(
+            self.db,
+            7,
+            self._update(channel_id=channel.id),
+        )
+
+        self.assertEqual(saved.upstream_api_key_record_id, "41")
+        self.assertEqual(saved.resolved_upstream_type, "newapi")
+        self.assertTrue(saved.upstream_identity_rebind_required)
+        self.assertEqual(saved.selected_group_id, "legacy")
+        self.assertEqual(saved.selected_group_name, "Legacy")
+        self.assertEqual(saved.effective_group_multiplier, 1.25)
+        self.assertEqual(saved.target_rate, 0.5)
 
     async def test_explicit_upstream_identity_rebind_archives_and_resets_binding(self) -> None:
         await self._manage(api_key="sk-record-rebind")
@@ -1410,6 +1672,74 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.rollback()
         config = await self._config()
         self.assertEqual(config.base_url, "https://upstream.example.com")
+        self.assertEqual(self.sub2api.base_url_update_calls, [])
+
+    async def test_channel_change_updates_sub2api_base_url_before_local_binding(self) -> None:
+        await self._manage(api_key="sk-origin-bound")
+        replacement = UpstreamChannel(
+            display_name="Replacement upstream",
+            canonical_base_url="https://replacement.example.com",
+            upstream_type="sub2api",
+        )
+        self.db.add(replacement)
+        await self.db.commit()
+        await self.db.refresh(replacement)
+
+        updated = await self.service.upsert_account(
+            self.db,
+            7,
+            self._update(
+                channel_id=replacement.id,
+                confirm_credential_rebind=True,
+            ),
+        )
+
+        self.assertEqual(
+            self.sub2api.base_url_update_calls,
+            [(7, "https://replacement.example.com")],
+        )
+        self.assertEqual(
+            self.sub2api.accounts[0]["credentials"]["base_url"],
+            "https://replacement.example.com",
+        )
+        stored = await self._config()
+        self.assertEqual(stored.channel_id, replacement.id)
+        self.assertEqual(stored.base_url, "https://replacement.example.com")
+        self.assertEqual(updated.channel_id, replacement.id)
+        self.assertEqual(updated.base_url, "https://replacement.example.com")
+
+    async def test_failed_sub2api_base_url_update_preserves_local_binding(self) -> None:
+        await self._manage(api_key="sk-origin-bound")
+        original = await self._config()
+        original_channel_id = original.channel_id
+        replacement = UpstreamChannel(
+            display_name="Replacement upstream",
+            canonical_base_url="https://replacement.example.com",
+            upstream_type="sub2api",
+        )
+        self.db.add(replacement)
+        await self.db.commit()
+        await self.db.refresh(replacement)
+        self.sub2api.base_url_update_error = Sub2ApiRequestError("remote update failed")
+
+        with self.assertRaises(UpstreamAccountServiceError):
+            await self.service.upsert_account(
+                self.db,
+                7,
+                self._update(
+                    channel_id=replacement.id,
+                    confirm_credential_rebind=True,
+                ),
+            )
+
+        await self.db.rollback()
+        stored = await self._config()
+        self.assertEqual(stored.channel_id, original_channel_id)
+        self.assertEqual(stored.base_url, "https://upstream.example.com")
+        self.assertEqual(
+            self.sub2api.accounts[0]["credentials"]["base_url"],
+            "https://upstream.example.com/v1",
+        )
 
     async def test_default_recharge_has_null_discovered_value_and_explicit_status(self) -> None:
         await self._manage(api_key="sk-default")
@@ -2194,6 +2524,89 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
                 call("GET", "/admin/accounts/17", config=config),
             ],
         )
+
+    async def test_account_base_url_update_uses_credentials_patch_and_confirms_readback(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {
+                    "data": {
+                        "id": 17,
+                        "type": "apikey",
+                        "credentials": {"base_url": "https://old.example/v1"},
+                    }
+                },
+                {},
+                {
+                    "data": {
+                        "id": 17,
+                        "type": "apikey",
+                        "credentials": {"base_url": "https://new.example"},
+                    }
+                },
+            ]
+        )
+        config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch:
+            updated = await client.update_account_base_url(
+                17,
+                "https://NEW.example/api/v1/",
+            )
+
+        self.assertEqual(updated["credentials"]["base_url"], "https://new.example")
+        self.assertEqual(
+            client._request.await_args_list,  # type: ignore[attr-defined]
+            [
+                call("GET", "/admin/accounts/17", config=config),
+                call(
+                    "POST",
+                    "/admin/accounts/bulk-update",
+                    config=config,
+                    json={
+                        "account_ids": [17],
+                        "credentials": {"base_url": "https://new.example"},
+                    },
+                ),
+                call("GET", "/admin/accounts/17", config=config),
+            ],
+        )
+
+    async def test_account_base_url_update_recovers_lost_response_without_repeating_write(self) -> None:
+        client = Sub2ApiClient()
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            side_effect=Sub2ApiRequestError("lost mutation response")
+        )
+        client.get_account_by_id = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {
+                    "id": 17,
+                    "type": "apikey",
+                    "credentials": {"base_url": "https://old.example"},
+                },
+                {
+                    "id": 17,
+                    "type": "apikey",
+                    "credentials": {"base_url": "https://new.example"},
+                },
+            ]
+        )
+        config, runtime_patch = self._runtime_patch()
+
+        with runtime_patch:
+            updated = await client.update_account_base_url(17, "https://new.example")
+
+        self.assertEqual(updated["credentials"]["base_url"], "https://new.example")
+        client._request.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "POST",
+            "/admin/accounts/bulk-update",
+            config=config,
+            json={
+                "account_ids": [17],
+                "credentials": {"base_url": "https://new.example"},
+            },
+        )
+        self.assertEqual(client.get_account_by_id.await_count, 2)  # type: ignore[attr-defined]
 
     async def test_account_name_update_checks_precondition_before_put(self) -> None:
         client = Sub2ApiClient()

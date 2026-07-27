@@ -12,9 +12,9 @@ from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
@@ -41,6 +41,7 @@ from app.schemas import (
 )
 from app.services.sub2api import Sub2ApiClient
 from app.services.change_logs import record_upstream_channel_changes
+from app.services.daily_usage_policy import daily_usage_failure_decision
 from app.services.events import elapsed_ms
 from app.services.runtime_config import get_runtime_config_service
 from app.services.notifications import (
@@ -60,6 +61,7 @@ from app.services.upstream_accounts import (
     INVALID_UPSTREAM_KEY_STATUSES,
     UpstreamAccountService,
     UpstreamAccountServiceError,
+    UpstreamRecordIdentityStatus,
     UpstreamHealthTransition,
     resolve_rate_pause_policy,
     get_upstream_account_service,
@@ -89,18 +91,6 @@ TOKEN_INVALID_ERROR = "Upstream channel token is invalid."
 
 
 API_KEY_EXPORT_BATCH_SIZE = 200
-TRANSIENT_DAILY_USAGE_STATUSES = frozenset(
-    {"failed", "network_error", "timeout", "unavailable"}
-)
-TRANSIENT_DAILY_USAGE_REASONS = frozenset(
-    {
-        "network",
-        "overall_discovery_error",
-        "response_missing",
-        "timeout",
-        "upstream_failure",
-    }
-)
 logger = logging.getLogger(__name__)
 
 
@@ -715,7 +705,24 @@ class UpstreamChannelService:
                 lock = await self.accounts._lock_for(account_id)
                 await lock.acquire()
                 account_locks.append(lock)
-            result = await self._sync_inventory_rows(db, remote_by_id)
+            result = None
+            for attempt in range(2):
+                try:
+                    result = await self._sync_inventory_rows(db, remote_by_id)
+                    break
+                except IntegrityError as exc:
+                    await db.rollback()
+                    db.expire_all()
+                    if attempt == 1:
+                        raise UpstreamAccountServiceError(
+                            "The upstream inventory changed concurrently; refresh and retry.",
+                            status_code=409,
+                        ) from exc
+            if result is None:
+                raise UpstreamAccountServiceError(
+                    "The upstream inventory could not be synchronized.",
+                    status_code=409,
+                )
             await self.accounts.sync_available_models(
                 db,
                 result[1],
@@ -745,6 +752,7 @@ class UpstreamChannelService:
         changed = False
         priority_membership_changed = False
         inventory_checked_at = _utcnow()
+        auto_assigned_config_ids: set[int] = set()
 
         for account_id, config in configs.items():
             if account_id not in remote_by_id:
@@ -767,9 +775,14 @@ class UpstreamChannelService:
                 if config is not None and config.channel_id is not None
                 else None
             )
+            binding_status = (
+                self.accounts._config_binding_status(remote, config)
+                if config is not None
+                else "unmanaged"
+            )
             name_only_binding_change = bool(
                 config is not None
-                and self.accounts._config_binding_status(remote, config) == "mismatch"
+                and binding_status == "mismatch"
                 and self.accounts._config_binding_differs_only_by_remote_name(
                     remote,
                     config,
@@ -778,32 +791,43 @@ class UpstreamChannelService:
             )
             if (
                 config is not None
-                and self.accounts._config_binding_status(remote, config) != "bound"
+                and binding_status != "bound"
                 and not name_only_binding_change
             ):
-                self.accounts.archive_data_before_invalidation(
-                    db,
-                    config,
-                    reason="remote_identity_mismatch",
-                    channel=stored_channel,
-                )
-                if any(
-                    value is not None
-                    for value in (
-                        config.upstream_usage_amount,
-                        config.upstream_usage_unit,
-                        config.upstream_usage_checked_at,
-                    )
-                ):
-                    self.accounts.clear_upstream_usage_state(config)
-                    changed = True
-                if config.priority_interval_id is not None:
-                    config.priority_interval_id = None
-                    config.desired_priority = None
-                    config.priority_sync_status = "unassigned"
-                    config.priority_sync_error = None
-                    changed = True
-                    priority_membership_changed = True
+                if self.accounts._config_binding_evidence_incomplete(remote, config):
+                    # Missing immutable identity fields are inconclusive. Keep
+                    # the existing configuration intact while all automatic
+                    # operations remain fail-closed on the non-bound status.
+                    continue
+                if binding_status == "mismatch":
+                    if not config.api_key_origin_rebind_required:
+                        self.accounts.archive_data_before_invalidation(
+                            db,
+                            config,
+                            reason="remote_identity_mismatch",
+                            channel=stored_channel,
+                        )
+                        config.api_key_origin_rebind_required = True
+                        changed = True
+                    if any(
+                        value is not None
+                        for value in (
+                            config.upstream_usage_amount,
+                            config.upstream_usage_unit,
+                            config.upstream_usage_checked_at,
+                        )
+                    ):
+                        self.accounts.clear_upstream_usage_state(config)
+                        changed = True
+                    if config.priority_interval_id is not None:
+                        config.priority_interval_id = None
+                        config.desired_priority = None
+                        config.priority_sync_status = "unassigned"
+                        config.priority_sync_error = None
+                        changed = True
+                        priority_membership_changed = True
+                # Legacy rows without a stored fingerprint remain visible for
+                # explicit confirmation, but must not be mutated or auto-bound.
                 continue
             remote_url = _remote_base_url(remote)
             configured_url: str | None = None
@@ -928,6 +952,7 @@ class UpstreamChannelService:
                     and not config.channel_auto_assign_disabled
                 ):
                     config.channel_id = channel.id
+                    auto_assigned_config_ids.add(config.id)
                     changed = True
                 config.remote_platform = _safe_text(self.sub2api.account_platform(remote), limit=64)
                 config.remote_account_type = _safe_text(self.sub2api.account_type(remote), limit=32)
@@ -941,6 +966,33 @@ class UpstreamChannelService:
                     # Inventory refreshes the display snapshot, while discovery
                     # owns the confirmed baseline used to detect rate changes.
                     config.current_rate = previous_current_rate
+
+        target_record_bindings: dict[
+            tuple[int, int], list[UpstreamAccountConfig]
+        ] = {}
+        for config in configs.values():
+            if (
+                config.channel_id is not None
+                and config.upstream_api_key_record_id is not None
+            ):
+                target_record_bindings.setdefault(
+                    (config.channel_id, config.upstream_api_key_record_id),
+                    [],
+                ).append(config)
+        for (_channel_id, record_id), candidates in target_record_bindings.items():
+            if len(candidates) < 2:
+                continue
+            for config in candidates:
+                if config.id in auto_assigned_config_ids:
+                    config.channel_id = None
+                    config.channel_auto_assign_disabled = True
+                config.upstream_api_key_record_id = None
+                config.upstream_identity_rebind_required = True
+                config.last_error = (
+                    f"Multiple local accounts have duplicate upstream API key record "
+                    f"#{record_id} for the same channel; explicit rebind is required."
+                )
+            changed = True
 
         await db.commit()
 
@@ -1595,37 +1647,6 @@ class UpstreamChannelService:
                 return group
         return None
 
-    @staticmethod
-    def _daily_usage_cache_is_current(
-        channel: UpstreamChannel,
-        period: str,
-        *,
-        time_zone: str,
-        now: datetime,
-    ) -> bool:
-        amount = _balance_number(getattr(channel, f"{period}_balance_used", None))
-        checked_at = getattr(channel, f"{period}_balance_checked_at", None)
-        if amount is None or amount < 0 or not isinstance(checked_at, datetime):
-            return False
-        normalized_checked_at = (
-            checked_at.replace(tzinfo=timezone.utc)
-            if checked_at.tzinfo is None
-            else checked_at
-        )
-        normalized_now = (
-            now.replace(tzinfo=timezone.utc)
-            if now.tzinfo is None
-            else now
-        )
-        try:
-            zone = ZoneInfo(time_zone)
-        except (ZoneInfoNotFoundError, ValueError):
-            zone = ZoneInfo(DEFAULT_TODAY_TIME_ZONE)
-        return (
-            normalized_checked_at.astimezone(zone).date()
-            == normalized_now.astimezone(zone).date()
-        )
-
     def _apply_daily_usage_failure(
         self,
         channel: UpstreamChannel,
@@ -1636,28 +1657,18 @@ class UpstreamChannelService:
         time_zone: str,
         now: datetime,
     ) -> None:
-        normalized_reason = str(reason or "").strip().lower()
-        transient = status in TRANSIENT_DAILY_USAGE_STATUSES
-        if status == "error":
-            transient = normalized_reason in TRANSIENT_DAILY_USAGE_REASONS
-            if normalized_reason.startswith("http_"):
-                try:
-                    status_code = int(normalized_reason[5:])
-                except ValueError:
-                    status_code = 0
-                transient = (
-                    status_code in {408, 425, 429}
-                    or 500 <= status_code <= 599
-                )
-        retained = bool(
-            transient
-            and self._daily_usage_cache_is_current(
-                channel,
-                period,
-                time_zone=time_zone,
-                now=now,
-            )
+        decision = daily_usage_failure_decision(
+            status=status,
+            reason=reason,
+            cached_amount=_balance_number(
+                getattr(channel, f"{period}_balance_used", None)
+            ),
+            checked_at=getattr(channel, f"{period}_balance_checked_at", None),
+            time_zone=time_zone,
+            fallback_time_zone=DEFAULT_TODAY_TIME_ZONE,
+            now=now,
         )
+        retained = decision.retain_cached_value
         setattr(
             channel,
             f"{period}_balance_status",
@@ -1667,19 +1678,14 @@ class UpstreamChannelService:
             setattr(channel, f"{period}_balance_used", None)
             setattr(channel, f"{period}_balance_unit", None)
             setattr(channel, f"{period}_balance_checked_at", None)
-        if status not in {
-            "credentials_missing",
-            "not_available",
-            "not_checked",
-            "unsupported",
-        }:
+        if decision.should_log:
             logger.warning(
                 "Upstream daily usage probe unavailable: channel_id=%s "
                 "period=%s status=%s reason=%s retained=%s",
                 channel.id,
                 period,
                 status,
-                normalized_reason or "unknown",
+                decision.normalized_reason or "unknown",
                 retained,
             )
 
@@ -2874,16 +2880,12 @@ class UpstreamChannelService:
         *,
         enabled: bool | None,
         automation_paused: bool,
-        mode: str,
-        threshold_percent: float,
         absolute_threshold: float,
-        previous_multiplier: float | None,
         current_multiplier: float | None,
         now: datetime,
     ) -> None:
         if automation_paused or enabled is None:
             return
-        existing = self.accounts._pause_hold(config, AUTO_PAUSE_REASON_RATE)
         if not enabled:
             self.accounts.set_pause_hold(
                 config,
@@ -2900,80 +2902,18 @@ class UpstreamChannelService:
         current = _decimal_multiplier(current_multiplier)
         if current is None:
             return
-        if mode == "absolute_multiplier":
-            boundary = Decimal(str(absolute_threshold))
-            self.accounts.set_pause_hold(
-                config,
-                AUTO_PAUSE_REASON_RATE,
-                active=current > boundary,
-                scope_channel_id=channel.id,
-                recovery_mode="rate_at_or_below_absolute_threshold",
-                now=now,
-                evidence={
-                    "mode": mode,
-                    "observed_multiplier": float(current),
-                    "absolute_threshold": absolute_threshold,
-                },
-            )
-            return
-
-        threshold = Decimal(str(threshold_percent)) / Decimal("100")
-        if existing is not None and existing.active:
-            evidence = existing.evidence_json if isinstance(existing.evidence_json, dict) else {}
-            baseline = _decimal_multiplier(evidence.get("baseline_multiplier"))
-            if baseline is not None:
-                boundary = baseline * (Decimal("1") + threshold)
-                increase_percent = float(
-                    (current / baseline - Decimal("1")) * Decimal("100")
-                )
-                self.accounts.set_pause_hold(
-                    config,
-                    AUTO_PAUSE_REASON_RATE,
-                    active=current > boundary,
-                    scope_channel_id=channel.id,
-                    recovery_mode="rate_within_threshold",
-                    now=now,
-                    evidence={
-                        "mode": "increase_percent",
-                        "baseline_multiplier": float(baseline),
-                        "observed_multiplier": float(current),
-                        "increase_percent": increase_percent,
-                        "threshold_percent": threshold_percent,
-                    },
-                )
-                return
-            # A hold created by another mode has no percent baseline. Resolve
-            # it, then evaluate this observation against the new policy below.
-            self.accounts.set_pause_hold(
-                config,
-                AUTO_PAUSE_REASON_RATE,
-                active=False,
-                scope_channel_id=channel.id,
-                recovery_mode="rate_within_threshold",
-                now=now,
-            )
-
-        previous = _decimal_multiplier(previous_multiplier)
-        if previous is None or current is None:
-            return
-        boundary = previous * (Decimal("1") + threshold)
-        if current <= boundary:
-            return
+        boundary = Decimal(str(absolute_threshold))
         self.accounts.set_pause_hold(
             config,
             AUTO_PAUSE_REASON_RATE,
-            active=True,
+            active=current > boundary,
             scope_channel_id=channel.id,
-            recovery_mode="rate_within_threshold",
+            recovery_mode="rate_at_or_below_absolute_threshold",
             now=now,
             evidence={
-                "mode": "increase_percent",
-                "baseline_multiplier": float(previous),
+                "mode": "absolute_multiplier",
                 "observed_multiplier": float(current),
-                "increase_percent": float(
-                    (current / previous - Decimal("1")) * Decimal("100")
-                ),
-                "threshold_percent": threshold_percent,
+                "absolute_threshold": absolute_threshold,
             },
         )
 
@@ -3791,12 +3731,11 @@ class UpstreamChannelService:
                     item.id: item for item in interval_result.scalars().all()
                 }
             discovery_base_url = channel.management_base_url or channel.canonical_base_url
-            preferred_type = (
-                channel.resolved_upstream_type
-                if channel.upstream_type == "auto"
-                and channel.resolved_upstream_type in {"newapi", "sub2api"}
-                else channel.upstream_type
-            )
+            # Auto channels must re-establish platform identity every time.
+            # Several management endpoints are shared by NewAPI and Sub2API,
+            # so a cached forced type can otherwise report a false success
+            # after the service behind the URL has changed platforms.
+            preferred_type = channel.upstream_type
             runtime_config = get_runtime_config_service()
             rate_pause_policies = {
                 config.id: resolve_rate_pause_policy(
@@ -4187,10 +4126,10 @@ class UpstreamChannelService:
                     for record_id, count in unbound_observation_counts.items()
                     if count > 1
                 }
-                identity_valid_by_config: dict[int, bool] = {}
+                identity_status_by_config: dict[int, UpstreamRecordIdentityStatus] = {}
                 for config, _current_remote in account_work_items:
                     if discovery_succeeded:
-                        identity_valid_by_config[config.id] = (
+                        identity_status_by_config[config.id] = (
                             await self.accounts.apply_upstream_record_identity(
                                 db,
                                 config,
@@ -4198,6 +4137,9 @@ class UpstreamChannelService:
                                     result,
                                     config.sub2api_account_id,
                                 ),
+                                observed_upstream_type=str(
+                                    _value(result, "upstream_type") or ""
+                                ).strip().lower(),
                                 record_owners=record_owners,
                                 ambiguous_unbound_record_ids=(
                                     ambiguous_unbound_record_ids
@@ -4205,8 +4147,10 @@ class UpstreamChannelService:
                             )
                         )
                     else:
-                        identity_valid_by_config[config.id] = not bool(
-                            config.upstream_identity_rebind_required
+                        identity_status_by_config[config.id] = (
+                            UpstreamRecordIdentityStatus.REBIND_REQUIRED
+                            if config.upstream_identity_rebind_required
+                            else UpstreamRecordIdentityStatus.VERIFIED
                         )
 
                 availability_semaphore = asyncio.Semaphore(4)
@@ -4215,7 +4159,10 @@ class UpstreamChannelService:
                     config: UpstreamAccountConfig,
                     current_remote: dict[str, Any],
                 ) -> tuple[int, str | None, dict[str, Any]]:
-                    if not identity_valid_by_config.get(config.id, True):
+                    if identity_status_by_config.get(
+                        config.id,
+                        UpstreamRecordIdentityStatus.INCONCLUSIVE,
+                    ) is not UpstreamRecordIdentityStatus.VERIFIED:
                         return config.id, None, {
                             "mode": config.availability_check_mode,
                             "status": "upstream_identity_rebind_required",
@@ -4278,7 +4225,10 @@ class UpstreamChannelService:
                             (None, {"mode": config.availability_check_mode, "status": "unknown"}),
                         )
                     )
-                    if not identity_valid_by_config.get(config.id, True):
+                    if identity_status_by_config.get(
+                        config.id,
+                        UpstreamRecordIdentityStatus.INCONCLUSIVE,
+                    ) is not UpstreamRecordIdentityStatus.VERIFIED:
                         config.last_discovered_at = channel.last_discovered_at
                         self.accounts.apply_remote_snapshot(
                             config,
@@ -4375,6 +4325,7 @@ class UpstreamChannelService:
                         config,
                         upstream_state,
                         now=channel.last_discovered_at or _utcnow(),
+                        time_zone=today_timezone,
                     )
                     health_transition = self.accounts.apply_authoritative_upstream_state(
                         config,
@@ -4474,14 +4425,6 @@ class UpstreamChannelService:
                         channel_id=channel.id,
                         now=policy_now,
                     )
-                    previous_authoritative_multiplier = self._authoritative_upstream_multiplier(
-                        previous_group_multiplier,
-                        previous_group_multiplier_status,
-                        previous_group_multiplier_source,
-                        previous_channel_recharge,
-                        previous_channel_recharge_status,
-                        previous_channel_recharge_source,
-                    )
                     current_authoritative_multiplier = self._authoritative_upstream_multiplier(
                         config.effective_group_multiplier,
                         config.group_multiplier_status,
@@ -4500,14 +4443,9 @@ class UpstreamChannelService:
                             else rate_pause_policy.get("enabled")
                         ),
                         automation_paused=automation_paused,
-                        mode=str(rate_pause_policy.get("mode") or "increase_percent"),
-                        threshold_percent=float(
-                            rate_pause_policy.get("threshold_percent") or 20.0
-                        ),
                         absolute_threshold=float(
                             rate_pause_policy.get("absolute_threshold") or 1.0
                         ),
-                        previous_multiplier=previous_authoritative_multiplier,
                         current_multiplier=current_authoritative_multiplier,
                         now=policy_now,
                     )

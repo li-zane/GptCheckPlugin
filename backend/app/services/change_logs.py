@@ -486,6 +486,11 @@ def record_upstream_channel_changes(
         old_name = str(old_group.get("name") or "").strip()[:200] or None
         new_name = str(new_group.get("name") or "").strip()[:200] or None
         if old_name != new_name:
+            name_change_details = {
+                **recharge_details,
+                "old_name": old_name,
+                "new_name": new_name,
+            }
             group_changes.append({
                 "change_type": "renamed",
                 "group_id": group_id[:128],
@@ -494,7 +499,7 @@ def record_upstream_channel_changes(
                 "new_status": "available",
                 "old_multiplier": old_value,
                 "new_multiplier": new_value,
-                "details": {"old_name": old_name, "new_name": new_name},
+                "details": name_change_details,
             })
             db.add(
                 UpstreamChannelChangeEvent(
@@ -503,7 +508,9 @@ def record_upstream_channel_changes(
                     event_type="group_name_changed",
                     group_id=group_id[:128],
                     group_name=new_name or old_name,
-                    details={"old_name": old_name, "new_name": new_name},
+                    old_value=old_value,
+                    new_value=new_value,
+                    details=name_change_details,
                     created_at=observed_at,
                 )
             )

@@ -89,14 +89,6 @@ KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS = "channel_monitor_fallback_test_models
 KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL = "channel_monitor_fallback_test_model"
 KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS = "channel_monitor_fallback_test_attempts"
 KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS = "channel_monitor_recovery_test_attempts"
-KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED = (
-    "api_key_auto_pause_on_upstream_rate_increase_enabled"
-)
-KEY_UPSTREAM_RATE_PAUSE_MODE = "upstream_rate_pause_mode"
-KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT = (
-    "upstream_rate_increase_threshold_percent"
-)
-KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD = "upstream_rate_absolute_threshold"
 KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED = (
     "api_key_auto_pause_on_negative_balance_enabled"
 )
@@ -117,6 +109,7 @@ KEY_NOTIFY_ACCOUNT_ENABLED = "notify_account_enabled"
 KEY_NOTIFY_API_KEY_RATE_CHANGED = "notify_api_key_rate_changed"
 KEY_NOTIFY_UPSTREAM_GROUP_CHANGED = "notify_upstream_group_changed"
 KEY_NOTIFY_UPSTREAM_BALANCE_LOW = "notify_upstream_balance_low"
+KEY_NOTIFY_UPSTREAM_TOKEN_INVALID = "notify_upstream_token_invalid"
 KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS = "upstream_rate_log_retention_days"
 KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
@@ -442,49 +435,6 @@ class RuntimeConfigService:
             5,
         )
 
-    async def get_api_key_auto_pause_on_upstream_rate_increase_enabled(self) -> bool:
-        values = await self._load_values()
-        return _bool_or_default(
-            values.get(KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED),
-            bool(
-                getattr(
-                    self.settings,
-                    "api_key_auto_pause_on_upstream_rate_increase_enabled",
-                    False,
-                )
-            ),
-        )
-
-    async def get_upstream_rate_increase_threshold_percent(self) -> float:
-        values = await self._load_values()
-        return _positive_bounded_float_or_default(
-            values.get(KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT),
-            float(
-                getattr(
-                    self.settings,
-                    "upstream_rate_increase_threshold_percent",
-                    20.0,
-                )
-            ),
-            100_000.0,
-        )
-
-    async def get_upstream_rate_pause_mode(self) -> str:
-        values = await self._load_values()
-        value = str(
-            values.get(KEY_UPSTREAM_RATE_PAUSE_MODE)
-            or getattr(self.settings, "upstream_rate_pause_mode", "increase_percent")
-        ).strip()
-        return value if value in {"increase_percent", "absolute_multiplier"} else "increase_percent"
-
-    async def get_upstream_rate_absolute_threshold(self) -> float:
-        values = await self._load_values()
-        return _positive_bounded_float_or_default(
-            values.get(KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD),
-            float(getattr(self.settings, "upstream_rate_absolute_threshold", 1.0)),
-            1000.0,
-        )
-
     async def get_api_key_auto_pause_on_negative_balance_enabled(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(
@@ -571,6 +521,10 @@ class RuntimeConfigService:
             "upstream_balance_low_enabled": _bool_or_default(
                 values.get(KEY_NOTIFY_UPSTREAM_BALANCE_LOW),
                 bool(getattr(self.settings, "notify_upstream_balance_low", False)),
+            ),
+            "upstream_channel_token_invalid_enabled": _bool_or_default(
+                values.get(KEY_NOTIFY_UPSTREAM_TOKEN_INVALID),
+                bool(getattr(self.settings, "notify_upstream_token_invalid", False)),
             ),
             "discord_bot_token": token,
             "discord_channel_id": (
@@ -952,38 +906,6 @@ class RuntimeConfigService:
                 1,
                 5,
             ),
-            "api_key_auto_pause_on_upstream_rate_increase_enabled": _bool_or_default(
-                values.get(KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED),
-                bool(
-                    getattr(
-                        self.settings,
-                        "api_key_auto_pause_on_upstream_rate_increase_enabled",
-                        False,
-                    )
-                ),
-            ),
-            "upstream_rate_pause_mode": (
-                values.get(KEY_UPSTREAM_RATE_PAUSE_MODE)
-                if values.get(KEY_UPSTREAM_RATE_PAUSE_MODE)
-                in {"increase_percent", "absolute_multiplier"}
-                else getattr(self.settings, "upstream_rate_pause_mode", "increase_percent")
-            ),
-            "upstream_rate_increase_threshold_percent": _positive_bounded_float_or_default(
-                values.get(KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT),
-                float(
-                    getattr(
-                        self.settings,
-                        "upstream_rate_increase_threshold_percent",
-                        20.0,
-                    )
-                ),
-                100_000.0,
-            ),
-            "upstream_rate_absolute_threshold": _positive_bounded_float_or_default(
-                values.get(KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD),
-                float(getattr(self.settings, "upstream_rate_absolute_threshold", 1.0)),
-                1000.0,
-            ),
             "api_key_auto_pause_on_negative_balance_enabled": _bool_or_default(
                 values.get(KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED),
                 bool(getattr(self.settings, "api_key_auto_pause_on_negative_balance_enabled", False)),
@@ -1030,6 +952,9 @@ class RuntimeConfigService:
             "notify_api_key_rate_changed": notification["api_key_rate_changed_enabled"],
             "notify_upstream_group_changed": notification["upstream_group_changed_enabled"],
             "notify_upstream_balance_low": notification["upstream_balance_low_enabled"],
+            "notify_upstream_token_invalid": notification[
+                "upstream_channel_token_invalid_enabled"
+            ],
             "upstream_rate_log_retention_days": _bounded_int_or_default(
                 values.get(KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS),
                 self.settings.upstream_rate_log_retention_days,
@@ -1256,7 +1181,6 @@ class RuntimeConfigService:
                 "account_model_whitelist_sync_enabled": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED,
                 "account_model_whitelist_sync_each_time": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME,
                 "channel_monitor_fallback_without_monitor_enabled": KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED,
-                "api_key_auto_pause_on_upstream_rate_increase_enabled": KEY_API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED,
                 "api_key_auto_pause_on_negative_balance_enabled": KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED,
                 "show_stale_negative_balance_alert": KEY_SHOW_STALE_NEGATIVE_BALANCE_ALERT,
                 "priority_assign_disabled_api_key_accounts": KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS,
@@ -1267,6 +1191,7 @@ class RuntimeConfigService:
                 "notify_api_key_rate_changed": KEY_NOTIFY_API_KEY_RATE_CHANGED,
                 "notify_upstream_group_changed": KEY_NOTIFY_UPSTREAM_GROUP_CHANGED,
                 "notify_upstream_balance_low": KEY_NOTIFY_UPSTREAM_BALANCE_LOW,
+                "notify_upstream_token_invalid": KEY_NOTIFY_UPSTREAM_TOKEN_INVALID,
             }
             for payload_key, setting_key in bool_setting_keys.items():
                 if payload.get(payload_key) is not None:
@@ -1298,26 +1223,6 @@ class RuntimeConfigService:
                     db,
                     KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS,
                     json.dumps(models, ensure_ascii=False),
-                )
-
-            if payload.get("upstream_rate_increase_threshold_percent") is not None:
-                await self._put(
-                    db,
-                    KEY_UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT,
-                    _format_number(float(payload["upstream_rate_increase_threshold_percent"])),
-                )
-
-            if payload.get("upstream_rate_pause_mode") is not None:
-                mode = str(payload["upstream_rate_pause_mode"])
-                if mode not in {"increase_percent", "absolute_multiplier"}:
-                    raise RuntimeConfigServiceError("The upstream rate pause mode is invalid.")
-                await self._put(db, KEY_UPSTREAM_RATE_PAUSE_MODE, mode)
-
-            if payload.get("upstream_rate_absolute_threshold") is not None:
-                await self._put(
-                    db,
-                    KEY_UPSTREAM_RATE_ABSOLUTE_THRESHOLD,
-                    _format_number(float(payload["upstream_rate_absolute_threshold"])),
                 )
 
             if payload.get("upstream_negative_balance_basis") is not None:
@@ -1786,18 +1691,6 @@ class RuntimeConfigService:
             "CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS": str(
                 int(settings.get("channel_monitor_recovery_test_attempts", 1))
             ),
-            "API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED": _env_bool(
-                bool(settings["api_key_auto_pause_on_upstream_rate_increase_enabled"])
-            ),
-            "UPSTREAM_RATE_PAUSE_MODE": str(
-                settings.get("upstream_rate_pause_mode", "increase_percent")
-            ),
-            "UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT": _format_number(
-                float(settings["upstream_rate_increase_threshold_percent"])
-            ),
-            "UPSTREAM_RATE_ABSOLUTE_THRESHOLD": _format_number(
-                float(settings.get("upstream_rate_absolute_threshold", 1.0))
-            ),
             "API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED": _env_bool(
                 bool(settings.get("api_key_auto_pause_on_negative_balance_enabled", False))
             ),
@@ -1832,6 +1725,9 @@ class RuntimeConfigService:
             ),
             "NOTIFY_UPSTREAM_BALANCE_LOW": _env_bool(
                 bool(settings.get("notify_upstream_balance_low", False))
+            ),
+            "NOTIFY_UPSTREAM_TOKEN_INVALID": _env_bool(
+                bool(settings.get("notify_upstream_token_invalid", False))
             ),
             "UPSTREAM_RATE_LOG_RETENTION_DAYS": str(int(settings["upstream_rate_log_retention_days"])),
             "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(

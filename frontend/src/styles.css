@@ -164,6 +164,14 @@
   box-sizing: border-box;
 }
 
+.middle-ellipsis-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
 html,
 body,
 #root {
@@ -1561,6 +1569,10 @@ h2 {
 .signal-row strong {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.signal-row strong > .middle-ellipsis-text {
+  width: 100%;
 }
 
 .history-item {
@@ -3379,7 +3391,9 @@ select:focus {
 }
 
 .phone-source-primary {
+  min-width: 0;
   overflow-wrap: anywhere;
+  width: 100%;
 }
 
 .phone-source-cell {
@@ -6027,53 +6041,6 @@ fieldset.api-key-field {
   color: var(--green);
 }
 
-.api-key-channel-urls {
-  align-items: center !important;
-  display: flex !important;
-  flex-wrap: nowrap !important;
-  gap: 4px !important;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-}
-
-.api-key-channel-urls a,
-.api-key-channel-urls .api-key-channel-url {
-  background: var(--info-bg);
-  border: 1px solid color-mix(in srgb, var(--info-ink) 18%, transparent);
-  border-radius: 5px;
-  color: var(--info-ink) !important;
-  display: inline-flex !important;
-  flex: 0 1 auto;
-  gap: 5px;
-  max-width: 100%;
-  min-height: 22px;
-  min-width: 0;
-  overflow: hidden;
-  padding: 3px 7px;
-  width: auto;
-}
-
-.api-key-channel-urls a span,
-.api-key-channel-urls .api-key-channel-url {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.api-key-channel-urls b {
-  color: inherit;
-  font-family: inherit;
-  font-size: 11px;
-  font-weight: 750;
-}
-
-.api-key-channel-urls a:hover,
-.api-key-channel-urls a:focus-visible {
-  background: color-mix(in srgb, var(--info-bg) 72%, var(--surface));
-  border-color: color-mix(in srgb, var(--info-ink) 36%, transparent);
-}
-
 .api-key-channel-section-tools {
   align-items: center;
   display: flex;
@@ -6946,9 +6913,14 @@ button.api-key-group-chip--more {
   align-items: stretch;
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(2, minmax(min(100%, 520px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 520px), 520px));
+  justify-content: start;
   min-width: 0;
   padding-top: 10px;
+}
+
+.api-key-segmented--two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .api-key-channel-card {
@@ -6980,12 +6952,14 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-head {
-  align-items: flex-start;
+  align-items: center;
+  background: color-mix(in srgb, var(--panel-2) 46%, var(--panel));
+  border-bottom: 1px solid var(--line);
   display: grid;
-  gap: 8px;
+  gap: 7px 9px;
   grid-template-columns: auto minmax(0, 1fr) auto;
   min-width: 0;
-  padding: 12px 13px 10px;
+  padding: 11px 12px 9px;
 }
 
 .api-key-channel-mark {
@@ -7009,63 +6983,112 @@ button.api-key-group-chip--more {
 
 .api-key-channel-title {
   display: grid;
-  gap: 4px;
   min-width: 0;
 }
 
-.api-key-channel-title > div {
+.api-key-channel-title-row {
   align-items: center;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 7px;
   min-width: 0;
 }
 
 .api-key-channel-title h3 {
   color: var(--ink);
+  flex: 1 1 82px;
   font-size: 15px;
   line-height: 1.35;
   max-width: 100%;
-  min-width: 0;
+  min-width: 58px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.api-key-channel-title a,
-.api-key-channel-url {
+.api-key-channel-addresses {
+  display: grid;
+  gap: 6px;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.api-key-channel-address {
   align-items: center;
-  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--primary);
   display: flex;
   font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
-  font-size: 12px;
-  gap: 5px;
-  line-height: 1.35;
-  min-width: 0;
-  text-decoration: none;
-}
-
-.api-key-channel-title a span,
-.api-key-channel-url {
-  max-width: 100%;
+  font-size: 11px;
+  gap: 6px;
+  line-height: 1.25;
+  min-height: 25px;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
+  padding: 4px 6px;
+  text-decoration: none;
   white-space: nowrap;
 }
 
-.api-key-channel-title a:hover {
-  color: var(--primary);
+.api-key-channel-title h3 > .middle-ellipsis-text {
+  text-overflow: clip;
+  width: 100%;
 }
 
-.api-key-channel-title a svg {
+.api-key-channel-title .api-key-inline-chips {
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.api-key-channel-title .api-key-inline-chips .api-key-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.api-key-channel-address b {
+  border-right: 1px solid var(--line);
+  color: var(--muted);
   flex: 0 0 auto;
+  font-family: inherit;
+  font-size: 10px;
+  padding-right: 6px;
+}
+
+.api-key-channel-address span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.api-key-channel-address svg {
+  flex: 0 0 auto;
+}
+
+.api-key-channel-address:hover,
+.api-key-channel-address:focus-visible {
+  background: var(--info-bg);
+  border-color: color-mix(in srgb, var(--info-ink) 32%, var(--line));
+}
+
+.api-key-channel-address--empty {
+  background: color-mix(in srgb, var(--panel-2) 72%, var(--panel));
+  color: var(--muted);
+  opacity: 0.76;
 }
 
 .api-key-channel-actions {
   align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
   display: flex;
-  gap: 5px;
+  gap: 3px;
+  padding: 2px;
 }
 
 .api-key-channel-stats {
@@ -7073,7 +7096,7 @@ button.api-key-group-chip--more {
   border-bottom: 1px solid var(--line);
   border-top: 1px solid var(--line);
   display: grid;
-  grid-template-columns: minmax(0, 1.65fr) minmax(110px, 0.62fr) minmax(145px, 1fr);
+  grid-template-columns: minmax(230px, 1fr) 135px 145px;
   min-width: 0;
 }
 
@@ -7458,7 +7481,7 @@ button.api-key-group-chip--more {
   }
 
   .api-key-channel-stats {
-    grid-template-columns: minmax(0, 1.55fr) minmax(105px, 0.55fr);
+    grid-template-columns: minmax(0, 1fr) 135px;
   }
 
   .api-key-channel-stat:last-child {
@@ -7531,21 +7554,34 @@ button.api-key-group-chip--more {
 }
 
 @media (max-width: 420px) {
-  .api-key-channel-title > div {
+  .api-key-channel-title-row {
     align-items: center;
     display: flex;
   }
 
   .api-key-channel-title .api-key-inline-chips {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
   }
 
   .api-key-channel-actions {
     display: flex;
   }
 
+  .api-key-channel-address {
+    gap: 4px;
+    padding-inline: 5px;
+  }
+
+  .api-key-channel-address b {
+    padding-right: 4px;
+  }
+
+  .api-key-channel-address svg {
+    display: none;
+  }
+
   .api-key-channel-stats {
-    grid-template-columns: minmax(0, 1.55fr) minmax(95px, 0.55fr);
+    grid-template-columns: minmax(0, 1fr) 125px;
   }
 
   .api-key-channel-stat + .api-key-channel-stat {
@@ -8251,8 +8287,9 @@ button.api-key-group-chip--more {
 
 .api-key-balance-summary-list {
   display: grid;
-  gap: 8px;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr));
+  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 146px), 146px));
+  justify-content: start;
   min-width: 0;
 }
 
@@ -8261,33 +8298,26 @@ button.api-key-group-chip--more {
   border: 1px solid var(--line);
   border-radius: 6px;
   display: grid;
-  gap: 7px 10px;
-  grid-template-areas:
-    "name platform"
-    "address adjusted";
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  gap: 7px;
   grid-template-rows: auto auto;
   min-width: 0;
-  padding: 9px 10px;
+  padding: 8px;
 }
 
 .api-key-balance-channel-name,
-.api-key-balance-management-url,
-.api-key-balance-amount {
+.api-key-balance-values {
   min-width: 0;
 }
 
 .api-key-balance-channel-name {
   color: var(--ink);
   font-size: 13px;
-  grid-area: name;
+  font-weight: 750;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.api-key-balance-channel-name--link,
-.api-key-balance-management-url {
+.api-key-balance-channel-name--link {
   align-items: center;
   color: var(--primary);
   display: flex;
@@ -8295,53 +8325,62 @@ button.api-key-group-chip--more {
   gap: 5px;
   max-width: 100%;
   text-decoration: none;
-}
-
-.api-key-balance-management-url {
-  grid-area: address;
-  justify-self: start;
+  width: 100%;
 }
 
 .api-key-balance-channel-name--link {
   justify-self: start;
 }
 
-.api-key-balance-channel-name--link > span,
-.api-key-balance-management-url > span {
+.api-key-balance-channel-name--link > span {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.api-key-balance-channel-name--link > .middle-ellipsis-text {
+  text-overflow: clip;
+}
+
 .api-key-balance-channel-name--link:hover,
-.api-key-balance-channel-name--link:focus-visible,
-.api-key-balance-management-url:hover,
-.api-key-balance-management-url:focus-visible {
+.api-key-balance-channel-name--link:focus-visible {
   color: var(--ink);
   text-decoration: underline;
 }
 
-.api-key-balance-amount {
+.api-key-balance-values {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.api-key-balance-value {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.api-key-balance-value small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.api-key-balance-value strong {
   color: var(--ink);
-  font-size: 18px;
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.api-key-balance-amount--platform {
-  grid-area: platform;
-  justify-self: end;
-  text-align: right;
-}
-
-.api-key-balance-amount--adjusted {
+.api-key-balance-value--adjusted strong {
   color: var(--green);
-  grid-area: adjusted;
-  justify-self: end;
-  text-align: right;
 }
 
 .api-key-channel-accounts {
@@ -8740,9 +8779,12 @@ button.api-key-group-chip--more {
     justify-self: end;
   }
 
+  .api-key-balance-summary-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .api-key-balance-channel-card {
-    gap: 7px 9px;
-    padding: 9px;
+    padding: 8px;
   }
 
   .api-key-monitor-summary {
@@ -8856,20 +8898,21 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-card {
-  height: 368px;
+  height: 371px;
 }
 
 .api-key-channel-groups {
   align-content: start;
   box-sizing: border-box;
-  height: 98px;
-  min-height: 98px;
+  height: 101px;
+  min-height: 101px;
 }
 
 .api-key-group-chips {
   align-content: flex-start;
-  max-height: 53px;
-  min-height: 53px;
+  max-height: 55px;
+  min-height: 55px;
+  padding-bottom: 2px;
 }
 
 .api-key-channel-balance-chips,
@@ -8930,7 +8973,9 @@ button.api-key-group-chip--more {
 
 .api-key-change-event-row {
   border-left: 4px solid var(--info-ink);
-  grid-template-columns: minmax(300px, 1.25fr) minmax(220px, 0.75fr);
+  border-bottom: 4px solid color-mix(in srgb, var(--line) 76%, var(--panel-2));
+  grid-template-columns: minmax(300px, 1fr) minmax(360px, 1fr);
+  min-height: 78px;
 }
 
 .api-key-change-event-row--group {
@@ -8961,15 +9006,112 @@ button.api-key-group-chip--more {
   color: var(--ok-ink);
 }
 
-.api-key-change-event-row .api-key-rate-log-identity > strong,
-.api-key-change-event-row .api-key-rate-log-identity > span {
-  color: var(--muted);
-  font-size: 13px;
+.api-key-change-event-row .api-key-rate-log-identity {
+  align-content: center;
+  gap: 5px;
+  grid-template-rows: 22px 24px;
+  min-height: 51px;
 }
 
-.api-key-change-event-row .api-key-rate-log-identity b {
+.api-key-change-identity-head,
+.api-key-change-identity-route,
+.api-key-change-message-line {
+  align-items: center;
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.api-key-change-identity-head {
+  gap: 7px;
+}
+
+.api-key-change-identity-head .api-key-change-category,
+.api-key-change-identity-head .api-key-unread-chip {
+  flex: 0 0 auto;
+}
+
+.api-key-change-identity-route {
+  color: var(--muted);
+  font-size: 12px;
+  gap: 18px;
+}
+
+.api-key-change-identity-route > span {
+  align-items: baseline;
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.api-key-change-identity-route > span:first-child {
+  flex: 0 1 46%;
+}
+
+.api-key-change-identity-route > span:last-child {
+  flex: 1 1 54%;
+}
+
+.api-key-change-identity-route b {
   color: var(--ink);
-  font-size: 15px;
+  font-size: 13px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.api-key-change-event-row .api-key-rate-log-cell--primary {
+  gap: 4px;
+  grid-template-rows: repeat(2, minmax(22px, 1fr));
+  min-height: 51px;
+  padding: 3px 9px;
+}
+
+.api-key-change-message-line {
+  gap: 7px;
+  min-height: 22px;
+}
+
+.api-key-change-message-line--primary > span:first-child {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.api-key-change-message-line .api-key-rate-log-flow {
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+
+.api-key-change-message-line .api-key-rate-log-flow b,
+.api-key-change-message-line .api-key-rate-log-flow strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.api-key-change-message-line .api-key-group-rate-detail {
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.api-key-change-message-line .api-key-group-rate-detail > span,
+.api-key-change-message-line .api-key-group-rate-detail > strong {
+  flex: 0 0 auto;
+}
+
+.api-key-change-message-line .api-key-group-rate-detail--composite {
+  border-left: 1px dashed var(--line);
+  border-top: 0;
+  padding-left: 7px;
+  padding-top: 0;
 }
 
 .api-key-ledger-time,
@@ -9010,6 +9152,7 @@ button.api-key-group-chip--more {
 
 .api-key-scheduling-event-row {
   align-items: center;
+  border-bottom: 4px solid color-mix(in srgb, var(--line) 76%, var(--panel-2));
 }
 
 .api-key-scheduling-field {
@@ -9093,7 +9236,7 @@ button.api-key-group-chip--more {
   }
 
   .api-key-channel-card {
-    height: 437px;
+    height: 440px;
   }
 
   .api-key-ledger-sticky {
@@ -9112,10 +9255,21 @@ button.api-key-group-chip--more {
 
 @media (max-width: 420px) {
   .api-key-channel-card {
-    height: 437px;
+    height: 440px;
   }
 }
 
 .api-key-rate-log-panel {
   overflow: clip;
+}
+
+@media (max-width: 760px) {
+  .api-key-change-event-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .api-key-change-event-row .api-key-rate-log-identity {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 7px;
+  }
 }

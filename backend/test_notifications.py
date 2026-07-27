@@ -24,6 +24,7 @@ from app.services.notifications import (
     enqueue_upstream_group_changed,
     enqueue_upstream_group_multiplier_changed,
 )
+from app.services.runtime_config import RuntimeConfigService
 
 
 def _notification_config(**overrides):
@@ -34,6 +35,7 @@ def _notification_config(**overrides):
         "account_enabled_enabled": True,
         "api_key_rate_changed_enabled": True,
         "upstream_balance_low_enabled": True,
+        "upstream_channel_token_invalid_enabled": False,
         "discord_bot_token": "bot-secret",
         "discord_channel_id": "123456",
     }
@@ -294,6 +296,25 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_upstream_token_invalid_event_deduplicates_by_credential(self) -> None:
         observed_at = datetime(2026, 7, 21, 9, 30, tzinfo=timezone.utc)
+        runtime = RuntimeConfigService(
+            SimpleNamespace(
+                discord_bot_notifications_enabled=False,
+                discord_bot_token="",
+                discord_bot_channel_id="",
+                notify_upstream_token_invalid=False,
+            )
+        )
+
+        async def load_notification_values() -> dict[str, str]:
+            return {
+                "discord_bot_notifications_enabled": "true",
+                "notify_upstream_token_invalid": "true",
+            }
+
+        runtime._load_values = load_notification_values
+        config = await runtime.get_notification_config()
+        self.assertTrue(config["upstream_channel_token_invalid_enabled"])
+
         async with self.sessions() as db:
             first = await enqueue_upstream_channel_token_invalid(
                 db,
@@ -301,9 +322,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
                 channel_name="哈基米",
                 credential_fingerprint="credential-a",
                 observed_at=observed_at,
-                runtime_config=_RuntimeConfig(
-                    _notification_config(upstream_channel_token_invalid_enabled=True)
-                ),
+                runtime_config=runtime,
             )
             second = await enqueue_upstream_channel_token_invalid(
                 db,
@@ -311,9 +330,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
                 channel_name="哈基米",
                 credential_fingerprint="credential-a",
                 observed_at=observed_at + timedelta(minutes=5),
-                runtime_config=_RuntimeConfig(
-                    _notification_config(upstream_channel_token_invalid_enabled=True)
-                ),
+                runtime_config=runtime,
             )
             await db.commit()
 

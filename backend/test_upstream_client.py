@@ -386,6 +386,183 @@ class UpstreamClientTests(unittest.TestCase):
         )
         self.assertEqual(uptime_headers[1:], (None, None))
 
+    def test_newapi_scalar_group_prefers_authoritative_string_id_after_rename(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/user/self/groups":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": [
+                            {"id": "vip", "name": "VIP renamed", "ratio": 1.8},
+                            {"id": "gold", "name": "vip", "ratio": 3.0},
+                        ],
+                    },
+                )
+            if target == "/api/token/?p=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "items": [{
+                                "id": 41,
+                                "key": "sk-account-complete",
+                                "group": "vip",
+                                "status": 1,
+                            }],
+                        },
+                    },
+                )
+            return httpx.Response(404, json={"message": "missing"})
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            api_key="sk-account-complete",
+            access_token="newapi-management-token",
+            new_api_user=7,
+            account_api_keys={7: "sk-account-complete"},
+        )
+
+        state = result.account_upstream_states[7]
+        self.assertEqual(state.group_id, "vip")
+        self.assertEqual(state.group_status, "available")
+        self.assertEqual(result.account_group_matches[7].id, "vip")
+        self.assertEqual(result.account_group_matches[7].name, "VIP renamed")
+        self.assertEqual(result.account_group_matches[7].multiplier, 1.8)
+        self.assertIsNotNone(result.matched_group)
+        self.assertEqual(result.matched_group.id, "vip")
+        self.assertEqual(result.matched_group.multiplier, 1.8)
+
+    def test_explicit_group_id_never_falls_back_to_a_same_named_group(self) -> None:
+        account_key = "sk-explicit-group-id"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": [
+                            {
+                                "id": "current-id",
+                                "name": "Shared name",
+                                "rate_multiplier": 1.5,
+                            }
+                        ],
+                    },
+                )
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 21,
+                                    "key": account_key,
+                                    "group_id": "deleted-id",
+                                    "group_name": "Shared name",
+                                    "status": "active",
+                                }
+                            ]
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            api_key=account_key,
+            account_api_keys={7: account_key},
+            selected_group_id="deleted-id",
+            selected_group_name="Shared name",
+        )
+
+        self.assertIsNone(result.matched_group)
+        self.assertNotIn(7, result.account_group_matches)
+        state = result.account_upstream_states[7]
+        self.assertEqual(state.group_id, "deleted-id")
+        self.assertEqual(state.group_name, "Shared name")
+        self.assertEqual(state.group_status, "deleted")
+
+    def test_group_discovery_preserves_different_ids_with_the_same_name(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/user/self/groups":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": [
+                            {"id": "group-a", "name": "Shared", "ratio": 1.5}
+                        ],
+                    },
+                )
+            if target == "/api/pricing":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "groups": [
+                                {"id": "group-b", "name": "Shared", "ratio": 2.5}
+                            ]
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(handler, upstream_type="newapi")
+
+        self.assertEqual(
+            [(group.id, group.name, group.multiplier) for group in result.groups],
+            [
+                ("group-a", "Shared", 1.5),
+                ("group-b", "Shared", 2.5),
+            ],
+        )
+
+    def test_rate_override_with_group_id_does_not_fall_back_to_name(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": [
+                            {"id": "group-a", "name": "Shared", "rate_multiplier": 1.5}
+                        ],
+                    },
+                )
+            if target == "/api/v1/groups/rates":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": [
+                            {
+                                "group_id": "missing-id",
+                                "group_name": "Shared",
+                                "rate_multiplier": 9.0,
+                            }
+                        ],
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(handler, upstream_type="sub2api")
+
+        self.assertEqual(len(result.groups), 1)
+        self.assertEqual(result.groups[0].id, "group-a")
+        self.assertEqual(result.groups[0].multiplier, 1.5)
+
     def test_newapi_batch_matches_masked_and_full_keys_without_leaking_secrets(self) -> None:
         alpha_key = "sk-local-alpha-secret-Z7Q9"
         beta_key = "sk-local-beta-secret-X6P8"
@@ -1317,7 +1494,7 @@ class UpstreamClientTests(unittest.TestCase):
             "payment.checkout-info.balance_recharge_multiplier",
         )
 
-    def test_sub2api_unique_mask_keeps_group_fields_without_reveal(self) -> None:
+    def test_sub2api_unique_mask_requires_full_detail_before_group_binding(self) -> None:
         account_key = "sk-sub2-account-secret-Q4M6"
         reveal_calls = 0
 
@@ -1353,11 +1530,143 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(reveal_calls, 0)
+        self.assertEqual(reveal_calls, 1)
         self.assertEqual(result.account_group_matches[7].id, "2")
         self.assertEqual(result.account_group_matches[7].name, "premium")
         self.assertEqual(result.account_group_matches[7].multiplier, 2.75)
         self.assertNotIn(account_key, json.dumps(result.as_dict()))
+
+    def test_sub2api_masked_key_detail_must_return_a_full_exact_key(self) -> None:
+        account_key = "sk-sub2-account-secret-Q4M6"
+        for detail_payload in (
+            None,
+            {"code": 0, "data": {"id": 21, "key": "sk****Q4M6"}},
+        ):
+            with self.subTest(detail_payload=detail_payload):
+                detail_requests: list[str] = []
+                usage_requests: list[str] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    target = request_target(request)
+                    if target == "/api/v1/groups/available":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": [
+                                    {"id": 2, "name": "premium", "rate_multiplier": 1.5}
+                                ],
+                            },
+                        )
+                    if target == "/api/v1/keys?page=1&page_size=200":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "items": [
+                                        {
+                                            "id": 21,
+                                            "key": "sk****Q4M6",
+                                            "group_id": 2,
+                                            "status": "active",
+                                        }
+                                    ],
+                                    "total": 1,
+                                },
+                            },
+                        )
+                    if target == "/api/v1/keys/21":
+                        detail_requests.append(target)
+                        if detail_payload is None:
+                            return httpx.Response(503)
+                        return httpx.Response(200, json=detail_payload)
+                    if request.url.path == SUB2API_API_KEY_USAGE_ENDPOINT:
+                        usage_requests.append(request.url.path)
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "stats": {
+                                        "21": {
+                                            "api_key_id": 21,
+                                            "today_actual_cost": 4.25,
+                                        }
+                                    }
+                                },
+                            },
+                        )
+                    return httpx.Response(404)
+
+                result = self.run_discovery(
+                    handler,
+                    upstream_type="sub2api",
+                    api_key=account_key,
+                    access_token="sub2-management-token",
+                    account_api_keys={7: account_key},
+                )
+
+                self.assertEqual(detail_requests, ["/api/v1/keys/21"])
+                self.assertEqual(usage_requests, [])
+                self.assertIsNone(result.matched_group)
+                self.assertIsNone(result.matched_account_state)
+                self.assertNotIn(7, result.account_group_matches)
+                self.assertNotIn(7, result.account_upstream_states)
+
+    def test_sub2api_failed_pagination_cannot_make_a_masked_candidate_authoritative(self) -> None:
+        account_key = "sk-sub2-account-secret-Q4M6"
+        requested_targets: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            requested_targets.append(target)
+            if target == "/api/v1/groups/available":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": [{"id": 2, "name": "premium", "rate_multiplier": 1.5}],
+                    },
+                )
+            if target == "/api/v1/keys?page=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 21, "key": "sk****Q4M6", "group_id": 2}
+                            ],
+                            "page": 1,
+                            "page_size": 200,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys?page=2&page_size=200":
+                return httpx.Response(503)
+            if target == "/api/v1/keys/21":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {"id": 21, "key": "sk-another-account-Q4M6"},
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2-management-token",
+            account_api_keys={7: account_key},
+        )
+
+        self.assertIn("/api/v1/keys?page=2&page_size=200", requested_targets)
+        self.assertIn("/api/v1/keys/21", requested_targets)
+        self.assertNotIn(7, result.account_group_matches)
+        self.assertNotIn(7, result.account_upstream_states)
 
     def test_sub2api_ignores_orphaned_numeric_group_ids_without_name_or_rate(self) -> None:
         valid_key = "sk-sub2-valid-secret-A1B2"
@@ -2196,7 +2505,7 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(later_page_requests, [])
         self.assertEqual(reveal_requests, [])
 
-    def test_cached_sub2api_key_record_id_uses_page_one_without_reveal(self) -> None:
+    def test_cached_sub2api_masked_page_record_fails_closed_when_detail_fails(self) -> None:
         detail_requests: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -2239,10 +2548,9 @@ class UpstreamClientTests(unittest.TestCase):
             account_api_key_record_ids={7: 41},
         )
 
-        state = result.account_upstream_states[7]
-        self.assertEqual(state.key_record_id, 41)
-        self.assertEqual(state.usage_amount, 3.25)
-        self.assertEqual(detail_requests, [])
+        self.assertNotIn(7, result.account_upstream_states)
+        self.assertGreaterEqual(len(detail_requests), 1)
+        self.assertEqual(set(detail_requests), {"/api/v1/keys/41"})
 
     def test_discovery_wrapper_forwards_cached_api_key_record_ids(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -2257,6 +2565,18 @@ class UpstreamClientTests(unittest.TestCase):
                         "data": {
                             "items": [{"id": 41, "key": "sk****rget", "status": "active"}],
                             "total": 1,
+                        },
+                    },
+                )
+            if target == "/api/v1/keys/41":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "id": 41,
+                            "key": "sk-page-one-target",
+                            "status": "active",
                         },
                     },
                 )
@@ -2367,7 +2687,14 @@ class UpstreamClientTests(unittest.TestCase):
                 detail_requests.append(target)
                 return httpx.Response(
                     200,
-                    json={"code": 0, "data": {"id": 401, "key": "sk****page", "status": "active"}},
+                    json={
+                        "code": 0,
+                        "data": {
+                            "id": 401,
+                            "key": "sk-record-on-later-page",
+                            "status": "active",
+                        },
+                    },
                 )
             if target.startswith("/api/v1/keys?page="):
                 later_page_requests.append(target)
@@ -2439,8 +2766,11 @@ class UpstreamClientTests(unittest.TestCase):
                     account_api_key_record_ids={7: 401},
                 )
 
-                state = result.account_upstream_states[7]
-                self.assertEqual(state.key_record_id, 401)
+                if "*" in detail_key:
+                    self.assertNotIn(7, result.account_upstream_states)
+                else:
+                    state = result.account_upstream_states[7]
+                    self.assertEqual(state.key_record_id, 401)
                 self.assertEqual(len(detail_requests), 1)
                 detail_request = detail_requests[0]
                 self.assertEqual(detail_request.method, "GET")
@@ -2450,6 +2780,60 @@ class UpstreamClientTests(unittest.TestCase):
                     "Bearer newapi-management-token",
                 )
                 self.assertEqual(detail_request.headers.get("New-Api-User"), "17")
+
+    def test_cached_newapi_masked_list_record_requires_full_detail_match(self) -> None:
+        detail_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/user/self/groups":
+                return httpx.Response(200, json={"success": True, "data": {}})
+            if target == "/api/token/?p=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "items": [{
+                                "id": 401,
+                                "key": "sk**********Z7Q9",
+                                "status": 1,
+                            }],
+                            "total": 1,
+                        },
+                    },
+                )
+            if target == "/api/token/401":
+                detail_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "id": 401,
+                            "key": "sk-another-account-with-Z7Q9",
+                            "status": 1,
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            api_key="sk-cached-newapi-target-Z7Q9",
+            access_token="newapi-management-token",
+            new_api_user=17,
+            account_api_keys={7: "sk-cached-newapi-target-Z7Q9"},
+            account_api_key_record_ids={7: 401},
+        )
+
+        self.assertNotIn(7, result.account_upstream_states)
+        self.assertIsNone(result.matched_account_state)
+        self.assertEqual(
+            [request_target(request) for request in detail_requests],
+            ["/api/token/401"],
+        )
 
     def test_cached_newapi_key_record_id_rejects_detail_for_another_key(self) -> None:
         detail_requests: list[httpx.Request] = []

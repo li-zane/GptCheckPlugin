@@ -438,10 +438,6 @@ export type AppSettings = {
   channel_monitor_fallback_test_attempts: number;
   channel_monitor_recovery_test_attempts: number;
   available_test_models: AccountLivenessModel[];
-  api_key_auto_pause_on_upstream_rate_increase_enabled?: boolean;
-  upstream_rate_pause_mode?: "increase_percent" | "absolute_multiplier";
-  upstream_rate_increase_threshold_percent?: number;
-  upstream_rate_absolute_threshold?: number;
   upstream_negative_balance_basis: "wallet" | "recharge_adjusted";
   upstream_balance_pause_threshold: number;
   show_stale_negative_balance_alert: boolean;
@@ -457,6 +453,7 @@ export type AppSettings = {
   notify_api_key_rate_changed: boolean;
   notify_upstream_group_changed: boolean;
   notify_upstream_balance_low: boolean;
+  notify_upstream_token_invalid: boolean;
   usage_limit_sample_five_hour_threshold_percent: number;
   usage_limit_sample_seven_day_threshold_percent: number;
   usage_limit_default_ranges: UsageLimitDefaultRanges;
@@ -516,10 +513,6 @@ export type AppSettingsUpdate = {
   channel_monitor_fallback_test_model?: string;
   channel_monitor_fallback_test_attempts?: number;
   channel_monitor_recovery_test_attempts?: number;
-  api_key_auto_pause_on_upstream_rate_increase_enabled?: boolean;
-  upstream_rate_pause_mode?: "increase_percent" | "absolute_multiplier";
-  upstream_rate_increase_threshold_percent?: number;
-  upstream_rate_absolute_threshold?: number;
   upstream_negative_balance_basis?: "wallet" | "recharge_adjusted";
   upstream_balance_pause_threshold?: number;
   show_stale_negative_balance_alert?: boolean;
@@ -535,6 +528,7 @@ export type AppSettingsUpdate = {
   notify_api_key_rate_changed?: boolean;
   notify_upstream_group_changed?: boolean;
   notify_upstream_balance_low?: boolean;
+  notify_upstream_token_invalid?: boolean;
   usage_limit_sample_five_hour_threshold_percent?: number;
   usage_limit_sample_seven_day_threshold_percent?: number;
   usage_limit_default_ranges?: UsageLimitDefaultRanges;
@@ -573,6 +567,8 @@ export type UpstreamGroupOption = {
   multiplier: number;
 };
 
+export type PriorityAllocationStrategy = "cost_optimized" | "fixed_step";
+
 export type PriorityInterval = {
   id: number | string;
   name: string;
@@ -580,11 +576,10 @@ export type PriorityInterval = {
   /** Exclusive upper bound. */
   end_priority: number;
   step: number;
+  allocation_strategy: PriorityAllocationStrategy;
   account_count?: number;
   effective_step?: number;
   rate_pause_enabled: boolean;
-  rate_pause_mode: "increase_percent" | "absolute_multiplier";
-  rate_increase_threshold_percent: number;
   rate_absolute_threshold: number;
   created_at?: string | null;
   updated_at?: string | null;
@@ -595,9 +590,8 @@ export type PriorityIntervalInput = {
   start_priority: number;
   end_priority: number;
   step: number;
+  allocation_strategy: PriorityAllocationStrategy;
   rate_pause_enabled: boolean;
-  rate_pause_mode: "increase_percent" | "absolute_multiplier";
-  rate_increase_threshold_percent: number;
   rate_absolute_threshold: number;
 };
 
@@ -684,8 +678,6 @@ export type UpstreamAccount = {
   rate_pause_policy?: "inherit" | "disabled" | "custom";
   rate_pause_effective_enabled?: boolean;
   rate_pause_effective_source?: "account" | "priority_interval" | "disabled";
-  rate_pause_mode?: "increase_percent" | "absolute_multiplier" | null;
-  rate_increase_threshold_percent?: number | null;
   rate_absolute_threshold?: number | null;
   composite_multiplier?: number | null;
   managed?: boolean;
@@ -789,8 +781,6 @@ export type UpstreamAccountUpdate = {
   manual_recharge_multiplier?: number | null;
   priority_assignment_when_disabled?: boolean | null;
   rate_pause_policy?: "inherit" | "disabled" | "custom";
-  rate_pause_mode?: "increase_percent" | "absolute_multiplier";
-  rate_increase_threshold_percent?: number | null;
   rate_absolute_threshold?: number | null;
   availability_check_mode?: "channel_monitor" | "independent_model" | "disabled";
   availability_monitor_id?: number | string | null;

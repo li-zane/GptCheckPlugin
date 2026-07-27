@@ -180,10 +180,6 @@ async def update_settings(
         "channel_monitor_fallback_test_model",
         "channel_monitor_fallback_test_attempts",
         "channel_monitor_recovery_test_attempts",
-        "api_key_auto_pause_on_upstream_rate_increase_enabled",
-        "upstream_rate_pause_mode",
-        "upstream_rate_increase_threshold_percent",
-        "upstream_rate_absolute_threshold",
         "api_key_auto_pause_on_negative_balance_enabled",
         "upstream_negative_balance_basis",
         "upstream_balance_pause_threshold",
@@ -245,6 +241,7 @@ async def update_settings(
         "notify_api_key_rate_changed",
         "notify_upstream_group_changed",
         "notify_upstream_balance_low",
+        "notify_upstream_token_invalid",
         })
     ):
         get_notification_dispatcher().wake()

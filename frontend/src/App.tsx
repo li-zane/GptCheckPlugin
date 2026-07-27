@@ -49,6 +49,7 @@ import { createContext, FormEvent, lazy, Suspense, useCallback, useContext, useE
 
 import { api, AUTH_EXPIRED_EVENT, upstreamLegacyBindingCounts } from "./api";
 import { HelpPopover } from "./HelpPopover";
+import { MiddleEllipsisText } from "./MiddleEllipsisText";
 import { oauthUsageBackgroundRefreshIntervals } from "./oauthUsageRefresh";
 import {
   persistOverviewBalanceAlertDismissed,
@@ -67,6 +68,7 @@ import {
   moveFallbackModel,
   normalizeFallbackModelChain,
 } from "./fallbackModelChain";
+import { LatestRequestCoordinator } from "./latestRequest";
 import {
   apiAccountLegacyBindingConfirmationMessage,
   apiAccountSyncMessage,
@@ -95,6 +97,10 @@ import {
   type UsageSampleSortField,
 } from "./usageSampleSort";
 import {
+  clearChangeLogCache,
+  getChangeLogSessionStorage,
+} from "./changeLogCache";
+import {
   clearUpstreamOverviewCache,
   getUpstreamOverviewSessionStorage,
   readUpstreamOverviewCache,
@@ -108,6 +114,17 @@ import {
   type AppRoute,
   type View,
 } from "./viewRouting";
+import {
+  accountMatchesUsageDetailFilter,
+  buildDisplayedUsageEstimate,
+  usageDetailAccountCounts,
+  usageDetailAccountRateLimited,
+  usageDetailAccountVisible,
+  usageEstimateHeaderStats,
+  usageProblemAccountUnusedQuota,
+  type ProblemUnusedQuotaSummary,
+  type UsageDetailAccountFilter,
+} from "./usageEstimatePresentation";
 import type {
   Account,
   AccountExceptionRecord,
@@ -149,15 +166,18 @@ const HistoryView = lazy(async () => ({
 type Theme = "light" | "dark";
 type AccountCounts = { actual: number; deduped: number; duplicates: number };
 type AccountStatusFilter = "all" | "normal" | "normal-no-rate-limit" | "five-hour-rate-limited" | "seven-day-rate-limited" | "monthly-rate-limited" | "error" | "deactive";
-type UsageDetailAccountFilter = "normal" | "rate-limited";
 type AccountSortField = "account" | "imported_at";
 type SortDirection = "asc" | "desc";
 type AccountJumpTarget = { email: string | null; sub2apiAccountId: string | null; requestedAt: number };
-type ProblemUnusedQuotaSummary = { accountCount: number; fiveHour: UsageWindowAggregate; sevenDay: UsageWindowAggregate };
 
 const defaultTimeZone = "Asia/Shanghai";
 const defaultSiteName = "sub2api AT 刷新机";
 const defaultUsageLimitSampleThresholdPercent = 99;
+
+function clearFrontendSessionCaches() {
+  clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+  clearChangeLogCache(getChangeLogSessionStorage());
+}
 const usageLimitWindowKeys = ["five_hour", "seven_day", "monthly"] as const;
 const coreSubscriptionTypes = new Set(["plus", "team", "pro", "free", "k12", "unknown"]);
 const seatBasedSubscriptionTypes = new Set(["team", "k12", "enterprise", "enterprise-edu", "edu"]);
@@ -270,6 +290,7 @@ const emptySettings: AppSettings = {
   notify_api_key_rate_changed: false,
   notify_upstream_group_changed: false,
   notify_upstream_balance_low: false,
+  notify_upstream_token_invalid: false,
   usage_limit_sample_five_hour_threshold_percent: 0,
   usage_limit_sample_seven_day_threshold_percent: 0,
   usage_limit_default_ranges: defaultUsageLimitRanges,
@@ -323,6 +344,8 @@ function App() {
   const apiKeySyncOperationRef = useRef(false);
   const oauthUsageRefreshGenerationRef = useRef(0);
   const oauthUsageRefreshTimersRef = useRef(new Set<number>());
+  const usageEstimateRequestsRef = useRef(new LatestRequestCoordinator());
+  const usageEstimateRefreshRequestRef = useRef<Promise<UsageEstimate> | null>(null);
   const [usageEstimate, setUsageEstimate] = useState<UsageEstimate | null>(null);
   const [usageLimitSamples, setUsageLimitSamples] = useState<UsageLimitSamples | null>(null);
   const [usageLimitSamplesLoading, setUsageLimitSamplesLoading] = useState(false);
@@ -412,6 +435,12 @@ function App() {
     if (safeResponse) setApiKeyAccountsCache(response);
   }, []);
 
+  const resetUsageEstimateRequests = useCallback(() => {
+    usageEstimateRequestsRef.current.invalidate();
+    usageEstimateRefreshRequestRef.current = null;
+    setUsageLoading(false);
+  }, []);
+
   const loadAll = useCallback(async ({ includePhones = true }: { includePhones?: boolean } = {}) => {
     if (settingsMutationPendingRef.current) return;
     const requestSequence = ++loadAllRequestSequenceRef.current;
@@ -452,8 +481,11 @@ function App() {
         : readUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url);
       setApiKeyAccountsCache(nextUpstreamOverview || cachedOverview);
     } else if (upstreamOverviewCacheScope(previousBaseUrl) !== upstreamOverviewCacheScope(nextSettings.sub2api_base_url)) {
-      clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+      clearFrontendSessionCaches();
       apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+      setUsageEstimate(null);
+      setUsageLimitSamples(null);
+      resetUsageEstimateRequests();
       const safeOverview = nextUpstreamOverview
         ? writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url, nextUpstreamOverview)
         : null;
@@ -463,7 +495,7 @@ function App() {
       if (nextUpstreamOverview) cacheApiKeyAccounts(nextUpstreamOverview, nextSettings.sub2api_base_url);
     }
     setSettings((current) => (appSettingsEqual(current, nextSettings) ? current : nextSettings));
-  }, [cacheApiKeyAccounts]);
+  }, [cacheApiKeyAccounts, resetUsageEstimateRequests]);
 
   const usageByEmail = useMemo(() => {
     const entries: Array<readonly [string, AccountUsageEstimate]> = [];
@@ -495,21 +527,48 @@ function App() {
   const accountCounts = useMemo(() => accountDisplayCounts(accounts), [accounts]);
   const problemUnusedQuota = useMemo(() => (usageEstimate ? usageProblemAccountUnusedQuota(usageEstimate.accounts) : null), [usageEstimate]);
 
-  const loadUsageEstimate = useCallback(async (refresh = true) => {
+  const loadUsageEstimate = useCallback((refresh = true): Promise<UsageEstimate> => {
+    const activeRefresh = usageEstimateRefreshRequestRef.current;
+    if (activeRefresh) return activeRefresh;
+
+    const request = usageEstimateRequestsRef.current.beginForeground();
     setUsageLoading(true);
     setUsageError("");
-    try {
-      const nextEstimate = await api.usageEstimate(refresh);
-      setUsageEstimate(nextEstimate);
-      setUsageEstimateRefreshed(refresh);
-      return nextEstimate;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "额度估算读取失败";
-      setUsageError(message);
-      throw error;
-    } finally {
-      setUsageLoading(false);
+    const requestPromise = (async () => {
+      try {
+        const nextEstimate = await api.usageEstimate(refresh);
+        if (request.isCurrent()) {
+          setUsageEstimate(nextEstimate);
+          setUsageEstimateRefreshed(refresh);
+        }
+        return nextEstimate;
+      } catch (error) {
+        if (request.isCurrent()) {
+          const message = error instanceof Error ? error.message : "额度估算读取失败";
+          setUsageError(message);
+        }
+        throw error;
+      } finally {
+        if (request.finish()) setUsageLoading(false);
+      }
+    })();
+
+    if (refresh) {
+      usageEstimateRefreshRequestRef.current = requestPromise;
+      void requestPromise.then(
+        () => {
+          if (usageEstimateRefreshRequestRef.current === requestPromise) {
+            usageEstimateRefreshRequestRef.current = null;
+          }
+        },
+        () => {
+          if (usageEstimateRefreshRequestRef.current === requestPromise) {
+            usageEstimateRefreshRequestRef.current = null;
+          }
+        },
+      );
     }
+    return requestPromise;
   }, []);
 
   const cancelOAuthUsageBackgroundRefresh = useCallback(() => {
@@ -528,14 +587,25 @@ function App() {
       const timer = window.setTimeout(async () => {
         oauthUsageRefreshTimersRef.current.delete(timer);
         if (generation !== oauthUsageRefreshGenerationRef.current) return;
+        const request = usageEstimateRequestsRef.current.beginBackground();
+        if (!request) {
+          scheduleNext(index + 1);
+          return;
+        }
         try {
           const nextEstimate = await api.usageEstimate(false);
-          if (generation !== oauthUsageRefreshGenerationRef.current) return;
-          setUsageEstimate(nextEstimate);
-          setUsageEstimateRefreshed(true);
-          setUsageError("");
+          if (
+            generation === oauthUsageRefreshGenerationRef.current
+            && request.isCurrent()
+          ) {
+            setUsageEstimate(nextEstimate);
+            setUsageEstimateRefreshed(true);
+            setUsageError("");
+          }
         } catch {
           // A later bounded retry can still pick up the completed background snapshot.
+        } finally {
+          request.finish();
         }
         scheduleNext(index + 1);
       }, intervals[index]);
@@ -622,16 +692,17 @@ function App() {
 
   useEffect(() => {
     const handleAuthExpired = () => {
-      clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+      clearFrontendSessionCaches();
       apiKeyAccountsCacheBaseUrlRef.current = null;
       setApiKeyAccountsCache(null);
       setUsageEstimate(null);
       setUsageLimitSamples(null);
+      resetUsageEstimateRequests();
       setAuthState("out");
     };
     window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
     return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
-  }, []);
+  }, [resetUsageEstimateRequests]);
 
   useEffect(() => {
     api
@@ -645,12 +716,15 @@ function App() {
         }
       })
       .catch(() => {
-        clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+        clearFrontendSessionCaches();
         apiKeyAccountsCacheBaseUrlRef.current = null;
         setApiKeyAccountsCache(null);
+        setUsageEstimate(null);
+        setUsageLimitSamples(null);
+        resetUsageEstimateRequests();
         setAuthState("out");
       });
-  }, [loadAll]);
+  }, [loadAll, resetUsageEstimateRequests]);
 
   useEffect(() => {
     if (authState !== "in") return;
@@ -804,9 +878,12 @@ function App() {
         nextSettings.sub2api_base_url !== previousSub2ApiBaseUrl
         || changesSub2ApiCredential
       ) {
-        clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+        clearFrontendSessionCaches();
         apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
         setApiKeyAccountsCache(null);
+        setUsageEstimate(null);
+        setUsageLimitSamples(null);
+        resetUsageEstimateRequests();
       }
       setNotice(brandingError ? `其他设置已保存，但 Logo 更新失败：${brandingError}` : "设置已保存");
       await loadAll().catch((error) => {
@@ -1019,9 +1096,12 @@ function App() {
                 await api.logout();
               } finally {
                 setBusy(false);
-                clearUpstreamOverviewCache(getUpstreamOverviewSessionStorage());
+                clearFrontendSessionCaches();
                 apiKeyAccountsCacheBaseUrlRef.current = null;
                 setApiKeyAccountsCache(null);
+                setUsageEstimate(null);
+                setUsageLimitSamples(null);
+                resetUsageEstimateRequests();
                 setAuthState("out");
               }
             }}
@@ -3998,7 +4078,11 @@ function PhoneSourceDetails({
 
   return (
     <div className="phone-source-stack">
-      {primaryText ? <span className="mono phone-source-primary">{primaryText}</span> : null}
+      {primaryText ? (
+        isPhoneUrlSource(primaryText)
+          ? <MiddleEllipsisText className="mono phone-source-primary" text={primaryText} />
+          : <span className="mono phone-source-primary">{primaryText}</span>
+      ) : null}
       <div className="account-chip-list">
         {smsCdk ? (
           <button className="phone-source-tag" onClick={onCopy} type="button">
@@ -4962,6 +5046,9 @@ function SettingsView({
   const [notifyApiKeyRateChanged, setNotifyApiKeyRateChanged] = useState(settings.notify_api_key_rate_changed ?? false);
   const [notifyUpstreamGroupChanged, setNotifyUpstreamGroupChanged] = useState(settings.notify_upstream_group_changed ?? false);
   const [notifyUpstreamBalanceLow, setNotifyUpstreamBalanceLow] = useState(settings.notify_upstream_balance_low ?? false);
+  const [notifyUpstreamTokenInvalid, setNotifyUpstreamTokenInvalid] = useState(
+    settings.notify_upstream_token_invalid ?? false,
+  );
   const [upstreamRateLogRetentionDays, setUpstreamRateLogRetentionDays] = useState(
     String(settings.upstream_rate_log_retention_days || 90),
   );
@@ -5075,6 +5162,7 @@ function SettingsView({
     setNotifyApiKeyRateChanged(settings.notify_api_key_rate_changed ?? false);
     setNotifyUpstreamGroupChanged(settings.notify_upstream_group_changed ?? false);
     setNotifyUpstreamBalanceLow(settings.notify_upstream_balance_low ?? false);
+    setNotifyUpstreamTokenInvalid(settings.notify_upstream_token_invalid ?? false);
     setUpstreamRateLogRetentionDays(String(settings.upstream_rate_log_retention_days || 90));
     setUsageLimitSampleFiveHourThreshold(String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0));
     setUsageLimitSampleSevenDayThreshold(String(settings.usage_limit_sample_seven_day_threshold_percent ?? 0));
@@ -5132,6 +5220,7 @@ function SettingsView({
     settings.notify_api_key_rate_changed,
     settings.notify_upstream_group_changed,
     settings.notify_upstream_balance_low,
+    settings.notify_upstream_token_invalid,
     settings.browser_min_available_memory_mb,
     settings.browser_refresh_max_concurrency,
     settings.display_timezone,
@@ -5366,6 +5455,7 @@ function SettingsView({
       notify_api_key_rate_changed: notifyApiKeyRateChanged,
       notify_upstream_group_changed: notifyUpstreamGroupChanged,
       notify_upstream_balance_low: notifyUpstreamBalanceLow,
+      notify_upstream_token_invalid: notifyUpstreamTokenInvalid,
       usage_limit_sample_five_hour_threshold_percent: usageLimitSampleFiveHourThresholdNumber,
       usage_limit_sample_seven_day_threshold_percent: usageLimitSampleSevenDayThresholdNumber,
       usage_limit_default_ranges: usageLimitDefaultRanges,
@@ -6180,6 +6270,10 @@ function SettingsView({
                 <input checked={notifyUpstreamBalanceLow} onChange={(event) => setNotifyUpstreamBalanceLow(event.target.checked)} type="checkbox" />
                 <span>上游余额不足</span>
               </label>
+              <label className="checkbox-line settings-toggle">
+                <input checked={notifyUpstreamTokenInvalid} onChange={(event) => setNotifyUpstreamTokenInvalid(event.target.checked)} type="checkbox" />
+                <span>上游令牌失效</span>
+              </label>
             </div>
             <div className="settings-notification-actions">
               <button
@@ -6519,7 +6613,7 @@ function SignalLine({ label, value }: { label: string; value: string }) {
   return (
     <div className="signal-row">
       <span>{label}</span>
-      <strong>{value}</strong>
+      <strong>{isPhoneUrlSource(value) ? <MiddleEllipsisText text={value} /> : value}</strong>
     </div>
   );
 }
@@ -7529,188 +7623,6 @@ function formatDuration(seconds: number) {
     return `${hours}小时${minutes > 0 ? `${minutes}分钟` : ""}`;
   }
   return `${minutes}分钟`;
-}
-
-function buildDisplayedUsageEstimate(estimate: UsageEstimate, includePausedAccounts: boolean): UsageEstimate {
-  const activeAccounts = estimate.accounts.filter(
-    (account) => usageDetailAccountVisible(account) && (includePausedAccounts || !accountIsManuallyPaused(account)),
-  );
-  const groups = estimate.groups
-    .map((group) => {
-      const rows = activeAccounts.filter((account) => account.groups.some((item) => item.id === group.group_id));
-      return {
-        ...group,
-        account_count: rows.length,
-        five_hour: aggregateUsageAccountsWindow(rows, "five_hour"),
-        seven_day: aggregateUsageAccountsWindow(rows, "seven_day"),
-      };
-    })
-    .filter((group) => group.account_count > 0);
-
-  return {
-    ...estimate,
-    overall: {
-      ...estimate.overall,
-      account_count: activeAccounts.length,
-      five_hour: aggregateUsageAccountsWindow(activeAccounts, "five_hour"),
-      seven_day: aggregateUsageAccountsWindow(activeAccounts, "seven_day"),
-    },
-    groups,
-    accounts: activeAccounts,
-  };
-}
-
-function usageDetailAccountVisible(account: AccountUsageEstimate) {
-  return !account.deactive && !account.error && !account.usage_error;
-}
-
-function usageProblemAccount(account: AccountUsageEstimate) {
-  return account.deactive || account.error;
-}
-
-function usageDetailAccountRateLimited(account: AccountUsageEstimate) {
-  return Boolean(account.rate_limited || account.five_hour.rate_limited || account.seven_day.rate_limited);
-}
-
-function accountMatchesUsageDetailFilter(account: AccountUsageEstimate, filter: UsageDetailAccountFilter) {
-  if (!usageDetailAccountVisible(account)) return false;
-  const rateLimited = usageDetailAccountRateLimited(account);
-  return filter === "rate-limited" ? rateLimited : !rateLimited;
-}
-
-function usageDetailAccountCounts(accounts: AccountUsageEstimate[]) {
-  let normal = 0;
-  let rateLimited = 0;
-
-  for (const account of accounts) {
-    if (!usageDetailAccountVisible(account)) continue;
-    if (usageDetailAccountRateLimited(account)) {
-      rateLimited += 1;
-    } else {
-      normal += 1;
-    }
-  }
-
-  return { normal, rateLimited };
-}
-
-function usageEstimateHeaderStats(estimate: UsageEstimate, includePausedAccounts: boolean) {
-  let availableCount = 0;
-  let rateLimitedCount = 0;
-
-  for (const account of estimate.accounts) {
-    if (!usageDetailAccountVisible(account)) continue;
-    if (usageDetailAccountRateLimited(account)) {
-      rateLimitedCount += 1;
-      continue;
-    }
-    if (!includePausedAccounts && accountIsManuallyPaused(account)) {
-      continue;
-    }
-    availableCount += 1;
-  }
-
-  return {
-    accountCount: estimate.overall.account_count,
-    availableCount,
-    rateLimitedCount,
-  };
-}
-
-function aggregateUsageAccountsWindow(accounts: AccountUsageEstimate[], windowKey: "five_hour" | "seven_day"): UsageWindowAggregate {
-  let spent = 0;
-  let limit = 0;
-  let remaining = 0;
-  let estimatedSpent = 0;
-  let enabledAccountCount = 0;
-  let estimableAccounts = 0;
-
-  for (const account of accounts) {
-    if (!usageDetailAccountVisible(account)) continue;
-    if (!account.usage_estimate_enabled) continue;
-    if (windowKey === "five_hour" && usageDetailAccountRateLimited(account)) continue;
-    const window = aggregateSourceWindow(account, windowKey);
-    if (window.rate_limited) continue;
-    if (window.window_kind === "none") continue;
-    enabledAccountCount += 1;
-    if (window.estimate_spent !== null) {
-      spent += window.estimate_spent;
-    }
-    if (window.estimated_limit === null || window.remaining === null) {
-      continue;
-    }
-    estimableAccounts += 1;
-    estimatedSpent += window.estimate_spent ?? 0;
-    limit += window.estimated_limit;
-    remaining += window.remaining;
-  }
-
-  return {
-    spent,
-    estimated_limit: estimableAccounts ? limit : null,
-    remaining: estimableAccounts ? remaining : enabledAccountCount === 0 ? 0 : null,
-    remaining_percent: estimableAccounts && limit > 0 ? clampPercentValue((remaining / limit) * 100) : null,
-    used_percent: estimableAccounts && limit > 0 ? clampPercentValue((estimatedSpent / limit) * 100) : null,
-    account_count: accounts.length,
-    enabled_account_count: enabledAccountCount,
-    estimable_accounts: estimableAccounts,
-  };
-}
-
-function usageProblemAccountUnusedQuota(accounts: AccountUsageEstimate[]): ProblemUnusedQuotaSummary {
-  const problemAccounts = accounts.filter(usageProblemAccount);
-  return {
-    accountCount: problemAccounts.length,
-    fiveHour: aggregateProblemUsageAccountsWindow(problemAccounts, "five_hour"),
-    sevenDay: aggregateProblemUsageAccountsWindow(problemAccounts, "seven_day"),
-  };
-}
-
-function aggregateProblemUsageAccountsWindow(accounts: AccountUsageEstimate[], windowKey: "five_hour" | "seven_day"): UsageWindowAggregate {
-  let spent = 0;
-  let limit = 0;
-  let remaining = 0;
-  let estimatedSpent = 0;
-  let windowAccountCount = 0;
-  let estimableAccounts = 0;
-
-  for (const account of accounts) {
-    const window = aggregateSourceWindow(account, windowKey);
-    if (window.window_kind === "none") continue;
-    windowAccountCount += 1;
-    if (window.estimate_spent !== null) {
-      spent += window.estimate_spent;
-    }
-    if (window.estimated_limit === null || window.remaining === null) {
-      continue;
-    }
-    estimableAccounts += 1;
-    estimatedSpent += window.estimate_spent ?? 0;
-    limit += window.estimated_limit;
-    remaining += window.remaining;
-  }
-
-  return {
-    spent,
-    estimated_limit: estimableAccounts ? limit : null,
-    remaining: estimableAccounts ? remaining : null,
-    remaining_percent: estimableAccounts && limit > 0 ? clampPercentValue((remaining / limit) * 100) : null,
-    used_percent: estimableAccounts && limit > 0 ? clampPercentValue((estimatedSpent / limit) * 100) : null,
-    account_count: accounts.length,
-    enabled_account_count: windowAccountCount,
-    estimable_accounts: estimableAccounts,
-  };
-}
-
-function aggregateSourceWindow(account: AccountUsageEstimate, windowKey: "five_hour" | "seven_day") {
-  const window = account[windowKey];
-  if (windowKey === "five_hour" && window.window_kind === "none") {
-    const longerWindowKind = account.seven_day.window_kind;
-    if (longerWindowKind === "seven_day" || longerWindowKind === "monthly") {
-      return account.seven_day;
-    }
-  }
-  return window;
 }
 
 function canBulkDeleteProblemAccount(account: Account) {

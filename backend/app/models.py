@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -321,6 +322,10 @@ class UpstreamPriorityInterval(Base):
         CheckConstraint("start_priority >= 0", name="ck_upstream_priority_interval_start"),
         CheckConstraint("end_priority > start_priority", name="ck_upstream_priority_interval_end"),
         CheckConstraint("step >= 1", name="ck_upstream_priority_interval_step"),
+        CheckConstraint(
+            "allocation_strategy IN ('cost_optimized', 'fixed_step')",
+            name="ck_upstream_priority_interval_allocation_strategy",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -328,14 +333,11 @@ class UpstreamPriorityInterval(Base):
     start_priority: Mapped[int] = mapped_column(Integer, nullable=False)
     end_priority: Mapped[int] = mapped_column(Integer, nullable=False)
     step: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    allocation_strategy: Mapped[str] = mapped_column(
+        String(32), default="cost_optimized", server_default="cost_optimized", nullable=False
+    )
     rate_pause_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
-    )
-    rate_pause_mode: Mapped[str] = mapped_column(
-        String(32), default="increase_percent", server_default="increase_percent", nullable=False
-    )
-    rate_increase_threshold_percent: Mapped[float] = mapped_column(
-        Float, default=20.0, server_default="20", nullable=False
     )
     rate_absolute_threshold: Mapped[float] = mapped_column(
         Float, default=1.0, server_default="1", nullable=False
@@ -356,9 +358,14 @@ class UpstreamAccountConfig(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    sub2api_account_id: Mapped[int] = mapped_column(Integer, unique=True, index=True, nullable=False)
+    sub2api_account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        unique=True,
+        index=True,
+        nullable=False,
+    )
     remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
-    upstream_api_key_record_id: Mapped[int | None] = mapped_column(Integer)
+    upstream_api_key_record_id: Mapped[int | None] = mapped_column(BigInteger)
     upstream_identity_rebind_required: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -398,8 +405,6 @@ class UpstreamAccountConfig(Base):
     rate_pause_policy: Mapped[str] = mapped_column(
         String(16), default="inherit", server_default="inherit", nullable=False
     )
-    rate_pause_mode: Mapped[str | None] = mapped_column(String(32))
-    rate_increase_threshold_percent: Mapped[float | None] = mapped_column(Float)
     rate_absolute_threshold: Mapped[float | None] = mapped_column(Float)
     remote_name: Mapped[str | None] = mapped_column(String(200))
     remote_platform: Mapped[str | None] = mapped_column(String(64))

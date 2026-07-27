@@ -561,12 +561,6 @@ class AppSettingsOut(BaseModel):
     channel_monitor_fallback_test_attempts: int = 1
     channel_monitor_recovery_test_attempts: int = 1
     available_test_models: list[AccountLivenessModelOut] = Field(default_factory=list)
-    api_key_auto_pause_on_upstream_rate_increase_enabled: bool = False
-    upstream_rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = (
-        "increase_percent"
-    )
-    upstream_rate_increase_threshold_percent: float = 20.0
-    upstream_rate_absolute_threshold: float = 1.0
     api_key_auto_pause_on_negative_balance_enabled: bool = False
     upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] = "wallet"
     upstream_balance_pause_threshold: float = 0.0
@@ -582,6 +576,7 @@ class AppSettingsOut(BaseModel):
     notify_api_key_rate_changed: bool = False
     notify_upstream_group_changed: bool = False
     notify_upstream_balance_low: bool = False
+    notify_upstream_token_invalid: bool = False
     upstream_rate_log_retention_days: int
     usage_limit_sample_five_hour_threshold_percent: float
     usage_limit_sample_seven_day_threshold_percent: float
@@ -660,20 +655,6 @@ class AppSettingsUpdate(BaseModel):
         ge=1,
         le=5,
     )
-    api_key_auto_pause_on_upstream_rate_increase_enabled: bool | None = None
-    upstream_rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] | None = None
-    upstream_rate_increase_threshold_percent: float | None = Field(
-        default=None,
-        gt=0,
-        le=100_000,
-        allow_inf_nan=False,
-    )
-    upstream_rate_absolute_threshold: float | None = Field(
-        default=None,
-        gt=0,
-        le=1000,
-        allow_inf_nan=False,
-    )
     api_key_auto_pause_on_negative_balance_enabled: bool | None = None
     upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] | None = None
     upstream_balance_pause_threshold: float | None = Field(
@@ -694,6 +675,7 @@ class AppSettingsUpdate(BaseModel):
     notify_api_key_rate_changed: bool | None = None
     notify_upstream_group_changed: bool | None = None
     notify_upstream_balance_low: bool | None = None
+    notify_upstream_token_invalid: bool | None = None
     upstream_rate_log_retention_days: int | None = Field(default=None, ge=1, le=3650)
     usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
@@ -786,11 +768,8 @@ class PriorityIntervalCreate(BaseModel):
     start_priority: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX - 1)
     end_priority: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
     step: int = Field(default=1, ge=1, le=JS_SAFE_INTEGER_MAX)
+    allocation_strategy: Literal["cost_optimized", "fixed_step"] = "cost_optimized"
     rate_pause_enabled: bool = False
-    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = "increase_percent"
-    rate_increase_threshold_percent: float = Field(
-        default=20.0, gt=0, le=100_000, allow_inf_nan=False
-    )
     rate_absolute_threshold: float = Field(
         default=1.0, gt=0, le=1000, allow_inf_nan=False
     )
@@ -842,12 +821,11 @@ class PriorityIntervalOut(BaseModel):
     start_priority: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX - 1)
     end_priority: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
     step: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    allocation_strategy: Literal["cost_optimized", "fixed_step"] = "cost_optimized"
     rate_pause_enabled: bool = False
-    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = "increase_percent"
-    rate_increase_threshold_percent: float = Field(gt=0, le=100_000, allow_inf_nan=False)
     rate_absolute_threshold: float = Field(gt=0, le=1000, allow_inf_nan=False)
     account_count: int = Field(default=0, ge=0)
-    effective_step: int = Field(default=1, ge=1, le=JS_SAFE_INTEGER_MAX)
+    effective_step: int = Field(default=1, ge=0, le=JS_SAFE_INTEGER_MAX)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -882,10 +860,6 @@ class UpstreamAccountUpdate(BaseModel):
     manual_recharge_multiplier: float | None = Field(default=None, gt=0, le=1000, allow_inf_nan=False)
     priority_assignment_when_disabled: bool | None = None
     rate_pause_policy: Literal["inherit", "disabled", "custom"] = "inherit"
-    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = "increase_percent"
-    rate_increase_threshold_percent: float | None = Field(
-        default=None, gt=0, le=100_000, allow_inf_nan=False
-    )
     rate_absolute_threshold: float | None = Field(
         default=None, gt=0, le=1000, allow_inf_nan=False
     )
@@ -1187,10 +1161,11 @@ class UpstreamAccountOut(BaseModel):
     identity_rebind_required: bool = False
     api_key_origin_rebind_required: bool = False
     upstream_identity_rebind_required: bool = False
-    upstream_api_key_record_id: int | None = Field(
+    upstream_api_key_record_id: str | None = Field(
         default=None,
-        ge=1,
-        le=JS_SAFE_INTEGER_MAX,
+        min_length=1,
+        max_length=19,
+        pattern=r"^[1-9][0-9]*$",
     )
     channel_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
     channel_name: str | None = None
@@ -1215,8 +1190,6 @@ class UpstreamAccountOut(BaseModel):
     rate_pause_policy: Literal["inherit", "disabled", "custom"] = "inherit"
     rate_pause_effective_enabled: bool = False
     rate_pause_effective_source: Literal["account", "priority_interval", "disabled"] = "disabled"
-    rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] | None = None
-    rate_increase_threshold_percent: float | None = None
     rate_absolute_threshold: float | None = None
     composite_multiplier: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     managed: bool

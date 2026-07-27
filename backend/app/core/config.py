@@ -89,22 +89,6 @@ class Settings(BaseSettings):
     channel_monitor_fallback_test_model: str = ""
     channel_monitor_fallback_test_attempts: int = Field(default=1, ge=1, le=5)
     channel_monitor_recovery_test_attempts: int = Field(default=1, ge=1, le=5)
-    api_key_auto_pause_on_upstream_rate_increase_enabled: bool = False
-    upstream_rate_pause_mode: Literal["increase_percent", "absolute_multiplier"] = (
-        "increase_percent"
-    )
-    upstream_rate_increase_threshold_percent: float = Field(
-        default=20.0,
-        gt=0,
-        le=100_000,
-        allow_inf_nan=False,
-    )
-    upstream_rate_absolute_threshold: float = Field(
-        default=1.0,
-        gt=0,
-        le=1000,
-        allow_inf_nan=False,
-    )
     api_key_auto_pause_on_negative_balance_enabled: bool = False
     upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] = "wallet"
     upstream_balance_pause_threshold: float = Field(
@@ -125,6 +109,7 @@ class Settings(BaseSettings):
     notify_api_key_rate_changed: bool = False
     notify_upstream_group_changed: bool = False
     notify_upstream_balance_low: bool = False
+    notify_upstream_token_invalid: bool = False
     usage_limit_sample_five_hour_threshold_percent: float = 0.0
     usage_limit_sample_seven_day_threshold_percent: float = 0.0
     usage_limit_default_ranges_json: str = ""

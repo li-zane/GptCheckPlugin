@@ -8,6 +8,7 @@ const cacheKeyPrefix = "sub2api-at-change-log:";
 const maxCachedItems = 200;
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+type EnumerableStorageLike = Pick<Storage, "key" | "length" | "removeItem">;
 type ChangeLogItem = UpstreamChannelChangeEvent | AccountSchedulingChangeEvent;
 
 export type ChangeLogCacheCategory = "upstream" | "account_rate" | "scheduling";
@@ -129,6 +130,21 @@ export function mergeChangeLogItems<T extends ChangeLogItem>(
 
 export function clearChangeLogMemoryCache() {
   memoryCache.clear();
+}
+
+export function clearChangeLogCache(storage: EnumerableStorageLike | null) {
+  memoryCache.clear();
+  if (!storage) return;
+  try {
+    const keys: string[] = [];
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (key?.startsWith(cacheKeyPrefix)) keys.push(key);
+    }
+    keys.forEach((key) => storage.removeItem(key));
+  } catch {
+    // Restricted browser contexts may reject storage access.
+  }
 }
 
 function normalizeBaseUrl(baseUrl: string) {

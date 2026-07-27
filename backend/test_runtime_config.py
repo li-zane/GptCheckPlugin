@@ -261,8 +261,6 @@ class RuntimeConfigTests(unittest.TestCase):
             "channel_monitor_auto_probe_enabled": False,
             "channel_monitor_fallback_test_attempts": 3,
             "channel_monitor_recovery_test_attempts": 5,
-            "api_key_auto_pause_on_upstream_rate_increase_enabled": True,
-            "upstream_rate_increase_threshold_percent": 25.5,
         }
         for field_name, value in changes.items():
             with self.subTest(field_name=field_name):
@@ -650,8 +648,6 @@ class RuntimeConfigTests(unittest.TestCase):
         invalid_values = {
             "channel_monitor_fallback_test_attempts": (0, 6),
             "channel_monitor_recovery_test_attempts": (0, 6),
-            "upstream_rate_increase_threshold_percent": (0, -1, 100_001, float("inf")),
-            "upstream_rate_absolute_threshold": (0, -1, 1001, float("inf")),
             "upstream_balance_pause_threshold": (
                 -1_000_000_001,
                 1_000_000_001,
@@ -676,10 +672,6 @@ class RuntimeConfigTests(unittest.TestCase):
                 "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED=true\n"
                 "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD=3\n"
                 "CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD=4\n"
-                "API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED=true\n"
-                "UPSTREAM_RATE_PAUSE_MODE=absolute_multiplier\n"
-                "UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT=37.5\n"
-                "UPSTREAM_RATE_ABSOLUTE_THRESHOLD=2.75\n"
                 "UPSTREAM_BALANCE_PAUSE_THRESHOLD=12.5\n",
                 encoding="utf-8",
             )
@@ -702,16 +694,6 @@ class RuntimeConfigTests(unittest.TestCase):
                 monitor_recovery_threshold = asyncio.run(
                     service.get_channel_monitor_recovery_consecutive_threshold()
                 )
-                auto_pause_on_rate_increase = asyncio.run(
-                    service.get_api_key_auto_pause_on_upstream_rate_increase_enabled()
-                )
-                rate_increase_threshold = asyncio.run(
-                    service.get_upstream_rate_increase_threshold_percent()
-                )
-                rate_pause_mode = asyncio.run(service.get_upstream_rate_pause_mode())
-                rate_absolute_threshold = asyncio.run(
-                    service.get_upstream_rate_absolute_threshold()
-                )
                 balance_pause_threshold = asyncio.run(
                     service.get_upstream_balance_pause_threshold()
                 )
@@ -724,10 +706,6 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(auto_pause_on_monitor)
         self.assertEqual(monitor_unavailable_threshold, 3)
         self.assertEqual(monitor_recovery_threshold, 4)
-        self.assertTrue(auto_pause_on_rate_increase)
-        self.assertEqual(rate_pause_mode, "absolute_multiplier")
-        self.assertEqual(rate_increase_threshold, 37.5)
-        self.assertEqual(rate_absolute_threshold, 2.75)
         self.assertEqual(balance_pause_threshold, 12.5)
         self.assertTrue(public["upstream_sync_enabled"])
         self.assertTrue(public["upstream_rate_sync_enabled"])
@@ -736,10 +714,6 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(public["api_key_auto_pause_on_channel_monitor_unavailable_enabled"])
         self.assertEqual(public["channel_monitor_unavailable_consecutive_threshold"], 3)
         self.assertEqual(public["channel_monitor_recovery_consecutive_threshold"], 4)
-        self.assertTrue(public["api_key_auto_pause_on_upstream_rate_increase_enabled"])
-        self.assertEqual(public["upstream_rate_pause_mode"], "absolute_multiplier")
-        self.assertEqual(public["upstream_rate_increase_threshold_percent"], 37.5)
-        self.assertEqual(public["upstream_rate_absolute_threshold"], 2.75)
         self.assertEqual(public["upstream_balance_pause_threshold"], 12.5)
 
     def test_upstream_rate_settings_are_persisted(self) -> None:
@@ -777,10 +751,6 @@ class RuntimeConfigTests(unittest.TestCase):
                 )
                 self.assertEqual(defaults["channel_monitor_recovery_consecutive_threshold"], 2)
                 self.assertEqual(defaults["channel_monitor_recovery_test_attempts"], 1)
-                self.assertFalse(defaults["api_key_auto_pause_on_upstream_rate_increase_enabled"])
-                self.assertEqual(defaults["upstream_rate_pause_mode"], "increase_percent")
-                self.assertEqual(defaults["upstream_rate_increase_threshold_percent"], 20.0)
-                self.assertEqual(defaults["upstream_rate_absolute_threshold"], 1.0)
                 self.assertEqual(defaults["upstream_balance_pause_threshold"], 0.0)
 
                 settings = await service.update_public_settings(
@@ -800,13 +770,10 @@ class RuntimeConfigTests(unittest.TestCase):
                         "account_model_whitelist_sync_interval_seconds": 1800,
                         "account_model_whitelist_sync_each_time": True,
                         "channel_monitor_recovery_test_attempts": 5,
-                        "api_key_auto_pause_on_upstream_rate_increase_enabled": True,
-                        "upstream_rate_pause_mode": "absolute_multiplier",
-                        "upstream_rate_increase_threshold_percent": 37.5,
-                        "upstream_rate_absolute_threshold": 2.75,
                         "upstream_balance_pause_threshold": 12.5,
                         "show_stale_negative_balance_alert": False,
                         "notify_account_enabled": True,
+                        "notify_upstream_token_invalid": True,
                         "upstream_rate_log_retention_days": 180,
                         "account_liveness_max_concurrency": 4,
                     }
@@ -833,13 +800,10 @@ class RuntimeConfigTests(unittest.TestCase):
                 )
                 self.assertEqual(settings["channel_monitor_recovery_consecutive_threshold"], 2)
                 self.assertEqual(settings["channel_monitor_recovery_test_attempts"], 5)
-                self.assertTrue(settings["api_key_auto_pause_on_upstream_rate_increase_enabled"])
-                self.assertEqual(settings["upstream_rate_pause_mode"], "absolute_multiplier")
-                self.assertEqual(settings["upstream_rate_increase_threshold_percent"], 37.5)
-                self.assertEqual(settings["upstream_rate_absolute_threshold"], 2.75)
                 self.assertEqual(settings["upstream_balance_pause_threshold"], 12.5)
                 self.assertFalse(settings["show_stale_negative_balance_alert"])
                 self.assertTrue(settings["notify_account_enabled"])
+                self.assertTrue(settings["notify_upstream_token_invalid"])
                 self.assertEqual(settings["account_liveness_max_concurrency"], 4)
                 self.assertEqual(settings["upstream_rate_log_retention_days"], 180)
                 self.assertTrue(await service.get_upstream_sync_enabled())
@@ -862,16 +826,6 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertEqual(
                     await service.get_channel_monitor_recovery_test_attempts(), 5
                 )
-                self.assertTrue(
-                    await service.get_api_key_auto_pause_on_upstream_rate_increase_enabled()
-                )
-                self.assertEqual(
-                    await service.get_upstream_rate_pause_mode(), "absolute_multiplier"
-                )
-                self.assertEqual(
-                    await service.get_upstream_rate_increase_threshold_percent(), 37.5
-                )
-                self.assertEqual(await service.get_upstream_rate_absolute_threshold(), 2.75)
                 self.assertEqual(await service.get_upstream_balance_pause_threshold(), 12.5)
                 self.assertFalse(await service.get_show_stale_negative_balance_alert())
                 self.assertEqual(await service.get_upstream_rate_log_retention_days(), 180)
@@ -895,13 +849,10 @@ class RuntimeConfigTests(unittest.TestCase):
                                     "account_model_whitelist_sync_enabled",
                                     "account_model_whitelist_sync_interval_seconds",
                                     "account_model_whitelist_sync_each_time",
-                                    "api_key_auto_pause_on_upstream_rate_increase_enabled",
-                                    "upstream_rate_pause_mode",
-                                    "upstream_rate_increase_threshold_percent",
-                                    "upstream_rate_absolute_threshold",
                                     "upstream_balance_pause_threshold",
                                     "show_stale_negative_balance_alert",
                                     "notify_account_enabled",
+                                    "notify_upstream_token_invalid",
                                     "upstream_rate_log_retention_days",
                                     "account_liveness_max_concurrency",
                                 ]
@@ -926,15 +877,10 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertEqual(values["account_model_whitelist_sync_each_time"], "true")
                 self.assertNotIn("channel_monitor_unavailable_consecutive_threshold", values)
                 self.assertNotIn("channel_monitor_recovery_consecutive_threshold", values)
-                self.assertEqual(
-                    values["api_key_auto_pause_on_upstream_rate_increase_enabled"], "true"
-                )
-                self.assertEqual(values["upstream_rate_pause_mode"], "absolute_multiplier")
-                self.assertEqual(values["upstream_rate_increase_threshold_percent"], "37.5")
-                self.assertEqual(values["upstream_rate_absolute_threshold"], "2.75")
                 self.assertEqual(values["upstream_balance_pause_threshold"], "12.5")
                 self.assertEqual(values["show_stale_negative_balance_alert"], "false")
                 self.assertEqual(values["notify_account_enabled"], "true")
+                self.assertEqual(values["notify_upstream_token_invalid"], "true")
                 self.assertEqual(values["upstream_rate_log_retention_days"], "180")
                 env_text = (project_root / ".env").read_text(encoding="utf-8")
                 self.assertIn("UPSTREAM_SYNC_ENABLED=true", env_text)
@@ -949,15 +895,10 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertIn("ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME=true", env_text)
                 self.assertNotIn("CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD", env_text)
                 self.assertNotIn("CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD", env_text)
-                self.assertIn(
-                    "API_KEY_AUTO_PAUSE_ON_UPSTREAM_RATE_INCREASE_ENABLED=true", env_text
-                )
-                self.assertIn("UPSTREAM_RATE_PAUSE_MODE=absolute_multiplier", env_text)
-                self.assertIn("UPSTREAM_RATE_INCREASE_THRESHOLD_PERCENT=37.5", env_text)
-                self.assertIn("UPSTREAM_RATE_ABSOLUTE_THRESHOLD=2.75", env_text)
                 self.assertIn("UPSTREAM_BALANCE_PAUSE_THRESHOLD=12.5", env_text)
                 self.assertIn("SHOW_STALE_NEGATIVE_BALANCE_ALERT=false", env_text)
                 self.assertIn("NOTIFY_ACCOUNT_ENABLED=true", env_text)
+                self.assertIn("NOTIFY_UPSTREAM_TOKEN_INVALID=true", env_text)
                 self.assertIn("ACCOUNT_LIVENESS_MAX_CONCURRENCY=4", env_text)
                 self.assertIn("UPSTREAM_RATE_LOG_RETENTION_DAYS=180", env_text)
             finally:
@@ -1198,10 +1139,6 @@ class _FakeSettings:
         self.channel_monitor_unavailable_consecutive_threshold = 2
         self.channel_monitor_recovery_consecutive_threshold = 2
         self.channel_monitor_recovery_test_attempts = 1
-        self.api_key_auto_pause_on_upstream_rate_increase_enabled = False
-        self.upstream_rate_pause_mode = "increase_percent"
-        self.upstream_rate_increase_threshold_percent = 20.0
-        self.upstream_rate_absolute_threshold = 1.0
         self.api_key_auto_pause_on_negative_balance_enabled = False
         self.upstream_negative_balance_basis = "wallet"
         self.upstream_balance_pause_threshold = 0.0
@@ -1261,10 +1198,6 @@ def _public_settings_fixture() -> dict:
         "channel_monitor_unavailable_consecutive_threshold": 2,
         "channel_monitor_recovery_consecutive_threshold": 2,
         "channel_monitor_recovery_test_attempts": 1,
-        "api_key_auto_pause_on_upstream_rate_increase_enabled": False,
-        "upstream_rate_pause_mode": "increase_percent",
-        "upstream_rate_increase_threshold_percent": 20.0,
-        "upstream_rate_absolute_threshold": 1.0,
         "api_key_auto_pause_on_negative_balance_enabled": False,
         "upstream_negative_balance_basis": "wallet",
         "upstream_balance_pause_threshold": 0.0,

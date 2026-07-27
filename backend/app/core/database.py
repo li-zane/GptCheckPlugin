@@ -143,10 +143,12 @@ async def _ensure_upstream_channel_reference_guards(conn: AsyncConnection) -> No
 async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
     result = await conn.execute(text("PRAGMA table_info(upstream_priority_intervals)"))
     priority_interval_columns = {str(row[1]) for row in result.fetchall()}
+    allocation_strategy_missing = bool(priority_interval_columns) and (
+        "allocation_strategy" not in priority_interval_columns
+    )
     optional_priority_interval_columns = {
+        "allocation_strategy": "VARCHAR(32) NOT NULL DEFAULT 'cost_optimized'",
         "rate_pause_enabled": "BOOLEAN NOT NULL DEFAULT 0",
-        "rate_pause_mode": "VARCHAR(32) NOT NULL DEFAULT 'increase_percent'",
-        "rate_increase_threshold_percent": "FLOAT NOT NULL DEFAULT 20",
         "rate_absolute_threshold": "FLOAT NOT NULL DEFAULT 1",
     }
     for column, column_type in optional_priority_interval_columns.items():
@@ -157,6 +159,24 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
                 )
             )
             priority_interval_columns.add(column)
+    if allocation_strategy_missing:
+        # Existing intervals used the rank-based fixed-step allocator. Preserve
+        # that behavior during upgrade; newly created intervals use the model default.
+        await conn.execute(
+            text(
+                "UPDATE upstream_priority_intervals "
+                "SET allocation_strategy = 'fixed_step'"
+            )
+        )
+    elif "allocation_strategy" in priority_interval_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_priority_intervals "
+                "SET allocation_strategy = 'cost_optimized' "
+                "WHERE allocation_strategy IS NULL "
+                "OR allocation_strategy NOT IN ('cost_optimized', 'fixed_step')"
+            )
+        )
 
     result = await conn.execute(text("PRAGMA table_info(upstream_channels)"))
     channel_columns = {str(row[1]) for row in result.fetchall()}
@@ -259,11 +279,9 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "priority_tiebreak_multiplier": "FLOAT",
         "priority_assignment_when_disabled": "BOOLEAN",
         "rate_pause_policy": "VARCHAR(16) NOT NULL DEFAULT 'inherit'",
-        "rate_pause_mode": "VARCHAR(32)",
-        "rate_increase_threshold_percent": "FLOAT",
         "rate_absolute_threshold": "FLOAT",
         "remote_identity_fingerprint": "VARCHAR(64)",
-        "upstream_api_key_record_id": "INTEGER",
+        "upstream_api_key_record_id": "BIGINT",
         "upstream_identity_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "api_key_origin_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "remote_name": "VARCHAR(200)",
@@ -354,6 +372,42 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
                 text(f"ALTER TABLE upstream_account_configs ADD COLUMN {column} {column_type}")
             )
             columns.add(column)
+
+    # Relative-increase policies cannot be converted to one absolute threshold
+    # without an account-specific baseline. Disable them once during upgrade so
+    # they are never silently reinterpreted as an absolute multiplier policy.
+    migration_key = "migration.disable_relative_rate_pause.v1"
+    completed = await conn.execute(
+        text("SELECT value FROM app_settings WHERE key = :key"),
+        {"key": migration_key},
+    )
+    if completed.scalar_one_or_none() is None:
+        if "rate_pause_mode" in priority_interval_columns:
+            await conn.execute(
+                text(
+                    "UPDATE upstream_priority_intervals SET rate_pause_enabled = 0 "
+                    "WHERE rate_pause_enabled = 1 "
+                    "AND COALESCE(rate_pause_mode, 'increase_percent') "
+                    "<> 'absolute_multiplier'"
+                )
+            )
+        if "rate_pause_mode" in columns:
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET rate_pause_policy = 'disabled', "
+                    "rate_absolute_threshold = NULL "
+                    "WHERE rate_pause_policy = 'custom' "
+                    "AND COALESCE(rate_pause_mode, 'increase_percent') "
+                    "<> 'absolute_multiplier'"
+                )
+            )
+        await conn.execute(
+            text(
+                "INSERT INTO app_settings (key, value, updated_at) "
+                "VALUES (:key, '1', CURRENT_TIMESTAMP)"
+            ),
+            {"key": migration_key},
+        )
     await conn.execute(
         text(
             "DROP INDEX IF EXISTS "

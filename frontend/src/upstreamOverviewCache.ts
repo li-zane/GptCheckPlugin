@@ -7,9 +7,10 @@ import type {
   UpstreamGroupOption,
   UpstreamType,
   PriorityInterval,
+  PriorityAllocationStrategy,
 } from "./types";
 
-export const upstreamOverviewCacheVersion = 7;
+export const upstreamOverviewCacheVersion = 8;
 const cacheKeyPrefix = "sub2api-at-upstream-overview:";
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem" | "key" | "length">;
@@ -220,13 +221,6 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
       || source.rate_pause_effective_source === "disabled"
       ? source.rate_pause_effective_source
       : undefined,
-    rate_pause_mode: source.rate_pause_mode === "increase_percent"
-      || source.rate_pause_mode === "absolute_multiplier"
-      ? source.rate_pause_mode
-      : source.rate_pause_mode === null
-        ? null
-        : undefined,
-    rate_increase_threshold_percent: nullableNumber(source.rate_increase_threshold_percent),
     rate_absolute_threshold: nullableNumber(source.rate_absolute_threshold),
     composite_multiplier: nullableNumber(source.composite_multiplier),
     managed: optionalBoolean(source.managed),
@@ -360,9 +354,9 @@ function sanitizePriorityIntervals(value: unknown): PriorityInterval[] {
     const startPriority = source ? nullableNumber(source.start_priority) : undefined;
     const endPriority = source ? nullableNumber(source.end_priority) : undefined;
     const step = source ? nullableNumber(source.step) : undefined;
-    const ratePauseMode: PriorityInterval["rate_pause_mode"] = source?.rate_pause_mode === "absolute_multiplier"
-      ? "absolute_multiplier"
-      : "increase_percent";
+    const allocationStrategy: PriorityAllocationStrategy = source?.allocation_strategy === "fixed_step"
+      ? "fixed_step"
+      : "cost_optimized";
     if (
       !source
       || id === null || id === undefined
@@ -377,9 +371,8 @@ function sanitizePriorityIntervals(value: unknown): PriorityInterval[] {
       start_priority: startPriority,
       end_priority: endPriority,
       step,
+      allocation_strategy: allocationStrategy,
       rate_pause_enabled: source.rate_pause_enabled === true,
-      rate_pause_mode: ratePauseMode,
-      rate_increase_threshold_percent: nullableNumber(source.rate_increase_threshold_percent) ?? 20,
       rate_absolute_threshold: nullableNumber(source.rate_absolute_threshold) ?? 1,
       account_count: nullableNumber(source.account_count) ?? undefined,
       effective_step: nullableNumber(source.effective_step) ?? undefined,

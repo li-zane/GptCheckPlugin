@@ -863,15 +863,9 @@ class UpstreamClient:
 
         try:
             groups = _discover_groups(active_type, usable)
-            masked_direct_records = _unique_masked_api_key_records(
-                active_type,
-                usable,
-                {normalized_api_key} if normalized_api_key is not None else set(),
-            )
             matched_record = (
                 revealed_api_key_records.get(normalized_api_key or "")
                 or _find_unique_api_key_record(active_type, usable, normalized_api_key)
-                or masked_direct_records.get(normalized_api_key or "")
             )
             available_group_refs = _available_group_refs(active_type, usable)
             matched_group = _select_group(
@@ -1081,16 +1075,10 @@ class UpstreamClient:
         else:
             return {}
 
-        masked_records = _unique_masked_api_key_records(
-            upstream_type,
-            payloads,
-            target_keys,
-        )
         pending_keys = {
             key
             for key in target_keys
             if _find_unique_api_key_record(upstream_type, payloads, key) is None
-            and key not in masked_records
         }
         if not pending_keys:
             return {}
@@ -1192,9 +1180,14 @@ class UpstreamClient:
             data = _unwrap(response.payload)
             if not isinstance(data, dict):
                 return None
+            returned_id = _api_key_record_id(data)
+            if returned_id is not None and returned_id != record_id:
+                return None
             revealed_key = _clean_secret(
                 _first_value(data, ("key", "api_key", "apiKey", "token", "value"))
             )
+            if revealed_key is None or "*" in revealed_key:
+                return None
             matching_targets = [
                 target_key
                 for target_key in pending_keys
@@ -2465,8 +2458,7 @@ def _merge_groups(existing: list[GroupOption], incoming: list[GroupOption]) -> l
             (
                 index
                 for index, current in enumerate(result)
-                if (candidate.id is not None and current.id == candidate.id)
-                or (candidate.name and current.name.casefold() == candidate.name.casefold())
+                if current.id == candidate.id
             ),
             None,
         )
@@ -2492,7 +2484,11 @@ def _apply_rate_overrides(groups: list[GroupOption], payload: Any) -> list[Group
     for identifier, name, multiplier in overrides:
         for index, group in enumerate(result):
             id_matches = identifier is not None and group.id == identifier
-            name_matches = name is not None and group.name.casefold() == name.casefold()
+            name_matches = (
+                identifier is None
+                and name is not None
+                and group.name.casefold() == name.casefold()
+            )
             if id_matches or name_matches:
                 result[index] = replace(group, multiplier=multiplier, source="groups.rates")
                 break
@@ -2620,17 +2616,11 @@ def _matched_target_api_key_records(
     target_keys: set[str],
     revealed_records: Mapping[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    masked_records = _unique_masked_api_key_records(
-        upstream_type,
-        payloads,
-        target_keys,
-    )
     matched: dict[str, dict[str, Any]] = {}
     for target_key in target_keys:
         record = (
             revealed_records.get(target_key)
             or _find_unique_api_key_record(upstream_type, payloads, target_key)
-            or masked_records.get(target_key)
         )
         if record is not None:
             matched[target_key] = record
@@ -2792,12 +2782,9 @@ def _api_key_record_matches_account(
     if record_key is None:
         return False
     if "*" in record_key:
-        matching_accounts = {
-            candidate_account_id
-            for candidate_account_id, candidate_key in api_keys_by_account.items()
-            if _masked_api_key_matches(record_key, candidate_key)
-        }
-        return matching_accounts == {account_id}
+        # Masks only identify detail candidates. They never prove ownership,
+        # even when one candidate appears unique in the currently loaded pages.
+        return False
     return _api_keys_equal(upstream_type, record_key, normalized_key)
 
 
@@ -2926,15 +2913,33 @@ def _account_upstream_state_from_record(
     key_record_id = _api_key_record_id(record)
     key_status = _normalize_api_key_status(upstream_type, record)
     group_id, group_name, group_present = _record_group_identity(record)
+    raw_group = record.get("group")
+    scalar_group_text = (
+        _clean_text(raw_group, 160)
+        if raw_group is not None and not isinstance(raw_group, dict)
+        else None
+    )
+    if (
+        group_id is None
+        and group_name is not None
+        and group_name == scalar_group_text
+        and group_name.casefold() in available_groups.ids
+    ):
+        # NewAPI commonly serializes a string group ID in the scalar `group`
+        # field. Prefer an authoritative ID match before treating it as a name.
+        group_id = group_name
+        group_name = None
     if _explicit_group_unavailable(record):
         group_status: str | None = "unavailable"
     elif group_present and group_id is None and group_name is None:
         group_status = "unassigned"
     elif available_groups.authoritative and (group_id is not None or group_name is not None):
-        matches = bool(
-            (group_id and group_id.casefold() in available_groups.ids)
-            or (group_name and group_name.casefold() in available_groups.names)
-        )
+        if group_id is not None:
+            matches = group_id.casefold() in available_groups.ids
+        else:
+            matches = bool(
+                group_name and group_name.casefold() in available_groups.names
+            )
         group_status = "available" if matches else "deleted"
     else:
         group_status = None
@@ -2977,16 +2982,10 @@ def _match_account_upstream_states(
     available_groups: _AvailableGroupRefs,
 ) -> dict[int, AccountUpstreamState]:
     matches: dict[int, AccountUpstreamState] = {}
-    masked_records = _unique_masked_api_key_records(
-        upstream_type,
-        payloads,
-        set(account_api_keys.values()),
-    )
     for account_id, api_key in account_api_keys.items():
         record = (
             revealed_records.get(api_key)
             or _find_unique_api_key_record(upstream_type, payloads, api_key)
-            or masked_records.get(api_key)
         )
         state = _account_upstream_state_from_record(
             upstream_type,
@@ -3007,16 +3006,10 @@ def _match_account_groups(
     available_groups: _AvailableGroupRefs,
 ) -> dict[int, AccountGroupMatch]:
     matches: dict[int, AccountGroupMatch] = {}
-    masked_records = _unique_masked_api_key_records(
-        upstream_type,
-        payloads,
-        set(account_api_keys.values()),
-    )
     for account_id, api_key in account_api_keys.items():
         record = (
             revealed_records.get(api_key)
             or _find_unique_api_key_record(upstream_type, payloads, api_key)
-            or masked_records.get(api_key)
         )
         if record is None:
             continue
@@ -3095,6 +3088,7 @@ def _account_group_match_from_record(
     authoritative_groups: bool = False,
 ) -> AccountGroupMatch | None:
     raw_group = record.get("group")
+    scalar_group_match: GroupOption | None = None
     if isinstance(raw_group, dict):
         record_id = _clean_identifier(_first_value(raw_group, ("id", "group_id", "groupId")))
         record_name = _clean_text(
@@ -3110,10 +3104,16 @@ def _account_group_match_from_record(
             if raw_group_text and raw_group_text.isdigit():
                 record_id = record_id or raw_group_text
             else:
+                if authoritative_groups and raw_group_text:
+                    scalar_group_match = _lookup_group(
+                        groups,
+                        raw_group_text,
+                        None,
+                    )
                 record_name = record_name or raw_group_text
         multiplier_source = record
 
-    selected = _lookup_group(groups, record_id, record_name)
+    selected = scalar_group_match or _lookup_group(groups, record_id, record_name)
     if selected is not None:
         return AccountGroupMatch(
             id=selected.id,
@@ -3188,6 +3188,7 @@ def _select_group(
     if matched_record is None:
         return None
     raw_group = matched_record.get("group")
+    scalar_group_match: GroupOption | None = None
     if isinstance(raw_group, dict):
         record_id = _clean_identifier(_first_value(raw_group, ("id", "group_id", "groupId")))
         record_name = _clean_text(_first_value(raw_group, ("name", "group_name", "groupName")), 160)
@@ -3199,9 +3200,19 @@ def _select_group(
             if raw_group_text and raw_group_text.isdigit():
                 record_id = record_id or raw_group_text
             else:
+                if (
+                    available_groups is not None
+                    and available_groups.authoritative
+                    and raw_group_text
+                ):
+                    scalar_group_match = _lookup_group(
+                        groups,
+                        raw_group_text,
+                        None,
+                    )
                 record_name = record_name or raw_group_text
 
-    selected = _lookup_group(groups, record_id, record_name)
+    selected = scalar_group_match or _lookup_group(groups, record_id, record_name)
     if selected is not None:
         return selected
 
@@ -3225,9 +3236,7 @@ def _select_group(
 
 def _lookup_group(groups: list[GroupOption], group_id: str | None, group_name: str | None) -> GroupOption | None:
     if group_id is not None:
-        match = next((group for group in groups if group.id == group_id), None)
-        if match is not None:
-            return match
+        return next((group for group in groups if group.id == group_id), None)
     if group_name:
         folded = group_name.casefold()
         return next((group for group in groups if group.name.casefold() == folded), None)

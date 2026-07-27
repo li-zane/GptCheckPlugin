@@ -69,7 +69,11 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             renamed_change["details"],
-            {"old_name": "Old name", "new_name": "Renamed"},
+            {
+                "old_recharge_multiplier": 1.0,
+                "old_name": "Old name",
+                "new_name": "Renamed",
+            },
         )
 
         events = list(
@@ -104,6 +108,9 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(renamed.details["old_name"], "Old name")
         self.assertEqual(renamed.details["new_name"], "Renamed")
+        self.assertEqual(renamed.old_value, 1.0)
+        self.assertIsNone(renamed.new_value)
+        self.assertEqual(renamed.details["old_recharge_multiplier"], 1.0)
         for event in events:
             created_at = event.created_at
             if created_at.tzinfo is None:

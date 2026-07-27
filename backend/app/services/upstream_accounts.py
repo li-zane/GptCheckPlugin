@@ -10,6 +10,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
+from enum import Enum
 from typing import Any
 from uuid import uuid4
 
@@ -34,19 +35,21 @@ from app.schemas import (
     UpstreamDiscoverAllOut,
     UpstreamGroupOptionOut,
 )
+from app.services.daily_usage_policy import daily_usage_cache_is_current
 from app.services.sub2api import Sub2ApiClient, Sub2ApiRequestError
 from app.services.notifications import (
     enqueue_api_key_account_state_changed,
     enqueue_api_key_rate_changed,
 )
 from app.services.runtime_config import get_runtime_config_service
-from app.services.upstream_client import discover_upstream
+from app.services.upstream_client import DEFAULT_TODAY_TIME_ZONE, discover_upstream
 
 
 RATE_QUANTUM = Decimal("0.0001")
 MAX_MULTIPLIER = Decimal("1000")
 DEFAULT_ENCRYPTION_KEY = "change-me-encryption-key"
 JS_SAFE_INTEGER_MAX = 9_007_199_254_740_991
+SIGNED_BIGINT_MAX = 9_223_372_036_854_775_807
 INVALID_UPSTREAM_KEY_STATUSES = frozenset({"disabled", "expired", "quota_exhausted"})
 INVALID_UPSTREAM_GROUP_STATUSES = frozenset({"unavailable", "unassigned", "deleted"})
 AUTO_PAUSE_REASON_BALANCE = "upstream_balance_negative"
@@ -64,6 +67,12 @@ AUTO_PAUSE_REASON_ORDER = (
 logger = logging.getLogger(__name__)
 
 
+class UpstreamRecordIdentityStatus(str, Enum):
+    VERIFIED = "verified"
+    INCONCLUSIVE = "inconclusive"
+    REBIND_REQUIRED = "rebind_required"
+
+
 def resolve_rate_pause_policy(
     config: UpstreamAccountConfig | None,
     interval: UpstreamPriorityInterval | None = None,
@@ -73,49 +82,36 @@ def resolve_rate_pause_policy(
         return {
             "enabled": False,
             "source": "disabled",
-            "mode": None,
-            "threshold_percent": None,
             "absolute_threshold": None,
         }
     policy = str(config.rate_pause_policy or "inherit").strip().lower()
     if policy == "custom":
-        mode = config.rate_pause_mode or "increase_percent"
         return {
             "enabled": True,
             "source": "account",
-            "mode": mode,
-            "threshold_percent": float(config.rate_increase_threshold_percent or 20.0),
             "absolute_threshold": float(config.rate_absolute_threshold or 1.0),
         }
     if policy == "disabled":
         return {
             "enabled": False,
             "source": "disabled",
-            "mode": None,
-            "threshold_percent": None,
             "absolute_threshold": None,
         }
     if interval is not None and bool(interval.rate_pause_enabled):
         return {
             "enabled": True,
             "source": "priority_interval",
-            "mode": interval.rate_pause_mode or "increase_percent",
-            "threshold_percent": float(interval.rate_increase_threshold_percent or 20.0),
             "absolute_threshold": float(interval.rate_absolute_threshold or 1.0),
         }
     if interval is not None:
         return {
             "enabled": False,
             "source": "disabled",
-            "mode": None,
-            "threshold_percent": None,
             "absolute_threshold": None,
         }
     return {
         "enabled": False,
         "source": "disabled",
-        "mode": None,
-        "threshold_percent": None,
         "absolute_threshold": None,
     }
 
@@ -610,12 +606,34 @@ class UpstreamAccountService:
         state: Any,
         *,
         now: datetime,
+        time_zone: str = DEFAULT_TODAY_TIME_ZONE,
         secrets: tuple[str | None, ...] = (),
     ) -> None:
+        def clear_unavailable_usage() -> None:
+            config.today_upstream_usage_amount = None
+            config.today_upstream_usage_unit = None
+            config.today_upstream_usage_status = "not_available"
+            config.today_upstream_usage_source = None
+            config.today_upstream_usage_checked_at = None
+            # These fields are the compatibility mirror for older clients.
+            config.upstream_usage_amount = None
+            config.upstream_usage_unit = None
+            config.upstream_usage_checked_at = None
+
         def retain_last_usage() -> bool:
             """Keep a dated successful value when this probe cannot confirm usage."""
             current_amount = _balance_number(config.today_upstream_usage_amount)
-            if current_amount is not None and current_amount >= 0:
+            if (
+                current_amount is not None
+                and current_amount >= 0
+                and daily_usage_cache_is_current(
+                    cached_amount=current_amount,
+                    checked_at=config.today_upstream_usage_checked_at,
+                    time_zone=time_zone,
+                    fallback_time_zone=DEFAULT_TODAY_TIME_ZONE,
+                    now=now,
+                )
+            ):
                 config.today_upstream_usage_status = "stale"
                 config.today_upstream_usage_source = (
                     config.today_upstream_usage_source
@@ -624,7 +642,17 @@ class UpstreamAccountService:
                 return True
 
             legacy_amount = _balance_number(config.upstream_usage_amount)
-            if legacy_amount is None or legacy_amount < 0:
+            if (
+                legacy_amount is None
+                or legacy_amount < 0
+                or not daily_usage_cache_is_current(
+                    cached_amount=legacy_amount,
+                    checked_at=config.upstream_usage_checked_at,
+                    time_zone=time_zone,
+                    fallback_time_zone=DEFAULT_TODAY_TIME_ZONE,
+                    now=now,
+                )
+            ):
                 return False
             config.today_upstream_usage_amount = legacy_amount
             config.today_upstream_usage_unit = config.upstream_usage_unit or "USD"
@@ -635,14 +663,12 @@ class UpstreamAccountService:
 
         if state is None:
             if not retain_last_usage():
-                config.today_upstream_usage_status = "not_available"
-                config.today_upstream_usage_checked_at = now
+                clear_unavailable_usage()
             return
         usage_amount = _balance_number(_value(state, "usage_amount"))
         if usage_amount is None or usage_amount < 0:
             if not retain_last_usage():
-                config.today_upstream_usage_status = "not_available"
-                config.today_upstream_usage_checked_at = now
+                clear_unavailable_usage()
             return
         config.today_upstream_usage_amount = usage_amount
         config.today_upstream_usage_unit = (
@@ -1400,7 +1426,7 @@ class UpstreamAccountService:
             parsed = int(raw_id) if raw_id is not None else 0
         except (TypeError, ValueError):
             return None
-        return parsed if 0 < parsed <= JS_SAFE_INTEGER_MAX else None
+        return parsed if 0 < parsed <= SIGNED_BIGINT_MAX else None
 
     async def apply_upstream_record_identity(
         self,
@@ -1408,18 +1434,49 @@ class UpstreamAccountService:
         config: UpstreamAccountConfig,
         state: Any,
         *,
+        observed_upstream_type: str | None = None,
         record_owners: dict[int, int] | None = None,
         ambiguous_unbound_record_ids: set[int] | None = None,
-    ) -> bool:
+    ) -> UpstreamRecordIdentityStatus:
         """Bind a verified upstream key row without silently replacing it."""
         observed_id = self._upstream_record_id(state)
+        normalized_observed_type = str(observed_upstream_type or "").strip().lower()
+        if normalized_observed_type not in {"newapi", "sub2api"}:
+            normalized_observed_type = ""
+        stored_id = config.upstream_api_key_record_id
+        stored_upstream_type = str(
+            config.resolved_upstream_type
+            or (config.upstream_type if config.upstream_type in {"newapi", "sub2api"} else "")
+        ).strip().lower()
+        if (
+            stored_id is not None
+            and stored_upstream_type
+            and normalized_observed_type
+            and stored_upstream_type != normalized_observed_type
+        ):
+            config.upstream_identity_rebind_required = True
+            config.last_error = (
+                f"The upstream platform changed from {stored_upstream_type} to "
+                f"{normalized_observed_type}; explicit rebind is required before "
+                "accepting an API key record from the new platform."
+            )
+            return UpstreamRecordIdentityStatus.REBIND_REQUIRED
         if observed_id is None:
-            return not bool(config.upstream_identity_rebind_required)
+            if config.upstream_identity_rebind_required:
+                return UpstreamRecordIdentityStatus.REBIND_REQUIRED
+            if stored_id is not None:
+                return UpstreamRecordIdentityStatus.INCONCLUSIVE
+            if normalized_observed_type:
+                config.resolved_upstream_type = normalized_observed_type
+            return UpstreamRecordIdentityStatus.VERIFIED
+
+        if stored_id is None and config.upstream_identity_rebind_required:
+            return UpstreamRecordIdentityStatus.REBIND_REQUIRED
 
         owner_id: int | None = None
         if record_owners is not None:
             owner_id = record_owners.get(observed_id)
-        elif config.channel_id is not None:
+        if owner_id is None and config.channel_id is not None:
             with db.no_autoflush:
                 owner_id = await db.scalar(
                     select(UpstreamAccountConfig.id)
@@ -1431,7 +1488,6 @@ class UpstreamAccountService:
                     .limit(1)
                 )
 
-        stored_id = config.upstream_api_key_record_id
         ambiguous = bool(
             ambiguous_unbound_record_ids
             and observed_id in ambiguous_unbound_record_ids
@@ -1443,20 +1499,22 @@ class UpstreamAccountService:
                 f"Upstream API key record #{observed_id} matches more than one local "
                 "account on this channel; explicit rebind is required."
             )
-            return False
+            return UpstreamRecordIdentityStatus.REBIND_REQUIRED
         if stored_id is not None and stored_id != observed_id:
             config.upstream_identity_rebind_required = True
             config.last_error = (
                 f"The upstream API key record ID changed from #{stored_id} to "
                 f"#{observed_id}; explicit rebind is required."
             )
-            return False
+            return UpstreamRecordIdentityStatus.REBIND_REQUIRED
 
         config.upstream_api_key_record_id = observed_id
         config.upstream_identity_rebind_required = False
+        if normalized_observed_type:
+            config.resolved_upstream_type = normalized_observed_type
         if record_owners is not None:
             record_owners[observed_id] = config.id
-        return True
+        return UpstreamRecordIdentityStatus.VERIFIED
 
     def _numeric_remote_id(self, account: dict[str, Any]) -> int | None:
         raw_id = self.sub2api.account_id(account)
@@ -1693,6 +1751,17 @@ class UpstreamAccountService:
         legacy = self._legacy_remote_binding_fingerprint(account)
         return "bound" if legacy is not None and stored == legacy else "mismatch"
 
+    def _config_binding_evidence_incomplete(
+        self,
+        account: dict[str, Any],
+        config: UpstreamAccountConfig | None,
+    ) -> bool:
+        if config is None or not str(config.remote_identity_fingerprint or "").strip():
+            return False
+        if account.get("_cached") is True:
+            return False
+        return self._remote_binding_fingerprint(account) is None
+
     def _config_binding_differs_only_by_remote_name(
         self,
         account: dict[str, Any],
@@ -1818,7 +1887,9 @@ class UpstreamAccountService:
             api_key_origin_rebind_required=api_key_origin_rebind_required,
             upstream_identity_rebind_required=upstream_identity_rebind_required,
             upstream_api_key_record_id=(
-                config.upstream_api_key_record_id if config is not None else None
+                str(config.upstream_api_key_record_id)
+                if config is not None and config.upstream_api_key_record_id is not None
+                else None
             ),
             remote_name=(
                 _safe_text(
@@ -1871,8 +1942,6 @@ class UpstreamAccountService:
             rate_pause_policy=(config.rate_pause_policy if config is not None else "inherit"),
             rate_pause_effective_enabled=bool(rate_pause_policy["enabled"]),
             rate_pause_effective_source=rate_pause_policy["source"],
-            rate_pause_mode=rate_pause_policy["mode"],
-            rate_increase_threshold_percent=rate_pause_policy["threshold_percent"],
             rate_absolute_threshold=rate_pause_policy["absolute_threshold"],
             composite_multiplier=(
                 _calculate_composite_multiplier(
@@ -2256,7 +2325,10 @@ class UpstreamAccountService:
                     UpstreamAccountConfig.sub2api_account_id == account_id,
                     UpstreamAccountConfig.remote_identity_fingerprint.is_(None),
                 )
-                .values(remote_identity_fingerprint=fingerprint)
+                .values(
+                    remote_identity_fingerprint=fingerprint,
+                    api_key_origin_rebind_required=False,
+                )
                 .execution_options(synchronize_session=False)
             )
             bound += int(result.rowcount or 0)
@@ -2355,9 +2427,6 @@ class UpstreamAccountService:
                 "manual_group_multiplier",
                 "manual_recharge_multiplier",
             }
-            preview_invalidated = bool(fields & preview_fields) or bool(
-                payload.api_key or payload.access_token or payload.clear_access_token
-            ) or binding_rebound or payload.confirm_upstream_identity_rebind
             current_api_key = (
                 decrypt_text(config.encrypted_api_key)
                 if not config.api_key_origin_rebind_required
@@ -2378,6 +2447,90 @@ class UpstreamAccountService:
                     raise UpstreamAccountServiceError(
                         "The upstream channel was not found.", status_code=404
                     )
+            remote_base_url_target: str | None = None
+            if "base_url" in fields and payload.base_url is not None:
+                remote_base_url_target = payload.base_url
+            elif (
+                "channel_id" in fields
+                and selected_channel is not None
+                and payload.channel_id != config.channel_id
+            ):
+                remote_base_url_target = selected_channel.canonical_base_url
+            next_origin = upstream_url_origin(remote_base_url_target or config.base_url)
+            if (
+                previous_origin is not None
+                and next_origin is not None
+                and next_origin != previous_origin
+                and not payload.confirm_credential_rebind
+            ):
+                raise UpstreamAccountServiceError(
+                    "Changing the upstream origin requires explicit credential rebind confirmation.",
+                    status_code=409,
+                )
+            if (
+                remote_base_url_target is not None
+                and _remote_base_url(remote) != remote_base_url_target
+            ):
+                endpoint_guard = self._remote_rename_guard_fingerprint(remote)
+
+                def validate_endpoint_candidate(candidate: dict[str, Any]) -> None:
+                    if self._remote_rename_guard_fingerprint(candidate) != endpoint_guard:
+                        raise UpstreamAccountServiceError(
+                            "The sub2api account identity or upstream address changed before "
+                            "the new channel could be applied; refresh the account list and try again.",
+                            status_code=409,
+                        )
+
+                try:
+                    remote = await self.sub2api.update_account_base_url(
+                        account_id,
+                        remote_base_url_target,
+                        validate_current=validate_endpoint_candidate,
+                    )
+                except UpstreamAccountServiceError:
+                    raise
+                except Exception as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    raise UpstreamAccountServiceError(
+                        "Unable to update the sub2api API key account upstream address."
+                    ) from None
+            preview_invalidated = any(
+                field in fields and getattr(payload, field) != getattr(config, field)
+                for field in preview_fields
+            ) or bool(
+                (payload.api_key and payload.api_key != current_api_key)
+                or (payload.access_token and payload.access_token != current_access_token)
+                or (payload.clear_access_token and current_access_token is not None)
+                or binding_rebound
+                or payload.confirm_upstream_identity_rebind
+            )
+            stored_record_upstream_type = str(
+                config.resolved_upstream_type
+                or (
+                    config.upstream_type
+                    if config.upstream_type in {"newapi", "sub2api"}
+                    else ""
+                )
+            ).strip().lower()
+            selected_record_upstream_type = str(
+                (
+                    selected_channel.resolved_upstream_type
+                    or (
+                        selected_channel.upstream_type
+                        if selected_channel.upstream_type in {"newapi", "sub2api"}
+                        else ""
+                    )
+                )
+                if selected_channel is not None
+                else ""
+            ).strip().lower()
+            channel_platform_changed = bool(
+                config.upstream_api_key_record_id is not None
+                and stored_record_upstream_type
+                and selected_record_upstream_type
+                and stored_record_upstream_type != selected_record_upstream_type
+            )
             identity_changed = (
                 binding_rebound
                 or
@@ -2439,7 +2592,16 @@ class UpstreamAccountService:
                 if selected_channel is not None:
                     config.base_url = selected_channel.canonical_base_url
                     config.upstream_type = selected_channel.upstream_type
-                    config.resolved_upstream_type = selected_channel.resolved_upstream_type
+                    if (
+                        config.upstream_api_key_record_id is None
+                        or payload.confirm_upstream_identity_rebind
+                    ):
+                        config.resolved_upstream_type = selected_channel.resolved_upstream_type
+                    elif config.resolved_upstream_type is None and stored_record_upstream_type:
+                        # Preserve the platform component of an existing record
+                        # binding. A normal save cannot prove a record belongs
+                        # to the channel's currently detected platform.
+                        config.resolved_upstream_type = stored_record_upstream_type
                     config.upstream_user_id = selected_channel.upstream_user_id
                     config.encrypted_access_token = selected_channel.encrypted_access_token
                     config.manual_recharge_multiplier = selected_channel.manual_recharge_multiplier
@@ -2457,8 +2619,6 @@ class UpstreamAccountService:
                 "manual_group_multiplier",
                 "manual_recharge_multiplier",
                 "rate_pause_policy",
-                "rate_pause_mode",
-                "rate_increase_threshold_percent",
                 "rate_absolute_threshold",
             ):
                 if field in fields:
@@ -2471,14 +2631,8 @@ class UpstreamAccountService:
                         )
                     setattr(config, field, value)
             if "rate_pause_policy" in fields and config.rate_pause_policy == "custom":
-                config.rate_pause_mode = config.rate_pause_mode or "increase_percent"
-                config.rate_increase_threshold_percent = (
-                    config.rate_increase_threshold_percent or 20.0
-                )
                 config.rate_absolute_threshold = config.rate_absolute_threshold or 1.0
             elif "rate_pause_policy" in fields and config.rate_pause_policy != "custom":
-                config.rate_pause_mode = None
-                config.rate_increase_threshold_percent = None
                 config.rate_absolute_threshold = None
             if "priority_assignment_when_disabled" in fields:
                 config.priority_assignment_when_disabled = payload.priority_assignment_when_disabled
@@ -2536,18 +2690,6 @@ class UpstreamAccountService:
                     config.availability_status = "disabled"
                 else:
                     config.availability_status = "pending"
-
-            next_origin = upstream_url_origin(config.base_url)
-            if (
-                previous_origin is not None
-                and next_origin is not None
-                and next_origin != previous_origin
-                and not payload.confirm_credential_rebind
-            ):
-                raise UpstreamAccountServiceError(
-                    "Changing the upstream origin requires explicit credential rebind confirmation.",
-                    status_code=409,
-                )
 
             if payload.api_key:
                 config.encrypted_api_key = encrypt_text(payload.api_key)
@@ -2608,6 +2750,14 @@ class UpstreamAccountService:
                         now=_utcnow(),
                         clear_ownership=binding_rebound,
                     )
+
+            if channel_platform_changed and not identity_changed:
+                config.upstream_identity_rebind_required = True
+                config.last_error = (
+                    f"The upstream platform changed from {stored_record_upstream_type} to "
+                    f"{selected_record_upstream_type}; explicit rebind is required before "
+                    "accepting an API key record from the new platform."
+                )
 
             if binding_rebound:
                 config.remote_identity_fingerprint = self._require_remote_binding_fingerprint(
@@ -2802,6 +2952,8 @@ class UpstreamAccountService:
         self,
         config: UpstreamAccountConfig,
         channel: UpstreamChannel | None,
+        *,
+        today_timezone: str,
     ) -> Any:
         api_key = (
             decrypt_text(config.encrypted_api_key)
@@ -2828,8 +2980,24 @@ class UpstreamAccountService:
                 if config.upstream_api_key_record_id is not None
                 else None
             ),
+            today_timezone=today_timezone,
         )
         return await result if inspect.isawaitable(result) else result
+
+    @staticmethod
+    async def _runtime_display_timezone() -> str:
+        try:
+            public_settings = await get_runtime_config_service().get_public_settings()
+        except Exception:
+            return DEFAULT_TODAY_TIME_ZONE
+        configured = (
+            public_settings.get("display_timezone")
+            if isinstance(public_settings, dict)
+            else None
+        )
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        return DEFAULT_TODAY_TIME_ZONE
 
     def _apply_balance_result(
         self,
@@ -2888,6 +3056,7 @@ class UpstreamAccountService:
         config: UpstreamAccountConfig,
     ) -> UpstreamAccountOut:
         self._require_config_binding(remote, config)
+        today_timezone = await self._runtime_display_timezone()
         now = _utcnow()
         channel = await self._channel_for_config(db, config)
         channel_secrets = self._known_channel_secrets(channel)
@@ -2908,7 +3077,13 @@ class UpstreamAccountService:
         tasks: list[Any] = [balance_task, local_recharge_task]
         upstream_attempted = has_credentials and has_base_url
         if upstream_attempted:
-            tasks.append(self._call_upstream_discovery(config, channel))
+            tasks.append(
+                self._call_upstream_discovery(
+                    config,
+                    channel,
+                    today_timezone=today_timezone,
+                )
+            )
         results = await asyncio.gather(*tasks, return_exceptions=True)
         balance_result, local_recharge_result = results[0], results[1]
         upstream_result = results[2] if upstream_attempted else None
@@ -2987,11 +3162,16 @@ class UpstreamAccountService:
                         if isinstance(account_states, dict)
                         else None
                     ) or _value(upstream_result, "matched_account_state")
-                    if not await self.apply_upstream_record_identity(
+                    resolved_type = str(
+                        _value(upstream_result, "upstream_type") or ""
+                    ).strip().lower()
+                    identity_status = await self.apply_upstream_record_identity(
                         db,
                         config,
                         upstream_state,
-                    ):
+                        observed_upstream_type=resolved_type,
+                    )
+                    if identity_status is not UpstreamRecordIdentityStatus.VERIFIED:
                         upstream_identity_mismatch = True
                         discovery_succeeded = False
                         upstream_state = None
@@ -3002,11 +3182,9 @@ class UpstreamAccountService:
                             config,
                             upstream_state,
                             now=now,
+                            time_zone=today_timezone,
                             secrets=known_secrets,
                         )
-                    resolved_type = str(_value(upstream_result, "upstream_type") or "").strip().lower()
-                    if resolved_type in {"newapi", "sub2api"}:
-                        config.resolved_upstream_type = resolved_type
                     options_value = _value(
                         upstream_result,
                         "groups",
@@ -3092,6 +3270,19 @@ class UpstreamAccountService:
                         config.discovered_group_multiplier = float(fresh_group)
                     if fresh_recharge is not None:
                         config.discovered_recharge_multiplier = float(fresh_recharge)
+
+        if (
+            upstream_attempted
+            and not discovery_succeeded
+            and not upstream_identity_mismatch
+        ):
+            self.apply_upstream_usage_state(
+                config,
+                None,
+                now=now,
+                time_zone=today_timezone,
+                secrets=known_secrets,
+            )
 
         if upstream_identity_mismatch:
             config.remote_platform = _safe_text(

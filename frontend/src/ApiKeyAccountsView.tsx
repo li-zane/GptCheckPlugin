@@ -44,6 +44,7 @@ import {
 
 import { api, upstreamLegacyBindingCounts } from "./api";
 import { HelpPopover } from "./HelpPopover";
+import { MiddleEllipsisText } from "./MiddleEllipsisText";
 import {
   latestChannelMonitorStatus,
   recentChannelMonitorTimeline,
@@ -127,6 +128,7 @@ import { routeFromPath, type ApiKeySubview } from "./viewRouting";
 import type {
   ApiKeyViewOperation,
   PriorityInterval,
+  PriorityAllocationStrategy,
   PriorityIntervalInput,
   AccountSchedulingChangeEvent,
   ChangeLogUnreadCounts,
@@ -171,8 +173,6 @@ type AccountForm = {
   remoteName: string;
   priorityAssignmentWhenDisabled: "inherit" | "enabled" | "disabled";
   ratePausePolicy: "inherit" | "disabled" | "custom";
-  ratePauseMode: "increase_percent" | "absolute_multiplier";
-  rateIncreaseThreshold: string;
   rateAbsoluteThreshold: string;
   availabilityCheckMode: "channel_monitor" | "independent_model" | "disabled";
   availabilityMonitorId: string;
@@ -184,9 +184,8 @@ type PriorityIntervalForm = {
   startPriority: string;
   endPriority: string;
   step: string;
+  allocationStrategy: PriorityAllocationStrategy;
   ratePauseEnabled: boolean;
-  ratePauseMode: "increase_percent" | "absolute_multiplier";
-  rateIncreaseThreshold: string;
   rateAbsoluteThreshold: string;
 };
 
@@ -222,8 +221,6 @@ const emptyAccountForm: AccountForm = {
   remoteName: "",
   priorityAssignmentWhenDisabled: "inherit",
   ratePausePolicy: "inherit",
-  ratePauseMode: "increase_percent",
-  rateIncreaseThreshold: "20",
   rateAbsoluteThreshold: "1",
   availabilityCheckMode: "channel_monitor",
   availabilityMonitorId: "",
@@ -235,9 +232,8 @@ const emptyPriorityIntervalForm: PriorityIntervalForm = {
   startPriority: "",
   endPriority: "",
   step: "1",
+  allocationStrategy: "cost_optimized",
   ratePauseEnabled: false,
-  ratePauseMode: "increase_percent",
-  rateIncreaseThreshold: "20",
   rateAbsoluteThreshold: "1",
 };
 
@@ -1206,8 +1202,6 @@ export function ApiKeyAccountsView({
           ? "disabled"
           : "inherit",
       ratePausePolicy: account.rate_pause_policy || "inherit",
-      ratePauseMode: account.rate_pause_mode || "increase_percent",
-      rateIncreaseThreshold: numberInputValue(account.rate_increase_threshold_percent) || "20",
       rateAbsoluteThreshold: numberInputValue(account.rate_absolute_threshold) || "1",
       availabilityCheckMode: account.availability_check_mode || "channel_monitor",
       availabilityMonitorId: account.availability_monitor_id == null
@@ -1311,9 +1305,8 @@ export function ApiKeyAccountsView({
       startPriority: String(interval.start_priority),
       endPriority: String(interval.end_priority),
       step: String(interval.step),
+      allocationStrategy: interval.allocation_strategy || "cost_optimized",
       ratePauseEnabled: interval.rate_pause_enabled === true,
-      ratePauseMode: interval.rate_pause_mode || "increase_percent",
-      rateIncreaseThreshold: String(interval.rate_increase_threshold_percent ?? 20),
       rateAbsoluteThreshold: String(interval.rate_absolute_threshold ?? 1),
     } : emptyPriorityIntervalForm);
     setDialogError("");
@@ -1548,13 +1541,8 @@ export function ApiKeyAccountsView({
         : accountForm.priorityAssignmentWhenDisabled === "enabled";
       payload.rate_pause_policy = accountForm.ratePausePolicy;
       if (accountForm.ratePausePolicy === "custom") {
-        const ratePolicy = ratePauseThresholdPayload(accountForm.ratePauseMode, accountForm.rateIncreaseThreshold, accountForm.rateAbsoluteThreshold);
-        payload.rate_pause_mode = accountForm.ratePauseMode;
-        payload.rate_increase_threshold_percent = ratePolicy.rate_increase_threshold_percent;
-        payload.rate_absolute_threshold = ratePolicy.rate_absolute_threshold;
+        payload.rate_absolute_threshold = ratePauseThresholdPayload(accountForm.rateAbsoluteThreshold);
       } else {
-        payload.rate_pause_mode = accountForm.ratePauseMode;
-        payload.rate_increase_threshold_percent = null;
         payload.rate_absolute_threshold = null;
       }
       const submittedAvailabilityMode = accountForm.availabilityCheckMode;
@@ -1574,7 +1562,7 @@ export function ApiKeyAccountsView({
       if (
         credentialRebind &&
         !window.confirm(
-          "账号将切换到不同的上游域名。继续会把账号 API Key 重新绑定到新域名，是否确认？",
+          "账号将切换到不同的上游域名。继续会先更新 Sub2API 账号的上游地址，再把本地 API Key 配置绑定到新渠道，是否确认？",
         )
       ) {
         return;
@@ -1631,6 +1619,7 @@ export function ApiKeyAccountsView({
     try {
       await api.discoverUpstreamChannel(channel.id);
       await loadData(true);
+      await refreshChangeLogUnreadCounts();
       rateLogsRequestSequence.current += 1;
       setRateLogs([]);
       setRateLogsLoading(false);
@@ -1698,6 +1687,7 @@ export function ApiKeyAccountsView({
       } else {
         await loadData(true);
       }
+      await refreshChangeLogUnreadCounts();
       rateLogsRequestSequence.current += 1;
       setRateLogs([]);
       setRateLogsLoading(false);
@@ -2357,6 +2347,32 @@ export function ApiKeyAccountsView({
                 />
               </label>
 
+              <fieldset className="api-key-field api-key-field--wide">
+                <legend>优先级方案</legend>
+                <div className="api-key-segmented api-key-segmented--two" role="group" aria-label="优先级分配方案">
+                  {([
+                    ["cost_optimized", "低倍率优先"],
+                    ["fixed_step", "固定间隔"],
+                  ] as const).map(([strategy, label]) => (
+                    <button
+                      aria-pressed={priorityIntervalForm.allocationStrategy === strategy}
+                      className={priorityIntervalForm.allocationStrategy === strategy ? "active" : ""}
+                      key={strategy}
+                      onClick={() => setPriorityIntervalForm((current) => ({
+                        ...current,
+                        allocationStrategy: strategy,
+                      }))}
+                      type="button"
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <small>{priorityIntervalForm.allocationStrategy === "cost_optimized"
+                  ? "按综合倍率比例计算成本效率，低倍率账号获得更低的优先级数值和更高的调度权重。"
+                  : "按综合倍率排序后，从区间起点开始使用固定间隔依次分配优先级。"}</small>
+              </fieldset>
+
               <label className="api-key-field">
                 <span>起始优先级</span>
                 <input
@@ -2381,19 +2397,30 @@ export function ApiKeyAccountsView({
                   value={priorityIntervalForm.endPriority}
                 />
               </label>
-              <label className="api-key-field api-key-field--wide">
-                <span>优先级间隔</span>
-                <input
-                  inputMode="numeric"
-                  min="1"
-                  onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, step: event.target.value }))}
-                  required
-                  step="1"
-                  type="number"
-                  value={priorityIntervalForm.step}
-                />
-                <small>账号较多时会自动缩短间隔；间隔 1 仍放不下时，多出的账号使用区间最后一个优先级。</small>
-              </label>
+              <div className="api-key-field api-key-field--wide">
+                <small>
+                  同一 Sub2API 调度分组内，数值更低的区间权重更高；需要形成固定层级时，建议连续设置且不重叠，例如 [40, 70) 与 [70, 100)。
+                </small>
+              </div>
+              {priorityIntervalForm.allocationStrategy === "fixed_step" ? (
+                <label className="api-key-field api-key-field--wide">
+                  <span>固定优先级间隔</span>
+                  <input
+                    inputMode="numeric"
+                    min="1"
+                    onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, step: event.target.value }))}
+                    required
+                    step="1"
+                    type="number"
+                    value={priorityIntervalForm.step}
+                  />
+                  <small>计算方式为起始优先级 + 排名 × 固定间隔；超过区间容量时末尾账号共用最高档位。</small>
+                </label>
+              ) : (
+                <div className="api-key-field api-key-field--wide">
+                  <small>最低和最高倍率占据区间两端，中间使用几何中位数反比例曲线；取整冲突由系统使用 1 个优先级的最小间隔处理。</small>
+                </div>
+              )}
               <label className="checkbox-line settings-toggle api-key-field--wide">
                 <input
                   checked={priorityIntervalForm.ratePauseEnabled}
@@ -2405,35 +2432,16 @@ export function ApiKeyAccountsView({
                   <small>绑定此区间且选择“继承”的账号会使用下面的阈值；倍率回落后自动恢复调度。</small>
                 </span>
               </label>
-              <div className="api-key-field api-key-field--wide api-key-segmented" role="group" aria-label="优先级区间倍率上涨暂停模式">
-                <button
-                  aria-pressed={priorityIntervalForm.ratePauseMode === "increase_percent"}
-                  className={priorityIntervalForm.ratePauseMode === "increase_percent" ? "active" : ""}
-                  disabled={!priorityIntervalForm.ratePauseEnabled}
-                  onClick={() => setPriorityIntervalForm((current) => ({ ...current, ratePauseMode: "increase_percent" }))}
-                  type="button"
-                >相对涨幅</button>
-                <button
-                  aria-pressed={priorityIntervalForm.ratePauseMode === "absolute_multiplier"}
-                  className={priorityIntervalForm.ratePauseMode === "absolute_multiplier" ? "active" : ""}
-                  disabled={!priorityIntervalForm.ratePauseEnabled}
-                  onClick={() => setPriorityIntervalForm((current) => ({ ...current, ratePauseMode: "absolute_multiplier" }))}
-                  type="button"
-                >综合倍率</button>
-              </div>
               <label className="api-key-field api-key-field--wide">
-                <span>{priorityIntervalForm.ratePauseMode === "increase_percent" ? "相对涨幅阈值" : "综合倍率阈值"}</span>
+                <span>综合倍率阈值</span>
                 <input
-                  aria-label={priorityIntervalForm.ratePauseMode === "increase_percent" ? "优先级区间倍率上涨百分比阈值" : "优先级区间综合倍率阈值"}
+                  aria-label="优先级区间综合倍率阈值"
                   disabled={!priorityIntervalForm.ratePauseEnabled}
                   min="0.000001"
-                  onChange={(event) => setPriorityIntervalForm((current) => ({
-                    ...current,
-                    [current.ratePauseMode === "increase_percent" ? "rateIncreaseThreshold" : "rateAbsoluteThreshold"]: event.target.value,
-                  }))}
+                  onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, rateAbsoluteThreshold: event.target.value }))}
                   step="any"
                   type="number"
-                  value={priorityIntervalForm.ratePauseMode === "increase_percent" ? priorityIntervalForm.rateIncreaseThreshold : priorityIntervalForm.rateAbsoluteThreshold}
+                  value={priorityIntervalForm.rateAbsoluteThreshold}
                 />
                 <small>设置保存后，在下一次上游同步时应用到该区间账号。</small>
               </label>
@@ -2716,7 +2724,7 @@ export function ApiKeyAccountsView({
                 <small>
                   {accountForm.ratePausePolicy === "inherit"
                     ? (editingAccount.priority_interval_id == null
-                      ? "当前账号未绑定优先级区间，继承后不会启用倍率上涨暂停。"
+                      ? "当前账号未绑定优先级区间，当前配置不会启用倍率上涨暂停。"
                       : "跟随所绑定优先级区间的开关和阈值。")
                     : accountForm.ratePausePolicy === "disabled"
                       ? "此账号不会因综合上游倍率超过阈值而自动暂停。"
@@ -2724,36 +2732,17 @@ export function ApiKeyAccountsView({
                 </small>
               </div>
               {accountForm.ratePausePolicy === "custom" ? (
-                <>
-                  <div className="api-key-field api-key-field--wide api-key-segmented" role="group" aria-label="账号倍率上涨暂停模式">
-                    <button
-                      aria-pressed={accountForm.ratePauseMode === "increase_percent"}
-                      className={accountForm.ratePauseMode === "increase_percent" ? "active" : ""}
-                      onClick={() => setAccountForm((current) => ({ ...current, ratePauseMode: "increase_percent" }))}
-                      type="button"
-                    >相对涨幅</button>
-                    <button
-                      aria-pressed={accountForm.ratePauseMode === "absolute_multiplier"}
-                      className={accountForm.ratePauseMode === "absolute_multiplier" ? "active" : ""}
-                      onClick={() => setAccountForm((current) => ({ ...current, ratePauseMode: "absolute_multiplier" }))}
-                      type="button"
-                    >综合倍率</button>
-                  </div>
-                  <label className="api-key-field api-key-field--wide">
-                    <span>{accountForm.ratePauseMode === "increase_percent" ? "相对涨幅阈值" : "综合倍率阈值"}</span>
-                    <input
-                      aria-label={accountForm.ratePauseMode === "increase_percent" ? "账号倍率上涨百分比阈值" : "账号综合倍率阈值"}
-                      min="0.000001"
-                      onChange={(event) => setAccountForm((current) => ({
-                        ...current,
-                        [accountForm.ratePauseMode === "increase_percent" ? "rateIncreaseThreshold" : "rateAbsoluteThreshold"]: event.target.value,
-                      }))}
-                      step="any"
-                      type="number"
-                      value={accountForm.ratePauseMode === "increase_percent" ? accountForm.rateIncreaseThreshold : accountForm.rateAbsoluteThreshold}
-                    />
-                  </label>
-                </>
+                <label className="api-key-field api-key-field--wide">
+                  <span>综合倍率阈值</span>
+                  <input
+                    aria-label="账号综合倍率阈值"
+                    min="0.000001"
+                    onChange={(event) => setAccountForm((current) => ({ ...current, rateAbsoluteThreshold: event.target.value }))}
+                    step="any"
+                    type="number"
+                    value={accountForm.rateAbsoluteThreshold}
+                  />
+                </label>
               ) : null}
 
               <div className="api-key-field api-key-field--wide">
@@ -2915,9 +2904,14 @@ function ChannelCard({
   const visibleGroups = groups.slice(0, 4);
   const type = resolvedChannelType(channel);
   const status = channelStatus(channel);
-  const url = channelBaseUrl(channel);
-  const managementUrl = channel.management_base_url?.trim() || url;
-  const hasSeparateManagementUrl = displayCanonicalUrl(managementUrl) !== displayCanonicalUrl(url);
+  const apiUrl = channelBaseUrl(channel);
+  const configuredManagementUrl = channel.management_base_url?.trim() || "";
+  const siteUrl = configuredManagementUrl || apiUrl;
+  const displayName = channelDisplayName(channel);
+  const isUrlDisplayName = urlLikeDisplayName(displayName, apiUrl)
+    || urlLikeDisplayName(displayName, siteUrl);
+  const hasSeparateManagementUrl = Boolean(configuredManagementUrl)
+    && displayCanonicalUrl(configuredManagementUrl) !== displayCanonicalUrl(apiUrl);
   const message = channelDisplayMessage(channel);
   const error = channelDisplayError(channel);
   const busy = Boolean(busyAction) || globallyDisabled;
@@ -2933,31 +2927,14 @@ function ChannelCard({
       <header className="api-key-channel-head">
         <div className="api-key-channel-mark" aria-hidden="true"><Globe2 size={18} /></div>
         <div className="api-key-channel-title">
-          <div>
-            <h3>{channelDisplayName(channel)}</h3>
+          <div className="api-key-channel-title-row">
+            <h3 title={isUrlDisplayName ? displayName : undefined}>
+              {isUrlDisplayName ? <MiddleEllipsisText text={displayName} /> : displayName}
+            </h3>
             <div className="api-key-inline-chips">
               <StatusChip status={type} />
               <StatusChip status={status} />
             </div>
-          </div>
-          <div className="api-key-channel-urls">
-            {isHttpUrl(url) ? (
-              <a href={url} rel="noreferrer" target="_blank" title={url}>
-                <span>{middleEllipsis(displayCanonicalUrl(url))}</span>
-                <ExternalLink size={13} />
-              </a>
-            ) : (
-              <span className="api-key-channel-url">{middleEllipsis(displayCanonicalUrl(url))}</span>
-            )}
-            {hasSeparateManagementUrl ? (
-              isHttpUrl(managementUrl) ? (
-                <a href={managementUrl} rel="noreferrer" target="_blank" title={managementUrl}>
-                  <b>管理</b>
-                  <span>{middleEllipsis(displayCanonicalUrl(managementUrl), 42)}</span>
-                  <ExternalLink size={13} />
-                </a>
-              ) : <span className="api-key-channel-url"><b>管理</b>{middleEllipsis(displayCanonicalUrl(managementUrl), 42)}</span>
-            ) : null}
           </div>
         </div>
         <div className="api-key-channel-actions">
@@ -2994,6 +2971,10 @@ function ChannelCard({
               <Trash2 size={15} />
             </button>
           )}
+        </div>
+        <div className="api-key-channel-addresses">
+          <ChannelAddressBox label="站点" url={siteUrl} />
+          <ChannelAddressBox label="API" url={hasSeparateManagementUrl ? apiUrl : ""} />
         </div>
       </header>
 
@@ -3042,7 +3023,7 @@ function ChannelCard({
         <ChannelStat className="api-key-channel-stat--recharge" icon={<BadgeDollarSign size={16} />} label="充值成本">
           <strong>{"¥" + formatCostPerUsd(channel.effective_recharge_multiplier) + " / $1"}</strong>
         </ChannelStat>
-        <ChannelStat className="api-key-channel-stat--probe" badge={<StatusChip status={status} />} icon={<Radar size={16} />} label="最近探测">
+        <ChannelStat className="api-key-channel-stat--probe" icon={<Radar size={16} />} label="最近探测">
           <strong>{formatDate(channel.last_discovered_at || channel.checked_at, displayTimeZone)}</strong>
         </ChannelStat>
       </div>
@@ -3645,9 +3626,7 @@ function AccountCardConfigurationTags({
   // effective fields.  Using the raw account policy here left inherited
   // thresholds blank even when the interval had enabled the pause rule.
   const rateThreshold = account.rate_pause_effective_enabled
-    ? account.rate_pause_mode === "absolute_multiplier"
-      ? formatMultiplier(account.rate_absolute_threshold)
-      : formatPercent(account.rate_increase_threshold_percent)
+    ? formatMultiplier(account.rate_absolute_threshold)
     : null;
   const mode = account.availability_check_mode || "disabled";
   const selectedMonitor = account.availability_monitor_id == null
@@ -4174,9 +4153,9 @@ function PriorityIntervalsView({
       <div className="api-key-panel-head">
         <div>
           <h2>优先级区间</h2>
-          <p>{shareSameCompositePriority
-            ? "区间上界不包含且允许重叠；同一区间按综合倍率从低到高分配，相同倍率账号共用一个优先级。"
-            : "区间上界不包含且允许重叠，不同类型账号可使用相同优先级范围；同一区间按综合倍率从低到高自动分配。"}</p>
+          <p>每个区间可独立使用低倍率优先或固定间隔方案；{shareSameCompositePriority
+            ? "相同倍率账号共用一个优先级。"
+            : "同倍率账号按手动排位分开。"}</p>
         </div>
         <div className="api-key-toolbar-actions">
           <button
@@ -4214,8 +4193,8 @@ function PriorityIntervalsView({
               : sortableCount;
             const waitingCount = assignedAccounts.length - sortableCount;
             const capacity = Math.max(0, interval.end_priority - interval.start_priority);
-            const sharedLastPriorityCount = sortableGroupCount > capacity
-              ? sortableGroupCount - capacity + 1
+            const sharedPriorityCount = sortableGroupCount > capacity
+              ? sortableGroupCount - capacity
               : 0;
             const effectiveStep = finiteNumber(interval.effective_step) ?? interval.step;
             return (
@@ -4224,6 +4203,7 @@ function PriorityIntervalsView({
                   <div>
                     <strong>{interval.name}</strong>
                     <span className="api-key-mono">[{interval.start_priority}, {interval.end_priority})</span>
+                    <span>{interval.allocation_strategy === "fixed_step" ? "固定间隔" : "低倍率优先"}</span>
                   </div>
                   <div className="api-key-row-actions">
                     <button
@@ -4249,8 +4229,12 @@ function PriorityIntervalsView({
                   </div>
                 </header>
                 <div className="api-key-priority-card-stats">
-                  <div><span>设定间隔</span><strong>{interval.step}</strong></div>
-                  <div><span>实际间隔</span><strong>{effectiveStep}</strong></div>
+                  {interval.allocation_strategy === "fixed_step" ? (
+                    <>
+                      <div><span>固定间隔</span><strong>{interval.step}</strong></div>
+                      <div><span>实际间隔</span><strong>{effectiveStep}</strong></div>
+                    </>
+                  ) : null}
                   <div><span>已选账号</span><strong>{assignedAccounts.length}</strong></div>
                   <div>
                     <span>{shareSameCompositePriority ? "倍率档位" : "参与排序"}</span>
@@ -4259,16 +4243,14 @@ function PriorityIntervalsView({
                 </div>
                 <p className={"api-key-priority-note" + (interval.rate_pause_enabled ? "" : " is-waiting")}>
                   倍率上涨暂停：{interval.rate_pause_enabled
-                    ? interval.rate_pause_mode === "absolute_multiplier"
-                      ? `开启 · 综合倍率达到 ${formatMultiplier(interval.rate_absolute_threshold)}`
-                      : `开启 · 相对涨幅达到 ${formatPercent(interval.rate_increase_threshold_percent)}`
+                    ? `开启 · 综合倍率达到 ${formatMultiplier(interval.rate_absolute_threshold)}`
                     : "关闭"}
                 </p>
-                {effectiveStep < interval.step ? (
-                  <p className="api-key-priority-note">账号数量较多，实际间隔已自动缩短为 {effectiveStep}。</p>
+                {interval.allocation_strategy === "fixed_step" && effectiveStep < interval.step ? (
+                  <p className="api-key-priority-note">区间空间有限，实际最低间隔已自动缩短为 {effectiveStep}。</p>
                 ) : null}
-                {sharedLastPriorityCount ? (
-                  <p className="api-key-priority-note is-warning">最后 {sharedLastPriorityCount} 个账号将共用优先级 {interval.end_priority - 1}。</p>
+                {sharedPriorityCount ? (
+                  <p className="api-key-priority-note is-warning">区间容量不足，至少 {sharedPriorityCount} 个倍率档位会与相邻档位共用优先级。</p>
                 ) : null}
                 {waitingCount ? (
                   <p className="api-key-priority-note is-waiting">{waitingCount} 个账号等待综合倍率，不参与容量和优先级计算。</p>
@@ -4430,84 +4412,92 @@ function RateChangeLogView({
             const newName = typeof log.details?.new_name === "string" ? log.details.new_name : null;
             const accountName = typeof log.details?.account_name === "string" ? log.details.account_name : null;
             const category = upstreamChangeCategory(log);
-            const subject = category.tone === "account"
-              ? <>API Key 账号 <b>{accountName || log.group_name || `#${log.group_id || "-"}`}</b></>
+            const subjectLabel = category.tone === "account"
+              ? "API Key 账号"
               : category.tone === "group"
-                ? <>上游分组 <b>{log.group_name || `#${log.group_id || "-"}`}</b></>
-                : <>上游配置 <b>{log.event_type === "channel_multiplier_changed" ? "充值倍率" : "状态"}</b></>;
+                ? "上游分组"
+                : "上游配置";
+            const subjectName = category.tone === "account"
+              ? accountName || log.group_name || `#${log.group_id || "-"}`
+              : category.tone === "group"
+                ? log.group_name || `#${log.group_id || "-"}`
+                : log.event_type === "channel_multiplier_changed" ? "充值倍率" : "状态";
+            const groupMultiplierValue = groupRate.newGroupMultiplier ?? groupRate.oldGroupMultiplier;
+            const compositeMultiplierValue = groupRate.newCompositeMultiplier ?? groupRate.oldCompositeMultiplier;
             return (
               <article
                 className={`api-key-rate-log-row api-key-change-event-row api-key-change-event-row--${category.tone}${log.unread ? " is-unread" : ""}`}
                 key={log.id}
               >
                 <div className="api-key-rate-log-identity">
-                  <div className={`api-key-change-category api-key-change-category--${category.tone}`}>{category.label}</div>
-                  <strong>上游 <b>{log.channel_name || "#" + (log.channel_id || "-")}</b></strong>
-                  <span>{subject}</span>
-                  <div className="api-key-rate-log-meta">
-                    {log.unread ? <span className="api-key-unread-chip">未读</span> : null}
+                  <div className="api-key-change-identity-head">
                     <time className="api-key-ledger-time" dateTime={log.created_at}>{formatDate(log.created_at, displayTimeZone)}</time>
+                    <div className={`api-key-change-category api-key-change-category--${category.tone}`}>{category.label}</div>
+                    {log.unread ? <span className="api-key-unread-chip">未读</span> : null}
+                  </div>
+                  <div className="api-key-change-identity-route">
+                    <span>上游 <b>{log.channel_name || "#" + (log.channel_id || "-")}</b></span>
+                    <span>{subjectLabel} <b>{subjectName}</b></span>
                   </div>
                 </div>
                 <div className="api-key-rate-log-cell api-key-rate-log-cell--primary">
-                  <span>{upstreamChannelChangeEventLabel(log.event_type)}</span>
-                  {multiplierEvent ? (
-                    <div className="api-key-rate-log-flow">
-                      <b>{formatRateLogMultiplier(log.old_value)}</b>
-                      <ArrowRight size={13} />
-                      <strong>{formatRateLogMultiplier(log.new_value)}</strong>
-                    </div>
-                  ) : nameEvent ? (
-                    <div className="api-key-rate-log-flow">
-                      <b>{oldName || "未命名"}</b>
-                      <ArrowRight size={13} />
-                      <strong>{newName || "未命名"}</strong>
-                    </div>
-                  ) : keyStatusEvent || groupStatusEvent ? (
-                    <div className="api-key-rate-log-flow">
-                      <b>{upstreamHealthStatusLabel(keyStatusEvent ? "key" : "group", log.old_status)}</b>
-                      <ArrowRight size={13} />
-                      <strong>{upstreamHealthStatusLabel(keyStatusEvent ? "key" : "group", log.new_status)}</strong>
-                    </div>
-                  ) : (
-                    <div className="api-key-rate-log-flow">
-                      <b>{upstreamGroupEventStatusLabel(log.old_status, log.event_type)}</b>
-                      <ArrowRight size={13} />
-                      <strong>{upstreamGroupEventStatusLabel(log.new_status, log.event_type)}</strong>
-                    </div>
-                  )}
-                  {groupAddedEvent && groupRate.newGroupMultiplier !== null ? (
-                    <div className="api-key-group-rate-detail">
-                      <span>分组倍率</span>
-                      <strong>{formatRateLogMultiplier(groupRate.newGroupMultiplier)}</strong>
-                    </div>
-                  ) : null}
-                  {(
-                    (groupAddedEvent || log.event_type === "group_multiplier_changed")
-                    && groupRate.showCompositeMultiplier
-                    && (
-                      groupRate.oldCompositeMultiplier !== null
-                      || groupRate.newCompositeMultiplier !== null
-                    )
-                  ) ? (
-                    <div className="api-key-group-rate-detail api-key-group-rate-detail--composite">
-                      <span>
-                        综合倍率
-                        {groupRate.rechargeMultiplier === null
-                          ? ""
-                          : `（充值 ${formatRateLogMultiplier(groupRate.rechargeMultiplier)}）`}
-                      </span>
-                      {groupAddedEvent ? (
-                        <strong>{formatRateLogMultiplier(groupRate.newCompositeMultiplier)}</strong>
+                  <div className="api-key-change-message-line api-key-change-message-line--primary">
+                    <span>{upstreamChannelChangeEventLabel(log.event_type)}</span>
+                  </div>
+                  <div className="api-key-change-message-line api-key-change-message-line--detail">
+                    {nameEvent ? (
+                      <div className="api-key-rate-log-flow">
+                        <b>{oldName || "未命名"}</b>
+                        <ArrowRight size={13} />
+                        <strong>{newName || "未命名"}</strong>
+                      </div>
+                    ) : (
+                      multiplierEvent ? (
+                        <div className="api-key-rate-log-flow">
+                          <b>{formatRateLogMultiplier(log.old_value)}</b>
+                          <ArrowRight size={13} />
+                          <strong>{formatRateLogMultiplier(log.new_value)}</strong>
+                        </div>
+                      ) : keyStatusEvent || groupStatusEvent ? (
+                        <div className="api-key-rate-log-flow">
+                          <b>{upstreamHealthStatusLabel(keyStatusEvent ? "key" : "group", log.old_status)}</b>
+                          <ArrowRight size={13} />
+                          <strong>{upstreamHealthStatusLabel(keyStatusEvent ? "key" : "group", log.new_status)}</strong>
+                        </div>
                       ) : (
                         <div className="api-key-rate-log-flow">
-                          <b>{formatRateLogMultiplier(groupRate.oldCompositeMultiplier)}</b>
+                          <b>{upstreamGroupEventStatusLabel(log.old_status, log.event_type)}</b>
                           <ArrowRight size={13} />
-                          <strong>{formatRateLogMultiplier(groupRate.newCompositeMultiplier)}</strong>
+                          <strong>{upstreamGroupEventStatusLabel(log.new_status, log.event_type)}</strong>
                         </div>
-                      )}
-                    </div>
-                  ) : null}
+                      )
+                    )}
+                    {(nameEvent || groupAddedEvent) && groupMultiplierValue !== null ? (
+                      <div className="api-key-group-rate-detail" title={`分组倍率 ${formatRateLogMultiplier(groupMultiplierValue)}`}>
+                        <span>分组倍率</span>
+                        <strong>{formatRateLogMultiplier(groupMultiplierValue)}</strong>
+                      </div>
+                    ) : null}
+                    {(
+                      (nameEvent || groupAddedEvent || log.event_type === "group_multiplier_changed")
+                      && groupRate.showCompositeMultiplier
+                      && compositeMultiplierValue !== null
+                    ) ? (
+                      <div
+                        className="api-key-group-rate-detail api-key-group-rate-detail--composite"
+                        title={`综合倍率 ${formatRateLogMultiplier(compositeMultiplierValue)}`}
+                      >
+                        <span>综合倍率</span>
+                        {log.event_type === "group_multiplier_changed" ? (
+                          <div className="api-key-rate-log-flow">
+                            <b>{formatRateLogMultiplier(groupRate.oldCompositeMultiplier)}</b>
+                            <ArrowRight size={13} />
+                            <strong>{formatRateLogMultiplier(groupRate.newCompositeMultiplier)}</strong>
+                          </div>
+                        ) : <strong>{formatRateLogMultiplier(compositeMultiplierValue)}</strong>}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </article>
             );
@@ -4915,6 +4905,22 @@ function ChannelStat({
   );
 }
 
+function ChannelAddressBox({ label, url }: { label: "站点" | "API"; url: string }) {
+  const address = url.trim();
+  const content = address ? displayFullUrl(address) : "";
+  const className = "api-key-channel-address" + (content ? "" : " api-key-channel-address--empty");
+  const children = <><b>{label}</b>{content ? <MiddleEllipsisText text={content} /> : null}</>;
+  if (!isHttpUrl(address)) {
+    return <span aria-label={`${label}地址未单独配置`} className={className} title={address || `${label}地址未单独配置`}>{children}</span>;
+  }
+  return (
+    <a className={className} href={address} rel="noreferrer" target="_blank" title={`${label}地址：${address}`}>
+      {children}
+      <ExternalLink size={12} />
+    </a>
+  );
+}
+
 function SummaryItem({
   label,
   value,
@@ -4953,6 +4959,9 @@ function UpstreamBalanceSummary({ channels }: { channels: UpstreamChannel[] }) {
 function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
   const configuredName = channel.display_name?.trim() || "";
   const managementUrl = channel.management_base_url?.trim() || channelBaseUrl(channel);
+  const displayName = configuredName || displayFullUrl(managementUrl) || "未配置地址";
+  const isUrlLabel = urlLikeDisplayName(displayName, managementUrl)
+    || urlLikeDisplayName(displayName, channelBaseUrl(channel));
   const platformBalance = formatCurrentPlatformBalance(channel);
   const adjustedBalance = formatCurrentRechargeAdjustedBalance(channel);
   const rechargeMultiplier = finiteNumber(channel.effective_recharge_multiplier);
@@ -4965,41 +4974,40 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
 
   return (
     <article className="api-key-balance-channel-card">
-      {configuredName ? (
-        <strong className="api-key-balance-channel-name" title={configuredName}>{configuredName}</strong>
-      ) : (
-        <BalanceManagementLink
-          className="api-key-balance-channel-name api-key-balance-channel-name--link"
-          url={managementUrl}
-        />
-      )}
-      <strong
-        aria-label={platformBalanceNote}
-        className="api-key-balance-amount api-key-balance-amount--platform"
-        title={platformBalanceNote}
-      >
-        {platformBalance}
-      </strong>
-      {configuredName ? (
-        <BalanceManagementLink className="api-key-balance-management-url" url={managementUrl} />
-      ) : null}
-      <strong
-        aria-label={adjustedBalanceNote}
-        className="api-key-balance-amount api-key-balance-amount--adjusted"
-        title={adjustedBalanceNote}
-      >
-        {adjustedBalance}
-      </strong>
+      <BalanceManagementLink
+        className="api-key-balance-channel-name api-key-balance-channel-name--link"
+        isUrlLabel={isUrlLabel}
+        label={displayName}
+        url={managementUrl}
+      />
+      <div className="api-key-balance-values">
+        <span aria-label={platformBalanceNote} className="api-key-balance-value" title={platformBalanceNote}>
+          <small>原始</small><strong>{platformBalance}</strong>
+        </span>
+        <span aria-label={adjustedBalanceNote} className="api-key-balance-value api-key-balance-value--adjusted" title={adjustedBalanceNote}>
+          <small>综合</small><strong>{adjustedBalance}</strong>
+        </span>
+      </div>
     </article>
   );
 }
 
-function BalanceManagementLink({ className, url }: { className: string; url: string }) {
-  const label = displayCanonicalUrl(url) || "未配置地址";
-  if (!isHttpUrl(url)) return <span className={className} title="未配置有效的管理地址">{label}</span>;
+function BalanceManagementLink({
+  className,
+  isUrlLabel = false,
+  label,
+  url,
+}: {
+  className: string;
+  isUrlLabel?: boolean;
+  label: string;
+  url: string;
+}) {
+  const visibleLabel = isUrlLabel ? <MiddleEllipsisText text={label} /> : <span>{label}</span>;
+  if (!isHttpUrl(url)) return <span className={className} title="未配置有效的管理地址">{visibleLabel}</span>;
   return (
     <a className={className} href={url} rel="noreferrer" target="_blank" title={`打开管理地址：${url}`}>
-      <span>{middleEllipsis(label)}</span>
+      {visibleLabel}
       <ExternalLink size={12} />
     </a>
   );
@@ -5302,43 +5310,29 @@ function priorityIntervalPayload(form: PriorityIntervalForm): PriorityIntervalIn
   if (name.length > 100) throw new Error("区间名称不能超过 100 个字符");
   const startPriority = Number(form.startPriority);
   const endPriority = Number(form.endPriority);
-  const step = Number(form.step);
-  const ratePause = ratePauseThresholdPayload(form.ratePauseMode, form.rateIncreaseThreshold, form.rateAbsoluteThreshold);
+  const step = form.allocationStrategy === "cost_optimized" ? 1 : Number(form.step);
+  const rateAbsoluteThreshold = ratePauseThresholdPayload(form.rateAbsoluteThreshold);
   if (!Number.isSafeInteger(startPriority) || !Number.isSafeInteger(endPriority)) {
     throw new Error("优先级范围必须使用整数");
   }
   if (startPriority < 0) throw new Error("起始优先级不能小于 0");
   if (endPriority <= startPriority) throw new Error("结束优先级必须大于起始优先级");
-  if (!Number.isSafeInteger(step) || step < 1) throw new Error("优先级间隔必须是大于 0 的整数");
+  if (!Number.isSafeInteger(step) || step < 1) throw new Error("固定优先级间隔必须是大于 0 的整数");
   return {
     name,
     start_priority: startPriority,
     end_priority: endPriority,
     step,
+    allocation_strategy: form.allocationStrategy,
     rate_pause_enabled: form.ratePauseEnabled,
-    rate_pause_mode: form.ratePauseMode,
-    ...ratePause,
+    rate_absolute_threshold: rateAbsoluteThreshold,
   };
 }
 
-function ratePauseThresholdPayload(
-  mode: "increase_percent" | "absolute_multiplier",
-  increaseThreshold: string,
-  absoluteThreshold: string,
-) {
-  const percent = Number(increaseThreshold);
+function ratePauseThresholdPayload(absoluteThreshold: string) {
   const absolute = Number(absoluteThreshold);
-  if (!Number.isFinite(percent) || percent <= 0 || percent > 100_000) throw new Error("相对涨幅阈值必须大于 0 且不超过 100000%");
   if (!Number.isFinite(absolute) || absolute <= 0 || absolute > 1000) throw new Error("综合倍率阈值必须大于 0 且不超过 1000");
-  return {
-    rate_increase_threshold_percent: mode === "increase_percent" ? percent : percent,
-    rate_absolute_threshold: mode === "absolute_multiplier" ? absolute : absolute,
-  };
-}
-
-function formatPercent(value: number | null | undefined) {
-  const number = finiteNumber(value);
-  return number === null ? "—" : `${number.toFixed(2)}%`;
+  return absolute;
 }
 
 function priorityIntervalAccountCount(interval: PriorityInterval, accounts: UpstreamAccount[]) {
@@ -5567,9 +5561,21 @@ function displayCanonicalUrl(value?: string | null) {
   return trimmed || value;
 }
 
+function displayFullUrl(value?: string | null) {
+  if (!value) return "";
+  return value.trim().replace(/\/+$/, "");
+}
+
+function urlLikeDisplayName(label: string, url: string) {
+  const normalized = label.trim();
+  return isHttpUrl(normalized)
+    || normalized === displayFullUrl(url)
+    || normalized === displayHost(url);
+}
+
 function middleEllipsis(value: string, maxLength = 54) {
   if (value.length <= maxLength) return value;
-  const marker = "···";
+  const marker = "...";
   const available = Math.max(2, maxLength - marker.length);
   const leading = Math.ceil(available / 2);
   const trailing = Math.floor(available / 2);

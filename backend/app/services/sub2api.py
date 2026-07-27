@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.core.upstream_urls import canonicalize_upstream_url
 from app.services.runtime_config import EffectiveSub2ApiConfig, get_runtime_config_service
 
 
@@ -1302,6 +1303,87 @@ class Sub2ApiClient:
         if not readback_completed:
             raise Sub2ApiRequestError("sub2api account readback did not complete after updating its name.")
         raise Sub2ApiRequestError("sub2api did not confirm the updated account name.")
+
+    async def update_account_base_url(
+        self,
+        account_id: str | int,
+        base_url: str,
+        *,
+        validate_current: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        normalized_base_url = canonicalize_upstream_url(base_url)
+        config = await get_runtime_config_service().get_sub2api_config()
+        current = await self.get_account_by_id(numeric_id, config=config)
+        if current is None:
+            raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
+        if validate_current is not None:
+            validate_current(current)
+
+        mutation_error: Exception | None = None
+        try:
+            # bulk-update merges this credentials patch without replacing the
+            # account's API key or other provider credentials.
+            await self._request(
+                "POST",
+                f"{config.accounts_path}/bulk-update",
+                config=config,
+                json={
+                    "account_ids": [numeric_id],
+                    "credentials": {"base_url": normalized_base_url},
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A lost response may still mean the one mutation succeeded. Read
+            # back the account, but never repeat the remote write.
+            mutation_error = exc
+
+        account_was_seen = False
+        readback_completed = False
+        try:
+            async with asyncio.timeout(SUB2API_MUTATION_READBACK_TIMEOUT_SECONDS):
+                for attempt in range(SUB2API_MUTATION_READBACK_ATTEMPTS):
+                    try:
+                        updated = await self.get_account_by_id(numeric_id, config=config)
+                        readback_completed = True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        updated = None
+                    if updated is not None:
+                        account_was_seen = True
+                        raw_base_url = _first_value(
+                            updated,
+                            ("credentials", "base_url"),
+                            ("base_url",),
+                        )
+                        try:
+                            confirmed_base_url = canonicalize_upstream_url(str(raw_base_url or ""))
+                        except ValueError:
+                            confirmed_base_url = None
+                        if confirmed_base_url == normalized_base_url:
+                            return updated
+                    if attempt + 1 < SUB2API_MUTATION_READBACK_ATTEMPTS:
+                        await asyncio.sleep(SUB2API_MUTATION_READBACK_DELAY_SECONDS)
+        except TimeoutError:
+            pass
+
+        if mutation_error is not None:
+            raise mutation_error
+        if readback_completed and not account_was_seen:
+            raise Sub2ApiRequestError(
+                "sub2api account was not found after updating its upstream address.",
+                status_code=404,
+            )
+        if not readback_completed:
+            raise Sub2ApiRequestError(
+                "sub2api account readback did not complete after updating its upstream address."
+            )
+        raise Sub2ApiRequestError("sub2api did not confirm the updated account upstream address.")
 
     async def set_account_schedulable(self, account_id: str | int, schedulable: bool) -> None:
         numeric_id = _positive_int(account_id)

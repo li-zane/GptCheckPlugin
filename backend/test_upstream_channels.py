@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.upstream_channels import router
@@ -40,7 +41,11 @@ from app.services.upstream_accounts import (
     AUTO_PAUSE_REASON_MONITOR,
     UpstreamAccountServiceError,
 )
-from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
+from app.services.upstream_channels import (
+    UpstreamChannelService,
+    UpstreamDiscoveryOptions,
+    get_upstream_channel_service,
+)
 from app.services.upstream_client import (
     AccountGroupMatch,
     AccountUpstreamState,
@@ -87,6 +92,7 @@ class FakeSub2Api(Sub2ApiClient):
         self.export_calls: list[list[int]] = []
         self.balance_results: dict[int, dict] = {}
         self.rate_update_calls: list[tuple[int, float]] = []
+        self.base_url_update_calls: list[tuple[int, str]] = []
         self.schedulable_calls: list[tuple[int, bool]] = []
         self.get_account_calls: list[int] = []
         self.today_costs: dict[int, float] = {}
@@ -160,6 +166,21 @@ class FakeSub2Api(Sub2ApiClient):
         account = next(item for item in self.accounts if int(item["id"]) == parsed_id)
         account["rate_multiplier"] = rate_multiplier
 
+    async def update_account_base_url(
+        self,
+        account_id: str | int,
+        base_url: str,
+        *,
+        validate_current=None,
+    ) -> dict:
+        parsed_id = int(account_id)
+        account = next(item for item in self.accounts if int(item["id"]) == parsed_id)
+        if validate_current is not None:
+            validate_current(dict(account))
+        self.base_url_update_calls.append((parsed_id, base_url))
+        account.setdefault("credentials", {})["base_url"] = base_url
+        return dict(account)
+
     async def set_account_schedulable(self, account_id: str | int, schedulable: bool) -> None:
         parsed_id = int(account_id)
         self.schedulable_calls.append((parsed_id, schedulable))
@@ -216,14 +237,6 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             get_channel_monitor_fallback_test_model=AsyncMock(return_value=""),
             get_channel_monitor_fallback_test_attempts=AsyncMock(return_value=1),
             get_channel_monitor_recovery_test_attempts=AsyncMock(return_value=1),
-            get_api_key_auto_pause_on_upstream_rate_increase_enabled=AsyncMock(
-                return_value=False
-            ),
-            get_upstream_rate_pause_mode=AsyncMock(return_value="increase_percent"),
-            get_upstream_rate_increase_threshold_percent=AsyncMock(
-                return_value=20.0
-            ),
-            get_upstream_rate_absolute_threshold=AsyncMock(return_value=1.0),
             get_upstream_balance_pause_threshold=AsyncMock(return_value=0.0),
             get_upstream_priority_sync_enabled=AsyncMock(return_value=True),
             get_notification_config=AsyncMock(
@@ -262,8 +275,6 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
     async def _enable_rate_interval(
         self,
         *,
-        mode: str = "increase_percent",
-        percent: float = 20.0,
         absolute: float = 1.0,
     ) -> None:
         interval = UpstreamPriorityInterval(
@@ -272,8 +283,6 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             end_priority=100,
             step=1,
             rate_pause_enabled=True,
-            rate_pause_mode=mode,
-            rate_increase_threshold_percent=percent,
             rate_absolute_threshold=absolute,
         )
         self.db.add(interval)
@@ -366,7 +375,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_overview_resolves_rate_pause_policy_from_priority_interval(self) -> None:
         await self.service.overview(self.db)
-        await self._enable_rate_interval(mode="absolute_multiplier", absolute=0.15)
+        await self._enable_rate_interval(absolute=0.15)
 
         overview = await self.service.overview(self.db, sync_inventory=False)
         account = next(
@@ -378,7 +387,6 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.rate_pause_policy, "inherit")
         self.assertTrue(account.rate_pause_effective_enabled)
         self.assertEqual(account.rate_pause_effective_source, "priority_interval")
-        self.assertEqual(account.rate_pause_mode, "absolute_multiplier")
         self.assertEqual(account.rate_absolute_threshold, 0.15)
 
     async def test_inventory_marks_missing_accounts_without_clearing_their_configuration(self) -> None:
@@ -574,6 +582,87 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(channels), 1)
         self.assertEqual(len(configs), 2)
+
+    async def test_inventory_retries_and_translates_concurrent_integrity_conflicts(
+        self,
+    ) -> None:
+        conflict = IntegrityError(
+            "UPDATE upstream_account_configs",
+            {},
+            RuntimeError("concurrent unique conflict"),
+        )
+        synchronized = ({}, {}, {}, False)
+        with (
+            patch.object(
+                self.service,
+                "_sync_inventory_rows",
+                new=AsyncMock(side_effect=[conflict, synchronized]),
+            ) as sync_rows,
+            patch.object(
+                self.service.accounts,
+                "sync_available_models",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await self.service._sync_inventory_unlocked(self.db)
+
+        self.assertEqual(result, synchronized)
+        self.assertEqual(sync_rows.await_count, 2)
+
+        repeated_conflict = AsyncMock(side_effect=[conflict, conflict])
+        with patch.object(
+            self.service,
+            "_sync_inventory_rows",
+            new=repeated_conflict,
+        ):
+            with self.assertRaises(UpstreamAccountServiceError) as context:
+                await self.service._sync_inventory_unlocked(self.db)
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(repeated_conflict.await_count, 2)
+
+    async def test_inventory_quarantines_duplicate_unassigned_record_ids_before_assignment(
+        self,
+    ) -> None:
+        await self.service.overview(self.db)
+        configs = list((await self.db.scalars(select(UpstreamAccountConfig))).all())
+        self.assertEqual(len(configs), 2)
+        for config in configs:
+            config.channel_id = None
+            config.channel_auto_assign_disabled = False
+            config.upstream_api_key_record_id = 88
+            config.upstream_identity_rebind_required = False
+            config.selected_group_id = "legacy"
+            config.selected_group_name = "Legacy"
+            config.effective_group_multiplier = 1.25
+            config.target_rate = 0.5
+        await self.db.commit()
+
+        overview = await self.service.overview(self.db)
+        repeated = await self.service.overview(self.db)
+
+        self.assertEqual(len(overview.channels), 1)
+        self.assertEqual(overview.channels[0].accounts, [])
+        self.assertEqual(
+            sorted(account.sub2api_account_id for account in overview.unassigned_accounts),
+            [7, 8],
+        )
+        self.assertEqual(repeated.channels[0].accounts, [])
+        self.assertEqual(
+            sorted(account.sub2api_account_id for account in repeated.unassigned_accounts),
+            [7, 8],
+        )
+        stored = list((await self.db.scalars(select(UpstreamAccountConfig))).all())
+        for config in stored:
+            self.assertIsNone(config.channel_id)
+            self.assertIsNone(config.upstream_api_key_record_id)
+            self.assertTrue(config.channel_auto_assign_disabled)
+            self.assertTrue(config.upstream_identity_rebind_required)
+            self.assertEqual(config.selected_group_id, "legacy")
+            self.assertEqual(config.selected_group_name, "Legacy")
+            self.assertEqual(config.effective_group_multiplier, 1.25)
+            self.assertEqual(config.target_rate, 0.5)
+            self.assertIn("duplicate upstream API key record #88", config.last_error or "")
 
     async def test_overview_and_account_discovery_share_config_creation_locks(self) -> None:
         expected_fingerprint = self.service.accounts._remote_identity_fingerprint(
@@ -862,6 +951,79 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.refresh(by_id[7])
         self.assertEqual(by_id[7].encrypted_api_key, original_ciphertext)
 
+    async def test_identity_mismatch_archive_is_idempotent_per_rebind_episode(
+        self,
+    ) -> None:
+        await self.service.overview(self.db)
+        stored = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        self.assertIsNotNone(stored)
+        stored.upstream_usage_amount = 1.25
+        stored.upstream_usage_unit = "USD"
+        stored.upstream_usage_checked_at = stored.created_at
+        await self.db.commit()
+
+        self.sub2api.accounts[0]["created_at"] = "2026-07-15T12:00:00Z"
+        await self.service.overview(self.db)
+        await self.service.overview(self.db)
+        await self.service.overview(self.db)
+
+        archives = list(
+            (
+                await self.db.scalars(
+                    select(UpstreamAccountDataArchive).where(
+                        UpstreamAccountDataArchive.sub2api_account_id == 7,
+                        UpstreamAccountDataArchive.reason
+                        == "remote_identity_mismatch",
+                    )
+                )
+            ).all()
+        )
+        self.assertEqual(len(archives), 1)
+        await self.db.refresh(stored)
+        self.assertTrue(stored.api_key_origin_rebind_required)
+
+        await self.service.accounts.upsert_account(
+            self.db,
+            7,
+            self._account_update(
+                7,
+                confirm_identity_rebind=True,
+                confirm_credential_rebind=True,
+            ),
+        )
+        await self.db.refresh(stored)
+        self.assertFalse(stored.api_key_origin_rebind_required)
+        stored.upstream_usage_amount = 2.5
+        stored.upstream_usage_unit = "USD"
+        stored.upstream_usage_checked_at = stored.updated_at
+        await self.db.commit()
+
+        self.sub2api.accounts[0]["created_at"] = "2026-07-16T12:00:00Z"
+        await self.service.overview(self.db)
+        archives = list(
+            (
+                await self.db.scalars(
+                    select(UpstreamAccountDataArchive).where(
+                        UpstreamAccountDataArchive.sub2api_account_id == 7,
+                        UpstreamAccountDataArchive.reason
+                        == "remote_identity_mismatch",
+                    )
+                )
+            ).all()
+        )
+        self.assertEqual(len(archives), 2)
+        self.assertEqual(
+            sorted(
+                archive.snapshot["upstream"]["upstream_usage_amount"]
+                for archive in archives
+            ),
+            [1.25, 2.5],
+        )
+
     async def test_remote_name_only_change_reconciles_cached_name_and_binding(self) -> None:
         await self.service.overview(self.db)
         stored = (
@@ -1127,6 +1289,75 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             replacement_call.kwargs["account_api_keys"],
             {8: replacement_key},
         )
+
+    async def test_legacy_unbound_inventory_sync_preserves_data_until_confirmation(
+        self,
+    ) -> None:
+        await self.service.overview(self.db)
+        stored = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        self.assertIsNotNone(stored)
+        interval = UpstreamPriorityInterval(
+            name="legacy-binding-pending",
+            start_priority=40,
+            end_priority=50,
+            step=1,
+        )
+        self.db.add(interval)
+        await self.db.flush()
+        checked_at = datetime(2026, 7, 26, 6, 0, tzinfo=timezone.utc)
+        stored.remote_identity_fingerprint = None
+        stored.priority_interval_id = interval.id
+        stored.desired_priority = 42
+        stored.priority_sync_status = "synced"
+        stored.upstream_usage_amount = 12.375
+        stored.upstream_usage_unit = "USD"
+        stored.upstream_usage_checked_at = checked_at
+        stored.today_upstream_usage_amount = 12.375
+        stored.today_upstream_usage_unit = "USD"
+        stored.today_upstream_usage_status = "ok"
+        stored.today_upstream_usage_checked_at = checked_at
+        await self.db.commit()
+
+        overview = await self.service.overview(self.db)
+        pending = next(
+            account
+            for channel in overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == 7
+        )
+        self.assertEqual(pending.identity_binding_status, "unbound")
+        self.assertFalse(pending.api_key_origin_rebind_required)
+
+        await self.db.refresh(stored)
+        self.assertEqual(stored.priority_interval_id, interval.id)
+        self.assertEqual(stored.desired_priority, 42)
+        self.assertEqual(stored.priority_sync_status, "synced")
+        self.assertEqual(stored.upstream_usage_amount, 12.375)
+        self.assertEqual(stored.upstream_usage_unit, "USD")
+        self.assertEqual(
+            stored.upstream_usage_checked_at,
+            checked_at.replace(tzinfo=None),
+        )
+        self.assertEqual(stored.today_upstream_usage_amount, 12.375)
+        self.assertEqual(stored.today_upstream_usage_status, "ok")
+        self.assertEqual(
+            stored.today_upstream_usage_checked_at,
+            checked_at.replace(tzinfo=None),
+        )
+        archives = list(
+            (
+                await self.db.scalars(
+                    select(UpstreamAccountDataArchive).where(
+                        UpstreamAccountDataArchive.sub2api_account_id == 7
+                    )
+                )
+            ).all()
+        )
+        self.assertEqual(archives, [])
 
     async def test_background_sync_never_claims_legacy_null_bindings(self) -> None:
         await self.service.overview(self.db)
@@ -2073,12 +2304,13 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(account.today_upstream_usage_status, "estimated")
 
-    async def test_successful_discovery_keeps_dated_usage_when_upstream_omits_a_key(self) -> None:
+    async def test_successful_discovery_keeps_same_day_usage_when_upstream_omits_a_key(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
         configs = (
             await self.db.execute(select(UpstreamAccountConfig))
         ).scalars().all()
         checked_at = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
         by_id = {config.sub2api_account_id: config for config in configs}
         for config in by_id.values():
             config.upstream_usage_amount = 12.375
@@ -2099,9 +2331,15 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         result.account_group_matches = {
             7: {"id": "default", "name": "Default", "multiplier": 1.0}
         }
-        with patch(
-            "app.services.upstream_channels.discover_upstream",
-            new=AsyncMock(return_value=result),
+        with (
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=AsyncMock(return_value=result),
+            ),
+            patch(
+                "app.services.upstream_channels._utcnow",
+                return_value=now,
+            ),
         ):
             discovered = await self.service.discover_channel(self.db, channel_id)
 
@@ -3645,6 +3883,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.manual_group_multiplier, 2.5)
 
     async def test_inconclusive_discovery_preserves_cached_upstream_api_key_record_id(self) -> None:
+        self.sub2api.accounts = self.sub2api.accounts[:1]
         channel_id = await self._configure_sub2api_credentials()
         stored = await self.db.scalar(
             select(UpstreamAccountConfig).where(
@@ -3653,16 +3892,223 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(stored)
         stored.upstream_api_key_record_id = 41
+        stored.resolved_upstream_type = "sub2api"
+        stored.selected_group_id = "legacy"
+        stored.selected_group_name = "Legacy"
+        stored.discovered_group_multiplier = 1.5
+        stored.effective_group_multiplier = 1.5
+        stored.group_multiplier_source = "upstream_key"
+        stored.group_multiplier_status = "ok"
+        stored.target_rate = 0.75
+        stored.upstream_usage_amount = 12.5
+        stored.upstream_usage_unit = "USD"
+        stored.upstream_usage_checked_at = datetime(
+            2026,
+            7,
+            26,
+            8,
+            0,
+            tzinfo=timezone.utc,
+        )
+        interval = UpstreamPriorityInterval(
+            name="inconclusive-identity",
+            start_priority=10,
+            end_priority=20,
+            step=1,
+        )
+        self.db.add(interval)
+        await self.db.flush()
+        stored.priority_interval_id = interval.id
+        stored.desired_priority = 12
+        stored.priority_sync_status = "synced"
         await self.db.commit()
 
+        discovery = AsyncMock(return_value=self._discovery_result())
         with patch(
             "app.services.upstream_channels.discover_upstream",
-            new=AsyncMock(return_value=self._discovery_result()),
+            new=discovery,
         ):
-            await self.service.discover_channel(self.db, channel_id)
+            await self.service.discover_channel(
+                self.db,
+                channel_id,
+                options=UpstreamDiscoveryOptions(sync_priorities=False),
+            )
 
         await self.db.refresh(stored)
         self.assertEqual(stored.upstream_api_key_record_id, 41)
+        self.assertFalse(stored.upstream_identity_rebind_required)
+        self.assertEqual(
+            (stored.selected_group_id, stored.selected_group_name),
+            ("legacy", "Legacy"),
+        )
+        self.assertEqual(stored.discovered_group_multiplier, 1.5)
+        self.assertEqual(stored.effective_group_multiplier, 1.5)
+        self.assertEqual(stored.group_multiplier_source, "upstream_key")
+        self.assertEqual(stored.group_multiplier_status, "ok")
+        self.assertEqual(stored.target_rate, 0.75)
+        self.assertEqual(stored.upstream_usage_amount, 12.5)
+        self.assertEqual(stored.upstream_usage_unit, "USD")
+        self.assertEqual(stored.priority_interval_id, interval.id)
+        self.assertEqual(stored.desired_priority, 12)
+        self.assertEqual(stored.priority_sync_status, "synced")
+
+    async def test_incomplete_remote_identity_preserves_priority_and_usage(self) -> None:
+        await self.service.overview(self.db)
+        stored = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        self.assertIsNotNone(stored)
+        interval = UpstreamPriorityInterval(
+            name="identity-evidence-hold",
+            start_priority=10,
+            end_priority=20,
+            step=1,
+        )
+        self.db.add(interval)
+        await self.db.flush()
+        stored.priority_interval_id = interval.id
+        stored.desired_priority = 12
+        stored.priority_sync_status = "synced"
+        stored.upstream_usage_amount = 7.5
+        stored.upstream_usage_unit = "USD"
+        stored.upstream_usage_checked_at = datetime(
+            2026,
+            7,
+            26,
+            8,
+            0,
+            tzinfo=timezone.utc,
+        )
+        await self.db.commit()
+
+        original_created_at = self.sub2api.accounts[0].pop("created_at", None)
+        overview = await self.service.overview(self.db)
+
+        isolated = next(
+            account
+            for channel in overview.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == 7
+        )
+        self.assertEqual(isolated.identity_binding_status, "mismatch")
+        self.assertFalse(isolated.managed)
+        await self.db.refresh(stored)
+        self.assertEqual(stored.priority_interval_id, interval.id)
+        self.assertEqual(stored.desired_priority, 12)
+        self.assertEqual(stored.priority_sync_status, "synced")
+        self.assertEqual(stored.upstream_usage_amount, 7.5)
+        self.assertEqual(stored.upstream_usage_unit, "USD")
+        archive = await self.db.scalar(
+            select(UpstreamAccountDataArchive).where(
+                UpstreamAccountDataArchive.sub2api_account_id == 7
+            )
+        )
+        self.assertIsNone(archive)
+
+        self.sub2api.accounts[0]["created_at"] = original_created_at
+        recovered = await self.service.overview(self.db)
+        recovered_account = next(
+            account
+            for channel in recovered.channels
+            for account in channel.accounts
+            if account.sub2api_account_id == 7
+        )
+        self.assertEqual(recovered_account.identity_binding_status, "bound")
+        await self.db.refresh(stored)
+        self.assertEqual(stored.priority_interval_id, interval.id)
+        self.assertEqual(stored.upstream_usage_amount, 7.5)
+
+    async def test_quarantined_record_owner_blocks_duplicate_binding(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+        configs = {
+            config.sub2api_account_id: config
+            for config in (
+                await self.db.scalars(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.channel_id == channel_id
+                    )
+                )
+            ).all()
+        }
+        owner = configs[7]
+        candidate = configs[8]
+        owner.upstream_api_key_record_id = 88
+        candidate.upstream_api_key_record_id = None
+        owner.encrypted_api_key = encrypt_text("sk-local-seven")
+        candidate.encrypted_api_key = encrypt_text("sk-local-eight")
+        await self.db.commit()
+
+        self.sub2api.accounts[0]["created_at"] = "2026-07-15T12:00:00Z"
+        result = self._discovery_result(
+            account_upstream_states={
+                8: AccountUpstreamState(
+                    key_record_id=88,
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                )
+            }
+        )
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+
+        await self.db.refresh(owner)
+        await self.db.refresh(candidate)
+        self.assertEqual(owner.upstream_api_key_record_id, 88)
+        self.assertIsNone(candidate.upstream_api_key_record_id)
+        self.assertTrue(candidate.upstream_identity_rebind_required)
+        self.assertIn("matches more than one local account", candidate.last_error or "")
+
+    async def test_same_record_id_requires_rebind_after_upstream_platform_change(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+        channel = await self.db.get(UpstreamChannel, channel_id)
+        stored = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        self.assertIsNotNone(channel)
+        self.assertIsNotNone(stored)
+        channel.upstream_type = "auto"
+        channel.resolved_upstream_type = "newapi"
+        stored.upstream_type = "auto"
+        stored.resolved_upstream_type = "newapi"
+        stored.upstream_api_key_record_id = 41
+        stored.encrypted_api_key = encrypt_text("sk-local-seven")
+        await self.db.commit()
+        result = self._discovery_result(
+            account_upstream_states={
+                7: AccountUpstreamState(
+                    key_record_id=41,
+                    key_status="active",
+                    group_status="available",
+                    group_id="default",
+                    group_name="Default",
+                )
+            }
+        )
+        result.upstream_type = "sub2api"
+
+        discovery = AsyncMock(return_value=result)
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=discovery,
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+
+        self.assertEqual(discovery.await_args.kwargs["upstream_type"], "auto")
+        await self.db.refresh(stored)
+        self.assertEqual(stored.upstream_api_key_record_id, 41)
+        self.assertEqual(stored.resolved_upstream_type, "newapi")
+        self.assertTrue(stored.upstream_identity_rebind_required)
+        self.assertIn("platform changed from newapi to sub2api", stored.last_error or "")
 
     async def test_same_observed_record_id_never_auto_binds_two_local_accounts(self) -> None:
         channel_id = await self._configure_sub2api_credentials()
@@ -4315,7 +4761,10 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         group_events = [event for event in events if event.event_type.startswith("group_")]
         self.assertEqual([event.event_type for event in group_events], ["group_name_changed"])
         self.assertEqual(group_events[0].group_id, "47")
-        self.assertEqual(group_events[0].details, {"old_name": "旧名称", "new_name": "新名称"})
+        self.assertEqual(group_events[0].old_value, 2.0)
+        self.assertEqual(group_events[0].new_value, 2.0)
+        self.assertEqual(group_events[0].details["old_name"], "旧名称")
+        self.assertEqual(group_events[0].details["new_name"], "新名称")
 
     async def test_discover_all_skips_channel_already_under_manual_discovery(self) -> None:
         base = await self.service.overview(self.db)
@@ -5965,11 +6414,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_rate_increase_hold_uses_trigger_baseline_until_rate_recovers(self) -> None:
+    async def test_rate_hold_uses_absolute_threshold_without_a_previous_baseline(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
-        await self._enable_rate_interval()
-        self.runtime_config.get_api_key_auto_pause_on_upstream_rate_increase_enabled.return_value = True
-        self.runtime_config.get_upstream_rate_increase_threshold_percent.return_value = 20.0
+        await self._enable_rate_interval(absolute=1.2)
         healthy_states = {
             account_id: AccountUpstreamState(
                 key_status="active",
@@ -5999,14 +6446,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.services.upstream_channels.discover_upstream",
-            new=AsyncMock(return_value=rate_result(1.0)),
-        ):
-            await self.service.discover_channel(self.db, channel_id)
-        with patch(
-            "app.services.upstream_channels.discover_upstream",
             new=AsyncMock(return_value=rate_result(1.5)),
         ):
-            await self.service.discover_channel(self.db, channel_id)
             await self.service.discover_channel(self.db, channel_id)
 
         self.assertEqual(
@@ -6023,8 +6464,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             for hold in config.pause_holds
             if hold.reason == "upstream_rate_increase" and hold.active
         )
-        self.assertEqual(hold.evidence_json["baseline_multiplier"], 1.0)
+        self.assertNotIn("baseline_multiplier", hold.evidence_json)
         self.assertEqual(hold.evidence_json["observed_multiplier"], 1.5)
+        self.assertEqual(hold.evidence_json["absolute_threshold"], 1.2)
 
         with patch(
             "app.services.upstream_channels.discover_upstream",
@@ -6039,10 +6481,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_absolute_upstream_multiplier_threshold_pauses_above_and_restores_at_boundary(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
-        await self._enable_rate_interval(mode="absolute_multiplier", absolute=1.2)
-        self.runtime_config.get_api_key_auto_pause_on_upstream_rate_increase_enabled.return_value = True
-        self.runtime_config.get_upstream_rate_pause_mode.return_value = "absolute_multiplier"
-        self.runtime_config.get_upstream_rate_absolute_threshold.return_value = 1.2
+        await self._enable_rate_interval(absolute=1.2)
         healthy_states = {
             account_id: AccountUpstreamState(
                 key_status="active",
@@ -6123,12 +6562,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             all(event.reason == "upstream_rate_increase" for event in events)
         )
 
-    async def test_switching_from_absolute_to_percent_rate_policy_releases_old_hold(self) -> None:
+    async def test_raising_absolute_rate_threshold_releases_old_hold(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id
-        await self._enable_rate_interval(mode="absolute_multiplier", absolute=1.0)
-        self.runtime_config.get_api_key_auto_pause_on_upstream_rate_increase_enabled.return_value = True
-        self.runtime_config.get_upstream_rate_pause_mode.return_value = "absolute_multiplier"
-        self.runtime_config.get_upstream_rate_absolute_threshold.return_value = 1.0
+        await self._enable_rate_interval(absolute=1.0)
         healthy_states = {
             account_id: AccountUpstreamState(
                 key_status="active",
@@ -6165,8 +6601,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sub2api.schedulable_calls, [(7, False), (8, False)])
 
         interval = await self.db.scalar(select(UpstreamPriorityInterval))
-        interval.rate_pause_mode = "increase_percent"
-        interval.rate_increase_threshold_percent = 20.0
+        interval.rate_absolute_threshold = 1.2
         await self.db.commit()
         with patch(
             "app.services.upstream_channels.discover_upstream",
@@ -6349,15 +6784,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             evidence={"baseline_multiplier": 1.0, "observed_multiplier": 1.5},
         )
         config.rate_pause_policy = "custom"
-        config.rate_pause_mode = "increase_percent"
-        config.rate_increase_threshold_percent = 20.0
         config.rate_absolute_threshold = 1.0
         self.service.accounts.sync_pause_compatibility_fields(config)
         await self.db.commit()
-        self.runtime_config.get_api_key_auto_pause_on_upstream_rate_increase_enabled.return_value = (
-            True
-        )
-
         original_set_schedulable = self.sub2api.set_account_schedulable
         attempts = 0
 
@@ -6422,8 +6851,6 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         config.pause_owned_by_plugin = True
         config.rate_pause_policy = "custom"
-        config.rate_pause_mode = "increase_percent"
-        config.rate_increase_threshold_percent = 20.0
         config.rate_absolute_threshold = 1.0
         config.auto_pause_episode_id = "runtime-setting-error-episode"
         config.auto_pause_channel_id = channel_id
@@ -6434,9 +6861,6 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
 
         self.runtime_config.get_api_key_auto_disable_on_upstream_unavailable.side_effect = (
-            RuntimeError("settings unavailable")
-        )
-        self.runtime_config.get_api_key_auto_pause_on_upstream_rate_increase_enabled.side_effect = (
             RuntimeError("settings unavailable")
         )
         healthy_states = {

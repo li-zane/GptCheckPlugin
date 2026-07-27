@@ -98,23 +98,28 @@ class PriorityAllocatorTests(unittest.TestCase):
         config.effective_recharge_multiplier = 1.0 if multiplier is not None else None
         return config
 
-    def test_allocator_shrinks_step_and_saturates_at_exclusive_end(self) -> None:
+    def test_allocator_uses_full_span_and_reports_capacity_collisions(self) -> None:
         interval = UpstreamPriorityInterval(
             id=1,
             name="main",
             start_priority=40,
             end_priority=70,
             step=2,
+            allocation_strategy="fixed_step",
         )
         sixteen = [self._config(index + 1, float(index + 1)) for index in range(16)]
         assignments, effective_step = allocate_interval_priorities(interval, sixteen)
         self.assertEqual(effective_step, 1)
-        self.assertEqual([assignments[index] for index in range(1, 17)], list(range(40, 56)))
+        self.assertEqual(assignments[1], 40)
+        self.assertEqual(assignments[2], 41)
+        self.assertEqual(assignments[8], 47)
+        self.assertEqual(assignments[16], 55)
 
         thirty_one = [self._config(index + 1, float(index + 1)) for index in range(31)]
         assignments, effective_step = allocate_interval_priorities(interval, thirty_one)
-        self.assertEqual(effective_step, 1)
-        self.assertEqual(assignments[30], 69)
+        self.assertEqual(effective_step, 0)
+        self.assertEqual(assignments[1], 40)
+        self.assertEqual(assignments[2], 41)
         self.assertEqual(assignments[31], 69)
 
     def test_allocator_uses_composite_multiplier_and_excludes_unknown_values(self) -> None:
@@ -134,9 +139,91 @@ class PriorityAllocatorTests(unittest.TestCase):
             [expensive, unknown, cheap],
         )
 
-        self.assertEqual(effective_step, 3)
-        self.assertEqual(assignments, {8: 10, 7: 13})
+        self.assertEqual(effective_step, 1)
+        self.assertEqual(assignments, {8: 10, 7: 19})
         self.assertNotIn(9, assignments)
+
+    def test_allocator_maps_inverse_cost_efficiency_onto_the_interval(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="main",
+            start_priority=40,
+            end_priority=70,
+            step=2,
+        )
+        cheap = self._config(1, 0.1)
+        near_cheap = self._config(2, 0.2)
+        expensive = self._config(3, 1.0)
+
+        assignments, effective_step = allocate_interval_priorities(
+            interval,
+            [expensive, near_cheap, cheap],
+        )
+
+        self.assertEqual(effective_step, 1)
+        self.assertEqual(assignments, {1: 40, 2: 50, 3: 69})
+
+    def test_cost_curve_ignores_configured_step_and_uses_unit_tie_spacing(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="main",
+            start_priority=40,
+            end_priority=70,
+            step=8,
+            allocation_strategy="cost_optimized",
+        )
+        alpha = self._config(1, 0.1)
+        beta = self._config(2, 0.1)
+        expensive = self._config(3, 1.0)
+
+        assignments, effective_step = allocate_interval_priorities(
+            interval,
+            [expensive, beta, alpha],
+        )
+
+        self.assertEqual(effective_step, 1)
+        self.assertEqual(assignments, {1: 40, 2: 41, 3: 69})
+
+    def test_cost_curve_spreads_unavoidable_tie_collisions_across_interval(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="small",
+            start_priority=40,
+            end_priority=43,
+            step=9,
+            allocation_strategy="cost_optimized",
+        )
+        configs = [self._config(index, 0.1) for index in range(1, 5)]
+
+        assignments, effective_step = allocate_interval_priorities(interval, configs)
+
+        self.assertEqual(effective_step, 0)
+        self.assertEqual(assignments, {1: 40, 2: 40, 3: 41, 4: 42})
+
+    def test_shared_priority_curve_keeps_account_weighted_geometric_median(self) -> None:
+        interval = UpstreamPriorityInterval(
+            id=1,
+            name="main",
+            start_priority=40,
+            end_priority=70,
+            step=2,
+        )
+        configs = [
+            self._config(1, 0.1),
+            self._config(2, 0.1),
+            self._config(3, 0.1),
+            self._config(4, 0.2),
+            self._config(5, 1.0),
+        ]
+
+        assignments, effective_step = allocate_interval_priorities(
+            interval,
+            configs,
+            share_same_composite_multiplier=True,
+        )
+
+        self.assertEqual(effective_step, 1)
+        self.assertEqual(assignments, {1: 40, 2: 40, 3: 40, 4: 52, 5: 69})
 
     def test_allocator_sorts_equal_multipliers_by_name_then_persisted_override(self) -> None:
         interval = UpstreamPriorityInterval(
@@ -152,18 +239,18 @@ class PriorityAllocatorTests(unittest.TestCase):
         beta.remote_name = "beta"
 
         assignments, _ = allocate_interval_priorities(interval, [beta, alpha])
-        self.assertEqual(assignments, {8: 40, 7: 42})
+        self.assertEqual(assignments, {8: 40, 7: 41})
 
         alpha.priority_tiebreak_order = 1
         alpha.priority_tiebreak_multiplier = 0.1
         beta.priority_tiebreak_order = 0
         beta.priority_tiebreak_multiplier = 0.1
         assignments, _ = allocate_interval_priorities(interval, [alpha, beta])
-        self.assertEqual(assignments, {7: 40, 8: 42})
+        self.assertEqual(assignments, {7: 40, 8: 41})
 
         beta.priority_tiebreak_multiplier = 0.2
         assignments, _ = allocate_interval_priorities(interval, [beta, alpha])
-        self.assertEqual(assignments, {8: 40, 7: 42})
+        self.assertEqual(assignments, {8: 40, 7: 41})
 
     def test_allocator_can_share_priority_across_equal_multiplier_accounts(self) -> None:
         interval = UpstreamPriorityInterval(
@@ -183,8 +270,8 @@ class PriorityAllocatorTests(unittest.TestCase):
             share_same_composite_multiplier=True,
         )
 
-        self.assertEqual(effective_step, 2)
-        self.assertEqual(assignments, {7: 40, 8: 40, 9: 42})
+        self.assertEqual(effective_step, 1)
+        self.assertEqual(assignments, {7: 40, 8: 40, 9: 69})
 
     def test_shared_multiplier_groups_determine_effective_step(self) -> None:
         interval = UpstreamPriorityInterval(
@@ -207,7 +294,7 @@ class PriorityAllocatorTests(unittest.TestCase):
             share_same_composite_multiplier=True,
         )
 
-        self.assertEqual(effective_step, 3)
+        self.assertEqual(effective_step, 1)
         self.assertEqual(assignments, {7: 40, 8: 40, 9: 43, 10: 43})
 
     def test_allocator_keeps_high_precision_tiebreak_after_float_storage(self) -> None:
@@ -231,7 +318,7 @@ class PriorityAllocatorTests(unittest.TestCase):
 
         assignments, _ = allocate_interval_priorities(interval, [alpha, beta])
 
-        self.assertEqual(assignments, {7: 40, 8: 42})
+        self.assertEqual(assignments, {7: 40, 8: 41})
         self.assertEqual(
             _tie_multiplier_key(Decimal("1.00000000000025")),
             Decimal("1.0000000000002"),
@@ -255,7 +342,7 @@ class PriorityAllocatorTests(unittest.TestCase):
             [large_alpha, large_beta],
         )
 
-        self.assertEqual(large_assignments, {11: 40, 10: 42})
+        self.assertEqual(large_assignments, {11: 40, 10: 41})
 
 class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -330,14 +417,14 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(moved.failed, 0)
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
-        self.assertEqual(priorities, {7: 42, 8: 40})
+        self.assertEqual(priorities, {7: 41, 8: 40})
         await self.db.refresh(alpha)
         await self.db.refresh(beta)
         self.assertEqual((alpha.priority_tiebreak_order, beta.priority_tiebreak_order), (1, 0))
 
         await self.service.rebalance(self.db)
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
-        self.assertEqual(priorities, {7: 42, 8: 40})
+        self.assertEqual(priorities, {7: 41, 8: 40})
 
     async def test_shared_multiplier_mode_rebalances_to_one_priority_and_rejects_tie_move(self) -> None:
         interval = await self._interval()
@@ -371,9 +458,9 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.updated, result.failed), (3, 0))
         self.assertEqual(raised.exception.status_code, 409)
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
-        self.assertEqual(priorities, {7: 40, 8: 40, 9: 42})
+        self.assertEqual(priorities, {7: 40, 8: 40, 9: 69})
         listed = await self.service.list_intervals(self.db)
-        self.assertEqual(listed[0].effective_step, 2)
+        self.assertEqual(listed[0].effective_step, 1)
 
     async def test_intervals_allow_overlap_and_adjacent_bounds(self) -> None:
         await self._interval(start=40, end=70)
@@ -393,7 +480,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((result.updated, result.failed), (3, 0))
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
-        self.assertEqual(priorities, {7: 44, 8: 40, 9: 42})
+        self.assertEqual(priorities, {7: 69, 8: 40, 9: 55})
         stored = (await self.db.execute(select(UpstreamAccountConfig))).scalars().all()
         self.assertTrue(all(item.priority_sync_status == "in_sync" for item in stored))
         listed = await self.accounts.list_accounts(self.db)
@@ -402,7 +489,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_rebalance_reuses_supplied_snapshot_when_priorities_are_unchanged(self) -> None:
         interval = await self._interval()
         await self._add_config(7, interval.id, group=1.0, priority=40)
-        await self._add_config(8, interval.id, group=2.0, priority=42)
+        await self._add_config(8, interval.id, group=2.0, priority=69)
         remote_by_id = {
             int(account["id"]): dict(account)
             for account in self.sub2api.accounts
@@ -464,7 +551,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.rebalance(self.db)
 
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
-        self.assertEqual(priorities, {7: 40, 8: 42})
+        self.assertEqual(priorities, {7: 40, 8: 69})
 
     async def test_subset_rebalance_updates_the_complete_affected_interval(self) -> None:
         interval = await self._interval()
@@ -485,7 +572,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
             for account in self.sub2api.accounts
         }
         self.assertEqual((result.considered, result.updated, result.failed), (2, 2, 0))
-        self.assertEqual(priorities, {7: 42, 8: 40, 9: 77})
+        self.assertEqual(priorities, {7: 69, 8: 40, 9: 77})
 
     async def test_unknown_multiplier_is_not_written_and_does_not_consume_capacity(self) -> None:
         interval = await self._interval(step=5)
@@ -505,7 +592,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(configs[8].desired_priority)
         listed = await self.service.list_intervals(self.db)
         self.assertEqual(listed[0].account_count, 2)
-        self.assertEqual(listed[0].effective_step, 5)
+        self.assertEqual(listed[0].effective_step, 1)
 
     async def test_delete_interval_only_unbinds_and_preserves_remote_priority(self) -> None:
         interval = await self._interval()
@@ -701,7 +788,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.failed, 0)
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
-        self.assertEqual(priorities, {7: 42, 8: 40})
+        self.assertEqual(priorities, {7: 69, 8: 40})
 
     async def test_rebalance_drops_config_deleted_while_waiting_for_account_lock(self) -> None:
         interval = await self._interval()

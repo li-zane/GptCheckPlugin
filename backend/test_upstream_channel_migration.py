@@ -130,6 +130,36 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row["channel_id"] is not None for row in bindings))
         self.assertEqual([row["balance_remaining"] for row in bindings], [10, 20, 30, 40])
 
+    async def test_existing_priority_intervals_keep_fixed_step_strategy_on_upgrade(self) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(text("DROP TABLE upstream_priority_intervals"))
+            await conn.execute(
+                text(
+                    "CREATE TABLE upstream_priority_intervals ("
+                    "id INTEGER PRIMARY KEY, name VARCHAR(100) NOT NULL, "
+                    "start_priority INTEGER NOT NULL, end_priority INTEGER NOT NULL, "
+                    "step INTEGER NOT NULL)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_priority_intervals "
+                    "(id, name, start_priority, end_priority, step) "
+                    "VALUES (1, 'plus', 40, 70, 2)"
+                )
+            )
+            await _migrate_upstream_channels(conn)
+            strategy = (
+                await conn.execute(
+                    text(
+                        "SELECT allocation_strategy FROM upstream_priority_intervals "
+                        "WHERE id = 1"
+                    )
+                )
+            ).scalar_one()
+
+        self.assertEqual(strategy, "fixed_step")
+
     async def test_migration_is_idempotent_and_preserves_legacy_not_null_column(self) -> None:
         async with self.engine.begin() as conn:
             await _migrate_upstream_channels(conn)
@@ -212,6 +242,100 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row.upstream_health_invalid_count == 0 for row in migrated_rows))
         self.assertTrue(all(row.availability_check_mode == "disabled" for row in migrated_rows))
         self.assertTrue(all(row.availability_status == "disabled" for row in migrated_rows))
+
+    async def test_migration_disables_relative_rate_pause_without_reinterpreting_thresholds(
+        self,
+    ) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "ALTER TABLE upstream_priority_intervals "
+                    "ADD COLUMN rate_pause_mode VARCHAR(32) NOT NULL "
+                    "DEFAULT 'increase_percent'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE upstream_account_configs "
+                    "ADD COLUMN rate_pause_policy VARCHAR(16) NOT NULL DEFAULT 'inherit'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE upstream_account_configs "
+                    "ADD COLUMN rate_absolute_threshold FLOAT"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE upstream_account_configs "
+                    "ADD COLUMN rate_pause_mode VARCHAR(32) NOT NULL "
+                    "DEFAULT 'increase_percent'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_priority_intervals ("
+                    "id, name, start_priority, end_priority, step, rate_pause_enabled, "
+                    "rate_absolute_threshold, rate_pause_mode, created_at, updated_at"
+                    ") VALUES "
+                    "(1, 'legacy-relative', 10, 20, 1, 1, 9, 'increase_percent', "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+                    "(2, 'legacy-absolute', 20, 30, 1, 1, 2.5, 'absolute_multiplier', "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET "
+                    "rate_pause_policy = 'custom', rate_absolute_threshold = 9, "
+                    "rate_pause_mode = 'increase_percent' WHERE id = 1"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_configs SET "
+                    "rate_pause_policy = 'custom', rate_absolute_threshold = 2.5, "
+                    "rate_pause_mode = 'absolute_multiplier' WHERE id = 2"
+                )
+            )
+
+            await _migrate_upstream_channels(conn)
+
+            intervals = (
+                await conn.execute(
+                    text(
+                        "SELECT id, rate_pause_enabled, rate_absolute_threshold "
+                        "FROM upstream_priority_intervals ORDER BY id"
+                    )
+                )
+            ).mappings().all()
+            accounts = (
+                await conn.execute(
+                    text(
+                        "SELECT id, rate_pause_policy, rate_absolute_threshold "
+                        "FROM upstream_account_configs WHERE id IN (1, 2) ORDER BY id"
+                    )
+                )
+            ).mappings().all()
+            migration_marker = (
+                await conn.execute(
+                    text(
+                        "SELECT value FROM app_settings "
+                        "WHERE key = 'migration.disable_relative_rate_pause.v1'"
+                    )
+                )
+            ).scalar_one()
+
+        self.assertEqual(intervals[0]["rate_pause_enabled"], 0)
+        self.assertEqual(intervals[0]["rate_absolute_threshold"], 9)
+        self.assertEqual(intervals[1]["rate_pause_enabled"], 1)
+        self.assertEqual(intervals[1]["rate_absolute_threshold"], 2.5)
+        self.assertEqual(accounts[0]["rate_pause_policy"], "disabled")
+        self.assertIsNone(accounts[0]["rate_absolute_threshold"])
+        self.assertEqual(accounts[1]["rate_pause_policy"], "custom")
+        self.assertEqual(accounts[1]["rate_absolute_threshold"], 2.5)
+        self.assertEqual(migration_marker, "1")
 
     async def test_migration_quarantines_duplicate_upstream_record_bindings(self) -> None:
         async with self.engine.begin() as conn:

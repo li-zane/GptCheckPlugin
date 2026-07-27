@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from decimal import Decimal, DecimalException, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, DecimalException, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
@@ -38,6 +38,8 @@ PRIORITY_READ_ERROR = "Unable to read sub2api API key account priorities."
 PRIORITY_PREFLIGHT_CONCURRENCY = 10
 TIE_MULTIPLIER_QUANTUM = Decimal("1e-13")
 MAX_COMPOSITE_MULTIPLIER = Decimal("1000000")
+PRIORITY_STRATEGY_COST_OPTIMIZED = "cost_optimized"
+PRIORITY_STRATEGY_FIXED_STEP = "fixed_step"
 
 
 def _decimal_composite_multiplier(value: Any) -> Decimal | None:
@@ -123,7 +125,107 @@ def priority_interval_effective_step(
     if account_count <= 1:
         return configured_step
     max_step = (end_priority - start_priority - 1) // (account_count - 1)
-    return max(1, min(configured_step, max_step))
+    return max(0, min(configured_step, max_step))
+
+
+def _geometric_median(multipliers: list[Decimal]) -> Decimal:
+    ordered = sorted(multipliers)
+    count = len(ordered)
+    if count == 0:
+        raise ValueError("At least one multiplier is required.")
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] * ordered[middle]).sqrt()
+
+
+def _cost_efficiency_scores(
+    multipliers: list[Decimal],
+    *,
+    center_multipliers: list[Decimal] | None = None,
+) -> list[Decimal]:
+    """Return inverse-cost scores centered on the account-weighted median."""
+    count = len(multipliers)
+    if count == 0:
+        return []
+    center = _geometric_median(center_multipliers or multipliers)
+    return [center / (center + multiplier) for multiplier in multipliers]
+
+
+def _cost_optimized_priority_group_offsets(
+    multipliers: list[Decimal],
+    *,
+    center_multipliers: list[Decimal],
+    available_span: int,
+    minimum_step: int,
+) -> list[int]:
+    """Map inverse-cost efficiency onto the full priority span.
+
+    Sub2API normalizes the priority score from the smallest and largest
+    candidate priorities. This mirrors its native upstream-cost curve so
+    multiplier ratios, rather than raw differences, determine preference.
+    """
+    count = len(multipliers)
+    if count <= 1:
+        return [0] * count
+
+    low = multipliers[0]
+    high = multipliers[-1]
+    if high > low:
+        efficiencies = _cost_efficiency_scores(
+            multipliers,
+            center_multipliers=center_multipliers,
+        )
+        highest_efficiency = efficiencies[0]
+        lowest_efficiency = efficiencies[-1]
+        efficiency_span = highest_efficiency - lowest_efficiency
+        targets = [
+            int(
+                (
+                    (highest_efficiency - efficiency)
+                    * Decimal(available_span)
+                    / efficiency_span
+                ).to_integral_value(rounding=ROUND_HALF_UP)
+            )
+            for efficiency in efficiencies
+        ]
+        targets[0] = 0
+        targets[-1] = available_span
+    else:
+        # Equal-cost accounts only need the smallest representable separation
+        # when sharing is disabled. Do not stretch ties across the whole band.
+        targets = (
+            [index * minimum_step for index in range(count)]
+            if minimum_step > 0
+            else [
+                (index * available_span) // (count - 1)
+                for index in range(count)
+            ]
+        )
+
+    offsets: list[int] = []
+    for index, target in enumerate(targets):
+        lower = index * minimum_step
+        if offsets:
+            lower = max(lower, offsets[-1] + minimum_step)
+        upper = available_span - (count - index - 1) * minimum_step
+        offsets.append(min(max(target, lower), upper))
+    return offsets
+
+
+def _fixed_step_priority_group_offsets(
+    *,
+    group_count: int,
+    available_span: int,
+    effective_step: int,
+) -> list[int]:
+    # Preserve the original rank-based allocator. If the interval is too
+    # small, trailing groups share its exclusive upper bound minus one.
+    assignment_step = max(1, effective_step)
+    return [
+        min(index * assignment_step, available_span)
+        for index in range(group_count)
+    ]
 
 
 def allocate_interval_priorities(
@@ -153,18 +255,46 @@ def allocate_interval_priorities(
                 multiplier_groups.append([config])
     else:
         multiplier_groups = [[config] for config in eligible]
+    strategy = str(
+        getattr(interval, "allocation_strategy", None)
+        or PRIORITY_STRATEGY_COST_OPTIMIZED
+    ).strip().lower()
+    configured_step = (
+        interval.step
+        if strategy == PRIORITY_STRATEGY_FIXED_STEP
+        else 1
+    )
     effective_step = priority_interval_effective_step(
         interval.start_priority,
         interval.end_priority,
-        interval.step,
+        configured_step,
         len(multiplier_groups),
     )
-    final_priority = interval.end_priority - 1
-    assignments = {
-        config.sub2api_account_id: min(
-            interval.start_priority + group_index * effective_step,
-            final_priority,
+    available_span = interval.end_priority - interval.start_priority - 1
+    group_multipliers = [
+        composite_multiplier(group[0])
+        for group in multiplier_groups
+    ]
+    account_multipliers = [
+        multiplier
+        for config in eligible
+        if (multiplier := composite_multiplier(config)) is not None
+    ]
+    if strategy == PRIORITY_STRATEGY_FIXED_STEP:
+        offsets = _fixed_step_priority_group_offsets(
+            group_count=len(multiplier_groups),
+            available_span=available_span,
+            effective_step=effective_step,
         )
+    else:
+        offsets = _cost_optimized_priority_group_offsets(
+            [multiplier for multiplier in group_multipliers if multiplier is not None],
+            center_multipliers=account_multipliers,
+            available_span=available_span,
+            minimum_step=effective_step,
+        )
+    assignments = {
+        config.sub2api_account_id: interval.start_priority + offsets[group_index]
         for group_index, group in enumerate(multiplier_groups)
         for config in group
     }
@@ -271,17 +401,23 @@ class UpstreamPriorityService:
             start_priority=interval.start_priority,
             end_priority=interval.end_priority,
             step=interval.step,
-            rate_pause_enabled=bool(interval.rate_pause_enabled),
-            rate_pause_mode=interval.rate_pause_mode or "increase_percent",
-            rate_increase_threshold_percent=float(
-                interval.rate_increase_threshold_percent or 20.0
+            allocation_strategy=(
+                interval.allocation_strategy or PRIORITY_STRATEGY_COST_OPTIMIZED
             ),
+            rate_pause_enabled=bool(interval.rate_pause_enabled),
             rate_absolute_threshold=float(interval.rate_absolute_threshold or 1.0),
             account_count=account_count,
             effective_step=priority_interval_effective_step(
                 interval.start_priority,
                 interval.end_priority,
-                interval.step,
+                (
+                    interval.step
+                    if (
+                        interval.allocation_strategy
+                        or PRIORITY_STRATEGY_COST_OPTIMIZED
+                    ) == PRIORITY_STRATEGY_FIXED_STEP
+                    else 1
+                ),
                 eligible_count,
             ),
             created_at=interval.created_at,
@@ -316,9 +452,8 @@ class UpstreamPriorityService:
                 start_priority=payload.start_priority,
                 end_priority=payload.end_priority,
                 step=payload.step,
+                allocation_strategy=payload.allocation_strategy,
                 rate_pause_enabled=payload.rate_pause_enabled,
-                rate_pause_mode=payload.rate_pause_mode,
-                rate_increase_threshold_percent=payload.rate_increase_threshold_percent,
                 rate_absolute_threshold=payload.rate_absolute_threshold,
             )
             db.add(interval)
@@ -350,9 +485,8 @@ class UpstreamPriorityService:
             interval.start_priority = payload.start_priority
             interval.end_priority = payload.end_priority
             interval.step = payload.step
+            interval.allocation_strategy = payload.allocation_strategy
             interval.rate_pause_enabled = payload.rate_pause_enabled
-            interval.rate_pause_mode = payload.rate_pause_mode
-            interval.rate_increase_threshold_percent = payload.rate_increase_threshold_percent
             interval.rate_absolute_threshold = payload.rate_absolute_threshold
             try:
                 await db.commit()
