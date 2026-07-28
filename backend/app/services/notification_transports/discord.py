@@ -109,6 +109,13 @@ class DiscordBotTransport(NotificationTransport):
             )
         if response.status_code == 401:
             raise NotificationTransportError("discord_unauthorized", retryable=False)
+        discord_code = _discord_error_code(response)
+        if response.status_code == 404 or discord_code == 10003:
+            raise NotificationTransportError("discord_channel_not_found", retryable=False)
+        if discord_code == 50013:
+            raise NotificationTransportError("discord_missing_permissions", retryable=False)
+        if response.status_code == 403 or discord_code == 50001:
+            raise NotificationTransportError("discord_missing_access", retryable=False)
         if 500 <= response.status_code < 600:
             raise NotificationTransportError("discord_server_error")
         raise NotificationTransportError("discord_request_rejected", retryable=False)
@@ -525,3 +532,14 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 def _is_valid_channel_id(value: str) -> bool:
     return value.isascii() and value.isdigit() and 1 <= len(value) <= 32
+
+
+def _discord_error_code(response: httpx.Response) -> int | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    return code if isinstance(code, int) else None

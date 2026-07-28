@@ -48,6 +48,13 @@ import {
 import { createContext, FormEvent, lazy, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { api, AUTH_EXPIRED_EVENT, upstreamLegacyBindingCounts } from "./api";
+import {
+  automationDurationDisplayValue,
+  automationDurationSecondsValue,
+  automationDurationUnits,
+  preferredAutomationDurationUnit,
+  type AutomationDurationUnit,
+} from "./automationDuration";
 import { HelpPopover } from "./HelpPopover";
 import { MiddleEllipsisText } from "./MiddleEllipsisText";
 import { oauthUsageBackgroundRefreshIntervals } from "./oauthUsageRefresh";
@@ -274,6 +281,7 @@ const emptySettings: AppSettings = {
   channel_monitor_fallback_test_model: "",
   channel_monitor_fallback_test_attempts: 1,
   channel_monitor_recovery_test_attempts: 1,
+  channel_monitor_test_attempt_interval_seconds: 0,
   available_test_models: [],
   upstream_negative_balance_basis: "wallet",
   upstream_balance_pause_threshold: 0,
@@ -1112,7 +1120,7 @@ function App() {
         </div>
       </aside>
 
-      <section className="workspace">
+      <section className={`workspace workspace--${view}`}>
         <header className="topbar">
           <div>
             <p className="eyebrow">本机管理面板</p>
@@ -4813,14 +4821,50 @@ function DiscordBotSetupGuideDialog({ onClose }: { onClose: () => void }) {
           </button>
         </header>
         <div className="discord-bot-setup-guide-body">
-          <p className="discord-bot-setup-guide-intro">按以下顺序完成配置。步骤卡片可在此弹框内滚动查看；带箭头的按钮会打开 Discord 官方页面。</p>
+          <p className="discord-bot-setup-guide-intro">推荐且受支持的方式是“私有 Bot + 服务器安装 + 单一通知频道”。不要只做用户安装，也不要把私信频道 ID 填作通知频道。</p>
+          <div className="discord-bot-security-note">
+            <ShieldCheck size={18} />
+            <div>
+              <strong>私有安装</strong>
+              <span>关闭 Public Bot 后，只有应用所有者或团队成员可以把 Bot 加入服务器；现有服务器安装不会因此失效。</span>
+            </div>
+          </div>
+          <section aria-labelledby="discord-bot-install-modes-title" className="discord-bot-install-modes">
+            <div className="discord-bot-install-modes-head">
+              <h3 id="discord-bot-install-modes-title">安装方式与区别</h3>
+              <p><code>Public / Private</code> 决定谁能安装，<code>User / Guild Install</code> 决定安装到哪里，两组设置互不替代。</p>
+            </div>
+            <div className="discord-bot-install-mode-grid">
+              <div className="discord-bot-install-mode">
+                <strong><code>Public Bot</code>（公开）</strong>
+                <p>在 <code>Bot</code> 页面开启 <code>Public Bot</code>，为 <code>Guild Install</code> 配置安装链接后即可分享；任何拿到链接、且有目标服务器管理权限的人都能安装。公开不会直接暴露 Token，但会扩大滥用、垃圾交互和运维排查范围。</p>
+              </div>
+              <div className="discord-bot-install-mode">
+                <strong><code>Private Bot</code>（私有，推荐）</strong>
+                <p>关闭 <code>Public Bot</code>，只有应用所有者或团队成员可以安装。将 <code>Install Link</code> 设为 <code>None</code>，再通过 <code>OAuth2 / URL Generator</code> 生成自用链接。</p>
+              </div>
+              <div className="discord-bot-install-mode">
+                <strong><code>User Install</code>（用户安装）</strong>
+                <p>应用安装到个人账号或私信上下文，Bot 不会成为服务器成员，也无法按本插件要求访问服务器通知频道，因此不适用于本插件。</p>
+              </div>
+              <div className="discord-bot-install-mode">
+                <strong><code>Guild Install</code>（服务器安装）</strong>
+                <p>Bot 会真正加入所选服务器，可取得频道权限并注册服务器命令。本插件仅支持这种安装方式，安装者需要目标服务器的“管理服务器”权限。</p>
+              </div>
+            </div>
+          </section>
           <ol className="discord-bot-setup-guide-steps">
             <li className="discord-bot-setup-step">
               <div className="discord-bot-setup-step-copy">
                 <span className="discord-bot-setup-step-number">1</span>
                 <div>
-                  <strong>创建 Bot 并取得 Token</strong>
-                  <p>创建或选择应用，进入“机器人”页创建 Bot。复制 Token 后填入本页的 Bot Token 输入框；重新生成 Token 后必须同步更新此处的值。</p>
+                  <strong>创建私有 Bot 并取得 Token</strong>
+                  <p>在 Developer Portal 创建或选择应用，进入 <code>Bot</code> 页面创建 Bot。</p>
+                  <ul className="discord-bot-setup-detail-list">
+                    <li>关闭 <code>Public Bot</code>，限制为应用所有者或团队成员安装。</li>
+                    <li>本插件不需要 Message Content、Server Members 或 Presence 等特权 Intent，可保持关闭。</li>
+                    <li>点击 <code>Reset Token</code> 取得 Token；Token 只填入本页，重新生成后必须同步更新。</li>
+                  </ul>
                   <a className="discord-bot-setup-link" href="https://discord.com/developers/applications" rel="noreferrer" target="_blank">
                     打开 Developer Portal <ExternalLink size={14} />
                   </a>
@@ -4843,40 +4887,44 @@ function DiscordBotSetupGuideDialog({ onClose }: { onClose: () => void }) {
                 <span aria-hidden="true" className="discord-bot-setup-screenshot-action"><ZoomIn size={16} />点击查看原图</span>
               </button>
             </li>
-            <li className="discord-bot-setup-step">
+            <li className="discord-bot-setup-step discord-bot-setup-step--compact">
               <div className="discord-bot-setup-step-copy">
                 <span className="discord-bot-setup-step-number">2</span>
                 <div>
-                  <strong>设置安装与命令范围</strong>
-                  <p>进入“安装”页，启用用户安装，选择 Discord 提供的安装链接，并为用户安装保留 <code>applications.commands</code>。安装后即可在 Bot 私信中使用 <code>/balance</code> 与 <code>/quota</code>。</p>
+                  <strong>配置服务器安装范围</strong>
+                  <p>进入 <code>Installation</code> 页面，将安装方式限定为服务器安装。</p>
+                  <ul className="discord-bot-setup-detail-list">
+                    <li><code>Installation Contexts</code> 只保留 <code>Guild Install</code>，取消 <code>User Install</code>。</li>
+                    <li><code>Install Link</code> 选择 <code>None</code>。私有 Bot 使用 Discord 提供的默认链接会导致 <code>Public Bot</code> 无法保存为关闭。</li>
+                  </ul>
                   <a className="discord-bot-setup-link" href="https://discord.com/developers/docs/tutorials/setting-up-a-bot-application" rel="noreferrer" target="_blank">
                     打开官方安装说明 <ExternalLink size={14} />
                   </a>
                 </div>
               </div>
-              <button
-                aria-label="打开设置安装与命令范围的截图"
-                className="discord-bot-setup-screenshot-button"
-                onClick={(event) => {
-                  screenshotTriggerRef.current = event.currentTarget;
-                  setPreviewScreenshot({
-                    alt: "Discord Developer Portal 的安装页面，用户安装范围包含 applications.commands",
-                    src: "/discord-install-guide.png",
-                    title: "设置安装与命令范围",
-                  });
-                }}
-                type="button"
-              >
-                <img alt="Discord Developer Portal 的安装页面，用户安装范围包含 applications.commands" className="discord-bot-setup-screenshot" loading="lazy" src="/discord-install-guide.png" />
-                <span aria-hidden="true" className="discord-bot-setup-screenshot-action"><ZoomIn size={16} />点击查看原图</span>
-              </button>
             </li>
             <li className="discord-bot-setup-step discord-bot-setup-step--compact">
               <div className="discord-bot-setup-step-copy">
                 <span className="discord-bot-setup-step-number">3</span>
                 <div>
-                  <strong>复制通知频道 ID</strong>
-                  <p>在 Discord 客户端的高级设置中启用开发者模式，再右键通知目标频道并选择“复制频道 ID”。也可使用与 Bot 的私信频道 ID。</p>
+                  <strong>生成服务器安装链接并安装</strong>
+                  <p>进入 <code>OAuth2 / URL Generator</code>，生成一次只供自己使用的服务器安装链接。</p>
+                  <ul className="discord-bot-setup-detail-list">
+                    <li><code>Scopes</code> 勾选 <code>bot</code> 与 <code>applications.commands</code>。</li>
+                    <li><code>Bot Permissions</code> 只勾选 <code>View Channels</code>、<code>Send Messages</code>、<code>Embed Links</code>，不要授予 <code>Administrator</code>。</li>
+                    <li>复制页面底部生成的 URL，用应用所有者或团队成员账号打开，选择你管理的目标服务器并完成授权。</li>
+                    <li>安装完成后，先在服务器成员列表确认 Bot 已出现。</li>
+                    <li>如果服务器不可选，当前 Discord 账号需要该服务器的“管理服务器”权限。</li>
+                  </ul>
+                </div>
+              </div>
+            </li>
+            <li className="discord-bot-setup-step discord-bot-setup-step--compact">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">4</span>
+                <div>
+                  <strong>检查频道权限并复制频道 ID</strong>
+                  <p>在目标服务器频道的权限设置中，确认 Bot 能查看频道、发送消息和嵌入链接。随后在 Discord 客户端的“高级设置”中启用开发者模式，右键该服务器频道并选择“复制频道 ID”。</p>
                   <a className="discord-bot-setup-link" href="https://support.discord.com/hc/en-us/articles/206346498-Where-can-I-find-my-User-Server-Message-ID" rel="noreferrer" target="_blank">
                     打开官方开发者模式说明 <ExternalLink size={14} />
                   </a>
@@ -4885,18 +4933,52 @@ function DiscordBotSetupGuideDialog({ onClose }: { onClose: () => void }) {
             </li>
             <li className="discord-bot-setup-step discord-bot-setup-step--compact">
               <div className="discord-bot-setup-step-copy">
-                <span className="discord-bot-setup-step-number">4</span>
+                <span className="discord-bot-setup-step-number">5</span>
                 <div>
-                  <strong>保存并发送测试通知</strong>
-                  <p>回到本页填写 Token 与频道 ID，选中需要的通知事件并保存。保存成功后点击“发送测试通知”，确认通知到达指定频道。</p>
-                  <a className="discord-bot-setup-link" href="https://discord.com/developers/docs/quick-start/getting-started" rel="noreferrer" target="_blank">
-                    打开 Discord Quick Start <ExternalLink size={14} />
-                  </a>
+                  <strong>保存插件设置</strong>
+                  <p>回到本页填写 Bot Token 和服务器频道 ID，启用 Discord Bot 通知，选择需要的通知事件并保存。保存后，后端会在该服务器注册 <code>/balance</code> 与 <code>/quota</code>，通常数秒内出现。</p>
+                </div>
+              </div>
+            </li>
+            <li className="discord-bot-setup-step discord-bot-setup-step--compact">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">6</span>
+                <div>
+                  <strong>发送测试并验证命令</strong>
+                  <p>点击“发送测试通知”，再到已配置频道输入 <code>/balance</code> 或 <code>/quota</code>。频道不存在、Bot 未加入服务器和权限不足会分别显示具体提示。</p>
+                </div>
+              </div>
+            </li>
+            <li className="discord-bot-setup-step discord-bot-setup-step--compact">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">7</span>
+                <div>
+                  <strong>现有安装是否需要重装</strong>
+                  <ul className="discord-bot-setup-detail-list">
+                    <li>Bot 已在目标服务器，且安装时已有 <code>bot</code> 与 <code>applications.commands</code>：关闭 Public Bot 后无需重装。</li>
+                    <li>之前只按旧指南做了 User Install 或只装到私信：需要执行一次 Guild Install，让 Bot 真正加入目标服务器。</li>
+                    <li>缺少命令 scope 时需要重新打开安装链接授权；仅修改频道权限时无需重装。</li>
+                    <li>旧的用户安装可在 Discord“用户设置 / 已授权的应用”中移除。</li>
+                  </ul>
+                </div>
+              </div>
+            </li>
+            <li className="discord-bot-setup-step discord-bot-setup-step--compact">
+              <div className="discord-bot-setup-step-copy">
+                <span className="discord-bot-setup-step-number">8</span>
+                <div>
+                  <strong>卸载或永久删除 Bot</strong>
+                  <p>先确认需要移除的范围。仅停止本插件通知时，不需要删除整个 Discord 应用。</p>
+                  <ul className="discord-bot-setup-detail-list">
+                    <li><strong>从某个服务器卸载：</strong>先在本插件设置中关闭 Discord Bot 通知并保存，再到该服务器的成员列表，右键 Bot 并选择“移出服务器”或“踢出”。其他服务器中的安装不受影响。</li>
+                    <li><strong>撤销旧的 User Install：</strong>打开 Discord“用户设置 / 已授权的应用”，找到该应用并选择“取消授权”。这不会自动移除服务器中的 Guild Install。</li>
+                    <li><strong>永久删除：</strong>进入 <code>Developer Portal / 应用 / General Information / Delete App</code>，按提示确认。这里删除的是整个应用，不是单独删除 Bot；Token、所有服务器安装和命令都会失效，且不可恢复。</li>
+                  </ul>
                 </div>
               </div>
             </li>
           </ol>
-          <p className="discord-bot-setup-guide-note">不要把 Bot Token 发到聊天、截图或提交到代码仓库。命令仅显示本插件已缓存的数据，不会触发上游余额或额度刷新。</p>
+          <p className="discord-bot-setup-guide-note">Public Bot 不会直接泄露 Token，但会允许其他人把应用安装到更多服务器，增加滥用、垃圾交互和运维排查面。此插件只需要一个私有服务器安装。不要把 Bot Token 发到聊天、截图或提交到代码仓库。</p>
         </div>
       </section>
       {previewScreenshot ? <DiscordBotSetupScreenshotPreviewDialog onClose={closeScreenshotPreview} screenshot={previewScreenshot} /> : null}
@@ -5012,6 +5094,9 @@ function SettingsView({
   );
   const [channelMonitorRecoveryTestAttempts, setChannelMonitorRecoveryTestAttempts] = useState(
     String(settings.channel_monitor_recovery_test_attempts ?? 1),
+  );
+  const [channelMonitorTestAttemptInterval, setChannelMonitorTestAttemptInterval] = useState(
+    String(settings.channel_monitor_test_attempt_interval_seconds ?? 0),
   );
   const [negativeBalanceBasis, setNegativeBalanceBasis] = useState<"wallet" | "recharge_adjusted">(
     settings.upstream_negative_balance_basis || "wallet",
@@ -5145,6 +5230,7 @@ function SettingsView({
     ));
     setChannelMonitorFallbackTestAttempts(String(settings.channel_monitor_fallback_test_attempts ?? 1));
     setChannelMonitorRecoveryTestAttempts(String(settings.channel_monitor_recovery_test_attempts ?? 1));
+    setChannelMonitorTestAttemptInterval(String(settings.channel_monitor_test_attempt_interval_seconds ?? 0));
     setNegativeBalanceBasis(settings.upstream_negative_balance_basis || "wallet");
     setBalancePauseThreshold(String(settings.upstream_balance_pause_threshold ?? 0));
     setShowStaleNegativeBalanceAlert(settings.show_stale_negative_balance_alert ?? true);
@@ -5206,6 +5292,7 @@ function SettingsView({
     settings.channel_monitor_fallback_test_model,
     settings.channel_monitor_fallback_test_attempts,
     settings.channel_monitor_recovery_test_attempts,
+    settings.channel_monitor_test_attempt_interval_seconds,
     settings.upstream_negative_balance_basis,
     settings.upstream_balance_pause_threshold,
     settings.show_stale_negative_balance_alert,
@@ -5269,6 +5356,7 @@ function SettingsView({
   const subscriptionRefreshBatchSizeNumber = Number(subscriptionRefreshBatchSize);
   const subscriptionRefreshMaxConcurrencyNumber = Number(subscriptionRefreshMaxConcurrency);
   const accountLivenessMaxConcurrencyNumber = Number(accountLivenessMaxConcurrency);
+  const channelMonitorTestAttemptIntervalNumber = Number(channelMonitorTestAttemptInterval);
   const cleanSiteName = siteName.trim();
   const cleanDiscordChannelId = discordChannelId.trim();
   const discordConfigurationInvalid = discordNotificationsEnabled && (
@@ -5310,6 +5398,10 @@ function SettingsView({
     !Number.isInteger(upstreamSyncMaxConcurrencyNumber) ||
     upstreamSyncMaxConcurrencyNumber < 0 ||
     upstreamSyncMaxConcurrencyNumber > 50 ||
+    channelMonitorTestAttemptInterval.trim() === "" ||
+    !Number.isInteger(channelMonitorTestAttemptIntervalNumber) ||
+    channelMonitorTestAttemptIntervalNumber < 0 ||
+    channelMonitorTestAttemptIntervalNumber > 300 ||
     !Number.isFinite(balancePauseThresholdNumber) ||
     balancePauseThresholdNumber < -1_000_000_000 ||
     balancePauseThresholdNumber > 1_000_000_000 ||
@@ -5442,6 +5534,7 @@ function SettingsView({
       channel_monitor_fallback_test_model: fallbackTestModels[0] || "",
       channel_monitor_fallback_test_attempts: Math.max(1, Math.min(5, Number(channelMonitorFallbackTestAttempts) || 1)),
       channel_monitor_recovery_test_attempts: Math.max(1, Math.min(5, Number(channelMonitorRecoveryTestAttempts) || 1)),
+      channel_monitor_test_attempt_interval_seconds: channelMonitorTestAttemptIntervalNumber,
       upstream_negative_balance_basis: negativeBalanceBasis,
       upstream_balance_pause_threshold: balancePauseThresholdNumber,
       show_stale_negative_balance_alert: showStaleNegativeBalanceAlert,
@@ -5473,8 +5566,11 @@ function SettingsView({
     if (clearXApiKey) {
       payload.clear_sub2api_x_api_key = true;
     }
-    if (discordBotToken.trim()) payload.discord_bot_token = discordBotToken.trim();
-    if (clearDiscordBotToken) payload.clear_discord_bot_token = true;
+    if (clearDiscordBotToken) {
+      payload.clear_discord_bot_token = true;
+    } else if (discordBotToken.trim()) {
+      payload.discord_bot_token = discordBotToken.trim();
+    }
     await onSave(payload, { logoFile, resetLogo });
   };
   const enabledAutomationCount = [
@@ -5600,12 +5696,11 @@ function SettingsView({
               <AutomationSettingRow
                 checked={oauthAccountSyncEnabled}
                 interval={(
-                  <AutomationSettingNumber
+                  <AutomationSettingDuration
                     ariaLabel="OAuth 账号同步间隔"
-                    max={86_400}
-                    min={30}
+                    maxSeconds={86_400}
+                    minSeconds={30}
                     onChange={setInterval}
-                    suffix="秒"
                     value={interval}
                   />
                 )}
@@ -5616,12 +5711,11 @@ function SettingsView({
               <AutomationSettingRow
                 checked={apiKeyAccountSyncEnabled}
                 interval={(
-                  <AutomationSettingNumber
+                  <AutomationSettingDuration
                     ariaLabel="API Key 账号同步间隔"
-                    max={86_400}
-                    min={30}
+                    maxSeconds={86_400}
+                    minSeconds={30}
                     onChange={setApiKeyAccountSyncInterval}
-                    suffix="秒"
                     value={apiKeyAccountSyncInterval}
                   />
                 )}
@@ -5633,12 +5727,11 @@ function SettingsView({
                 checked={accountModelWhitelistSyncEnabled}
                 description="开启后按独立间隔刷新已导入账号的可用模型白名单；关闭时仍会在首次导入或本地缺失白名单时补齐。"
                 interval={(
-                  <AutomationSettingNumber
+                  <AutomationSettingDuration
                     ariaLabel="账号可用模型白名单刷新间隔"
-                    max={86_400}
-                    min={60}
+                    maxSeconds={86_400}
+                    minSeconds={60}
                     onChange={setAccountModelWhitelistSyncInterval}
-                    suffix="秒"
                     value={accountModelWhitelistSyncInterval}
                   />
                 )}
@@ -5681,12 +5774,11 @@ function SettingsView({
               <AutomationSettingRow
                 checked={upstreamSyncEnabled}
                 interval={(
-                  <AutomationSettingNumber
+                  <AutomationSettingDuration
                     ariaLabel="API Key 上游同步间隔"
-                    max={86_400}
-                    min={60}
+                    maxSeconds={86_400}
+                    minSeconds={60}
                     onChange={setUpstreamSyncInterval}
-                    suffix="秒"
                     value={upstreamSyncInterval}
                   />
                 )}
@@ -5799,12 +5891,11 @@ function SettingsView({
               <AutomationSettingRow
                 checked={usageRefreshEnabled}
                 interval={(
-                  <AutomationSettingNumber
+                  <AutomationSettingDuration
                     ariaLabel="OAuth 用量窗口同步间隔"
-                    max={86_400}
-                    min={60}
+                    maxSeconds={86_400}
+                    minSeconds={60}
                     onChange={setUsageRefreshInterval}
-                    suffix="秒"
                     value={usageRefreshInterval}
                   />
                 )}
@@ -5831,7 +5922,7 @@ function SettingsView({
                   <span className="settings-label-with-help">
                     <strong>API Key 账号可用性监测策略</strong>
                     <HelpPopover label="查看 API Key 可用性监测策略说明">
-                      仅处理已绑定具体监控面板或已启用独立模型测试的账号。监控面板代表上游的单个分组或模型路由，不代表上游站点整体状态；面板明确可用时不直连账号测试，面板缺失、读取失败、状态未知或不可用时按账号白名单模型回退测试。自动检测跟随上游同步；存在余额、上游 Key、分组或倍率等其他暂停原因时保留上次结果并暂停自动连接测试，手动检测仍会先刷新监控面板及其状态详情并执行。启用账号的暂停判定使用“暂停判定测试次数”，因可用性监测而暂停的账号使用独立的“恢复判定测试次数”；任意一次连接成功即判定可用，全部失败才暂停或保持暂停。没有可用回退模型时不会据此暂停账号。
+                      仅处理已绑定具体监控面板或已启用独立模型测试的账号。监控面板代表上游的单个分组或模型路由，不代表上游站点整体状态；面板状态为可用或降级时都直接判定账号可用，不进行回退模型测试，降级仅以黄色状态提示。面板缺失、读取失败、状态未知或不可用时才按账号白名单模型回退测试。自动检测跟随上游同步；存在余额、上游 Key、分组或倍率等其他暂停原因时保留上次结果并暂停自动连接测试，手动检测仍会先刷新监控面板及其状态详情并执行。启用账号的暂停判定使用“暂停判定测试次数”，因可用性监测而暂停的账号使用独立的“恢复判定测试次数”；任意一次连接成功即判定可用，全部失败才暂停或保持暂停。没有可用回退模型时不会据此暂停账号。
                     </HelpPopover>
                   </span>
                   <span className={`api-key-chip api-key-chip--${apiKeyChannelMonitorPauseEnabled ? "success" : "muted"}`}>
@@ -5905,6 +5996,21 @@ function SettingsView({
                       min={1}
                       onChange={setChannelMonitorRecoveryTestAttempts}
                       value={channelMonitorRecoveryTestAttempts}
+                    />
+                  </label>
+                  <label className="settings-test-attempt-interval">
+                    <span className="settings-label-with-help">
+                      多次测试间隔
+                      <HelpPopover label="查看多次测试间隔说明">
+                        当暂停或恢复判定需要测试多次时，每次失败后等待此时间再开始下一次；设为 0 秒时连续测试。
+                      </HelpPopover>
+                    </span>
+                    <AutomationSettingDuration
+                      ariaLabel="账号多次连接测试间隔"
+                      maxSeconds={300}
+                      minSeconds={0}
+                      onChange={setChannelMonitorTestAttemptInterval}
+                      value={channelMonitorTestAttemptInterval}
                     />
                   </label>
                 </div>
@@ -6219,8 +6325,11 @@ function SettingsView({
                 Bot Token
                 <input
                   autoComplete="new-password"
-                  disabled={clearDiscordBotToken}
-                  onChange={(event) => setDiscordBotToken(event.target.value)}
+                  onChange={(event) => {
+                    const token = event.target.value;
+                    setDiscordBotToken(token);
+                    if (token) setClearDiscordBotToken(false);
+                  }}
                   placeholder={settings.discord_bot_token_set ? `已保存 ${settings.discord_bot_token_hint || ""}` : "输入 Discord Bot Token"}
                   type="password"
                   value={discordBotToken}
@@ -6242,7 +6351,10 @@ function SettingsView({
                 disabled={!settings.discord_bot_token_set && !discordBotToken}
                 onChange={(event) => {
                   setClearDiscordBotToken(event.target.checked);
-                  if (event.target.checked) setDiscordBotToken("");
+                  if (event.target.checked) {
+                    setDiscordBotToken("");
+                    setDiscordNotificationsEnabled(false);
+                  }
                 }}
                 type="checkbox"
               />
@@ -6614,6 +6726,50 @@ function SignalLine({ label, value }: { label: string; value: string }) {
     <div className="signal-row">
       <span>{label}</span>
       <strong>{isPhoneUrlSource(value) ? <MiddleEllipsisText text={value} /> : value}</strong>
+    </div>
+  );
+}
+
+function AutomationSettingDuration({
+  ariaLabel,
+  disabled = false,
+  maxSeconds,
+  minSeconds,
+  onChange,
+  value,
+}: {
+  ariaLabel: string;
+  disabled?: boolean;
+  maxSeconds: number;
+  minSeconds: number;
+  onChange: (value: string) => void;
+  value: string;
+}) {
+  const [unit, setUnit] = useState<AutomationDurationUnit>(() => preferredAutomationDurationUnit(value));
+  const displayValue = automationDurationDisplayValue(value, unit);
+
+  return (
+    <div className="automation-setting-duration">
+      <input
+        aria-label={ariaLabel}
+        disabled={disabled}
+        max={Number(automationDurationDisplayValue(String(maxSeconds), unit))}
+        min={Number(automationDurationDisplayValue(String(minSeconds), unit))}
+        onChange={(event) => onChange(automationDurationSecondsValue(event.target.value, unit))}
+        step="any"
+        type="number"
+        value={displayValue}
+      />
+      <select
+        aria-label={`${ariaLabel}单位`}
+        disabled={disabled}
+        onChange={(event) => setUnit(event.target.value as AutomationDurationUnit)}
+        value={unit}
+      >
+        {automationDurationUnits.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
     </div>
   );
 }

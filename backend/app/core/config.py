@@ -89,6 +89,7 @@ class Settings(BaseSettings):
     channel_monitor_fallback_test_model: str = ""
     channel_monitor_fallback_test_attempts: int = Field(default=1, ge=1, le=5)
     channel_monitor_recovery_test_attempts: int = Field(default=1, ge=1, le=5)
+    channel_monitor_test_attempt_interval_seconds: int = Field(default=0, ge=0, le=300)
     api_key_auto_pause_on_negative_balance_enabled: bool = False
     upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] = "wallet"
     upstream_balance_pause_threshold: float = Field(

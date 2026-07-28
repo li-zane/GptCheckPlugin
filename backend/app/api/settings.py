@@ -180,6 +180,7 @@ async def update_settings(
         "channel_monitor_fallback_test_model",
         "channel_monitor_fallback_test_attempts",
         "channel_monitor_recovery_test_attempts",
+        "channel_monitor_test_attempt_interval_seconds",
         "api_key_auto_pause_on_negative_balance_enabled",
         "upstream_negative_balance_basis",
         "upstream_balance_pause_threshold",
@@ -270,9 +271,20 @@ async def send_notification_test(_: dict = Depends(require_admin)) -> MessageRes
             "discord_rate_limited": "Discord 当前触发频率限制，请稍后再试。",
             "discord_timeout": "Discord 请求超时。",
             "discord_network_error": "无法连接 Discord。",
+            "discord_channel_not_found": "Discord 频道不存在，请重新复制目标服务器频道的频道 ID。",
+            "discord_missing_access": "Bot 尚未安装到该频道所在服务器，或无权查看该频道。请使用服务器安装并检查频道权限。",
+            "discord_missing_permissions": "Bot 缺少发送消息权限。请授予查看频道、发送消息和嵌入链接权限。",
             "discord_request_rejected": "Discord 拒绝了消息请求。",
         }
-        status_code = 400 if exc.code in {"notifications_disabled", "discord_not_configured", "discord_unauthorized"} else 502
+        status_code = 400 if exc.code in {
+            "notifications_disabled",
+            "discord_not_configured",
+            "discord_unauthorized",
+            "discord_channel_not_found",
+            "discord_missing_access",
+            "discord_missing_permissions",
+            "discord_request_rejected",
+        } else 502
         raise HTTPException(
             status_code=status_code,
             detail=messages.get(exc.code, "Discord 测试通知发送失败。"),

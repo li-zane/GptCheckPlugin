@@ -1142,6 +1142,30 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(body, rendered)
                 self.assertEqual(raised.exception.retry_after_seconds, retry_after)
 
+    async def test_discord_permission_errors_are_actionable_and_safe(self) -> None:
+        cases = [
+            (403, 50001, "discord_missing_access"),
+            (403, 50013, "discord_missing_permissions"),
+            (404, 10003, "discord_channel_not_found"),
+        ]
+        for status, discord_code, expected_code in cases:
+            with self.subTest(discord_code=discord_code):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        status,
+                        json={"code": discord_code, "message": "top-secret-response"},
+                    )
+
+                def client_factory(**kwargs):
+                    return httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs)
+
+                transport = DiscordBotTransport(_RuntimeConfig(), client_factory=client_factory)
+                with self.assertRaises(NotificationTransportError) as raised:
+                    await transport.send(NotificationEnvelope(1, "test", "Title", "Message"))
+                self.assertEqual(str(raised.exception), expected_code)
+                self.assertNotIn("top-secret-response", str(raised.exception))
+                self.assertFalse(raised.exception.retryable)
+
     async def test_discord_timeout_has_a_safe_error(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ReadTimeout("secret timeout detail", request=request)

@@ -155,7 +155,15 @@ class DiscordCommandServiceTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, json={"id": "111111"})
             if path.endswith("/channels/222222"):
                 return httpx.Response(200, json={"guild_id": "333333"})
-            if request.method == "GET" and path.endswith("/commands"):
+            if request.method == "GET" and path == "/api/v10/applications/111111/commands":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"id": "10", "name": "quota", "description": "legacy global"},
+                        {"id": "20", "name": "unrelated", "description": "keep"},
+                    ],
+                )
+            if request.method == "GET" and path.endswith("/guilds/333333/commands"):
                 return httpx.Response(
                     200,
                     json=[
@@ -172,12 +180,13 @@ class DiscordCommandServiceTests(unittest.IsolatedAsyncioTestCase):
         await service._register_commands("bot-token", "222222")
 
         writes = [(request.method, request.url.path) for request in requests if request.method != "GET"]
-        self.assertEqual(len(writes), 2)
-        self.assertTrue(any(method == "POST" and path.endswith("/commands") for method, path in writes))
-        self.assertTrue(any(method == "PATCH" and path.endswith("/commands/1") for method, path in writes))
-        self.assertFalse(any(method == "DELETE" for method, _ in writes))
+        self.assertEqual(len(writes), 3)
+        self.assertIn(("DELETE", "/api/v10/applications/111111/commands/10"), writes)
+        self.assertNotIn(("DELETE", "/api/v10/applications/111111/commands/20"), writes)
+        self.assertTrue(any(method == "POST" and "/guilds/333333/commands" in path for method, path in writes))
+        self.assertTrue(any(method == "PATCH" and path.endswith("/guilds/333333/commands/1") for method, path in writes))
 
-    async def test_registration_updates_legacy_command_missing_user_install_context(self) -> None:
+    async def test_guild_registration_omits_global_install_fields(self) -> None:
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -186,13 +195,15 @@ class DiscordCommandServiceTests(unittest.IsolatedAsyncioTestCase):
             if path.endswith("/oauth2/applications/@me"):
                 return httpx.Response(200, json={"id": "111111"})
             if path.endswith("/channels/222222"):
-                return httpx.Response(200, json={})
-            if request.method == "GET" and path.endswith("/commands"):
+                return httpx.Response(200, json={"guild_id": "333333"})
+            if request.method == "GET" and path == "/api/v10/applications/111111/commands":
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and path.endswith("/guilds/333333/commands"):
                 return httpx.Response(
                     200,
                     json=[
-                        {"id": "1", "name": "balance", "description": "查看上游余额缓存", "type": 1},
-                        {"id": "2", "name": "quota", "description": "查看 OAuth 账号额度缓存", "type": 1},
+                        {"id": "1", "name": "balance", "description": "old", "type": 1},
+                        {"id": "2", "name": "quota", "description": "old", "type": 1},
                     ],
                 )
             return httpx.Response(200, json={})
@@ -207,8 +218,24 @@ class DiscordCommandServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(updates), 2)
         for request in updates:
             payload = json.loads(request.content)
-            self.assertEqual(payload["integration_types"], [0, 1])
-            self.assertEqual(payload["contexts"], [0, 1, 2])
+            self.assertNotIn("integration_types", payload)
+            self.assertNotIn("contexts", payload)
+            self.assertIn("/guilds/333333/commands/", request.url.path)
+
+    async def test_registration_requires_a_server_channel(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/applications/@me"):
+                return httpx.Response(200, json={"id": "111111"})
+            if request.url.path.endswith("/channels/222222"):
+                return httpx.Response(200, json={"type": 1})
+            return httpx.Response(500)
+
+        def client_factory(**kwargs):
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs)
+
+        service = DiscordCommandService(client_factory=client_factory)
+        with self.assertRaisesRegex(RuntimeError, "discord_guild_channel_required"):
+            await service._register_commands("bot-token", "222222")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,11 @@ import {
   upstreamRateChangeLogsPath,
 } from "../src/api.ts";
 import {
+  automationDurationDisplayValue,
+  automationDurationSecondsValue,
+  preferredAutomationDurationUnit,
+} from "../src/automationDuration.ts";
+import {
   accountCanBeLivenessTested,
   livenessAccountIds,
   MAX_LIVENESS_ACCOUNTS,
@@ -388,10 +393,18 @@ test("App navigation uses history state, a page refresh control, and a top setti
   assert.match(source, /discord-bot-setup-screenshot-button/);
   assert.match(source, /DiscordBotSetupScreenshotPreviewDialog/);
   assert.match(source, /discord\.com\/developers\/applications/);
+  assert.match(source, /Public Bot.*公开/);
+  assert.match(source, /Private Bot.*私有，推荐/);
+  assert.match(source, /User Install.*用户安装/);
+  assert.match(source, /Guild Install.*服务器安装/);
+  assert.match(source, /已授权的应用/);
+  assert.match(source, /General Information \/ Delete App/);
+  assert.match(source, /删除的是整个应用，不是单独删除 Bot/);
   const styleSource = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(styleSource, /\.discord-bot-setup-guide-body[\s\S]*overflow-y:\s*auto/);
   assert.match(styleSource, /\.discord-bot-setup-screenshot/);
   assert.match(styleSource, /\.discord-bot-screenshot-preview-dialog/);
+  assert.match(styleSource, /\.discord-bot-install-mode-grid[\s\S]*grid-template-columns:\s*repeat\(2/);
 });
 
 test("automatic pause settings keep balance controls while multiplier policy belongs to intervals and accounts", () => {
@@ -523,6 +536,57 @@ test("fallback model chain preserves unique order and supports list controls", (
   assert.equal(firstUnusedFallbackModel(["a"], ["a"]), null);
 });
 
+test("automation durations keep a seconds payload while allowing manual units", () => {
+  assert.equal(preferredAutomationDurationUnit("30"), "second");
+  assert.equal(preferredAutomationDurationUnit("900"), "minute");
+  assert.equal(preferredAutomationDurationUnit("3600"), "hour");
+  assert.equal(automationDurationDisplayValue("90", "minute"), "1.5");
+  assert.equal(automationDurationDisplayValue("3600", "hour"), "1");
+  assert.equal(automationDurationDisplayValue("30", "hour"), "0.008333");
+  assert.equal(automationDurationSecondsValue("1.5", "minute"), "90");
+  assert.equal(automationDurationSecondsValue("0.5", "hour"), "1800");
+
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const typesSource = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
+
+  assert.ok((appSource.match(/<AutomationSettingDuration/g) || []).length >= 6);
+  assert.match(appSource, /min=\{Number\(automationDurationDisplayValue\(String\(minSeconds\), unit\)\)\}/);
+  assert.match(appSource, /max=\{Number\(automationDurationDisplayValue\(String\(maxSeconds\), unit\)\)\}/);
+  assert.match(appSource, /channel_monitor_test_attempt_interval_seconds: channelMonitorTestAttemptIntervalNumber/);
+  assert.match(appSource, /channelMonitorTestAttemptIntervalNumber > 300/);
+  assert.match(appSource, /多次测试间隔/);
+  assert.equal((typesSource.match(/channel_monitor_test_attempt_interval_seconds/g) || []).length, 2);
+  assert.match(styles, /\.automation-setting-duration\s*\{[^}]*grid-template-columns:/s);
+  assert.match(styles, /\.automation-settings-table\s*\{[^}]*display: grid;[^}]*gap: 9px;/s);
+  assert.match(styles, /@media \(max-width: 560px\)[\s\S]*?\.automation-setting-row\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
+
+  assert.doesNotMatch(appSource, /autoComplete="new-password"\s+disabled=\{clearDiscordBotToken\}/);
+  assert.match(appSource, /if \(token\) setClearDiscordBotToken\(false\)/);
+  assert.match(appSource, /setDiscordNotificationsEnabled\(false\)/);
+  assert.match(appSource, /if \(clearDiscordBotToken\) \{[\s\S]*?\} else if \(discordBotToken\.trim\(\)\)/);
+
+  assert.doesNotMatch(accountSource, /failedMonitorStatuses = \[[^\]]*degraded/);
+  assert.match(accountSource, /\? "monitor-degraded"/);
+  assert.match(accountSource, /当前探测可用（降级）/);
+  assert.doesNotMatch(accountSource, /status === "degraded"[\s\S]{0,120}当前探测不可用/);
+  assert.match(accountSource, /const available = status === "available" \|\| monitorDegraded/);
+  assert.match(accountSource, /绑定监控面板判定（降级，视为可用）/);
+  assert.match(accountSource, /监控面板当前为降级，按可用处理，不进行回退模型测试/);
+  assert.match(appSource, /面板状态为可用或降级时都直接判定账号可用，不进行回退模型测试/);
+  assert.match(styles, /\.api-key-availability-indicator--monitor-degraded\s*\{[^}]*var\(--warn-bg\)[^}]*var\(--warn-ink\)/s);
+  assert.match(accountSource, /disabled=\{busy \|\| identityBlocked\}\s+onClick=\{onForceConnectionTest\}/);
+  assert.match(accountSource, /未绑定可用性监控面板，将使用账号白名单内的回退模型测试连接/);
+  assert.match(accountSource, /api-key-scheduling-log-panel/);
+  assert.match(styles, /\.api-key-scheduling-log-panel \.api-key-ledger-sticky\s*\{\s*position: static;/);
+  assert.match(styles, /\.workspace--api-keys \.topbar h1\s*\{[^}]*font-size: 21px;/s);
+  assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.api-key-subview-tabs\s*\{[^}]*display: flex;[^}]*overflow-x: auto;/s);
+  assert.match(styles, /\.api-key-rate-pause-toggle \.settings-toggle-copy\s*\{[^}]*display: grid;/s);
+  assert.doesNotMatch(styles, /\.api-key-rate-pause-toggle\s*\{[^}]*min-height:\s*0;/s);
+  assert.match(accountSource, /综合倍率严格大于阈值时暂停，等于或低于阈值时不暂停/);
+});
+
 test("API key operation feedback uses the title bar and upstream card widths stay stable", () => {
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
@@ -556,6 +620,9 @@ test("API key change pages expose separate ledgers and unread highlighting", () 
   assert.match(source, /api-key-change-message-line--primary">\s*<span>\{upstreamChannelChangeEventLabel\(log\.event_type\)\}<\/span>\s*<\/div>\s*<div className="api-key-change-message-line api-key-change-message-line--detail">\s*\{nameEvent \? \(\s*<div className="api-key-rate-log-flow">/s);
   assert.match(source, /\(nameEvent \|\| groupAddedEvent\) && groupMultiplierValue !== null/);
   assert.match(source, /className="api-key-change-message-line api-key-change-message-line--detail"/);
+  assert.match(source, /api-key-change-event-row api-key-scheduling-event-row/);
+  assert.match(source, /api-key-change-category--scheduling-\$\{statusTone\}/);
+  assert.match(source, /<span>API Key 账号 <b>\{log\.account_name/);
   assert.match(source, /function schedulingEvidenceLabel/);
   assert.match(source, /账号连接测试：\$\{testStatus\}/);
   assert.match(source, /观测综合倍率/);
@@ -565,10 +632,12 @@ test("API key change pages expose separate ledgers and unread highlighting", () 
   assert.match(styles, /\.api-key-change-event-row \.api-key-rate-log-identity\s*\{[^}]*grid-template-rows: 22px 24px;[^}]*min-height: 51px;/s);
   assert.match(styles, /\.api-key-change-event-row \.api-key-rate-log-cell--primary\s*\{[^}]*grid-template-rows: repeat\(2, minmax\(22px, 1fr\)\);/s);
   assert.match(styles, /\.api-key-scheduling-event-row\s*\{[^}]*border-bottom: 4px solid/s);
+  assert.match(styles, /\.api-key-scheduling-event-row--paused\s*\{[^}]*border-left-color: var\(--danger-ink\)/s);
+  assert.match(styles, /\.api-key-change-category--scheduling-restored\s*\{[^}]*var\(--ok-bg\)/s);
   assert.match(styles, /\.api-key-scheduling-evidence/);
 });
 
-test("change ledger highlighting remains pending until its subview is left", () => {
+test("change ledger badges clear immediately for the open subview", () => {
   assert.deepEqual(CHANGE_LOG_READ_RETRY_DELAYS_MS, [1_000, 2_000, 4_000]);
   assert.equal(pendingReadThroughId(null, [
     { id: 11, unread: false },
@@ -593,13 +662,17 @@ test("change ledger highlighting remains pending until its subview is left", () 
   };
   assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "rate-log"), {
     ...unreadCounts,
+    upstream_changes: 0,
   });
   assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "schedule-log"), {
     ...unreadCounts,
+    account_scheduling_changes: 0,
   });
   assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "account-rate-log"), {
     ...unreadCounts,
+    account_rate_changes: 0,
   });
+  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "accounts"), unreadCounts);
 
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(source, /previousSubviewRef\.current !== "rate-log"/);
@@ -771,7 +844,7 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(accountSource, /查看 \$\{accountDisplayName\(account\)\} 的可用性监测详情/);
   assert.match(accountSource, /监控面板未能确认可用，随后由回退连接测试判定/);
   assert.match(accountSource, /为节省测试 token，暂不进行可用性测试/);
-  assert.match(accountSource, /\["当前回退候选模型", source === "channel_monitor_fallback" \? chosenModel : null\]/);
+  assert.match(accountSource, /\["当前回退候选模型", source === "channel_monitor_fallback" && !monitorDegraded \? chosenModel : null\]/);
   assert.doesNotMatch(accountSource, /监控面板未能确认可用后连接测试判定/);
   assert.match(accountSource, /\["配置阈值", evidence\.threshold/);
   assert.match(helpSource, /trigger\?: ReactNode/);
@@ -786,8 +859,8 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.settings-local-nav\s*\{\s*top:\s*calc\(var\(--app-sidebar-offset\) \+ var\(--app-header-height\)\);/);
   assert.match(styles, /\.notice > button\s*\{/);
   assert.match(styles, /\.api-key-monitor-current--success/);
-  assert.match(styles, /\.api-key-channel-card\s*\{\s*height: 371px;/);
-  assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: 440px;/);
+  assert.match(styles, /\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 371px;/);
+  assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 440px;/);
   assert.doesNotMatch(styles, /\.api-key-channel-accounts\s*\{[^}]*margin-top:\s*auto;/s);
   assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 520px\), 520px\)\);/s);
   assert.match(styles, /@media \(max-width: 1160px\)\s*\{\s*\.api-key-channel-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
@@ -826,9 +899,18 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(appSource, /dialogRef\.current\.querySelectorAll<HTMLElement>/);
   assert.match(appSource, /fallbackModelDialogTriggerRef\.current\?\.focus\(\)/);
   assert.doesNotMatch(styles, /api-key-rate-pause-tag--inherited/);
-  assert.match(accountSource, /className="api-key-scheduling-columns"/);
-  assert.match(accountSource, />暂停原因<\/span>/);
+  assert.doesNotMatch(accountSource, /className="api-key-scheduling-columns"/);
+  assert.match(accountSource, /暂停原因详情/);
   assert.doesNotMatch(accountSource, />同时生效<\/span>/);
+});
+
+test("priority intervals can open account management with the interval filter applied", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(source, /const viewPriorityIntervalAccounts = useCallback\(\(interval: PriorityInterval\) =>/);
+  assert.match(source, /setAccountSearch\(""\);[\s\S]*setAccountStatusFilter\("all"\);[\s\S]*setAccountUpstreamFilter\("all"\);[\s\S]*setPlatformFilter\("all"\);/);
+  assert.match(source, /setPriorityIntervalFilter\(String\(interval\.id\)\);\s*onSubviewChange\("accounts"\);/);
+  assert.match(source, /aria-label=\{`查看优先级区间 \$\{interval\.name\} 的账号`\}/);
+  assert.match(source, /onViewAccounts=\{viewPriorityIntervalAccounts\}/);
 });
 
 test("channel monitor current status uses the newest timestamp rather than response order", () => {

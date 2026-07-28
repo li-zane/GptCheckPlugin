@@ -27,43 +27,53 @@ COLOR_BLURPLE = 0x5865F2
 FIELD_VALUE_LIMIT = 1024
 QUOTA_PROGRESS_SEGMENTS = 10
 
-# Explicitly opt the commands into both installation types and all interaction
-# contexts.  Without these fields, commands created before user-install was
-# enabled can remain restricted to guild installs and will not appear in a DM.
-COMMAND_INTEGRATION_TYPES = (0, 1)  # Guild install, user install.
-COMMAND_CONTEXTS = (0, 1, 2)  # Guild, bot DM, private channel.
 COMMANDS = (
     {
         "name": "balance",
         "description": "查看上游余额缓存",
         "type": 1,
-        "integration_types": list(COMMAND_INTEGRATION_TYPES),
-        "contexts": list(COMMAND_CONTEXTS),
     },
     {
         "name": "quota",
         "description": "查看 OAuth 账号额度缓存",
         "type": 1,
-        "integration_types": list(COMMAND_INTEGRATION_TYPES),
-        "contexts": list(COMMAND_CONTEXTS),
     },
 )
+MANAGED_COMMAND_NAMES = frozenset(command["name"] for command in COMMANDS)
 
 logger = logging.getLogger(__name__)
 
 
 def _command_requires_update(current: dict[str, Any], command: dict[str, Any]) -> bool:
-    """Keep existing global commands aligned with their installation scope."""
+    """Keep the configured guild commands aligned with this service."""
     if current.get("description") != command["description"]:
         return True
     if current.get("type") != command["type"]:
         return True
-    for field in ("integration_types", "contexts"):
-        expected = command[field]
-        actual = current.get(field)
-        if not isinstance(actual, list) or sorted(actual) != sorted(expected):
-            return True
     return False
+
+
+def _discord_error_code(response: httpx.Response) -> int | str | None:
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    return code if isinstance(code, (int, str)) else None
+
+
+def _raise_for_discord_status(response: httpx.Response, operation: str) -> None:
+    if 200 <= response.status_code < 300:
+        return
+    logger.warning(
+        "Discord API request failed: operation=%s status=%s code=%s",
+        operation,
+        response.status_code,
+        _discord_error_code(response) or "unknown",
+    )
+    response.raise_for_status()
 
 
 class DiscordCommandService:
@@ -159,19 +169,37 @@ class DiscordCommandService:
                 client.get(f"{DISCORD_API_BASE_URL}/oauth2/applications/@me", headers=headers),
                 client.get(f"{DISCORD_API_BASE_URL}/channels/{channel_id}", headers=headers),
             )
-            application_response.raise_for_status()
-            channel_response.raise_for_status()
+            _raise_for_discord_status(application_response, "read_application")
+            _raise_for_discord_status(channel_response, "read_configured_channel")
             application_id = str(application_response.json().get("id") or "").strip()
             channel_payload = channel_response.json()
             guild_id = str(channel_payload.get("guild_id") or "").strip()
             if not _valid_snowflake(application_id):
                 raise RuntimeError("discord_application_id_unavailable")
-            command_base = f"{DISCORD_API_BASE_URL}/applications/{application_id}"
-            if _valid_snowflake(guild_id):
-                command_base += f"/guilds/{guild_id}"
-            command_base += "/commands"
+            if not _valid_snowflake(guild_id):
+                raise RuntimeError("discord_guild_channel_required")
+
+            global_command_base = f"{DISCORD_API_BASE_URL}/applications/{application_id}/commands"
+            global_response = await client.get(global_command_base, headers=headers)
+            _raise_for_discord_status(global_response, "list_global_commands")
+            for command in global_response.json():
+                if (
+                    isinstance(command, dict)
+                    and str(command.get("name") or "") in MANAGED_COMMAND_NAMES
+                    and _valid_snowflake(str(command.get("id") or ""))
+                ):
+                    delete_response = await client.delete(
+                        f"{global_command_base}/{command['id']}",
+                        headers=headers,
+                    )
+                    _raise_for_discord_status(delete_response, "delete_legacy_global_command")
+
+            command_base = (
+                f"{DISCORD_API_BASE_URL}/applications/{application_id}"
+                f"/guilds/{guild_id}/commands"
+            )
             existing_response = await client.get(command_base, headers=headers)
-            existing_response.raise_for_status()
+            _raise_for_discord_status(existing_response, "list_guild_commands")
             existing = {
                 str(item.get("name") or ""): item
                 for item in existing_response.json()
@@ -189,7 +217,7 @@ class DiscordCommandService:
                     )
                 else:
                     continue
-                response.raise_for_status()
+                _raise_for_discord_status(response, "write_guild_command")
 
     async def _run_gateway(self, token: str, channel_id: str) -> None:
         async with websockets.connect(

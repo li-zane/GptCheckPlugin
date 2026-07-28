@@ -1108,6 +1108,14 @@ export function ApiKeyAccountsView({
     }).filter(({ account }) => upstreamAccountMatchesStatus(account, accountStatusFilter));
     return sortUpstreamAccountEntries(filtered);
   }, [accountSearch, accountStatusFilter, accountUpstreamFilter, allAccountEntries, platformFilter, priorityIntervalFilter]);
+  const viewPriorityIntervalAccounts = useCallback((interval: PriorityInterval) => {
+    setAccountSearch("");
+    setAccountStatusFilter("all");
+    setAccountUpstreamFilter("all");
+    setPlatformFilter("all");
+    setPriorityIntervalFilter(String(interval.id));
+    onSubviewChange("accounts");
+  }, [onSubviewChange]);
 
   const summary = useMemo(
     () => ({
@@ -2224,6 +2232,7 @@ export function ApiKeyAccountsView({
           onDelete={(interval) => void deletePriorityInterval(interval)}
           onEdit={openPriorityIntervalConfig}
           onRebalance={() => void rebalancePriorityIntervals()}
+          onViewAccounts={viewPriorityIntervalAccounts}
           rebalancing={priorityIntervalsBusy}
           shareSameCompositePriority={shareSameCompositePriority}
         />
@@ -2421,7 +2430,7 @@ export function ApiKeyAccountsView({
                   <small>最低和最高倍率占据区间两端，中间使用几何中位数反比例曲线；取整冲突由系统使用 1 个优先级的最小间隔处理。</small>
                 </div>
               )}
-              <label className="checkbox-line settings-toggle api-key-field--wide">
+              <label className="checkbox-line settings-toggle api-key-field--wide api-key-rate-pause-toggle">
                 <input
                   checked={priorityIntervalForm.ratePauseEnabled}
                   onChange={(event) => setPriorityIntervalForm((current) => ({ ...current, ratePauseEnabled: event.target.checked }))}
@@ -2429,7 +2438,7 @@ export function ApiKeyAccountsView({
                 />
                 <span className="settings-toggle-copy">
                   <strong>综合上游倍率上涨时自动暂停账号</strong>
-                  <small>绑定此区间且选择“继承”的账号会使用下面的阈值；倍率回落后自动恢复调度。</small>
+                  <small>绑定此区间且选择“继承”的账号会使用下面的阈值；综合倍率严格大于阈值时暂停，等于或低于阈值时不暂停。</small>
                 </span>
               </label>
               <label className="api-key-field api-key-field--wide">
@@ -2443,7 +2452,7 @@ export function ApiKeyAccountsView({
                   type="number"
                   value={priorityIntervalForm.rateAbsoluteThreshold}
                 />
-                <small>设置保存后，在下一次上游同步时应用到该区间账号。</small>
+                <small>设置保存后，在下一次上游同步时应用；只有综合倍率严格大于该阈值才会暂停账号。</small>
               </label>
             </div>
             <DialogError message={dialogError} />
@@ -3337,6 +3346,7 @@ function AccountCard({
     || account.upstream_identity_rebind_required,
   );
   const priorityIdentityBlocked = priorityIntervalAssignmentBlocked(account);
+  const usesFallbackConnectionTest = !channel || account.availability_monitor_id == null;
   const current = finiteNumber(account.current_rate);
   const target = finiteNumber(account.target_rate);
   const groupMultiplier = finiteNumber(account.effective_group_multiplier);
@@ -3542,7 +3552,9 @@ function AccountCard({
           onClick={onTestAvailability}
           title={account.availability_check_mode === "disabled"
             ? "请先为账号绑定监控面板或设置独立测试模型"
-            : "按自动监测逻辑测试；正常账号使用暂停判定次数，因可用性监测暂停的账号使用恢复判定次数"}
+            : usesFallbackConnectionTest
+              ? "未绑定可用性监控面板，将按设置中的回退模型链测试"
+              : "按自动监测逻辑测试；正常账号使用暂停判定次数，因可用性监测暂停的账号使用恢复判定次数"}
           type="button"
         >
           {busyAction === "availability-test" ? <RefreshCcw className="spin" size={15} /> : <Activity size={15} />}
@@ -3550,11 +3562,11 @@ function AccountCard({
         <button
           aria-label={`强制测试 ${accountDisplayName(account)} 的连接`}
           className="api-key-icon-button"
-          disabled={busy || identityBlocked || !channel}
+          disabled={busy || identityBlocked}
           onClick={onForceConnectionTest}
-          title={channel
-            ? "直接调用 Sub2API 连接测试接口；不会读取监控面板，也不会改变自动暂停、恢复或调度状态"
-            : "账号尚未分配上游，无法选择白名单内的测试模型"}
+          title={usesFallbackConnectionTest
+            ? "未绑定可用性监控面板，将使用账号白名单内的回退模型测试连接"
+            : "直接调用 Sub2API 连接测试接口；不会读取监控面板，也不会改变自动暂停、恢复或调度状态"}
           type="button"
         >
           {busyAction === "connection-test" ? <RefreshCcw className="spin" size={15} /> : <PlugZap size={15} />}
@@ -3638,14 +3650,17 @@ function AccountCardConfigurationTags({
     ? latestChannelMonitorStatus(selectedMonitor.primary_status, selectedMonitor.timeline)
     : "";
   const healthyMonitorStatuses = ["available", "healthy", "operational", "ok", "success"];
-  const failedMonitorStatuses = ["degraded", "unavailable", "error", "failed", "timeout", "invalid"];
+  const failedMonitorStatuses = ["unavailable", "error", "failed", "timeout", "invalid"];
   const monitorDeleted = account.availability_monitor_id != null
     && channel?.channel_monitor_status === "ok"
     && !selectedMonitor;
   const channelStatus = String(channel?.channel_monitor_status || "").trim().toLowerCase();
+  const monitorDegraded = selectedMonitorStatus === "degraded" || channelStatus === "degraded";
   const monitorTone = account.availability_monitor_id == null
     ? "warn"
-    : monitorDeleted || failedMonitorStatuses.includes(selectedMonitorStatus)
+    : monitorDegraded
+      ? "warn"
+      : monitorDeleted || failedMonitorStatuses.includes(selectedMonitorStatus)
       || failedMonitorStatuses.includes(channelStatus)
       ? "danger"
       : selectedMonitor && channelStatus === "ok" && healthyMonitorStatuses.includes(selectedMonitorStatus)
@@ -3816,8 +3831,19 @@ function AccountAvailabilityIndicator({
   const source = String(account.availability_source || "").trim().toLowerCase();
   const monitoringUnconfigured = mode === "disabled";
   const monitoringGloballyDisabled = !monitoringUnconfigured && status === "disabled";
-  const available = status === "available";
-  const unavailable = status === "unavailable";
+  const selectedMonitor = account.availability_monitor_id == null
+    ? null
+    : (channel?.channel_monitors || []).find(
+        (monitor) => String(monitor.id) === String(account.availability_monitor_id),
+      );
+  const selectedMonitorStatus = selectedMonitor
+    ? latestChannelMonitorStatus(selectedMonitor.primary_status, selectedMonitor.timeline)
+    : null;
+  const channelMonitorStatus = String(channel?.channel_monitor_status || "").trim().toLowerCase();
+  const monitorDegraded = mode === "channel_monitor"
+    && (selectedMonitorStatus === "degraded" || channelMonitorStatus === "degraded");
+  const available = status === "available" || monitorDegraded;
+  const unavailable = status === "unavailable" && !monitorDegraded;
   const otherPauseReasons = activePauseHolds
     .filter((hold) => hold.reason !== "channel_monitor_unavailable")
     .map((hold) => upstreamChangeReasonLabel(hold.reason));
@@ -3829,6 +3855,8 @@ function AccountAvailabilityIndicator({
   );
   const sourceText = monitoringUnconfigured
     ? "尚未配置自动可用性监测"
+    : monitorDegraded
+      ? "绑定监控面板判定（降级，视为可用）"
     : source === "channel_monitor"
       ? "绑定监控面板判定"
       : source === "channel_monitor_fallback"
@@ -3845,20 +3873,12 @@ function AccountAvailabilityIndicator({
       : unavailable
         ? "不可用"
         : account.availability_status || "未检测";
-  const selectedMonitor = account.availability_monitor_id == null
-    ? null
-    : (channel?.channel_monitors || []).find(
-        (monitor) => String(monitor.id) === String(account.availability_monitor_id),
-      );
   const monitorBindingMissing = account.availability_check_mode === "channel_monitor"
     && account.availability_monitor_id == null;
   const monitorWasDeleted = account.availability_check_mode === "channel_monitor"
     && account.availability_monitor_id != null
     && channel?.channel_monitor_status === "ok"
     && !selectedMonitor;
-  const selectedMonitorStatus = selectedMonitor
-    ? latestChannelMonitorStatus(selectedMonitor.primary_status, selectedMonitor.timeline)
-    : null;
   const monitorAvailable = mode === "channel_monitor"
     && channel?.channel_monitor_status === "ok"
     && [
@@ -3933,6 +3953,8 @@ function AccountAvailabilityIndicator({
         ? "monitor-independent"
       : monitorUnbound
         ? "monitor-unbound"
+        : monitorDegraded
+          ? "monitor-degraded"
         : monitorUnknown
           ? "monitor-unknown"
         : monitorAvailable
@@ -3963,11 +3985,13 @@ function AccountAvailabilityIndicator({
           ["检测方式", sourceText],
           ["监控面板", bindingText],
           ["监控面板状态", monitorStatusText],
-          ["当前回退候选模型", source === "channel_monitor_fallback" ? chosenModel : null],
-          ["回退模型链", fallbackChainHasNoAccountModel ? "没有属于该账号模型白名单的候选模型" : null],
+          ["当前回退候选模型", source === "channel_monitor_fallback" && !monitorDegraded ? chosenModel : null],
+          ["回退模型链", !monitorDegraded && fallbackChainHasNoAccountModel ? "没有属于该账号模型白名单的候选模型" : null],
           ["独立模型", source === "independent_model" ? chosenModel : null],
           ["最近检测", account.availability_checked_at ? formatDate(account.availability_checked_at, displayTimeZone) : null],
-          ["具体说明", availabilityMessageText(account.availability_message)],
+          ["具体说明", monitorDegraded
+            ? "监控面板当前为降级，按可用处理，不进行回退模型测试。"
+            : availabilityMessageText(account.availability_message)],
         ]}
       />
     </HelpPopover>
@@ -4132,6 +4156,7 @@ function PriorityIntervalsView({
   onDelete,
   onEdit,
   onRebalance,
+  onViewAccounts,
   rebalancing,
   shareSameCompositePriority,
 }: {
@@ -4142,6 +4167,7 @@ function PriorityIntervalsView({
   onDelete: (interval: PriorityInterval) => void;
   onEdit: (interval: PriorityInterval) => void;
   onRebalance: () => void;
+  onViewAccounts: (interval: PriorityInterval) => void;
   rebalancing: boolean;
   shareSameCompositePriority: boolean;
 }) {
@@ -4207,6 +4233,15 @@ function PriorityIntervalsView({
                   </div>
                   <div className="api-key-row-actions">
                     <button
+                      aria-label={`查看优先级区间 ${interval.name} 的账号`}
+                      className="api-key-icon-button"
+                      onClick={() => onViewAccounts(interval)}
+                      title="查看区间账号"
+                      type="button"
+                    >
+                      <UsersRound size={15} />
+                    </button>
+                    <button
                       aria-label={`编辑优先级区间 ${interval.name}`}
                       className="api-key-icon-button"
                       disabled={busy}
@@ -4243,7 +4278,7 @@ function PriorityIntervalsView({
                 </div>
                 <p className={"api-key-priority-note" + (interval.rate_pause_enabled ? "" : " is-waiting")}>
                   倍率上涨暂停：{interval.rate_pause_enabled
-                    ? `开启 · 综合倍率达到 ${formatMultiplier(interval.rate_absolute_threshold)}`
+                    ? `开启 · 综合倍率大于 ${formatMultiplier(interval.rate_absolute_threshold)}`
                     : "关闭"}
                 </p>
                 {interval.allocation_strategy === "fixed_step" && effectiveStep < interval.step ? (
@@ -4545,7 +4580,7 @@ function SchedulingChangeLogView({
   onRefresh: () => void;
 }) {
   return (
-    <section className="api-key-panel api-key-rate-log-panel" aria-label="账号调度变化记录">
+    <section className="api-key-panel api-key-rate-log-panel api-key-scheduling-log-panel" aria-label="账号调度变化记录">
       <div className="api-key-ledger-sticky">
         <div className="api-key-panel-head">
         <div>
@@ -4609,13 +4644,6 @@ function SchedulingChangeLogView({
           </button>
         ) : null}
         </form>
-        <div className="api-key-scheduling-columns" aria-hidden="true">
-          <span>API Key 账号</span>
-          <span>上游</span>
-          <span>时间</span>
-          <span>调度状态</span>
-          <span>暂停原因</span>
-        </div>
       </div>
 
       {error ? (
@@ -4643,51 +4671,53 @@ function SchedulingChangeLogView({
             const reasonLabel = schedulingReasonLabel(log);
             return (
               <article
-                className={`api-key-rate-log-row api-key-scheduling-event-row api-key-scheduling-event-row--${statusTone}${log.unread ? " is-unread" : ""}`}
+                className={`api-key-rate-log-row api-key-change-event-row api-key-scheduling-event-row api-key-scheduling-event-row--${statusTone}${log.unread ? " is-unread" : ""}`}
                 key={log.id}
               >
-              <div className="api-key-scheduling-field api-key-scheduling-field--account">
-                <span>API Key 账号</span>
-                <strong>{log.account_name || `#${log.sub2api_account_id}`}</strong>
-                <div className="api-key-rate-log-meta api-key-scheduling-unread">
-                  {log.unread ? <span className="api-key-unread-chip">未读</span> : null}
+                <div className="api-key-rate-log-identity">
+                  <div className="api-key-change-identity-head">
+                    <time className="api-key-ledger-time" dateTime={log.created_at}>{formatDate(log.created_at, displayTimeZone)}</time>
+                    <div className={`api-key-change-category api-key-change-category--scheduling-${statusTone}`}>
+                      {schedulingResultLabel(log.event_type)}
+                    </div>
+                    {log.unread ? <span className="api-key-unread-chip">未读</span> : null}
+                  </div>
+                  <div className="api-key-change-identity-route">
+                    <span>上游 <b>{log.channel_name || "未分配"}</b></span>
+                    <span>API Key 账号 <b>{log.account_name || `#${log.sub2api_account_id}`}</b></span>
+                  </div>
                 </div>
-              </div>
-              <div className="api-key-scheduling-field api-key-scheduling-field--upstream">
-                <span>上游</span>
-                <strong>{log.channel_name || "未分配"}</strong>
-              </div>
-              <time className="api-key-scheduling-time" dateTime={log.created_at}>
-                {formatDate(log.created_at, displayTimeZone)}
-              </time>
-              <div className={`api-key-rate-log-cell api-key-rate-log-cell--status is-${statusTone}`}>
-                <span>调度状态</span>
-                <div className="api-key-rate-log-flow">
-                  <b>{schedulableLabel(log.old_schedulable)}</b>
-                  <ArrowRight size={13} />
-                  <strong>{schedulableLabel(log.new_schedulable)}</strong>
+                <div className="api-key-rate-log-cell api-key-rate-log-cell--primary">
+                  <div className="api-key-change-message-line api-key-change-message-line--primary">
+                    <span>调度状态</span>
+                    <div className="api-key-rate-log-flow">
+                      <b>{schedulableLabel(log.old_schedulable)}</b>
+                      <ArrowRight size={13} />
+                      <strong>{schedulableLabel(log.new_schedulable)}</strong>
+                    </div>
+                  </div>
+                  <div className="api-key-change-message-line api-key-change-message-line--detail">
+                    <HelpPopover
+                      label={`查看 ${log.account_name || `账号 #${log.sub2api_account_id}`} 的暂停原因详情`}
+                      trigger={<span className="api-key-scheduling-reason-trigger">{reasonLabel}</span>}
+                      triggerClassName="help-popover-trigger--content"
+                    >
+                      <span className="api-key-status-detail">
+                        <strong>{reasonLabel}</strong>
+                        <PopoverDetails rows={[
+                          ["账号", log.account_name || `#${log.sub2api_account_id}`],
+                          ["上游", log.channel_name || "未分配"],
+                          ["调度结果", schedulingResultLabel(log.event_type)],
+                          ["检测详情", evidenceLabel || null],
+                          ["执行错误", log.safe_error || null],
+                          ["记录时间", formatDate(log.created_at, displayTimeZone)],
+                        ]} />
+                      </span>
+                    </HelpPopover>
+                    {evidenceLabel ? <span className="api-key-scheduling-evidence" title={evidenceLabel}>{evidenceLabel}</span> : null}
+                    {log.safe_error ? <span className="api-key-rate-log-safe-error" title={log.safe_error}>{log.safe_error}</span> : null}
+                  </div>
                 </div>
-              </div>
-              <div className="api-key-rate-log-cell api-key-rate-log-cell--reason">
-                <span>暂停原因</span>
-                <HelpPopover
-                  label={`查看 ${log.account_name || `账号 #${log.sub2api_account_id}`} 的暂停原因详情`}
-                  trigger={<span className="api-key-scheduling-reason-trigger">{reasonLabel}</span>}
-                  triggerClassName="help-popover-trigger--content"
-                >
-                  <span className="api-key-status-detail">
-                    <strong>{reasonLabel}</strong>
-                    <PopoverDetails rows={[
-                      ["账号", log.account_name || `#${log.sub2api_account_id}`],
-                      ["上游", log.channel_name || "未分配"],
-                      ["调度结果", schedulingResultLabel(log.event_type)],
-                      ["检测详情", evidenceLabel || null],
-                      ["执行错误", log.safe_error || null],
-                      ["记录时间", formatDate(log.created_at, displayTimeZone)],
-                    ]} />
-                  </span>
-                </HelpPopover>
-              </div>
               </article>
             );
           })}
@@ -5410,7 +5440,7 @@ function monitorCurrentProbe(monitor: UpstreamChannelMonitor) {
     };
   }
   if (status === "degraded") {
-    return { label: "当前探测不可用", tone: "warn" as const };
+    return { label: "当前探测可用（降级）", tone: "warn" as const };
   }
   if (["error", "failed", "timeout", "unavailable"].includes(status)) {
     return {

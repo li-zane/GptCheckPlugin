@@ -38,9 +38,11 @@ export function departedChangeLogSubview(
 
 export function visibleChangeLogUnreadCounts(
   counts: ChangeLogUnreadCounts,
-  _currentSubview: ApiKeySubview,
+  currentSubview: ApiKeySubview,
 ): ChangeLogUnreadCounts {
-  // Opening a ledger is not the read boundary. Keep its badge visible until
-  // the user leaves and the persisted read cursor has been advanced.
-  return { ...counts };
+  const visible = { ...counts };
+  if (currentSubview === "rate-log") visible.upstream_changes = 0;
+  if (currentSubview === "account-rate-log") visible.account_rate_changes = 0;
+  if (currentSubview === "schedule-log") visible.account_scheduling_changes = 0;
+  return visible;
 }

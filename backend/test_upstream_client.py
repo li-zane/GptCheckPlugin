@@ -3915,6 +3915,50 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertIn("Used list summaries for 1 monitor(s)", result.channel_monitors_message)
         self.assertNotIn(secret, json.dumps(result.as_dict()))
 
+    def test_sub2api_channel_monitor_details_can_target_one_monitor(self) -> None:
+        detail_ids: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 17, "name": "First", "primary_status": "degraded"},
+                                {"id": 18, "name": "Second", "primary_status": "degraded"},
+                            ]
+                        },
+                    },
+                )
+            if (
+                request.url.path.startswith(f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/")
+                and request.url.path.endswith("/status")
+            ):
+                monitor_id = int(request.url.path.rsplit("/", 2)[-2])
+                detail_ids.append(monitor_id)
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"primary_status": "operational"}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            include_channel_monitor_details=True,
+            channel_monitor_detail_ids={18},
+            monitor_only=True,
+        )
+
+        self.assertEqual(detail_ids, [18])
+        self.assertEqual(
+            [monitor["primary_status"] for monitor in result.channel_monitors],
+            ["degraded", "operational"],
+        )
+
     def test_sub2api_channel_monitor_detail_concurrency_is_bounded(self) -> None:
         active_details = 0
         max_active_details = 0

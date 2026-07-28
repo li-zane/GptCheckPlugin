@@ -1638,13 +1638,24 @@ class UpstreamChannelService:
     def _selected_group(config: UpstreamAccountConfig, groups: list[dict[str, Any]]) -> dict[str, Any] | None:
         selected_id = (config.selected_group_id or "").strip().casefold()
         selected_name = (config.selected_group_name or "").strip().casefold()
-        for group in groups:
-            group_id = str(group.get("id") or "").strip().casefold()
-            group_name = str(group.get("name") or "").strip().casefold()
-            if selected_id and group_id == selected_id:
-                return group
-            if selected_name and group_name == selected_name:
-                return group
+        if selected_id:
+            return next(
+                (
+                    group
+                    for group in groups
+                    if str(group.get("id") or "").strip().casefold() == selected_id
+                ),
+                None,
+            )
+        if selected_name:
+            return next(
+                (
+                    group
+                    for group in groups
+                    if str(group.get("name") or "").strip().casefold() == selected_name
+                ),
+                None,
+            )
         return None
 
     def _apply_daily_usage_failure(
@@ -2082,7 +2093,9 @@ class UpstreamChannelService:
             if group_name not in current_by_name
             and str(group.get("id") or "").strip().casefold() in removed_by_id
         }
-        if not removed_by_id:
+        if not removed_by_id and not any(
+            config.upstream_group_status == "deleted" for config in configs
+        ):
             return
         changed = False
         for config in configs:
@@ -2094,14 +2107,13 @@ class UpstreamChannelService:
             state = states.get(state_key)
             state_group_id = str(_value(state, "group_id") or "").strip().casefold()
             state_group_name = str(_value(state, "group_name") or "").strip().casefold()
+            removed: dict[str, Any] | None = None
             if state_group_id or state_group_name:
                 removed = (
                     removed_by_id.get(state_group_id)
                     if state_group_id
                     else removed_by_name.get(state_group_name)
                 )
-                if removed is None:
-                    continue
             else:
                 selected_id = str(config.selected_group_id or "").strip().casefold()
                 selected_name = str(config.selected_group_name or "").strip().casefold()
@@ -2110,15 +2122,42 @@ class UpstreamChannelService:
                     if selected_id
                     else removed_by_name.get(selected_name)
                 )
-                if removed is None:
-                    continue
+
+            if removed is None and config.upstream_group_status == "deleted":
+                retained_group_id = str(
+                    _value(state, "group_id") or config.selected_group_id or ""
+                ).strip()
+                retained_group_name = str(
+                    _value(state, "group_name") or config.selected_group_name or ""
+                ).strip()
+                normalized_retained_id = retained_group_id.casefold()
+                normalized_retained_name = retained_group_name.casefold()
+                group_is_current = bool(
+                    normalized_retained_id in current_by_id
+                    if normalized_retained_id
+                    else normalized_retained_name in current_by_name
+                )
+                if not group_is_current and (
+                    retained_group_id or retained_group_name
+                ):
+                    removed = {
+                        "id": retained_group_id,
+                        "name": retained_group_name,
+                    }
+            if removed is None:
+                continue
 
             group_id = str(_value(state, "group_id") or removed.get("id") or "").strip() or None
             group_name = str(
                 _value(state, "group_name") or removed.get("name") or ""
             ).strip() or None
             if isinstance(state, AccountUpstreamState):
-                states[state_key] = replace(state, group_status="deleted")
+                states[state_key] = replace(
+                    state,
+                    group_status="deleted",
+                    group_id=group_id,
+                    group_name=group_name,
+                )
             elif isinstance(state, dict):
                 states[state_key] = {
                     **state,
@@ -2142,6 +2181,7 @@ class UpstreamChannelService:
         result: Any,
         *,
         now: datetime,
+        channel_monitor_detail_ids: set[int] | None = None,
     ) -> None:
         status = str(_value(result, "status") or "error").strip().lower()
         if status != "ok":
@@ -2155,11 +2195,48 @@ class UpstreamChannelService:
             channel.channel_monitor_checked_at = now
             return
         raw_monitors = _value(result, "channel_monitors")
-        channel.channel_monitors = (
+        discovered_monitors = (
             [dict(item) for item in raw_monitors if isinstance(item, dict)]
             if isinstance(raw_monitors, list)
             else []
         )
+        if channel_monitor_detail_ids is not None:
+            cached_by_id: dict[int, dict[str, Any]] = {}
+            for cached in channel.channel_monitors or []:
+                if not isinstance(cached, dict):
+                    continue
+                try:
+                    cached_id = int(cached.get("id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if cached_id > 0:
+                    cached_by_id[cached_id] = cached
+            detail_fields = (
+                "primary_status",
+                "primary_latency_ms",
+                "primary_ping_latency_ms",
+                "availability_7d",
+                "availability_window",
+                "extra_models",
+                "timeline",
+            )
+            merged_monitors: list[dict[str, Any]] = []
+            for discovered in discovered_monitors:
+                try:
+                    monitor_id = int(discovered.get("id") or 0)
+                except (TypeError, ValueError):
+                    monitor_id = 0
+                cached = cached_by_id.get(monitor_id)
+                if cached is None or monitor_id in channel_monitor_detail_ids:
+                    merged_monitors.append(discovered)
+                    continue
+                merged = {**cached, **discovered}
+                for field in detail_fields:
+                    if field in cached:
+                        merged[field] = cached[field]
+                merged_monitors.append(merged)
+            discovered_monitors = merged_monitors
+        channel.channel_monitors = discovered_monitors
         raw_monitor_total = _value(result, "channel_monitors_total")
         try:
             parsed_monitor_total = int(raw_monitor_total)
@@ -2216,6 +2293,8 @@ class UpstreamChannelService:
         configs: list[UpstreamAccountConfig],
         model: str,
         attempts: int,
+        *,
+        attempt_interval_seconds: float = 0,
     ) -> tuple[bool | None, str | None, int | None, int]:
         candidates = sorted(
             {
@@ -2234,10 +2313,17 @@ class UpstreamChannelService:
         if not callable(tester):
             return None, "The local Sub2API client does not support connection tests.", None, 0
 
+        try:
+            bounded_interval = float(attempt_interval_seconds)
+        except (TypeError, ValueError):
+            bounded_interval = 0.0
+        if not 0 < bounded_interval <= 300:
+            bounded_interval = 0.0
+        bounded_attempts = max(1, min(5, attempts))
         last_error: str | None = None
         last_account_id: int | None = None
         completed_attempts = 0
-        for index in range(max(1, min(5, attempts))):
+        for index in range(bounded_attempts):
             config = candidates[index % len(candidates)]
             last_account_id = config.sub2api_account_id
             completed_attempts += 1
@@ -2258,6 +2344,8 @@ class UpstreamChannelService:
             if success:
                 return True, None, last_account_id, completed_attempts
             last_error = _safe_text(error, limit=300) or "Connection test failed."
+            if bounded_interval and index + 1 < bounded_attempts:
+                await asyncio.sleep(bounded_interval)
         return False, last_error, last_account_id, completed_attempts
 
     async def _prepare_channel_monitor_guard(
@@ -2359,6 +2447,7 @@ class UpstreamChannelService:
         automation_paused: bool,
         blocking_pause_reason: str | None = None,
         monitor_probe_fresh: bool = True,
+        force_unbound_fallback: bool = False,
     ) -> tuple[str | None, dict[str, Any]]:
         recovering = any(
             hold.reason == AUTO_PAUSE_REASON_MONITOR
@@ -2383,13 +2472,29 @@ class UpstreamChannelService:
                     ),
                 ),
             )
+            get_attempt_interval = getattr(
+                runtime_config,
+                "get_channel_monitor_test_attempt_interval_seconds",
+                None,
+            )
+            raw_attempt_interval = (
+                await get_attempt_interval()
+                if callable(get_attempt_interval)
+                else 0
+            )
+            try:
+                attempt_interval_seconds = float(raw_attempt_interval)
+            except (TypeError, ValueError):
+                attempt_interval_seconds = 0.0
+            if not 0 <= attempt_interval_seconds <= 300:
+                attempt_interval_seconds = 0.0
         except Exception:
             config.availability_status = "unknown"
             config.availability_source = None
             config.availability_message = "Availability settings could not be read."
             return None, {"mode": config.availability_check_mode, "status": "unknown"}
 
-        if not enabled:
+        if not enabled and not force_unbound_fallback:
             config.availability_status = "disabled"
             config.availability_source = None
             config.availability_unavailable_count = 0
@@ -2419,6 +2524,7 @@ class UpstreamChannelService:
             "mode": mode,
             "test_purpose": "recovery" if recovering else "pause",
             "max_test_attempts": attempts,
+            "test_attempt_interval_seconds": attempt_interval_seconds,
         }
 
         def paused_by_other_reason() -> tuple[None, dict[str, Any]]:
@@ -2428,6 +2534,8 @@ class UpstreamChannelService:
             return None, evidence
 
         def action_for_result(status: str) -> str | None:
+            if not enabled:
+                return "clear"
             return "clear" if status == "available" else "hold"
 
         if mode == "independent_model":
@@ -2452,6 +2560,7 @@ class UpstreamChannelService:
                 [config],
                 model,
                 attempts,
+                attempt_interval_seconds=attempt_interval_seconds,
             )
             evidence.update(
                 model=model or None,
@@ -2490,17 +2599,7 @@ class UpstreamChannelService:
         ]
         selected_monitor: dict[str, Any] | None = None
         fallback_reason: str
-        if channel.channel_monitor_status != "ok":
-            fallback_reason = (
-                _safe_text(channel.channel_monitor_message, limit=300)
-                or "The upstream channel monitor result is unavailable."
-            )
-            evidence.update(
-                monitor_id=config.availability_monitor_id,
-                monitor_status="unknown",
-                monitor_source="channel_monitor",
-            )
-        elif config.availability_monitor_id is None:
+        if config.availability_monitor_id is None:
             fallback_reason = "No concrete upstream monitor panel is bound."
             evidence.update(
                 monitor_id=None,
@@ -2512,9 +2611,11 @@ class UpstreamChannelService:
                 "get_channel_monitor_fallback_without_monitor_enabled",
                 None,
             )
-            allow_unbound_fallback = bool(
-                await get_unbound_fallback()
-            ) if callable(get_unbound_fallback) else False
+            allow_unbound_fallback = force_unbound_fallback or (
+                bool(await get_unbound_fallback())
+                if callable(get_unbound_fallback)
+                else False
+            )
             evidence["fallback_without_monitor_enabled"] = allow_unbound_fallback
             if not allow_unbound_fallback:
                 config.availability_status = "not_configured"
@@ -2523,6 +2624,16 @@ class UpstreamChannelService:
                 )
                 evidence.update(status="not_configured", model=None)
                 return None, evidence
+        elif channel.channel_monitor_status not in {"ok", "degraded"}:
+            fallback_reason = (
+                _safe_text(channel.channel_monitor_message, limit=300)
+                or "The upstream channel monitor result is unavailable."
+            )
+            evidence.update(
+                monitor_id=config.availability_monitor_id,
+                monitor_status="unknown",
+                monitor_source="channel_monitor",
+            )
         else:
             selected_monitor = next(
                 (
@@ -2550,6 +2661,7 @@ class UpstreamChannelService:
                 )
                 if monitor_status in {
                     "available",
+                    "degraded",
                     "healthy",
                     "operational",
                     "ok",
@@ -2562,7 +2674,6 @@ class UpstreamChannelService:
                 fallback_reason = (
                     "The configured channel monitor reported an unavailable status."
                     if monitor_status in {
-                        "degraded",
                         "unavailable",
                         "error",
                         "failed",
@@ -2593,7 +2704,9 @@ class UpstreamChannelService:
             [config],
             model,
             attempts,
+            attempt_interval_seconds=attempt_interval_seconds,
         )
+        config.availability_checked_at = _utcnow()
         config.availability_source = "channel_monitor_fallback"
         evidence.update(
             model=model,
@@ -2646,7 +2759,10 @@ class UpstreamChannelService:
             )
         channel_id = config.channel_id
         monitor_refresh_status = "not_required"
-        if config.availability_check_mode == "channel_monitor":
+        if (
+            config.availability_check_mode == "channel_monitor"
+            and config.availability_monitor_id is not None
+        ):
             try:
                 async with self._discover_all_lock:
                     await self._discover_channel(
@@ -2655,6 +2771,7 @@ class UpstreamChannelService:
                         sync_inventory=False,
                         remote_by_id={account_id: remote},
                         include_channel_monitor_details=True,
+                        channel_monitor_detail_ids={config.availability_monitor_id},
                         monitor_details_only=True,
                     )
                 monitor_refresh_status = "refreshed"
@@ -2715,6 +2832,7 @@ class UpstreamChannelService:
                     automation_paused=False,
                     blocking_pause_reason=None,
                     monitor_probe_fresh=True,
+                    force_unbound_fallback=True,
                 )
                 evidence["manual_test"] = True
                 evidence["monitor_refresh_status"] = monitor_refresh_status
@@ -2808,9 +2926,9 @@ class UpstreamChannelService:
             )
         )
         self.accounts._require_config_binding(remote, config)
-        if config is None or config.channel_id is None:
+        if config is None:
             raise UpstreamAccountServiceError(
-                "The API Key account is not assigned to an upstream.",
+                "The API Key account is not managed by this service.",
                 status_code=409,
             )
 
@@ -3675,6 +3793,7 @@ class UpstreamChannelService:
         sync_inventory: bool = True,
         remote_by_id: dict[int, dict[str, Any]] | None = None,
         include_channel_monitor_details: bool = False,
+        channel_monitor_detail_ids: set[int] | None = None,
         monitor_details_only: bool = False,
         options: UpstreamDiscoveryOptions | None = None,
         local_recharge_snapshot: tuple[float | None, str | None, str] | None = None,
@@ -3784,6 +3903,7 @@ class UpstreamChannelService:
                     optimized_endpoint_fallbacks=True,
                     include_channel_monitors=refresh_channel_monitors,
                     include_channel_monitor_details=include_channel_monitor_details,
+                    channel_monitor_detail_ids=channel_monitor_detail_ids,
                     monitor_only=monitor_details_only,
                     today_timezone=today_timezone,
                 )
@@ -3910,6 +4030,7 @@ class UpstreamChannelService:
                     channel,
                     result,
                     now=observed_at,
+                    channel_monitor_detail_ids=channel_monitor_detail_ids,
                 )
                 if token_invalid:
                     channel.balance_status = TOKEN_INVALID_STATUS

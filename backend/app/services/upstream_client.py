@@ -340,6 +340,7 @@ class UpstreamClient:
         optimized_endpoint_fallbacks: bool = False,
         include_channel_monitors: bool = True,
         include_channel_monitor_details: bool = False,
+        channel_monitor_detail_ids: Iterable[int] | None = None,
         monitor_only: bool = False,
         today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
     ) -> DiscoveryResult:
@@ -531,6 +532,7 @@ class UpstreamClient:
                                     SUB2API_CHANNEL_MONITORS_ENDPOINT
                                 ),
                                 access_token=access_token,
+                                channel_monitor_detail_ids=channel_monitor_detail_ids,
                             )
                         except Exception:
                             # List summaries remain useful when an older
@@ -1228,6 +1230,7 @@ class UpstreamClient:
         *,
         list_result: _FetchResult | None,
         access_token: str | None,
+        channel_monitor_detail_ids: Iterable[int] | None = None,
     ) -> dict[int, _FetchResult]:
         token = _clean_secret(access_token)
         if (
@@ -1241,11 +1244,22 @@ class UpstreamClient:
         if not isinstance(data, dict) or not isinstance(data.get("items"), list):
             return {}
 
+        requested_ids = (
+            None
+            if channel_monitor_detail_ids is None
+            else {
+                monitor_id
+                for raw_monitor_id in channel_monitor_detail_ids
+                if (monitor_id := _positive_int64(raw_monitor_id)) is not None
+            }
+        )
         monitor_ids: list[int] = []
         seen_ids: set[int] = set()
         for raw in data["items"]:
             monitor_id = _positive_int64(raw.get("id")) if isinstance(raw, dict) else None
             if monitor_id is None or monitor_id in seen_ids:
+                continue
+            if requested_ids is not None and monitor_id not in requested_ids:
                 continue
             monitor_ids.append(monitor_id)
             seen_ids.add(monitor_id)
@@ -1757,6 +1771,7 @@ async def discover_upstream(
     optimized_endpoint_fallbacks: bool = False,
     include_channel_monitors: bool = True,
     include_channel_monitor_details: bool = False,
+    channel_monitor_detail_ids: Iterable[int] | None = None,
     monitor_only: bool = False,
     today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
@@ -1783,6 +1798,7 @@ async def discover_upstream(
         optimized_endpoint_fallbacks=optimized_endpoint_fallbacks,
         include_channel_monitors=include_channel_monitors,
         include_channel_monitor_details=include_channel_monitor_details,
+        channel_monitor_detail_ids=channel_monitor_detail_ids,
         monitor_only=monitor_only,
         today_timezone=today_timezone,
     )

@@ -89,6 +89,9 @@ KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS = "channel_monitor_fallback_test_models
 KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL = "channel_monitor_fallback_test_model"
 KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS = "channel_monitor_fallback_test_attempts"
 KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS = "channel_monitor_recovery_test_attempts"
+KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS = (
+    "channel_monitor_test_attempt_interval_seconds"
+)
 KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED = (
     "api_key_auto_pause_on_negative_balance_enabled"
 )
@@ -433,6 +436,21 @@ class RuntimeConfigService:
             int(getattr(self.settings, "channel_monitor_recovery_test_attempts", 1)),
             1,
             5,
+        )
+
+    async def get_channel_monitor_test_attempt_interval_seconds(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS),
+            int(
+                getattr(
+                    self.settings,
+                    "channel_monitor_test_attempt_interval_seconds",
+                    0,
+                )
+            ),
+            0,
+            300,
         )
 
     async def get_api_key_auto_pause_on_negative_balance_enabled(self) -> bool:
@@ -906,6 +924,18 @@ class RuntimeConfigService:
                 1,
                 5,
             ),
+            "channel_monitor_test_attempt_interval_seconds": _bounded_int_or_default(
+                values.get(KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS),
+                int(
+                    getattr(
+                        self.settings,
+                        "channel_monitor_test_attempt_interval_seconds",
+                        0,
+                    )
+                ),
+                0,
+                300,
+            ),
             "api_key_auto_pause_on_negative_balance_enabled": _bool_or_default(
                 values.get(KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED),
                 bool(getattr(self.settings, "api_key_auto_pause_on_negative_balance_enabled", False)),
@@ -1205,6 +1235,7 @@ class RuntimeConfigService:
                 "account_model_whitelist_sync_interval_seconds": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS,
                 "channel_monitor_fallback_test_attempts": KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS,
                 "channel_monitor_recovery_test_attempts": KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS,
+                "channel_monitor_test_attempt_interval_seconds": KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS,
             }
             for payload_key, setting_key in int_setting_keys.items():
                 if payload.get(payload_key) is not None:
@@ -1690,6 +1721,9 @@ class RuntimeConfigService:
             ),
             "CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS": str(
                 int(settings.get("channel_monitor_recovery_test_attempts", 1))
+            ),
+            "CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS": str(
+                int(settings.get("channel_monitor_test_attempt_interval_seconds", 0))
             ),
             "API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED": _env_bool(
                 bool(settings.get("api_key_auto_pause_on_negative_balance_enabled", False))

@@ -437,6 +437,7 @@ export type AppSettings = {
   channel_monitor_fallback_test_model: string;
   channel_monitor_fallback_test_attempts: number;
   channel_monitor_recovery_test_attempts: number;
+  channel_monitor_test_attempt_interval_seconds: number;
   available_test_models: AccountLivenessModel[];
   upstream_negative_balance_basis: "wallet" | "recharge_adjusted";
   upstream_balance_pause_threshold: number;
@@ -513,6 +514,7 @@ export type AppSettingsUpdate = {
   channel_monitor_fallback_test_model?: string;
   channel_monitor_fallback_test_attempts?: number;
   channel_monitor_recovery_test_attempts?: number;
+  channel_monitor_test_attempt_interval_seconds?: number;
   upstream_negative_balance_basis?: "wallet" | "recharge_adjusted";
   upstream_balance_pause_threshold?: number;
   show_stale_negative_balance_alert?: boolean;

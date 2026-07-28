@@ -560,6 +560,7 @@ class AppSettingsOut(BaseModel):
     channel_monitor_fallback_test_model: str = ""
     channel_monitor_fallback_test_attempts: int = 1
     channel_monitor_recovery_test_attempts: int = 1
+    channel_monitor_test_attempt_interval_seconds: int = 0
     available_test_models: list[AccountLivenessModelOut] = Field(default_factory=list)
     api_key_auto_pause_on_negative_balance_enabled: bool = False
     upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] = "wallet"
@@ -654,6 +655,11 @@ class AppSettingsUpdate(BaseModel):
         default=None,
         ge=1,
         le=5,
+    )
+    channel_monitor_test_attempt_interval_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=300,
     )
     api_key_auto_pause_on_negative_balance_enabled: bool | None = None
     upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] | None = None
