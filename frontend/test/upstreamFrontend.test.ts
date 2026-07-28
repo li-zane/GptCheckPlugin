@@ -2807,6 +2807,14 @@ test("key-filtered usage history displays the selected key usage rather than the
   );
 });
 
+test("usage history net income uses recharge-adjusted cost in the revenue currency", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /function historyNetIncome\([^]*?const cost = finiteNumber\(value\?\.cost_adjusted\);/,
+  );
+});
+
 test("upstream change API prefers the new ledger and falls back only when unavailable", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;

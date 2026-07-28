@@ -6093,8 +6093,8 @@ function historyIncomeUnit(days: UpstreamUsageHistory["days"]) {
 
 function historyNetIncome(value: Pick<UpstreamUsageHistory["totals"], "income" | "cost" | "cost_adjusted"> | null) {
   const income = finiteNumber(value?.income);
-  // Income and raw upstream cost share the upstream currency; the adjusted cost is a separate recharge-basis amount.
-  const cost = finiteNumber(value?.cost) ?? finiteNumber(value?.cost_adjusted);
+  // Sub2API income is recorded in CNY, so only the recharge-adjusted cost can form a net value.
+  const cost = finiteNumber(value?.cost_adjusted);
   if (income === null && cost === null) return null;
   return (income || 0) - (cost || 0);
 }
