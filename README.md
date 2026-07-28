@@ -25,6 +25,27 @@ npm run dev
 
 生产环境请把 `.env` 里的 `APP_ADMIN_KEY`、`APP_SESSION_SECRET`、`APP_ENCRYPTION_KEY` 换成长随机值，并把 `COOKIE_SECURE=true` 放在 HTTPS 反代之后使用。
 
+## x1 部署流程
+
+x1 的 `/root/apps/GptCheckPlugin` 是生产运行目录，也是 `origin/main` 的工作副本。代码只在本地修改一次；部署时保留原始 Git 提交，不在 x1 手工重复修改，也不再使用 `git format-patch` / `git am` 重建提交。
+
+本地完成开发后，先运行相关测试和生产构建，确认工作树只包含本次修改，再提交并推送：
+
+```powershell
+git status --short
+git push origin main
+```
+
+然后在 x1 执行仓库内的部署脚本：
+
+```bash
+ssh x1 'bash /root/apps/GptCheckPlugin/scripts/deploy-x1.sh'
+```
+
+脚本只接受 `main` 对 `origin/main` 的快进更新。它会拒绝未提交修改或分叉历史，在更新前创建 `rollback/pre-deploy-<UTC时间>` 回滚分支，然后安装后端与前端依赖、构建前端、重启 `gptcheckplugin.service` 和 `gptcheckplugin-frontend.service`，并检查后端健康接口及前端首页。这样本地、GitHub 和 x1 会保持相同提交编号。
+
+需要回滚时，先停止继续部署并确认目标回滚分支，再从该分支创建一个正常的回滚提交并推送到 `main`；生产部署仍通过同一脚本完成，不直接改写 x1 的 `main` 历史。
+
 ## sub2api 配置
 
 默认按当前 sub2api 公开前端接口形态配置：
