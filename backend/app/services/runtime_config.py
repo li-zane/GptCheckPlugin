@@ -1085,6 +1085,13 @@ class RuntimeConfigService:
                 "A site logo cannot be set and cleared in the same request."
             )
         current_values = await self._load_values()
+        usage_history_time_zone = _clean_timezone(
+            str(
+                payload.get("display_timezone")
+                or current_values.get(KEY_DISPLAY_TIMEZONE)
+                or self.settings.display_timezone
+            )
+        )
         current_base_url = _normalize_base_url(
             current_values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url
         )
@@ -1326,6 +1333,7 @@ class RuntimeConfigService:
                 await prune_upstream_usage_history(
                     db,
                     retention_days=retention_days,
+                    time_zone=usage_history_time_zone,
                 )
 
             if payload.get("usage_limit_sample_five_hour_threshold_percent") is not None:

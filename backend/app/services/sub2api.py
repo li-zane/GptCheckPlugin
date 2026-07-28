@@ -6,7 +6,7 @@ import json
 import math
 import re
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -70,6 +70,8 @@ SUB2API_REQUEST_TOTAL_TIMEOUT_SECONDS = 90.0
 SUB2API_USAGE_REFRESH_TIMEOUT_SECONDS = 10.0
 SUB2API_TODAY_STATS_TIMEOUT_SECONDS = 10.0
 SUB2API_TODAY_STATS_BATCH_SIZE = 100
+SUB2API_DAILY_STATS_MAX_DAYS = 366
+SUB2API_DAILY_STATS_CONCURRENCY = 8
 SUB2API_TEST_TOTAL_TIMEOUT_SECONDS = 70.0
 MAX_REMOTE_ACCOUNT_ERROR_CHARS = 500
 MAX_SUB2API_ACCOUNT_PAGES = 100
@@ -346,6 +348,52 @@ def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int
         cost = _bounded_number(raw_cost, minimum=0, maximum=1_000_000_000_000_000)
         if cost is not None:
             parsed[account_id] = cost
+    return parsed
+
+
+def _parse_account_daily_costs(payload: Any) -> dict[date, float]:
+    """Extract per-calendar-day actual costs from one account's stats payload."""
+
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        return {}
+    code = payload.get("code")
+    if code is not None and code not in {0, 200, "0", "200"}:
+        return {}
+    data = payload.get("data", payload)
+    if not isinstance(data, dict):
+        return {}
+    history = data.get("history")
+    if not isinstance(history, list):
+        return {}
+
+    parsed: dict[date, float] = {}
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        raw_day = item.get("date")
+        if not isinstance(raw_day, str):
+            continue
+        try:
+            usage_date = date.fromisoformat(raw_day.strip()[:10])
+        except ValueError:
+            continue
+        raw_cost = next(
+            (
+                item.get(field)
+                for field in (
+                    "actual_cost",
+                    "actualCost",
+                    "today_actual_cost",
+                    "todayActualCost",
+                    "cost",
+                )
+                if item.get(field) is not None
+            ),
+            None,
+        )
+        cost = _bounded_number(raw_cost, minimum=0, maximum=1_000_000_000_000_000)
+        if cost is not None:
+            parsed[usage_date] = cost
     return parsed
 
 
@@ -1164,6 +1212,61 @@ class Sub2ApiClient:
         except TimeoutError as exc:
             raise Sub2ApiRequestError("sub2api today statistics request timed out.") from exc
         return costs
+
+    async def get_account_daily_costs(
+        self,
+        account_ids: list[int],
+        *,
+        days: int = 2,
+    ) -> dict[int, dict[date, float]]:
+        """Return historic actual-cost readings keyed by account and local date."""
+
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for account_id in account_ids:
+            parsed_id = _positive_int(account_id)
+            if parsed_id is None:
+                raise ValueError("Account ids must be positive integers.")
+            if parsed_id not in seen:
+                normalized_ids.append(parsed_id)
+                seen.add(parsed_id)
+        if len(normalized_ids) > MAX_SUB2API_ACCOUNTS:
+            raise ValueError("Too many account ids were provided.")
+        if not normalized_ids:
+            return {}
+        if not 1 <= int(days) <= SUB2API_DAILY_STATS_MAX_DAYS:
+            raise ValueError(
+                f"days must be between 1 and {SUB2API_DAILY_STATS_MAX_DAYS}."
+            )
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        semaphore = asyncio.Semaphore(SUB2API_DAILY_STATS_CONCURRENCY)
+
+        async def fetch(account_id: int) -> tuple[int, dict[date, float]]:
+            async with semaphore:
+                payload = await self._request(
+                    "GET",
+                    f"{config.accounts_path}/{account_id}/stats",
+                    config=config,
+                    params={"days": int(days)},
+                    total_timeout_seconds=SUB2API_TODAY_STATS_TIMEOUT_SECONDS,
+                )
+            return account_id, _parse_account_daily_costs(payload)
+
+        results = await asyncio.gather(
+            *(fetch(account_id) for account_id in normalized_ids),
+            return_exceptions=True,
+        )
+        values: dict[int, dict[date, float]] = {}
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                continue
+            account_id, costs = result
+            if costs:
+                values[account_id] = costs
+        return values
 
     async def get_payment_balance_recharge_multiplier_info(self) -> tuple[float, bool]:
         config = await get_runtime_config_service().get_sub2api_config()

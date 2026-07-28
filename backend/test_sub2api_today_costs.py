@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.services.sub2api import _parse_account_today_costs
+from app.services.sub2api import _parse_account_daily_costs, _parse_account_today_costs
 
 
 class Sub2ApiTodayCostsTests(unittest.TestCase):
@@ -31,6 +31,24 @@ class Sub2ApiTodayCostsTests(unittest.TestCase):
                 5: 5.0,
                 6: 6.5,
             },
+        )
+
+    def test_parses_historical_actual_costs_by_date(self) -> None:
+        payload = {
+            "code": 0,
+            "data": {
+                "history": [
+                    {"date": "2026-07-27", "actual_cost": "4.5"},
+                    {"date": "2026-07-28T00:00:00Z", "actualCost": 6},
+                    {"date": "invalid", "actual_cost": 9},
+                    {"date": "2026-07-29", "actual_cost": -1},
+                ]
+            },
+        }
+
+        self.assertEqual(
+            {item.isoformat(): value for item, value in _parse_account_daily_costs(payload).items()},
+            {"2026-07-27": 4.5, "2026-07-28": 6.0},
         )
 
 

@@ -59,6 +59,12 @@ def _safe_text(value: Any, *, limit: int) -> str | None:
     return normalized[:limit] if normalized else None
 
 
+def channel_identity(channel: UpstreamChannel) -> str:
+    """Return the durable upstream identity used by accounting rows."""
+
+    return _safe_text(channel.canonical_base_url, limit=500) or f"channel:{channel.id}"
+
+
 def _snapshot_multiplier(channel: UpstreamChannel, existing: float | None = None) -> float | None:
     return _finite_amount(
         existing
@@ -88,12 +94,12 @@ def _total_values(row: UpstreamChannelDailyUsage | None) -> dict[str, float | No
 async def _daily_row(
     db: AsyncSession,
     *,
-    channel_id: int,
+    identity: str,
     day: date,
 ) -> UpstreamChannelDailyUsage | None:
     return await db.scalar(
         select(UpstreamChannelDailyUsage).where(
-            UpstreamChannelDailyUsage.channel_id == channel_id,
+            UpstreamChannelDailyUsage.channel_identity == identity,
             UpstreamChannelDailyUsage.usage_date == day,
         )
     )
@@ -102,13 +108,11 @@ async def _daily_row(
 async def _account_daily_row(
     db: AsyncSession,
     *,
-    channel_id: int,
     account_id: int,
     day: date,
 ) -> UpstreamAccountDailyUsage | None:
     return await db.scalar(
         select(UpstreamAccountDailyUsage).where(
-            UpstreamAccountDailyUsage.channel_id == channel_id,
             UpstreamAccountDailyUsage.sub2api_account_id == account_id,
             UpstreamAccountDailyUsage.usage_date == day,
         )
@@ -125,18 +129,16 @@ async def _refresh_daily_account_aggregates(
                 func.sum(UpstreamAccountDailyUsage.upstream_usage),
                 func.sum(UpstreamAccountDailyUsage.income),
             ).where(
-                UpstreamAccountDailyUsage.channel_id == row.channel_id,
+                UpstreamAccountDailyUsage.channel_identity == row.channel_identity,
                 UpstreamAccountDailyUsage.usage_date == row.usage_date,
             )
         )
     ).one()
     upstream_usage = _finite_amount(sums[0])
     income = _finite_amount(sums[1])
-    if upstream_usage is not None:
-        row.upstream_api_key_usage = upstream_usage
-    if income is not None:
-        row.income = income
-        row.income_unit = "CNY"
+    row.upstream_api_key_usage = upstream_usage
+    row.income = income
+    row.income_unit = "CNY" if income is not None else None
 
 
 async def _apply_lifetime_delta(
@@ -149,14 +151,17 @@ async def _apply_lifetime_delta(
     changed = any(before[name] != after[name] for name in before)
     if not changed:
         return
-    total = await db.get(UpstreamChannelUsageTotal, channel.id)
+    identity = channel_identity(channel)
+    total = await db.get(UpstreamChannelUsageTotal, identity)
     if total is None:
         total = UpstreamChannelUsageTotal(
+            channel_identity=identity,
             channel_id=channel.id,
             channel_name=_safe_text(channel.display_name, limit=200),
         )
         db.add(total)
     else:
+        total.channel_id = channel.id
         total.channel_name = _safe_text(channel.display_name, limit=200)
     for field, total_field in (
         ("balance_used", "total_balance_used"),
@@ -164,24 +169,21 @@ async def _apply_lifetime_delta(
         ("upstream_api_key_usage", "total_upstream_api_key_usage"),
         ("income", "total_income"),
     ):
-        old_value = before[field]
-        new_value = after[field]
-        if new_value is None:
-            continue
-        old_number = old_value if old_value is not None else 0.0
-        next_total = float(getattr(total, total_field) or 0.0) + new_value - old_number
+        old_number = before[field] if before[field] is not None else 0.0
+        new_number = after[field] if after[field] is not None else 0.0
+        next_total = float(getattr(total, total_field) or 0.0) + new_number - old_number
         setattr(total, total_field, max(0.0, next_total))
 
 
 async def should_fetch_yesterday_usage(
     db: AsyncSession,
     *,
-    channel_id: int,
+    channel: UpstreamChannel,
     now: datetime,
     time_zone: str,
 ) -> bool:
     yesterday = usage_day(now, time_zone) - timedelta(days=1)
-    row = await _daily_row(db, channel_id=channel_id, day=yesterday)
+    row = await _daily_row(db, identity=channel_identity(channel), day=yesterday)
     return row is None or not row.finalized
 
 
@@ -195,7 +197,7 @@ async def hydrate_yesterday_usage(
     """Expose a finalized local day in the existing channel-card compatibility fields."""
 
     yesterday = usage_day(now, time_zone) - timedelta(days=1)
-    row = await _daily_row(db, channel_id=channel.id, day=yesterday)
+    row = await _daily_row(db, identity=channel_identity(channel), day=yesterday)
     if row is None or not row.finalized or _finite_amount(row.balance_used) is None:
         return False
     channel.yesterday_balance_used = row.balance_used
@@ -217,16 +219,20 @@ async def snapshot_today_usage(
     """Upsert the current local day without ever adding duplicate lifetime totals."""
 
     day = usage_day(now, time_zone)
-    row = await _daily_row(db, channel_id=channel.id, day=day)
+    identity = channel_identity(channel)
+    row = await _daily_row(db, identity=identity, day=day)
     if row is None:
         row = UpstreamChannelDailyUsage(
             channel_id=channel.id,
+            channel_identity=identity,
             channel_name=_safe_text(channel.display_name, limit=200),
             usage_date=day,
         )
         db.add(row)
         await db.flush()
     before = _total_values(row)
+    row.channel_id = channel.id
+    row.channel_identity = identity
     row.channel_name = _safe_text(channel.display_name, limit=200)
     row.observed_at = now
     if (
@@ -245,17 +251,23 @@ async def snapshot_today_usage(
         account_id = int(config.sub2api_account_id)
         account_row = await _account_daily_row(
             db,
-            channel_id=channel.id,
             account_id=account_id,
             day=day,
         )
         if account_row is None:
             account_row = UpstreamAccountDailyUsage(
                 channel_id=channel.id,
+                channel_identity=identity,
                 sub2api_account_id=account_id,
                 usage_date=day,
             )
             db.add(account_row)
+        elif account_row.channel_identity != identity:
+            # Sub2API's daily stats are cumulative. If an API-key account is
+            # rebound during the day, recording it under both channels would
+            # count the same revenue and key usage twice. Keep the first
+            # observed ownership until the next local day.
+            continue
         account_row.upstream_api_key_record_id = config.upstream_api_key_record_id
         account_row.account_name = _safe_text(config.remote_name, limit=200)
         account_row.remote_identity_fingerprint = _safe_text(
@@ -294,6 +306,7 @@ async def finalize_yesterday_usage(
     db: AsyncSession,
     *,
     channel: UpstreamChannel,
+    income_by_account: dict[int, float] | None = None,
     now: datetime,
     time_zone: str,
 ) -> bool:
@@ -310,10 +323,12 @@ async def finalize_yesterday_usage(
             time_zone=time_zone,
         )
 
-    row = await _daily_row(db, channel_id=channel.id, day=yesterday)
+    identity = channel_identity(channel)
+    row = await _daily_row(db, identity=identity, day=yesterday)
     if row is None:
         row = UpstreamChannelDailyUsage(
             channel_id=channel.id,
+            channel_identity=identity,
             channel_name=_safe_text(channel.display_name, limit=200),
             usage_date=yesterday,
         )
@@ -321,6 +336,8 @@ async def finalize_yesterday_usage(
         await db.flush()
     before = _total_values(row)
     multiplier = _snapshot_multiplier(channel, row.recharge_multiplier)
+    row.channel_id = channel.id
+    row.channel_identity = identity
     row.channel_name = _safe_text(channel.display_name, limit=200)
     row.balance_used = balance_used
     row.balance_unit = _safe_text(channel.yesterday_balance_unit, limit=32) or "USD"
@@ -329,14 +346,22 @@ async def finalize_yesterday_usage(
     row.observed_at = channel.yesterday_balance_checked_at or now
     row.finalized = True
     row.finalized_at = now
-    await db.execute(
-        UpstreamAccountDailyUsage.__table__.update()
-        .where(
-            UpstreamAccountDailyUsage.channel_id == channel.id,
-            UpstreamAccountDailyUsage.usage_date == yesterday,
-        )
-        .values(finalized=True)
+    account_rows = list(
+        (
+            await db.execute(
+                select(UpstreamAccountDailyUsage).where(
+                    UpstreamAccountDailyUsage.channel_identity == identity,
+                    UpstreamAccountDailyUsage.usage_date == yesterday,
+                )
+            )
+        ).scalars()
     )
+    for account_row in account_rows:
+        income = _finite_amount((income_by_account or {}).get(account_row.sub2api_account_id))
+        if income is not None:
+            account_row.income = income
+            account_row.income_unit = "CNY"
+        account_row.finalized = True
     await db.flush()
     await _refresh_daily_account_aggregates(db, row)
     await _apply_lifetime_delta(
@@ -349,16 +374,72 @@ async def finalize_yesterday_usage(
     return True
 
 
+async def upsert_historical_channel_usage(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    usage_date: date,
+    balance_used: float,
+    balance_unit: str = "USD",
+    recharge_multiplier: float | None = None,
+    observed_at: datetime | None = None,
+) -> UpstreamChannelDailyUsage:
+    """Import a verified historical wallet reading without duplicating totals.
+
+    This is intentionally a service-level primitive for one-off recovery and
+    backfill jobs. It applies the same before/after lifetime delta as live
+    snapshots, so repeated imports of the same value remain idempotent.
+    """
+
+    usage = _finite_amount(balance_used)
+    if usage is None:
+        raise ValueError("balance_used must be a finite non-negative number.")
+    identity = channel_identity(channel)
+    row = await _daily_row(db, identity=identity, day=usage_date)
+    if row is None:
+        row = UpstreamChannelDailyUsage(
+            channel_id=channel.id,
+            channel_identity=identity,
+            channel_name=_safe_text(channel.display_name, limit=200),
+            usage_date=usage_date,
+        )
+        db.add(row)
+        await db.flush()
+    before = _total_values(row)
+    multiplier = _finite_amount(recharge_multiplier)
+    if multiplier is None:
+        multiplier = _snapshot_multiplier(channel, row.recharge_multiplier)
+    row.channel_id = channel.id
+    row.channel_identity = identity
+    row.channel_name = _safe_text(channel.display_name, limit=200)
+    row.balance_used = usage
+    row.balance_unit = _safe_text(balance_unit, limit=32) or "USD"
+    row.recharge_multiplier = multiplier
+    row.balance_used_adjusted = _adjusted(usage, multiplier)
+    row.observed_at = observed_at or datetime.now(timezone.utc)
+    row.finalized = True
+    row.finalized_at = observed_at or datetime.now(timezone.utc)
+    await db.flush()
+    await _apply_lifetime_delta(
+        db,
+        channel=channel,
+        before=before,
+        after=_total_values(row),
+    )
+    return row
+
+
 async def prune_upstream_usage_history(
     db: AsyncSession,
     *,
     retention_days: int,
     now: datetime | None = None,
+    time_zone: str = DEFAULT_TIME_ZONE,
 ) -> None:
     if not 1 <= retention_days <= 3650:
         raise ValueError("retention_days must be between 1 and 3650.")
     reference = now or datetime.now(timezone.utc)
-    cutoff = reference.date() - timedelta(days=retention_days)
+    cutoff = usage_day(reference, time_zone) - timedelta(days=retention_days - 1)
     await db.execute(
         delete(UpstreamAccountDailyUsage).where(UpstreamAccountDailyUsage.usage_date < cutoff)
     )
@@ -381,12 +462,13 @@ async def usage_history(
     if (end_date - start_date).days + 1 > MAX_HISTORY_DAYS:
         raise ValueError(f"A history request can cover at most {MAX_HISTORY_DAYS} days.")
 
+    identity = channel_identity(channel)
     daily_rows = list(
         (
             await db.execute(
                 select(UpstreamChannelDailyUsage)
                 .where(
-                    UpstreamChannelDailyUsage.channel_id == channel.id,
+                    UpstreamChannelDailyUsage.channel_identity == identity,
                     UpstreamChannelDailyUsage.usage_date >= start_date,
                     UpstreamChannelDailyUsage.usage_date <= end_date,
                 )
@@ -398,7 +480,7 @@ async def usage_history(
     account_statement = (
         select(UpstreamAccountDailyUsage)
         .where(
-            UpstreamAccountDailyUsage.channel_id == channel.id,
+            UpstreamAccountDailyUsage.channel_identity == identity,
             UpstreamAccountDailyUsage.usage_date >= start_date,
             UpstreamAccountDailyUsage.usage_date <= end_date,
         )
@@ -509,7 +591,7 @@ async def usage_history(
     def sum_days(field: str) -> float:
         return sum(float(item[field]) for item in days if item[field] is not None)
 
-    total = await db.get(UpstreamChannelUsageTotal, channel.id)
+    total = await db.get(UpstreamChannelUsageTotal, identity)
     return {
         "channel_id": channel.id,
         "channel_name": channel.display_name,
@@ -547,12 +629,14 @@ async def usage_history(
 __all__ = [
     "DEFAULT_TIME_ZONE",
     "MAX_HISTORY_DAYS",
+    "channel_identity",
     "finalize_yesterday_usage",
     "hydrate_yesterday_usage",
     "normalize_history_time_zone",
     "prune_upstream_usage_history",
     "should_fetch_yesterday_usage",
     "snapshot_today_usage",
+    "upsert_historical_channel_usage",
     "usage_day",
     "usage_history",
 ]

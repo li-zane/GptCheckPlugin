@@ -323,15 +323,19 @@ class UpstreamChannelDailyUsage(Base):
     __tablename__ = "upstream_channel_daily_usages"
     __table_args__ = (
         UniqueConstraint(
-            "channel_id",
+            "channel_identity",
             "usage_date",
-            name="uq_upstream_channel_daily_usage_channel_date",
+            name="uq_upstream_channel_daily_usage_identity_date",
         ),
+        Index("ix_upstream_channel_daily_usage_identity_date", "channel_identity", "usage_date"),
         Index("ix_upstream_channel_daily_usage_channel_date", "channel_id", "usage_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    # Channel database IDs can be reused by SQLite after deletion. The
+    # canonical URL identifies the upstream that actually produced this row.
+    channel_identity: Mapped[str] = mapped_column(String(500), index=True, nullable=False)
     channel_name: Mapped[str | None] = mapped_column(String(200))
     usage_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     balance_used: Mapped[float | None] = mapped_column(Float)
@@ -358,14 +362,13 @@ class UpstreamAccountDailyUsage(Base):
     __tablename__ = "upstream_account_daily_usages"
     __table_args__ = (
         UniqueConstraint(
-            "channel_id",
             "sub2api_account_id",
             "usage_date",
-            name="uq_upstream_account_daily_usage_channel_account_date",
+            name="uq_upstream_account_daily_usage_account_date",
         ),
         Index(
-            "ix_upstream_account_daily_usage_channel_date",
-            "channel_id",
+            "ix_upstream_account_daily_usage_identity_date",
+            "channel_identity",
             "usage_date",
         ),
         Index(
@@ -377,6 +380,7 @@ class UpstreamAccountDailyUsage(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    channel_identity: Mapped[str] = mapped_column(String(500), index=True, nullable=False)
     sub2api_account_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
     upstream_api_key_record_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     account_name: Mapped[str | None] = mapped_column(String(200))
@@ -402,7 +406,8 @@ class UpstreamChannelUsageTotal(Base):
 
     __tablename__ = "upstream_channel_usage_totals"
 
-    channel_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_identity: Mapped[str] = mapped_column(String(500), primary_key=True)
+    channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
     channel_name: Mapped[str | None] = mapped_column(String(200))
     total_balance_used: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     total_balance_used_adjusted: Mapped[float] = mapped_column(

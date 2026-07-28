@@ -13,7 +13,7 @@ from app.services.runtime_config import RuntimeConfigService, get_runtime_config
 from app.services.sub2api import Sub2ApiClient
 from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
 from app.services.upstream_rate_logs import prune_upstream_rate_change_logs
-from app.services.upstream_usage_history import prune_upstream_usage_history
+from app.services.upstream_usage_history import DEFAULT_TIME_ZONE, prune_upstream_usage_history
 
 
 UPSTREAM_RATE_SYNC_TIMEOUT_SECONDS = 300
@@ -325,6 +325,17 @@ class UpstreamRateSyncService:
             if callable(usage_retention_getter)
             else None
         )
+        usage_history_time_zone = DEFAULT_TIME_ZONE
+        public_settings_getter = getattr(self.runtime_config, "get_public_settings", None)
+        if callable(public_settings_getter):
+            try:
+                public_settings = await public_settings_getter()
+                if isinstance(public_settings, dict):
+                    configured_time_zone = str(public_settings.get("display_timezone") or "").strip()
+                    if configured_time_zone:
+                        usage_history_time_zone = configured_time_zone
+            except Exception:
+                pass
         async with AsyncSessionLocal() as db:
             await prune_upstream_rate_change_logs(
                 db,
@@ -341,6 +352,7 @@ class UpstreamRateSyncService:
                 await prune_upstream_usage_history(
                     db,
                     retention_days=usage_retention_days,
+                    time_zone=usage_history_time_zone,
                 )
                 commit = getattr(db, "commit", None)
                 if callable(commit):

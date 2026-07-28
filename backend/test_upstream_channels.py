@@ -97,6 +97,8 @@ class FakeSub2Api(Sub2ApiClient):
         self.get_account_calls: list[int] = []
         self.today_costs: dict[int, float] = {}
         self.today_cost_calls: list[list[int]] = []
+        self.daily_costs: dict[int, dict] = {}
+        self.daily_cost_calls: list[tuple[list[int], int]] = []
         self.connection_test_calls: list[tuple[int, str]] = []
         self.connection_test_results: list[tuple[bool, str | None]] = []
         self.account_model_calls: list[int] = []
@@ -148,6 +150,14 @@ class FakeSub2Api(Sub2ApiClient):
             account_id: self.today_costs[account_id]
             for account_id in account_ids
             if account_id in self.today_costs
+        }
+
+    async def get_account_daily_costs(self, account_ids: list[int], *, days: int = 2) -> dict[int, dict]:
+        self.daily_cost_calls.append((list(account_ids), days))
+        return {
+            account_id: dict(self.daily_costs[account_id])
+            for account_id in account_ids
+            if account_id in self.daily_costs
         }
 
     async def get_account_models(self, account: dict | str) -> list[dict[str, str]]:

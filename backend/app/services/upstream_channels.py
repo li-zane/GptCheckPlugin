@@ -7,7 +7,7 @@ import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
@@ -88,6 +88,7 @@ from app.services.upstream_usage_history import (
     hydrate_yesterday_usage,
     should_fetch_yesterday_usage,
     snapshot_today_usage,
+    usage_day,
 )
 from app.services.workflow_coordination import get_workflow_coordinator
 
@@ -3912,7 +3913,7 @@ class UpstreamChannelService:
                     not monitor_details_only
                     and await should_fetch_yesterday_usage(
                         db,
-                        channel_id=channel.id,
+                        channel=channel,
                         now=usage_snapshot_now,
                         time_zone=today_timezone,
                     )
@@ -4140,6 +4141,24 @@ class UpstreamChannelService:
                 raise
             except Exception:
                 local_today_costs = {}
+            yesterday_income_by_account: dict[int, float] = {}
+            daily_cost_getter = getattr(self.sub2api, "get_account_daily_costs", None)
+            if include_yesterday_usage and callable(daily_cost_getter):
+                try:
+                    daily_costs = await daily_cost_getter(linked_account_ids, days=2)
+                    yesterday = usage_day(usage_snapshot_now, today_timezone) - timedelta(days=1)
+                    yesterday_income_by_account = {
+                        account_id: costs[yesterday]
+                        for account_id, costs in daily_costs.items()
+                        if isinstance(costs, dict) and yesterday in costs
+                    }
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The wallet's finalized upstream reading remains usable
+                    # even when Sub2API cannot provide the companion income
+                    # history for a particular account.
+                    yesterday_income_by_account = {}
             balance_guard_action = (
                 None
                 if options is not None and options.evaluate_balance_guard is False
@@ -4673,6 +4692,7 @@ class UpstreamChannelService:
                     await finalize_yesterday_usage(
                         db,
                         channel=channel,
+                        income_by_account=yesterday_income_by_account,
                         now=history_now,
                         time_zone=today_timezone,
                     )
