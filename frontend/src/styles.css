@@ -9825,7 +9825,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-accounts {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.65fr) minmax(0, 1.3fr);
 }
 
 @media (max-width: 760px) {
@@ -9844,16 +9844,6 @@ button.api-key-group-chip--more {
 
   .api-key-usage-history-totals {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .api-key-channel-accounts {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .api-key-channel-accounts .api-key-channel-account-button:nth-child(3) {
-    border-left: 0;
-    border-top: 1px solid var(--line);
-    grid-column: 1 / -1;
   }
 }
 
@@ -9881,5 +9871,15 @@ button.api-key-group-chip--more {
 
   .api-key-usage-history-chart svg {
     height: 205px;
+  }
+
+  .api-key-channel-accounts .api-key-channel-account-button {
+    font-size: 12px;
+    gap: 5px;
+    padding-inline: 6px;
+  }
+
+  .api-key-channel-account-button > svg:last-child {
+    display: none;
   }
 }

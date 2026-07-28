@@ -3142,9 +3142,10 @@ function ChannelCard({
           <div className="api-key-channel-daily-usage">
             {[yesterdayUsage, todayUsage].map((usage) => (
               <span
+                aria-label={usage.detail}
                 className={"api-key-channel-usage-chip api-key-chip api-key-chip--" + usage.tone}
                 key={usage.label}
-                title={`${usage.label}消耗余额 ${usage.value}${usage.stale ? "，上游本次探测失败，显示当天最后一次有效值" : ""}`}
+                title={usage.detail}
               >
                 <span>{usage.label}{usage.stale ? "（旧）" : ""}</span><b>{usage.value}</b>
               </span>
@@ -6181,11 +6182,13 @@ function formatDailyBalanceUsed(
   const rawValue = visible
     ? formatUpstreamBalance(amount, unit || channel.balance_unit, 2)
     : "-";
-  const adjustedValue = visible && !yesterday
+  const adjustedValue = visible
     ? formatRechargeAdjustedBalance(adjustedAmount, amount, channel.effective_recharge_multiplier)
     : "-";
+  const staleDetail = stale ? "；上游本次探测失败，显示当天最后一次有效值" : "";
+  const label = yesterday ? "昨日" : "今日";
   return {
-    label: yesterday ? "昨日" : "今日",
+    label,
     stale,
     tone: current
       ? "success"
@@ -6198,7 +6201,8 @@ function formatDailyBalanceUsed(
             : "muted",
     rawValue,
     adjustedValue,
-    value: `原 ${rawValue} · 综 ${adjustedValue}`,
+    value: adjustedValue,
+    detail: `${label}消耗余额：原始 ${rawValue}；综合（考虑充值倍率）${adjustedValue}${staleDetail}`,
   };
 }
 

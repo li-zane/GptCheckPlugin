@@ -1164,6 +1164,9 @@ test("account usage is shown for Sub2API but omitted for NewAPI", () => {
 test("upstream channel cards keep URLs and daily usage compact", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const dailyBalanceFormatter = source.match(
+    /function formatDailyBalanceUsed\([\s\S]*?\n\}/,
+  )?.[0] || "";
   assert.match(source, /const siteUrl = configuredManagementUrl \|\| apiUrl/);
   assert.match(source, /<ChannelAddressBox label="站点" url=\{siteUrl\} \/>/);
   assert.match(source, /<ChannelAddressBox label="API" url=\{hasSeparateManagementUrl \? apiUrl : ""\} \/>/);
@@ -1186,6 +1189,26 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 520px\), 520px\)\);[^}]*justify-content: start;/s);
   assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: minmax\(230px, 1fr\) 135px 145px;/s);
   assert.match(styles, /\.api-key-channel-daily-usage\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
+  assert.match(dailyBalanceFormatter, /value:\s*adjustedValue,/);
+  assert.doesNotMatch(dailyBalanceFormatter, /value:\s*`原 /);
+  assert.match(
+    dailyBalanceFormatter,
+    /detail:\s*`[^`]*原始 \$\{rawValue\}[^`]*综合（考虑充值倍率）\$\{adjustedValue\}[^`]*`/,
+  );
+  assert.match(source, /title=\{usage\.detail\}/);
+  assert.match(source, /aria-label=\{usage\.detail\}/);
+  assert.match(
+    styles,
+    /\.api-key-channel-accounts\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1\.05fr\)\s+minmax\(0,\s*0\.65fr\)\s+minmax\(0,\s*1\.3fr\);/s,
+  );
+  assert.doesNotMatch(
+    styles,
+    /@media \(max-width: 760px\)(?:(?!@media)[\s\S])*?\.api-key-channel-accounts \.api-key-channel-account-button:nth-child\(3\)\s*\{[^}]*grid-column:\s*1 \/ -1;/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 480px\)(?:(?!@media)[\s\S])*?\.api-key-channel-account-button\s*>\s*svg:last-child\s*\{[^}]*display:\s*none;/,
+  );
 });
 
 test("API key dense views keep readable type and collapse change records on narrow screens", () => {
