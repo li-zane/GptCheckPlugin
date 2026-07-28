@@ -7081,7 +7081,9 @@ button.api-key-group-chip--more {
   align-items: stretch;
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 300px));
+  justify-content: start;
+  max-width: 1230px;
   min-width: 0;
   padding-top: 10px;
 }
@@ -7263,8 +7265,13 @@ button.api-key-group-chip--more {
   border-bottom: 1px solid var(--line);
   border-top: 1px solid var(--line);
   display: grid;
-  grid-template-columns: minmax(230px, 1fr) 135px 145px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   min-width: 0;
+}
+
+.api-key-channel-stat--balance {
+  border-bottom: 1px solid var(--line);
+  grid-column: 1 / -1;
 }
 
 .api-key-channel-stat {
@@ -7277,6 +7284,10 @@ button.api-key-group-chip--more {
 
 .api-key-channel-stat + .api-key-channel-stat {
   border-left: 1px solid var(--line);
+}
+
+.api-key-channel-stat--balance + .api-key-channel-stat {
+  border-left: 0;
 }
 
 .api-key-channel-stat-label {
@@ -7621,12 +7632,6 @@ button.api-key-group-chip--more {
   max-width: 100%;
 }
 
-@media (max-width: 1160px) {
-  .api-key-channel-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
 @media (max-width: 760px) {
   .api-key-channel-view .api-key-summary-item strong {
     font-size: 17px;
@@ -7640,28 +7645,13 @@ button.api-key-group-chip--more {
 
   .api-key-channel-grid {
     grid-template-columns: minmax(0, 1fr);
+    max-width: 360px;
     padding-top: 10px;
+    width: 100%;
   }
 
   .api-key-channel-head {
     padding: 13px 12px 11px;
-  }
-
-  .api-key-channel-stats {
-    grid-template-columns: minmax(0, 1fr) 135px;
-  }
-
-  .api-key-channel-stat:last-child {
-    border-left: 0;
-    border-top: 1px solid var(--line);
-    grid-column: 1 / -1;
-    min-height: 62px;
-  }
-
-  .api-key-channel-stat:last-child .api-key-channel-stat-value {
-    align-items: center;
-    display: flex;
-    gap: 8px;
   }
 
   .api-key-channel-credential-line .api-key-channel-message {
@@ -7745,35 +7735,6 @@ button.api-key-group-chip--more {
 
   .api-key-channel-address svg {
     display: none;
-  }
-
-  .api-key-channel-stats {
-    grid-template-columns: minmax(0, 1fr) 125px;
-  }
-
-  .api-key-channel-stat + .api-key-channel-stat {
-    border-left: 1px solid var(--line);
-    border-top: 0;
-  }
-
-  .api-key-channel-stat,
-  .api-key-channel-stat:last-child {
-    grid-column: auto;
-    min-height: 60px;
-  }
-
-  .api-key-channel-stat:last-child {
-    border-left: 0;
-    border-top: 1px solid var(--line);
-    grid-column: 1 / -1;
-  }
-
-  .api-key-channel-stat .api-key-channel-stat-value,
-  .api-key-channel-stat:last-child .api-key-channel-stat-value {
-    align-items: center;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px 8px;
   }
 
   .api-key-account-row > .api-key-row-actions {
