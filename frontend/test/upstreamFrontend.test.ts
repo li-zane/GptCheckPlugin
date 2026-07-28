@@ -2799,6 +2799,14 @@ test("upstream usage history query encodes channel, date, account, and display t
   assert.equal(upstreamUsageHistoryPath("channel / 1"), "/api/upstream-channels/channel%20%2F%201/usage-history");
 });
 
+test("key-filtered usage history displays the selected key usage rather than the channel aggregate", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /function historyDayUsage\(day: UpstreamUsageHistory\["days"\]\[number\], selectedAccountId: string \| null\) \{\s+if \(!selectedAccountId\) return finiteNumber\(day\.balance_used\);\s+return finiteNumber\(usageHistoryDayAccount\(day, selectedAccountId\)\?\.upstream_usage\);\s+\}/,
+  );
+});
+
 test("upstream change API prefers the new ledger and falls back only when unavailable", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;

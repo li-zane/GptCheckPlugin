@@ -6054,7 +6054,7 @@ function usageHistoryDayAccount(day: UpstreamUsageHistory["days"][number], selec
 
 function historyDayUsage(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
   if (!selectedAccountId) return finiteNumber(day.balance_used);
-  return finiteNumber(day.upstream_api_key_usage) ?? finiteNumber(usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage);
+  return finiteNumber(usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage);
 }
 
 function historyDayAdjustedUsage(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
