@@ -588,7 +588,7 @@ test("automation durations keep a seconds payload while allowing manual units", 
   assert.match(accountSource, /综合倍率严格大于阈值时暂停，等于或低于阈值时不暂停/);
 });
 
-test("API key operation feedback uses the title bar and upstream card widths stay stable", () => {
+test("API key operation feedback uses the title bar and upstream cards fill the available row", () => {
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
@@ -596,7 +596,9 @@ test("API key operation feedback uses the title bar and upstream card widths sta
   assert.match(appSource, /onNotice=\{setNotice\}/);
   assert.match(accountSource, /const setNotice = onNotice/);
   assert.doesNotMatch(accountSource, /<Feedback tone="success"/);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 520px\), 520px\)\);/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 520px\), 1fr\)\);/s);
+  assert.doesNotMatch(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 520px\), 520px\)\);/s);
+  assert.doesNotMatch(styles, /\.api-key-channel-grid\s*\{[^}]*justify-content:\s*start;/s);
 });
 
 test("API key change pages expose separate ledgers and unread highlighting", () => {
@@ -736,6 +738,9 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(accountSource, /<UpstreamBalanceSummary channels=\{assignedChannels\} \/>/);
   assert.match(accountSource, /<span>渠道状态 \{channel\.channel_monitor_count/);
   assert.match(accountSource, /<span>今日使用<\/span>/);
+  assert.match(accountSource, /<section aria-label="上游余额" className="api-key-balance-summary">/);
+  assert.match(accountSource, /<div className="api-key-balance-summary-head">\s*<span>上游余额<\/span>/s);
+  assert.doesNotMatch(accountSource, /上游渠道余额/);
   assert.match(accountSource, /<option value="inherit">/);
   assert.match(accountSource, /priority_assignment_when_disabled = accountForm\.priorityAssignmentWhenDisabled === "inherit"\s*\? null/s);
   assert.doesNotMatch(accountSource, /today_upstream_usage_amount \?\? account\.upstream_usage_amount/);
@@ -750,14 +755,17 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(accountSource, /isUrlLabel=\{isUrlLabel\}/);
   assert.match(accountSource, /isUrlDisplayName \? <MiddleEllipsisText text=\{displayName\} \/> : displayName/);
   assert.match(accountSource, /function BalanceManagementLink[\s\S]*href=\{url\}/);
-  assert.match(accountSource, /className="api-key-balance-values"/);
-  assert.match(accountSource, /<small>原始<\/small><strong>\{platformBalance\}<\/strong>/);
-  assert.match(accountSource, /<small>综合<\/small><strong>\{adjustedBalance\}<\/strong>/);
+  assert.match(accountSource, /const balanceNote = `\$\{platformBalanceNote\}；\$\{adjustedBalanceNote\}`/);
+  assert.match(
+    accountSource,
+    /<div aria-label=\{balanceNote\} className="api-key-balance-metric" title=\{balanceNote\}>\s*<small>余额<\/small>\s*<strong><span>原 \{platformBalance\}<\/span><span>综 \{adjustedBalance\}<\/span><\/strong>/s,
+  );
+  assert.doesNotMatch(accountSource, /className="api-key-balance-values"/);
   assert.match(styles, /\.api-key-balance-summary\s*\{[^}]*grid-column: 1 \/ -1;/s);
   assert.match(styles, /\.api-key-balance-summary\s*\{[^}]*background: var\(--panel\);[^}]*box-shadow: var\(--shadow\);/s);
   assert.match(styles, /\.api-key-balance-summary-list\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 146px\), 146px\)\);/s);
-  assert.match(styles, /\.api-key-balance-channel-card\s*\{[^}]*grid-template-rows: auto auto;/s);
-  assert.match(styles, /\.api-key-balance-values\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
+  assert.match(styles, /\.api-key-balance-channel-card\s*\{[^}]*grid-template-rows: auto auto auto;/s);
+  assert.match(styles, /\.api-key-balance-metric\s*\{[^}]*display: grid;[^}]*gap: 3px;/s);
   assert.match(styles, /\.api-key-dialog-account-grid\s*\{[^}]*height: 100%;[^}]*max-height: 100%;[^}]*overflow-y: auto;/s);
   const openMonitor = accountSource.match(/const openChannelMonitors = \(channel: UpstreamChannel\) => \{[\s\S]*?\n  \};/)?.[0] || "";
   assert.ok(openMonitor);
@@ -863,7 +871,7 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(styles, /\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 371px;/);
   assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 440px;/);
   assert.doesNotMatch(styles, /\.api-key-channel-accounts\s*\{[^}]*margin-top:\s*auto;/s);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 520px\), 520px\)\);/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 520px\), 1fr\)\);/s);
   assert.match(styles, /@media \(max-width: 1160px\)\s*\{\s*\.api-key-channel-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
   assert.doesNotMatch(styles, /api-key-channel-card--groups-expanded/);
   assert.match(accountSource, /trigger=\{<span>原<\/span>\}/);
@@ -1186,7 +1194,8 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(styles, /\.api-key-channel-address\s*\{[^}]*overflow: hidden;[^}]*white-space: nowrap;/s);
   assert.match(styles, /\.api-key-group-chips\s*\{[^}]*max-height: 55px;[^}]*padding-bottom: 2px;/s);
   assert.match(styles, /\.api-key-channel-head\s*\{[^}]*background: color-mix[^}]*border-bottom: 1px solid var\(--line\);/s);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 520px\), 520px\)\);[^}]*justify-content: start;/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fit, minmax\(min\(100%, 520px\), 1fr\)\);/s);
+  assert.doesNotMatch(styles, /\.api-key-channel-grid\s*\{[^}]*justify-content:\s*start;/s);
   assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: minmax\(230px, 1fr\) 135px 145px;/s);
   assert.match(styles, /\.api-key-channel-daily-usage\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
   assert.match(dailyBalanceFormatter, /value:\s*adjustedValue,/);

@@ -5405,9 +5405,9 @@ function SummaryItem({
 
 function UpstreamBalanceSummary({ channels }: { channels: UpstreamChannel[] }) {
   return (
-    <section aria-label="上游渠道余额" className="api-key-balance-summary">
+    <section aria-label="上游余额" className="api-key-balance-summary">
       <div className="api-key-balance-summary-head">
-        <span>上游渠道余额</span>
+        <span>上游余额</span>
         <small>{channels.length} 个渠道</small>
       </div>
       <div className="api-key-balance-summary-list">
@@ -5434,6 +5434,7 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
   const adjustedBalanceNote = adjustedBalance === "—"
     ? "综合余额：当前无法按上游充值倍率计算"
     : `综合余额：平台余额 × 充值倍率${rechargeMultiplier === null ? "" : ` ${rechargeMultiplier.toLocaleString("zh-CN", { maximumFractionDigits: 6 })}`} = ${adjustedBalance}`;
+  const balanceNote = `${platformBalanceNote}；${adjustedBalanceNote}`;
   const todayUsage = formatBalanceSummaryTodayUsage(channel);
   const todayUsageNote = `今日消耗余额：原始 ${todayUsage.rawValue}；综合 ${todayUsage.adjustedValue}${todayUsage.stale ? "（显示当天最后一次有效值）" : ""}`;
 
@@ -5445,15 +5446,11 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
         label={displayName}
         url={managementUrl}
       />
-      <div className="api-key-balance-values">
-        <span aria-label={platformBalanceNote} className="api-key-balance-value" title={platformBalanceNote}>
-          <small>原始</small><strong>{platformBalance}</strong>
-        </span>
-        <span aria-label={adjustedBalanceNote} className="api-key-balance-value api-key-balance-value--adjusted" title={adjustedBalanceNote}>
-          <small>综合</small><strong>{adjustedBalance}</strong>
-        </span>
+      <div aria-label={balanceNote} className="api-key-balance-metric" title={balanceNote}>
+        <small>余额</small>
+        <strong><span>原 {platformBalance}</span><span>综 {adjustedBalance}</span></strong>
       </div>
-      <div className="api-key-balance-today-usage" title={todayUsageNote}>
+      <div aria-label={todayUsageNote} className="api-key-balance-metric api-key-balance-today-usage" title={todayUsageNote}>
         <small>今日消耗</small>
         <strong><span>原 {todayUsage.rawValue}</span><span>综 {todayUsage.adjustedValue}</span></strong>
       </div>
