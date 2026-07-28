@@ -6,6 +6,7 @@ import {
   ArrowUp,
   BadgeDollarSign,
   CalendarDays,
+  ChartNoAxesCombined,
   CheckCircle2,
   CircleOff,
   ExternalLink,
@@ -140,6 +141,8 @@ import type {
   UpstreamChannelsResponse,
   UpstreamChannelUpdate,
   UpstreamType,
+  UpstreamUsageHistory,
+  UpstreamUsageHistoryFilters,
 } from "./types";
 
 type ChannelStatusFilter = "all" | "pending" | "attention" | "undiscovered";
@@ -194,6 +197,14 @@ type AccountCollectionDialog = {
   channel: UpstreamChannel | null;
   title: string;
 };
+
+type UsageHistoryFilters = {
+  startDate: string;
+  endDate: string;
+  apiKeyAccountId: string;
+};
+
+type UsageHistoryDatePreset = "today" | "seven_days" | "thirty_days" | "ninety_days" | "this_month";
 
 const emptyData: UpstreamChannelsResponse = {
   channels: [],
@@ -313,6 +324,16 @@ export function ApiKeyAccountsView({
   const [accountUpstreamDialog, setAccountUpstreamDialog] = useState<UpstreamChannel | null>(null);
   const [channelGroupDialog, setChannelGroupDialog] = useState<UpstreamChannel | null>(null);
   const [channelMonitorDialog, setChannelMonitorDialog] = useState<UpstreamChannel | null>(null);
+  const [channelUsageHistoryDialog, setChannelUsageHistoryDialog] = useState<UpstreamChannel | null>(null);
+  const [channelUsageHistory, setChannelUsageHistory] = useState<UpstreamUsageHistory | null>(null);
+  const [channelUsageHistoryLoading, setChannelUsageHistoryLoading] = useState(false);
+  const [channelUsageHistoryError, setChannelUsageHistoryError] = useState("");
+  const [channelUsageHistoryDraftFilters, setChannelUsageHistoryDraftFilters] = useState<UsageHistoryFilters>(() => (
+    usageHistoryDefaultFilters(displayTimeZone)
+  ));
+  const [channelUsageHistoryFilters, setChannelUsageHistoryFilters] = useState<UsageHistoryFilters>(() => (
+    usageHistoryDefaultFilters(displayTimeZone)
+  ));
   const [channelMonitorLoading, setChannelMonitorLoading] = useState(false);
   const [channelMonitorError, setChannelMonitorError] = useState("");
   const [dialogError, setDialogError] = useState("");
@@ -325,6 +346,7 @@ export function ApiKeyAccountsView({
   const backgroundRefreshGeneration = useRef(0);
   const rateLogsRequestSequence = useRef(0);
   const scheduleLogsRequestSequence = useRef(0);
+  const channelUsageHistoryRequestSequence = useRef(0);
   const unreadCountsRequestSequence = useRef(0);
   const rateLogsRef = useRef<UpstreamChannelChangeEvent[]>([]);
   const scheduleLogsRef = useRef<AccountSchedulingChangeEvent[]>([]);
@@ -381,6 +403,7 @@ export function ApiKeyAccountsView({
     setAccountUpstreamDialog(refreshDialogChannel);
     setChannelGroupDialog(refreshDialogChannel);
     setChannelMonitorDialog(refreshDialogChannel);
+    setChannelUsageHistoryDialog(refreshDialogChannel);
   }, []);
   const refreshChangeLogUnreadCounts = useCallback(async () => {
     const sequence = ++unreadCountsRequestSequence.current;
@@ -1008,6 +1031,11 @@ export function ApiKeyAccountsView({
     setAccountUpstreamDialog(null);
     setChannelGroupDialog(null);
     setChannelMonitorDialog(null);
+    channelUsageHistoryRequestSequence.current += 1;
+    setChannelUsageHistoryDialog(null);
+    setChannelUsageHistory(null);
+    setChannelUsageHistoryLoading(false);
+    setChannelUsageHistoryError("");
     setChannelMonitorLoading(false);
     setChannelMonitorError("");
     setChannelForm(emptyChannelForm);
@@ -1029,6 +1057,7 @@ export function ApiKeyAccountsView({
       && !accountUpstreamDialog
       && !channelGroupDialog
       && !channelMonitorDialog
+      && !channelUsageHistoryDialog
     ) return;
     const previousOverflow = document.body.style.overflow;
     const dialog = dialogRef.current;
@@ -1073,6 +1102,7 @@ export function ApiKeyAccountsView({
     accountUpstreamDialog,
     channelGroupDialog,
     channelMonitorDialog,
+    channelUsageHistoryDialog,
     closeDialog,
     editingAccount,
     editingChannel,
@@ -1304,6 +1334,71 @@ export function ApiKeyAccountsView({
     setChannelMonitorDialog(null);
     setChannelGroupDialog(channel);
   };
+
+  const loadChannelUsageHistory = useCallback(async (
+    channel: UpstreamChannel,
+    filters: UsageHistoryFilters,
+  ) => {
+    const requestSequence = ++channelUsageHistoryRequestSequence.current;
+    if (usageHistoryDateRangeInvalid(filters)) {
+      setChannelUsageHistoryLoading(false);
+      setChannelUsageHistoryError("开始日期不能晚于结束日期");
+      return;
+    }
+    setChannelUsageHistoryLoading(true);
+    setChannelUsageHistoryError("");
+    try {
+      const response = await api.upstreamUsageHistory(channel.id, usageHistoryApiFilters(filters, displayTimeZone));
+      if (requestSequence !== channelUsageHistoryRequestSequence.current) return;
+      setChannelUsageHistory(normalizeUsageHistory(response));
+    } catch (reason) {
+      if (requestSequence !== channelUsageHistoryRequestSequence.current) return;
+      setChannelUsageHistoryError(errorMessage(reason, "上游历史用量读取失败"));
+    } finally {
+      if (requestSequence === channelUsageHistoryRequestSequence.current) {
+        setChannelUsageHistoryLoading(false);
+      }
+    }
+  }, [displayTimeZone]);
+
+  const openChannelUsageHistory = (channel: UpstreamChannel) => {
+    rememberDialogTrigger();
+    channelUsageHistoryRequestSequence.current += 1;
+    const filters = usageHistoryDefaultFilters(displayTimeZone);
+    setAccountCollectionDialog(null);
+    setAccountUpstreamDialog(null);
+    setChannelGroupDialog(null);
+    setChannelMonitorDialog(null);
+    setChannelUsageHistory(null);
+    setChannelUsageHistoryError("");
+    setChannelUsageHistoryDraftFilters(filters);
+    setChannelUsageHistoryFilters(filters);
+    setChannelUsageHistoryDialog(channel);
+  };
+
+  const applyChannelUsageHistoryFilters = () => {
+    if (usageHistoryDateRangeInvalid(channelUsageHistoryDraftFilters)) {
+      setChannelUsageHistoryError("开始日期不能晚于结束日期");
+      return;
+    }
+    setChannelUsageHistoryError("");
+    setChannelUsageHistoryFilters({ ...channelUsageHistoryDraftFilters });
+  };
+
+  const applyChannelUsageHistoryPreset = (preset: UsageHistoryDatePreset) => {
+    const filters = {
+      ...usageHistoryFiltersForPreset(preset, displayTimeZone),
+      apiKeyAccountId: channelUsageHistoryDraftFilters.apiKeyAccountId,
+    };
+    setChannelUsageHistoryError("");
+    setChannelUsageHistoryDraftFilters(filters);
+    setChannelUsageHistoryFilters(filters);
+  };
+
+  useEffect(() => {
+    if (!channelUsageHistoryDialog) return;
+    void loadChannelUsageHistory(channelUsageHistoryDialog, channelUsageHistoryFilters);
+  }, [channelUsageHistoryDialog, channelUsageHistoryFilters, loadChannelUsageHistory]);
 
   const openPriorityIntervalConfig = (interval?: PriorityInterval) => {
     rememberDialogTrigger();
@@ -2209,6 +2304,7 @@ export function ApiKeyAccountsView({
                 onShowAccounts={() => openChannelAccounts(channel)}
                 onShowGroups={() => openChannelGroups(channel)}
                 onShowMonitors={() => openChannelMonitors(channel)}
+                onShowUsageHistory={() => openChannelUsageHistory(channel)}
                 rateWritesEnabled={rateWritesEnabled}
               />
             ))}
@@ -2298,6 +2394,7 @@ export function ApiKeyAccountsView({
               onShowAccounts={() => openChannelAccounts(accountUpstreamDialog)}
               onShowGroups={() => openChannelGroups(accountUpstreamDialog)}
               onShowMonitors={() => openChannelMonitors(accountUpstreamDialog)}
+              onShowUsageHistory={() => openChannelUsageHistory(accountUpstreamDialog)}
               rateWritesEnabled={rateWritesEnabled}
             />
           </div>
@@ -2330,6 +2427,30 @@ export function ApiKeyAccountsView({
             error={channelMonitorError}
             loading={channelMonitorLoading}
             onRefresh={() => void refreshChannelMonitors(channelMonitorDialog)}
+          />
+        </Modal>
+      ) : null}
+
+      {channelUsageHistoryDialog ? (
+        <Modal
+          dialogRef={dialogRef}
+          eyebrow="历史用量与每日收支"
+          onClose={closeDialog}
+          saving={false}
+          title={channelDisplayName(channelUsageHistoryDialog)}
+        >
+          <UpstreamUsageHistoryDialog
+            appliedFilters={channelUsageHistoryFilters}
+            channel={channelUsageHistoryDialog}
+            displayTimeZone={displayTimeZone}
+            draftFilters={channelUsageHistoryDraftFilters}
+            error={channelUsageHistoryError}
+            history={channelUsageHistory}
+            loading={channelUsageHistoryLoading}
+            onApplyFilters={applyChannelUsageHistoryFilters}
+            onDraftFiltersChange={setChannelUsageHistoryDraftFilters}
+            onPreset={applyChannelUsageHistoryPreset}
+            onRefresh={() => void loadChannelUsageHistory(channelUsageHistoryDialog, channelUsageHistoryFilters)}
           />
         </Modal>
       ) : null}
@@ -2894,6 +3015,7 @@ function ChannelCard({
   onShowAccounts,
   onShowGroups,
   onShowMonitors,
+  onShowUsageHistory,
   rateWritesEnabled,
 }: {
   channel: UpstreamChannel;
@@ -2907,6 +3029,7 @@ function ChannelCard({
   onShowAccounts: () => void;
   onShowGroups: () => void;
   onShowMonitors: () => void;
+  onShowUsageHistory: () => void;
   rateWritesEnabled: boolean;
 }) {
   const groups = channel.group_options || [];
@@ -3099,13 +3222,23 @@ function ChannelCard({
 
       <section className="api-key-channel-accounts" aria-label="渠道账号">
         <button
-          aria-label={`查看 ${channelDisplayName(channel)} 的 ${accountCount} 个 API Key 账号`}
+          aria-label={`查看 ${channelDisplayName(channel)} 的 ${accountCount} 个账号`}
           className="api-key-channel-account-button"
           onClick={onShowAccounts}
           type="button"
         >
           <UsersRound size={16} />
-          <span>API Key 账号 {accountCount} 个</span>
+          <span>账号 {accountCount} 个</span>
+          <ArrowRight size={15} />
+        </button>
+        <button
+          aria-label={`查看 ${channelDisplayName(channel)} 的历史用量统计`}
+          className="api-key-channel-account-button"
+          onClick={onShowUsageHistory}
+          type="button"
+        >
+          <ChartNoAxesCombined size={16} />
+          <span>统计</span>
           <ArrowRight size={15} />
         </button>
         <button
@@ -3167,13 +3300,13 @@ function UnassignedCard({
       </header>
       <section className="api-key-channel-accounts">
         <button
-          aria-label={`查看 ${accountCount} 个待分配 API Key 账号`}
+          aria-label={`查看 ${accountCount} 个待分配账号`}
           className="api-key-channel-account-button"
           onClick={onShowAccounts}
           type="button"
         >
           <UsersRound size={16} />
-          <span>API Key 账号 {accountCount} 个</span>
+          <span>账号 {accountCount} 个</span>
           <ArrowRight size={15} />
         </button>
       </section>
@@ -3235,6 +3368,305 @@ function ChannelMonitorList({
         </div>
       )}
     </div>
+  );
+}
+
+function UpstreamUsageHistoryDialog({
+  appliedFilters,
+  channel,
+  displayTimeZone,
+  draftFilters,
+  error,
+  history,
+  loading,
+  onApplyFilters,
+  onDraftFiltersChange,
+  onPreset,
+  onRefresh,
+}: {
+  appliedFilters: UsageHistoryFilters;
+  channel: UpstreamChannel;
+  displayTimeZone: string;
+  draftFilters: UsageHistoryFilters;
+  error: string;
+  history: UpstreamUsageHistory | null;
+  loading: boolean;
+  onApplyFilters: () => void;
+  onDraftFiltersChange: (filters: UsageHistoryFilters) => void;
+  onPreset: (preset: UsageHistoryDatePreset) => void;
+  onRefresh: () => void;
+}) {
+  const accountOptions = usageHistoryAccountOptions(history, channel);
+  const days = history?.days || [];
+  const selectedAccountId = appliedFilters.apiKeyAccountId || null;
+  const selectedAccount = selectedAccountId
+    ? accountOptions.find((account) => String(account.sub2api_account_id) === selectedAccountId) || null
+    : null;
+  const totals = history?.totals || null;
+  const lifetimeTotals = history?.lifetime_totals || null;
+  const costUnit = historyCostUnit(days, selectedAccountId);
+  const totalNet = historyNetIncome(totals);
+  const lifetimeNet = historyNetIncome(lifetimeTotals);
+  const appliedRange = history
+    ? `${history.start_date} 至 ${history.end_date}`
+    : [appliedFilters.startDate, appliedFilters.endDate].filter(Boolean).join(" 至 ");
+
+  return (
+    <div className="api-key-usage-history-dialog-body">
+      <div className="api-key-usage-history-toolbar">
+        <div className="api-key-usage-history-filters">
+          <label>
+            <span><CalendarDays size={14} />开始</span>
+            <input
+              max={draftFilters.endDate || undefined}
+              onChange={(event) => onDraftFiltersChange({ ...draftFilters, startDate: event.target.value })}
+              type="date"
+              value={draftFilters.startDate}
+            />
+          </label>
+          <label>
+            <span><CalendarDays size={14} />结束</span>
+            <input
+              min={draftFilters.startDate || undefined}
+              onChange={(event) => onDraftFiltersChange({ ...draftFilters, endDate: event.target.value })}
+              type="date"
+              value={draftFilters.endDate}
+            />
+          </label>
+          <label>
+            <span><KeyRound size={14} />密钥</span>
+            <select
+              onChange={(event) => onDraftFiltersChange({ ...draftFilters, apiKeyAccountId: event.target.value })}
+              value={draftFilters.apiKeyAccountId}
+            >
+              <option value="">全部账号</option>
+              {accountOptions.map((account) => (
+                <option key={String(account.sub2api_account_id)} value={String(account.sub2api_account_id)}>
+                  {usageHistoryAccountLabel(account)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="api-key-button api-key-button--secondary"
+            disabled={loading || usageHistoryDateRangeInvalid(draftFilters)}
+            onClick={onApplyFilters}
+            type="button"
+          >
+            <Search size={15} />
+            <span>筛选</span>
+          </button>
+          <button
+            aria-label="刷新历史用量"
+            className="api-key-icon-button"
+            disabled={loading}
+            onClick={onRefresh}
+            title="刷新"
+            type="button"
+          >
+            <RefreshCcw className={loading ? "spin" : undefined} size={15} />
+          </button>
+        </div>
+        <div aria-label="快捷时间筛选" className="api-key-segmented api-key-usage-history-presets" role="group">
+          {([
+            ["today", "今天"],
+            ["seven_days", "近 7 天"],
+            ["thirty_days", "近 30 天"],
+            ["ninety_days", "近 90 天"],
+            ["this_month", "本月"],
+          ] as Array<[UsageHistoryDatePreset, string]>).map(([preset, label]) => (
+            <button
+              aria-pressed={usageHistoryPresetActive(preset, draftFilters, displayTimeZone)}
+              className={usageHistoryPresetActive(preset, draftFilters, displayTimeZone) ? "active" : ""}
+              key={preset}
+              onClick={() => onPreset(preset)}
+              type="button"
+            >{label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="api-key-usage-history-context">
+        <span>{selectedAccount ? `密钥：${usageHistoryAccountLabel(selectedAccount)}` : "全部账号"}</span>
+        <small>{appliedRange || "近 30 天"} · {history?.time_zone || displayTimeZone}</small>
+      </div>
+
+      {error ? <div className="api-key-channel-error api-key-usage-history-error" role="alert"><AlertTriangle size={14} /><span>{error}</span></div> : null}
+
+      {loading && !history ? (
+        <div className="api-key-empty api-key-usage-history-loading" role="status">
+          <RefreshCcw className="spin" size={18} />
+          <span>正在读取已保存的每日用量…</span>
+        </div>
+      ) : null}
+
+      {history && !days.length ? (
+        <div className="api-key-empty api-key-usage-history-empty">
+          <ChartNoAxesCombined size={18} />
+          <span>筛选期间暂无已保存的每日用量</span>
+        </div>
+      ) : null}
+
+      {history && days.length ? (
+        <>
+          <div className="api-key-usage-history-totals" aria-label="筛选期间汇总">
+            <UsageHistoryMetric label="原始成本" value={formatHistoryAmount(totals?.cost, costUnit)} />
+            <UsageHistoryMetric label="综合成本" tone="cost" value={formatHistoryAmount(totals?.cost_adjusted, "CNY")} />
+            <UsageHistoryMetric label="收入" tone="income" value={formatHistoryAmount(totals?.income, historyIncomeUnit(days))} />
+            <UsageHistoryMetric label="净收入" tone={totalNet !== null && totalNet < 0 ? "negative" : "income"} value={formatHistorySignedAmount(totalNet, historyIncomeUnit(days))} />
+          </div>
+
+          <UsageHistoryLineChart
+            days={days}
+            selectedAccountId={selectedAccountId}
+            title={selectedAccount ? "每日密钥用量" : "每日上游消耗"}
+          />
+
+          <div className="api-key-usage-history-table-wrap">
+            <table className="api-key-usage-history-table">
+              <thead>
+                <tr>
+                  <th scope="col">日期</th>
+                  <th scope="col">用量</th>
+                  <th scope="col">成本（原始 / 综合）</th>
+                  <th scope="col">收入</th>
+                  <th scope="col">净收入</th>
+                </tr>
+              </thead>
+              <tbody>
+                {days.map((day) => {
+                  const dailyCost = historyDayCost(day, selectedAccountId);
+                  const dailyAdjustedCost = historyDayAdjustedCost(day, selectedAccountId);
+                  const dailyNet = historyNetIncome({
+                    income: day.income,
+                    cost: dailyCost,
+                    cost_adjusted: dailyAdjustedCost,
+                  });
+                  return (
+                    <tr key={day.date}>
+                      <th scope="row">{formatUsageHistoryDate(day.date, displayTimeZone)}</th>
+                      <td>{formatHistoryUsage(historyDayUsage(day, selectedAccountId), historyDayUsageUnit(day, selectedAccountId))}</td>
+                      <td>
+                        <span>{formatHistoryAmount(dailyCost, historyDayCostUnit(day, selectedAccountId))}</span>
+                        <small>{formatHistoryAmount(dailyAdjustedCost, "CNY")}</small>
+                      </td>
+                      <td>{formatHistoryAmount(day.income, day.income_unit || historyIncomeUnit(days))}</td>
+                      <td className={dailyNet !== null && dailyNet < 0 ? "is-negative" : "is-positive"}>
+                        {formatHistorySignedAmount(dailyNet, day.income_unit || historyIncomeUnit(days))}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {lifetimeTotals ? (
+            <div className="api-key-usage-history-lifetime" aria-label="累计收支">
+              <span>累计</span>
+              <strong>综合成本 {formatHistoryAmount(lifetimeTotals.cost_adjusted, "CNY")}</strong>
+              <strong>收入 {formatHistoryAmount(lifetimeTotals.income, historyIncomeUnit(days))}</strong>
+              <strong className={lifetimeNet !== null && lifetimeNet < 0 ? "is-negative" : "is-positive"}>
+                净收入 {formatHistorySignedAmount(lifetimeNet, historyIncomeUnit(days))}
+              </strong>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function UsageHistoryMetric({ label, tone, value }: { label: string; tone?: string; value: string }) {
+  return (
+    <div className={"api-key-usage-history-metric" + (tone ? ` api-key-usage-history-metric--${tone}` : "")}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function UsageHistoryLineChart({
+  days,
+  selectedAccountId,
+  title,
+}: {
+  days: UpstreamUsageHistory["days"];
+  selectedAccountId: string | null;
+  title: string;
+}) {
+  const series = days.map((day) => ({
+    date: day.date,
+    original: historyDayUsage(day, selectedAccountId),
+    adjusted: historyDayAdjustedUsage(day, selectedAccountId),
+  }));
+  const values = series.flatMap((point) => [point.original, point.adjusted]).filter((value): value is number => value !== null);
+  if (!values.length) {
+    return (
+      <section className="api-key-usage-history-chart api-key-usage-history-chart--empty" aria-label={title}>
+        <div><ChartNoAxesCombined size={16} /><strong>{title}</strong></div>
+        <span>筛选期间没有可绘制的用量数据</span>
+      </section>
+    );
+  }
+
+  const width = 760;
+  const height = 236;
+  const padding = { top: 20, right: 18, bottom: 34, left: 54 };
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+  const maximum = Math.max(...values, 0);
+  const yMaximum = maximum === 0 ? 1 : maximum * 1.08;
+  const xFor = (index: number) => padding.left + (series.length <= 1 ? chartWidth / 2 : (index / (series.length - 1)) * chartWidth);
+  const yFor = (value: number | null) => value === null ? null : padding.top + chartHeight - (value / yMaximum) * chartHeight;
+  const pointsFor = (key: "original" | "adjusted") => series
+    .map((point, index) => {
+      const y = yFor(point[key]);
+      return y === null ? null : `${xFor(index).toFixed(1)},${y.toFixed(1)}`;
+    })
+    .filter((point): point is string => point !== null)
+    .join(" ");
+  const labelIndexes = usageHistoryLabelIndexes(series.length);
+  const gridValues = [0, 0.25, 0.5, 0.75, 1];
+
+  return (
+    <section className="api-key-usage-history-chart" aria-label={title}>
+      <div className="api-key-usage-history-chart-head">
+        <div><ChartNoAxesCombined size={16} /><strong>{title}</strong></div>
+        <div className="api-key-usage-history-chart-legend">
+          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--original" />原始</span>
+          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--adjusted" />综合</span>
+        </div>
+      </div>
+      <svg preserveAspectRatio="none" role="img" viewBox={`0 0 ${width} ${height}`}>
+        <title>{title}</title>
+        {gridValues.map((fraction) => {
+          const y = padding.top + chartHeight - chartHeight * fraction;
+          return (
+            <g key={fraction}>
+              <line className="api-key-usage-history-chart-grid" x1={padding.left} x2={width - padding.right} y1={y} y2={y} />
+              <text className="api-key-usage-history-chart-axis" textAnchor="end" x={padding.left - 8} y={y + 4}>
+                {formatHistoryChartNumber(yMaximum * fraction)}
+              </text>
+            </g>
+          );
+        })}
+        {pointsFor("original") ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--original" points={pointsFor("original")} /> : null}
+        {pointsFor("adjusted") ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--adjusted" points={pointsFor("adjusted")} /> : null}
+        {series.map((point, index) => {
+          const originalY = yFor(point.original);
+          const adjustedY = yFor(point.adjusted);
+          const x = xFor(index);
+          return (
+            <g key={point.date}>
+              {originalY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--original" cx={x} cy={originalY} r={3}><title>{`${point.date} 原始 ${formatHistoryUsage(point.original)}`}</title></circle> : null}
+              {adjustedY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--adjusted" cx={x} cy={adjustedY} r={3}><title>{`${point.date} 综合 ${formatHistoryUsage(point.adjusted)}`}</title></circle> : null}
+              {labelIndexes.has(index) ? <text className="api-key-usage-history-chart-axis" textAnchor="middle" x={x} y={height - 10}>{shortUsageHistoryDate(point.date)}</text> : null}
+            </g>
+          );
+        })}
+      </svg>
+    </section>
   );
 }
 
@@ -5001,6 +5433,8 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
   const adjustedBalanceNote = adjustedBalance === "—"
     ? "综合余额：当前无法按上游充值倍率计算"
     : `综合余额：平台余额 × 充值倍率${rechargeMultiplier === null ? "" : ` ${rechargeMultiplier.toLocaleString("zh-CN", { maximumFractionDigits: 6 })}`} = ${adjustedBalance}`;
+  const todayUsage = formatBalanceSummaryTodayUsage(channel);
+  const todayUsageNote = `今日消耗余额：原始 ${todayUsage.rawValue}；综合 ${todayUsage.adjustedValue}${todayUsage.stale ? "（显示当天最后一次有效值）" : ""}`;
 
   return (
     <article className="api-key-balance-channel-card">
@@ -5017,6 +5451,10 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
         <span aria-label={adjustedBalanceNote} className="api-key-balance-value api-key-balance-value--adjusted" title={adjustedBalanceNote}>
           <small>综合</small><strong>{adjustedBalance}</strong>
         </span>
+      </div>
+      <div className="api-key-balance-today-usage" title={todayUsageNote}>
+        <small>今日消耗</small>
+        <strong><span>原 {todayUsage.rawValue}</span><span>综 {todayUsage.adjustedValue}</span></strong>
       </div>
     </article>
   );
@@ -5513,6 +5951,212 @@ function formatCurrentRechargeAdjustedBalance(channel: UpstreamChannel) {
   );
 }
 
+function usageHistoryDefaultFilters(timeZone: string): UsageHistoryFilters {
+  return { ...usageHistoryFiltersForPreset("thirty_days", timeZone), apiKeyAccountId: "" };
+}
+
+function usageHistoryFiltersForPreset(
+  preset: UsageHistoryDatePreset,
+  timeZone: string,
+): Pick<UsageHistoryFilters, "startDate" | "endDate"> {
+  const endDate = usageHistoryDateInTimeZone(timeZone);
+  if (preset === "today") return { startDate: endDate, endDate };
+  if (preset === "this_month") return { startDate: `${endDate.slice(0, 8)}01`, endDate };
+  const days = preset === "seven_days" ? 7 : preset === "ninety_days" ? 90 : 30;
+  return { startDate: usageHistoryShiftDate(endDate, -(days - 1)), endDate };
+}
+
+function usageHistoryDateInTimeZone(timeZone: string, now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    day: "2-digit",
+    month: "2-digit",
+    timeZone,
+    year: "numeric",
+  }).formatToParts(now);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function usageHistoryShiftDate(value: string, days: number) {
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return date.toISOString().slice(0, 10);
+}
+
+function usageHistoryDateRangeInvalid(filters: Pick<UsageHistoryFilters, "startDate" | "endDate">) {
+  return Boolean(filters.startDate && filters.endDate && filters.startDate > filters.endDate);
+}
+
+function usageHistoryApiFilters(filters: UsageHistoryFilters, timeZone: string): UpstreamUsageHistoryFilters {
+  return {
+    startDate: filters.startDate || undefined,
+    endDate: filters.endDate || undefined,
+    apiKeyAccountId: filters.apiKeyAccountId || undefined,
+    timeZone,
+  };
+}
+
+function usageHistoryPresetActive(
+  preset: UsageHistoryDatePreset,
+  filters: Pick<UsageHistoryFilters, "startDate" | "endDate">,
+  timeZone: string,
+) {
+  const range = usageHistoryFiltersForPreset(preset, timeZone);
+  return filters.startDate === range.startDate && filters.endDate === range.endDate;
+}
+
+function normalizeUsageHistory(history: UpstreamUsageHistory): UpstreamUsageHistory {
+  const zeroTotals = {
+    balance_used: 0,
+    balance_used_adjusted: 0,
+    upstream_api_key_usage: 0,
+    income: 0,
+    cost: null,
+    cost_adjusted: null,
+  };
+  return {
+    ...history,
+    api_key_accounts: Array.isArray(history.api_key_accounts) ? history.api_key_accounts : [],
+    days: Array.isArray(history.days)
+      ? history.days.map((day) => ({
+          ...day,
+          api_key_accounts: Array.isArray(day.api_key_accounts) ? day.api_key_accounts : [],
+        }))
+      : [],
+    totals: history.totals || zeroTotals,
+    lifetime_totals: history.lifetime_totals || history.totals || zeroTotals,
+  };
+}
+
+function usageHistoryAccountOptions(history: UpstreamUsageHistory | null, channel: UpstreamChannel) {
+  const options = history?.api_key_accounts || (channel.accounts || []).map((account) => ({
+    sub2api_account_id: account.sub2api_account_id,
+    account_name: account.remote_name || null,
+    upstream_api_key_record_id: account.upstream_api_key_record_id,
+  }));
+  const unique = new Map<string, UpstreamUsageHistory["api_key_accounts"][number]>();
+  for (const account of options) {
+    const id = account?.sub2api_account_id;
+    if (id === null || id === undefined || id === "") continue;
+    unique.set(String(id), account);
+  }
+  return [...unique.values()];
+}
+
+function usageHistoryAccountLabel(account: UpstreamUsageHistory["api_key_accounts"][number]) {
+  return account.account_name?.trim() || `账号 #${account.sub2api_account_id}`;
+}
+
+function usageHistoryDayAccount(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
+  if (!selectedAccountId) return null;
+  return day.api_key_accounts.find((account) => String(account.sub2api_account_id) === selectedAccountId) || null;
+}
+
+function historyDayUsage(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
+  if (!selectedAccountId) return finiteNumber(day.balance_used);
+  return finiteNumber(day.upstream_api_key_usage) ?? finiteNumber(usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage);
+}
+
+function historyDayAdjustedUsage(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
+  if (!selectedAccountId) return finiteNumber(day.balance_used_adjusted);
+  return finiteNumber(usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage_adjusted);
+}
+
+function historyDayUsageUnit(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
+  if (!selectedAccountId) return day.balance_unit || null;
+  return usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage_unit || day.balance_unit || null;
+}
+
+function historyDayCost(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
+  return finiteNumber(day.cost) ?? historyDayUsage(day, selectedAccountId);
+}
+
+function historyDayAdjustedCost(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
+  return finiteNumber(day.cost_adjusted) ?? historyDayAdjustedUsage(day, selectedAccountId);
+}
+
+function historyDayCostUnit(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
+  return historyDayUsageUnit(day, selectedAccountId);
+}
+
+function historyCostUnit(days: UpstreamUsageHistory["days"], selectedAccountId: string | null) {
+  return days.map((day) => historyDayCostUnit(day, selectedAccountId)).find(Boolean) || historyBalanceUnit(days);
+}
+
+function historyBalanceUnit(days: UpstreamUsageHistory["days"]) {
+  return days.find((day) => day.balance_unit)?.balance_unit || null;
+}
+
+function historyIncomeUnit(days: UpstreamUsageHistory["days"]) {
+  return days.find((day) => day.income_unit)?.income_unit || "CNY";
+}
+
+function historyNetIncome(value: Pick<UpstreamUsageHistory["totals"], "income" | "cost" | "cost_adjusted"> | null) {
+  const income = finiteNumber(value?.income);
+  // Income and raw upstream cost share the upstream currency; the adjusted cost is a separate recharge-basis amount.
+  const cost = finiteNumber(value?.cost) ?? finiteNumber(value?.cost_adjusted);
+  if (income === null && cost === null) return null;
+  return (income || 0) - (cost || 0);
+}
+
+function formatHistoryAmount(value: unknown, unit?: string | null) {
+  return finiteNumber(value) === null ? "—" : formatUpstreamBalance(value, unit || "CNY", 2);
+}
+
+function formatHistoryUsage(value: unknown, unit?: string | null) {
+  return finiteNumber(value) === null ? "—" : formatUpstreamBalance(value, unit || undefined, 2);
+}
+
+function formatHistorySignedAmount(value: number | null, unit?: string | null) {
+  if (value === null || !Number.isFinite(value)) return "—";
+  const prefix = value > 0 ? "+" : value < 0 ? "−" : "";
+  return prefix + formatHistoryAmount(Math.abs(value), unit);
+}
+
+function formatHistoryChartNumber(value: number) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })}M`;
+  if (value >= 1_000) return `${(value / 1_000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })}k`;
+  return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function usageHistoryLabelIndexes(length: number) {
+  const indexes = new Set<number>();
+  if (!length) return indexes;
+  const labelCount = Math.min(length, 5);
+  for (let index = 0; index < labelCount; index += 1) {
+    indexes.add(Math.round((index / Math.max(1, labelCount - 1)) * (length - 1)));
+  }
+  return indexes;
+}
+
+function shortUsageHistoryDate(value: string) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.slice(5).replace("-", "/") : value;
+}
+
+function formatUsageHistoryDate(value: string, timeZone: string) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  return formatDate(value, timeZone);
+}
+
+function formatBalanceSummaryTodayUsage(channel: UpstreamChannel) {
+  const amount = channel.today_balance_used;
+  const status = String(channel.today_balance_status || "not_checked").toLowerCase();
+  const visible = finiteNumber(amount) !== null && ["ok", "stale", "stored"].includes(status);
+  return {
+    rawValue: visible
+      ? formatUpstreamBalance(amount, channel.today_balance_unit || channel.balance_unit, 2)
+      : "-",
+    adjustedValue: visible
+      ? formatRechargeAdjustedBalance(
+          channel.today_recharge_adjusted_balance_used,
+          amount,
+          channel.effective_recharge_multiplier,
+        )
+      : "-",
+    stale: status === "stale",
+  };
+}
+
 function formatDailyBalanceUsed(
   channel: UpstreamChannel,
   period: "today" | "yesterday",
@@ -5520,6 +6164,7 @@ function formatDailyBalanceUsed(
 ) {
   const yesterday = period === "yesterday";
   const amount = yesterday ? channel.yesterday_balance_used : channel.today_balance_used;
+  const adjustedAmount = yesterday ? null : channel.today_recharge_adjusted_balance_used;
   const unit = yesterday ? channel.yesterday_balance_unit : channel.today_balance_unit;
   const status = String(
     (yesterday ? channel.yesterday_balance_status : channel.today_balance_status) || "not_checked",
@@ -5528,10 +6173,17 @@ function formatDailyBalanceUsed(
     ? channel.yesterday_balance_checked_at
     : channel.today_balance_checked_at;
   const hasCurrentValue = finiteNumber(amount) !== null && isToday(checkedAt, timeZone);
-  const current = status === "ok"
+  const current = (status === "ok" || status === "stored")
     && hasCurrentValue;
   const stale = status === "stale" && hasCurrentValue;
   const unsupported = /^(?:credentials_missing|not_available|unsupported)$/.test(status);
+  const visible = current || stale;
+  const rawValue = visible
+    ? formatUpstreamBalance(amount, unit || channel.balance_unit, 2)
+    : "-";
+  const adjustedValue = visible && !yesterday
+    ? formatRechargeAdjustedBalance(adjustedAmount, amount, channel.effective_recharge_multiplier)
+    : "-";
   return {
     label: yesterday ? "昨日" : "今日",
     stale,
@@ -5544,9 +6196,9 @@ function formatDailyBalanceUsed(
           : isFailureStatus(status)
             ? "danger"
             : "muted",
-    value: current || stale
-      ? formatUpstreamBalance(amount, unit || channel.balance_unit, 2)
-      : "-",
+    rawValue,
+    adjustedValue,
+    value: `原 ${rawValue} · 综 ${adjustedValue}`,
   };
 }
 

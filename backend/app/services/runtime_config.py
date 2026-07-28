@@ -31,6 +31,7 @@ from app.core.sub2api_urls import (
 )
 from app.services.upstream_rate_logs import delete_expired_upstream_rate_change_logs
 from app.services.change_logs import delete_expired_change_logs
+from app.services.upstream_usage_history import prune_upstream_usage_history
 
 
 KEY_SUB2API_BASE_URL = "sub2api_base_url"
@@ -114,6 +115,7 @@ KEY_NOTIFY_UPSTREAM_GROUP_CHANGED = "notify_upstream_group_changed"
 KEY_NOTIFY_UPSTREAM_BALANCE_LOW = "notify_upstream_balance_low"
 KEY_NOTIFY_UPSTREAM_TOKEN_INVALID = "notify_upstream_token_invalid"
 KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS = "upstream_rate_log_retention_days"
+KEY_UPSTREAM_USAGE_DATA_RETENTION_DAYS = "upstream_usage_data_retention_days"
 KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
 KEY_USAGE_LIMIT_DEFAULT_RANGES = "usage_limit_default_ranges"
@@ -598,6 +600,15 @@ class RuntimeConfigService:
             3650,
         )
 
+    async def get_upstream_usage_data_retention_days(self) -> int:
+        values = await self._load_values()
+        return _bounded_int_or_default(
+            values.get(KEY_UPSTREAM_USAGE_DATA_RETENTION_DAYS),
+            int(getattr(self.settings, "upstream_usage_data_retention_days", 90)),
+            1,
+            3650,
+        )
+
     async def get_usage_limit_sample_thresholds(self) -> dict[str, float]:
         values = await self._load_values()
         return {
@@ -991,6 +1002,12 @@ class RuntimeConfigService:
                 1,
                 3650,
             ),
+            "upstream_usage_data_retention_days": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_USAGE_DATA_RETENTION_DAYS),
+                int(getattr(self.settings, "upstream_usage_data_retention_days", 90)),
+                1,
+                3650,
+            ),
             "usage_limit_sample_five_hour_threshold_percent": _threshold_or_settings_default(
                 values.get(KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT),
                 self.settings.usage_limit_sample_five_hour_threshold_percent,
@@ -1295,6 +1312,18 @@ class RuntimeConfigService:
                     retention_days=retention_days,
                 )
                 await delete_expired_change_logs(
+                    db,
+                    retention_days=retention_days,
+                )
+
+            if payload.get("upstream_usage_data_retention_days") is not None:
+                retention_days = int(payload["upstream_usage_data_retention_days"])
+                await self._put(
+                    db,
+                    KEY_UPSTREAM_USAGE_DATA_RETENTION_DAYS,
+                    str(retention_days),
+                )
+                await prune_upstream_usage_history(
                     db,
                     retention_days=retention_days,
                 )
@@ -1764,6 +1793,9 @@ class RuntimeConfigService:
                 bool(settings.get("notify_upstream_token_invalid", False))
             ),
             "UPSTREAM_RATE_LOG_RETENTION_DAYS": str(int(settings["upstream_rate_log_retention_days"])),
+            "UPSTREAM_USAGE_DATA_RETENTION_DAYS": str(
+                int(settings.get("upstream_usage_data_retention_days", 90))
+            ),
             "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(
                 float(settings["usage_limit_sample_five_hour_threshold_percent"])
             ),

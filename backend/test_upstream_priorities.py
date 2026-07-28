@@ -403,17 +403,28 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         interval = await self._interval()
         alpha = await self._add_config(7, interval.id, group=0.1, name="Alpha")
         beta = await self._add_config(8, interval.id, group=0.1, name="Beta")
-        await self.service.rebalance(self.db)
-        fingerprint = self.accounts._remote_identity_fingerprint(self.sub2api.accounts[0])
-
-        moved = await self.service.move_equal_multiplier_priority(
-            self.db,
-            7,
-            PriorityTieMoveRequest(
-                direction="up",
-                expected_identity_fingerprint=fingerprint,
-            ),
+        runtime = SimpleNamespace(
+            get_priority_assign_disabled_api_key_accounts=AsyncMock(return_value=False),
+            get_priority_share_same_composite_multiplier=AsyncMock(return_value=False),
         )
+
+        with patch(
+            "app.services.upstream_priorities.get_runtime_config_service",
+            return_value=runtime,
+        ):
+            await self.service.rebalance(self.db)
+            fingerprint = self.accounts._remote_identity_fingerprint(
+                self.sub2api.accounts[0]
+            )
+
+            moved = await self.service.move_equal_multiplier_priority(
+                self.db,
+                7,
+                PriorityTieMoveRequest(
+                    direction="up",
+                    expected_identity_fingerprint=fingerprint,
+                ),
+            )
 
         self.assertEqual(moved.failed, 0)
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
@@ -422,7 +433,11 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.refresh(beta)
         self.assertEqual((alpha.priority_tiebreak_order, beta.priority_tiebreak_order), (1, 0))
 
-        await self.service.rebalance(self.db)
+        with patch(
+            "app.services.upstream_priorities.get_runtime_config_service",
+            return_value=runtime,
+        ):
+            await self.service.rebalance(self.db)
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
         self.assertEqual(priorities, {7: 41, 8: 40})
 

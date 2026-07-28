@@ -13,7 +13,6 @@ import {
   Database,
   ExternalLink,
   Globe2,
-  History,
   Inbox,
   Image as ImageIcon,
   KeyRound,
@@ -289,6 +288,7 @@ const emptySettings: AppSettings = {
   priority_assign_disabled_api_key_accounts: false,
   priority_share_same_composite_multiplier: false,
   upstream_rate_log_retention_days: 90,
+  upstream_usage_data_retention_days: 90,
   discord_bot_notifications_enabled: false,
   discord_bot_token_set: false,
   discord_bot_token_hint: null,
@@ -5137,6 +5137,9 @@ function SettingsView({
   const [upstreamRateLogRetentionDays, setUpstreamRateLogRetentionDays] = useState(
     String(settings.upstream_rate_log_retention_days || 90),
   );
+  const [upstreamUsageDataRetentionDays, setUpstreamUsageDataRetentionDays] = useState(
+    String(settings.upstream_usage_data_retention_days ?? settings.upstream_data_retention_days ?? 90),
+  );
   const [usageLimitSampleFiveHourThreshold, setUsageLimitSampleFiveHourThreshold] = useState(
     String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0),
   );
@@ -5250,6 +5253,9 @@ function SettingsView({
     setNotifyUpstreamBalanceLow(settings.notify_upstream_balance_low ?? false);
     setNotifyUpstreamTokenInvalid(settings.notify_upstream_token_invalid ?? false);
     setUpstreamRateLogRetentionDays(String(settings.upstream_rate_log_retention_days || 90));
+    setUpstreamUsageDataRetentionDays(
+      String(settings.upstream_usage_data_retention_days ?? settings.upstream_data_retention_days ?? 90),
+    );
     setUsageLimitSampleFiveHourThreshold(String(settings.usage_limit_sample_five_hour_threshold_percent ?? 0));
     setUsageLimitSampleSevenDayThreshold(String(settings.usage_limit_sample_seven_day_threshold_percent ?? 0));
     setUsageLimitDefaultRanges(mergeUsageLimitDefaultRanges(settings.usage_limit_default_ranges, subscriptionTypes));
@@ -5328,6 +5334,8 @@ function SettingsView({
     settings.usage_refresh_interval_seconds,
     settings.usage_refresh_max_concurrency,
     settings.upstream_rate_log_retention_days,
+    settings.upstream_usage_data_retention_days,
+    settings.upstream_data_retention_days,
     settings.upstream_rate_sync_enabled,
     settings.upstream_priority_sync_enabled ?? true,
     settings.upstream_sync_enabled,
@@ -5348,6 +5356,7 @@ function SettingsView({
   const upstreamSyncMaxConcurrencyNumber = Number(upstreamSyncMaxConcurrency);
   const balancePauseThresholdNumber = Number(balancePauseThreshold);
   const upstreamRateLogRetentionDaysNumber = Number(upstreamRateLogRetentionDays);
+  const upstreamUsageDataRetentionDaysNumber = Number(upstreamUsageDataRetentionDays);
   const usageLimitSampleFiveHourThresholdNumber = Number(usageLimitSampleFiveHourThreshold);
   const usageLimitSampleSevenDayThresholdNumber = Number(usageLimitSampleSevenDayThreshold);
   const protocolRefreshMaxConcurrencyNumber = Number(protocolRefreshMaxConcurrency);
@@ -5408,6 +5417,9 @@ function SettingsView({
     !Number.isInteger(upstreamRateLogRetentionDaysNumber) ||
     upstreamRateLogRetentionDaysNumber < 1 ||
     upstreamRateLogRetentionDaysNumber > 3650 ||
+    !Number.isInteger(upstreamUsageDataRetentionDaysNumber) ||
+    upstreamUsageDataRetentionDaysNumber < 1 ||
+    upstreamUsageDataRetentionDaysNumber > 3650 ||
     !Number.isFinite(usageLimitSampleFiveHourThresholdNumber) ||
     usageLimitSampleFiveHourThresholdNumber < 0 ||
     usageLimitSampleFiveHourThresholdNumber > 100 ||
@@ -5541,6 +5553,7 @@ function SettingsView({
       priority_assign_disabled_api_key_accounts: priorityAssignDisabledAccounts,
       priority_share_same_composite_multiplier: priorityShareSameCompositeMultiplier,
       upstream_rate_log_retention_days: upstreamRateLogRetentionDaysNumber,
+      upstream_usage_data_retention_days: upstreamUsageDataRetentionDaysNumber,
       discord_bot_notifications_enabled: discordNotificationsEnabled,
       discord_bot_channel_id: cleanDiscordChannelId,
       notify_oauth_account_disabled: notifyAccountScheduling,
@@ -5595,7 +5608,7 @@ function SettingsView({
         <button onClick={() => scrollToSettingsSection("settings-automation")} type="button"><RefreshCcw size={15} /><span>自动任务</span></button>
         <button onClick={() => scrollToSettingsSection("settings-resources")} type="button"><TimerReset size={15} /><span>资源限制</span></button>
         <button onClick={() => scrollToSettingsSection("settings-usage")} type="button"><Database size={15} /><span>用量额度</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-upstream-log")} type="button"><History size={15} /><span>上游记录</span></button>
+        <button onClick={() => scrollToSettingsSection("settings-data-management")} type="button"><Database size={15} /><span>数据管理与备份</span></button>
         <button onClick={() => scrollToSettingsSection("settings-notifications")} type="button"><Activity size={15} /><span>通知</span></button>
         <button onClick={() => scrollToSettingsSection("settings-display-security")} type="button"><ShieldCheck size={15} /><span>显示安全</span></button>
         <button onClick={() => scrollToSettingsSection("settings-scan")} type="button"><Radar size={15} /><span>端口扫描</span></button>
@@ -6282,8 +6295,8 @@ function SettingsView({
             </div>
           </fieldset>
 
-          <fieldset className="settings-section settings-section--api-key" id="settings-upstream-log">
-            <legend>上游变化记录</legend>
+          <fieldset className="settings-section settings-section--api-key" id="settings-data-management">
+            <legend>数据管理与备份</legend>
             <div className="settings-grid settings-section-grid">
               <label>
                 上游变化保留天数
@@ -6294,6 +6307,17 @@ function SettingsView({
                   type="number"
                   value={upstreamRateLogRetentionDays}
                 />
+              </label>
+              <label>
+                上游数据存储天数
+                <input
+                  max={3650}
+                  min={1}
+                  onChange={(event) => setUpstreamUsageDataRetentionDays(event.target.value)}
+                  type="number"
+                  value={upstreamUsageDataRetentionDays}
+                />
+                <small>每日明细到期后会清理；各上游的累计成本和收入始终保留。</small>
               </label>
             </div>
           </fieldset>
@@ -6465,7 +6489,8 @@ function SettingsView({
             <span>
               {settings.automation_paused ? "自动任务已暂停" : "自动任务运行中"} · 已开启 {enabledAutomationCount}/13 ·
               上游线程 {settings.upstream_sync_max_concurrency ?? 2} · 测活线程 {settings.account_liveness_max_concurrency ?? 3} ·
-              上游变化保留 {settings.upstream_rate_log_retention_days} 天
+              上游变化保留 {settings.upstream_rate_log_retention_days} 天 ·
+              上游数据保存 {settings.upstream_usage_data_retention_days ?? settings.upstream_data_retention_days ?? 90} 天
             </span>
           </div>
           <button className="secondary-button" disabled={busy} onClick={onScan} type="button">

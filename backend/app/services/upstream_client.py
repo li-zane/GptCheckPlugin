@@ -343,6 +343,7 @@ class UpstreamClient:
         channel_monitor_detail_ids: Iterable[int] | None = None,
         monitor_only: bool = False,
         today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
+        include_yesterday_usage: bool = True,
     ) -> DiscoveryResult:
         raw_account_api_keys = account_api_keys if isinstance(account_api_keys, Mapping) else {}
         secrets = (api_key, access_token, *raw_account_api_keys.values())
@@ -418,6 +419,13 @@ class UpstreamClient:
                     NEWAPI_UPTIME_STATUS_ENDPOINT,
                     SUB2API_CHANNEL_MONITORS_ENDPOINT,
                 }
+            )
+        if not monitor_only and not include_yesterday_usage:
+            # Yesterday is immutable after its daily snapshot has been
+            # finalized locally. Keep the request out of both initial and
+            # optimized compatibility endpoint sets.
+            endpoints = tuple(
+                endpoint for endpoint in endpoints if endpoint != SUB2API_USAGE_STATS_ENDPOINT
             )
         newapi_today_usage_params = _newapi_today_usage_params(today_timezone)
         newapi_yesterday_usage_params = _newapi_yesterday_usage_params(today_timezone)
@@ -509,6 +517,12 @@ class UpstreamClient:
                                     SUB2API_CHANNEL_MONITORS_ENDPOINT,
                                 }
                             )
+                        if not include_yesterday_usage:
+                            compatibility_endpoints = tuple(
+                                endpoint
+                                for endpoint in compatibility_endpoints
+                                if endpoint != SUB2API_USAGE_STATS_ENDPOINT
+                            )
                         if compatibility_endpoints:
                             compatibility_results = await asyncio.gather(
                                 *(fetch_endpoint(endpoint) for endpoint in compatibility_endpoints)
@@ -540,7 +554,11 @@ class UpstreamClient:
                             return {}
 
                     async def fetch_newapi_yesterday_usage() -> _FetchResult | None:
-                        if candidate_type != "newapi" or monitor_only:
+                        if (
+                            candidate_type != "newapi"
+                            or monitor_only
+                            or not include_yesterday_usage
+                        ):
                             return None
                         yesterday_headers = _headers_for_endpoint(
                             NEWAPI_TODAY_USAGE_ENDPOINT,
@@ -1774,6 +1792,7 @@ async def discover_upstream(
     channel_monitor_detail_ids: Iterable[int] | None = None,
     monitor_only: bool = False,
     today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
+    include_yesterday_usage: bool = True,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     transport: httpx.AsyncBaseTransport | None = None,
     resolver: Resolver | None = None,
@@ -1801,6 +1820,7 @@ async def discover_upstream(
         channel_monitor_detail_ids=channel_monitor_detail_ids,
         monitor_only=monitor_only,
         today_timezone=today_timezone,
+        include_yesterday_usage=include_yesterday_usage,
     )
 
 

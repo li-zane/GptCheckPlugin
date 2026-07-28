@@ -43,6 +43,8 @@ import type {
   UpstreamChannelUpdate,
   UpstreamChangeLog,
   UpstreamRateChangeLog,
+  UpstreamUsageHistory,
+  UpstreamUsageHistoryFilters,
 } from "./types";
 
 export class ApiError extends Error {
@@ -145,6 +147,21 @@ export function upstreamRateChangeLogsPath(
   filters?: UpstreamChangeLogFilters,
 ) {
   return `/api/upstream-accounts/rate-change-logs?${upstreamChangeLogsQuery(limit, beforeId, filters)}`;
+}
+
+export function upstreamUsageHistoryPath(
+  channelId: number | string,
+  filters?: UpstreamUsageHistoryFilters,
+) {
+  const params = new URLSearchParams();
+  if (filters?.startDate) params.set("start_date", filters.startDate);
+  if (filters?.endDate) params.set("end_date", filters.endDate);
+  if (filters?.apiKeyAccountId !== null && filters?.apiKeyAccountId !== undefined && filters.apiKeyAccountId !== "") {
+    params.set("api_key_account_id", String(filters.apiKeyAccountId));
+  }
+  if (filters?.timeZone) params.set("time_zone", filters.timeZone);
+  const query = params.toString();
+  return `/api/upstream-channels/${encodeURIComponent(String(channelId))}/usage-history${query ? `?${query}` : ""}`;
 }
 
 async function requestUpstreamChangeLogs(
@@ -440,6 +457,8 @@ export const api = {
     ),
   upstreamChannels: (refresh = false) =>
     request<UpstreamChannelsResponse>(`/api/upstream-channels?refresh=${refresh ? "true" : "false"}`),
+  upstreamUsageHistory: (channelId: number | string, filters?: UpstreamUsageHistoryFilters) =>
+    request<UpstreamUsageHistory>(upstreamUsageHistoryPath(channelId, filters)),
   syncApiKeyInventory: () =>
     request<UpstreamChannelsResponse>(
       "/api/upstream-channels/sync-inventory",

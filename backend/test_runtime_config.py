@@ -645,6 +645,11 @@ class RuntimeConfigTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 AppSettingsUpdate(upstream_rate_log_retention_days=value)
 
+    def test_upstream_usage_data_retention_rejects_out_of_range_values(self) -> None:
+        for value in (0, 3651):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                AppSettingsUpdate(upstream_usage_data_retention_days=value)
+
     def test_policy_guard_thresholds_reject_out_of_range_values(self) -> None:
         invalid_values = {
             "channel_monitor_fallback_test_attempts": (0, 6),
@@ -670,6 +675,7 @@ class RuntimeConfigTests(unittest.TestCase):
             env_path.write_text(
                 "UPSTREAM_RATE_SYNC_ENABLED=true\n"
                 "UPSTREAM_RATE_LOG_RETENTION_DAYS=180\n"
+                "UPSTREAM_USAGE_DATA_RETENTION_DAYS=120\n"
                 "SHOW_STALE_NEGATIVE_BALANCE_ALERT=false\n"
                 "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED=true\n"
                 "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD=3\n"
@@ -685,6 +691,9 @@ class RuntimeConfigTests(unittest.TestCase):
                 enabled = asyncio.run(service.get_upstream_rate_sync_enabled())
                 upstream_enabled = asyncio.run(service.get_upstream_sync_enabled())
                 retention_days = asyncio.run(service.get_upstream_rate_log_retention_days())
+                usage_retention_days = asyncio.run(
+                    service.get_upstream_usage_data_retention_days()
+                )
                 show_stale_alert = asyncio.run(
                     service.get_show_stale_negative_balance_alert()
                 )
@@ -708,6 +717,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertTrue(upstream_enabled)
         self.assertEqual(retention_days, 180)
+        self.assertEqual(usage_retention_days, 120)
         self.assertFalse(show_stale_alert)
         self.assertTrue(auto_pause_on_monitor)
         self.assertEqual(monitor_unavailable_threshold, 3)
@@ -717,6 +727,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(public["upstream_sync_enabled"])
         self.assertTrue(public["upstream_rate_sync_enabled"])
         self.assertEqual(public["upstream_rate_log_retention_days"], 180)
+        self.assertEqual(public["upstream_usage_data_retention_days"], 120)
         self.assertFalse(public["show_stale_negative_balance_alert"])
         self.assertTrue(public["api_key_auto_pause_on_channel_monitor_unavailable_enabled"])
         self.assertEqual(public["channel_monitor_unavailable_consecutive_threshold"], 3)
@@ -747,6 +758,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 defaults = await service.get_public_settings()
                 self.assertFalse(defaults["upstream_rate_sync_enabled"])
                 self.assertEqual(defaults["upstream_rate_log_retention_days"], 90)
+                self.assertEqual(defaults["upstream_usage_data_retention_days"], 90)
                 self.assertFalse(
                     defaults["api_key_auto_pause_on_channel_monitor_unavailable_enabled"]
                 )
@@ -785,6 +797,7 @@ class RuntimeConfigTests(unittest.TestCase):
                         "notify_account_enabled": True,
                         "notify_upstream_token_invalid": True,
                         "upstream_rate_log_retention_days": 180,
+                        "upstream_usage_data_retention_days": 120,
                         "account_liveness_max_concurrency": 4,
                     }
                 )
@@ -817,6 +830,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertTrue(settings["notify_upstream_token_invalid"])
                 self.assertEqual(settings["account_liveness_max_concurrency"], 4)
                 self.assertEqual(settings["upstream_rate_log_retention_days"], 180)
+                self.assertEqual(settings["upstream_usage_data_retention_days"], 120)
                 self.assertTrue(await service.get_upstream_sync_enabled())
                 self.assertTrue(await service.get_upstream_rate_sync_enabled())
                 self.assertFalse(await service.get_upstream_priority_sync_enabled())
@@ -843,6 +857,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertEqual(await service.get_upstream_balance_pause_threshold(), 12.5)
                 self.assertFalse(await service.get_show_stale_negative_balance_alert())
                 self.assertEqual(await service.get_upstream_rate_log_retention_days(), 180)
+                self.assertEqual(await service.get_upstream_usage_data_retention_days(), 120)
 
                 async with runtime_config.AsyncSessionLocal() as db:
                     result = await db.execute(
@@ -869,6 +884,7 @@ class RuntimeConfigTests(unittest.TestCase):
                                     "notify_account_enabled",
                                     "notify_upstream_token_invalid",
                                     "upstream_rate_log_retention_days",
+                                    "upstream_usage_data_retention_days",
                                     "account_liveness_max_concurrency",
                                 ]
                             )
@@ -898,6 +914,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertEqual(values["notify_account_enabled"], "true")
                 self.assertEqual(values["notify_upstream_token_invalid"], "true")
                 self.assertEqual(values["upstream_rate_log_retention_days"], "180")
+                self.assertEqual(values["upstream_usage_data_retention_days"], "120")
                 env_text = (project_root / ".env").read_text(encoding="utf-8")
                 self.assertIn("UPSTREAM_SYNC_ENABLED=true", env_text)
                 self.assertIn("UPSTREAM_RATE_SYNC_ENABLED=true", env_text)

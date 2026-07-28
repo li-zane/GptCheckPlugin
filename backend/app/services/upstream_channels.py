@@ -83,6 +83,12 @@ from app.services.upstream_client import (
     discover_upstream,
     refresh_sub2api_tokens,
 )
+from app.services.upstream_usage_history import (
+    finalize_yesterday_usage,
+    hydrate_yesterday_usage,
+    should_fetch_yesterday_usage,
+    snapshot_today_usage,
+)
 from app.services.workflow_coordination import get_workflow_coordinator
 
 
@@ -1164,6 +1170,14 @@ class UpstreamChannelService:
             recharge_adjusted_balance = (
                 channel.balance_remaining * channel.effective_recharge_multiplier
             )
+        today_recharge_adjusted_balance_used = None
+        if (
+            channel.today_balance_used is not None
+            and channel.effective_recharge_multiplier is not None
+        ):
+            today_recharge_adjusted_balance_used = (
+                channel.today_balance_used * channel.effective_recharge_multiplier
+            )
         monitors = channel.channel_monitors if isinstance(channel.channel_monitors, list) else []
         return UpstreamChannelOut(
             id=channel.id,
@@ -1213,6 +1227,7 @@ class UpstreamChannelService:
             today_balance_unit=channel.today_balance_unit,
             today_balance_status=channel.today_balance_status,
             today_balance_checked_at=channel.today_balance_checked_at,
+            today_recharge_adjusted_balance_used=today_recharge_adjusted_balance_used,
             yesterday_balance_used=channel.yesterday_balance_used,
             yesterday_balance_unit=channel.yesterday_balance_unit,
             yesterday_balance_status=channel.yesterday_balance_status,
@@ -3891,21 +3906,41 @@ class UpstreamChannelService:
                 # Isolated tests and early startup may not have runtime
                 # settings available; keep the application's default zone.
                 pass
+            usage_snapshot_now = _utcnow()
+            try:
+                include_yesterday_usage = (
+                    not monitor_details_only
+                    and await should_fetch_yesterday_usage(
+                        db,
+                        channel_id=channel.id,
+                        now=usage_snapshot_now,
+                        time_zone=today_timezone,
+                    )
+                )
+            except Exception:
+                # Keep the existing upstream read behavior if an early upgrade
+                # has not created the local daily-usage tables yet.
+                include_yesterday_usage = True
 
             async def run_discovery(active_access_token: str | None, active_type: str) -> Any:
+                discovery_kwargs: dict[str, Any] = {
+                    "base_url": discovery_base_url,
+                    "upstream_type": active_type,
+                    "access_token": active_access_token,
+                    "new_api_user": channel.upstream_user_id,
+                    "account_api_keys": account_api_keys,
+                    "account_api_key_record_ids": account_api_key_record_ids,
+                    "optimized_endpoint_fallbacks": True,
+                    "include_channel_monitors": refresh_channel_monitors,
+                    "include_channel_monitor_details": include_channel_monitor_details,
+                    "channel_monitor_detail_ids": channel_monitor_detail_ids,
+                    "monitor_only": monitor_details_only,
+                    "today_timezone": today_timezone,
+                }
+                if not include_yesterday_usage:
+                    discovery_kwargs["include_yesterday_usage"] = False
                 discovery = discover_upstream(
-                    base_url=discovery_base_url,
-                    upstream_type=active_type,
-                    access_token=active_access_token,
-                    new_api_user=channel.upstream_user_id,
-                    account_api_keys=account_api_keys,
-                    account_api_key_record_ids=account_api_key_record_ids,
-                    optimized_endpoint_fallbacks=True,
-                    include_channel_monitors=refresh_channel_monitors,
-                    include_channel_monitor_details=include_channel_monitor_details,
-                    channel_monitor_detail_ids=channel_monitor_detail_ids,
-                    monitor_only=monitor_details_only,
-                    today_timezone=today_timezone,
+                    **discovery_kwargs,
                 )
                 return await discovery if inspect.isawaitable(discovery) else discovery
 
@@ -4093,27 +4128,13 @@ class UpstreamChannelService:
                 )
             if not token_invalid:
                 await self._apply_api_key_balance_fallback(channel, configs)
-            missing_usage_account_ids = [
-                config.sub2api_account_id
-                for config in configs
-                if (
-                    (state := self._synchronized_upstream_state(
-                        result,
-                        config.sub2api_account_id,
-                    ))
-                    is None
-                    or (
-                        usage_amount := _balance_number(
-                            _value(state, "usage_amount")
-                        )
-                    )
-                    is None
-                    or usage_amount < 0
-                )
-            ]
+            # The local today-stats batch doubles as the revenue source for
+            # historical channel accounting.  The same response still feeds
+            # the pre-existing upstream-usage fallback below.
+            linked_account_ids = [config.sub2api_account_id for config in configs]
             try:
                 local_today_costs = await self.sub2api.get_account_today_costs(
-                    missing_usage_account_ids
+                    linked_account_ids
                 )
             except asyncio.CancelledError:
                 raise
@@ -4634,6 +4655,34 @@ class UpstreamChannelService:
                     if config.balance_guard_operation == "paused"
                     and config.balance_guard_channel_id == channel.id
                 )
+                history_now = channel.last_discovered_at or _utcnow()
+                history_configs = [
+                    config
+                    for config in current_configs.values()
+                    if config.channel_id == channel.id
+                ]
+                if discovery_succeeded:
+                    await snapshot_today_usage(
+                        db,
+                        channel=channel,
+                        configs=history_configs,
+                        income_by_account=local_today_costs,
+                        now=history_now,
+                        time_zone=today_timezone,
+                    )
+                    await finalize_yesterday_usage(
+                        db,
+                        channel=channel,
+                        now=history_now,
+                        time_zone=today_timezone,
+                    )
+                else:
+                    await hydrate_yesterday_usage(
+                        db,
+                        channel=channel,
+                        now=history_now,
+                        time_zone=today_timezone,
+                    )
                 await db.flush()
             await db.commit()
             await db.refresh(channel)

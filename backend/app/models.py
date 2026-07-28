@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -314,6 +315,107 @@ class UpstreamChannel(Base):
     last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UpstreamChannelDailyUsage(Base):
+    """A durable per-day upstream balance and linked account revenue snapshot."""
+
+    __tablename__ = "upstream_channel_daily_usages"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_id",
+            "usage_date",
+            name="uq_upstream_channel_daily_usage_channel_date",
+        ),
+        Index("ix_upstream_channel_daily_usage_channel_date", "channel_id", "usage_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    channel_name: Mapped[str | None] = mapped_column(String(200))
+    usage_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    balance_used: Mapped[float | None] = mapped_column(Float)
+    balance_used_adjusted: Mapped[float | None] = mapped_column(Float)
+    balance_unit: Mapped[str | None] = mapped_column(String(32))
+    recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_api_key_usage: Mapped[float | None] = mapped_column(Float)
+    income: Mapped[float | None] = mapped_column(Float)
+    income_unit: Mapped[str | None] = mapped_column(String(32))
+    finalized: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False, index=True
+    )
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class UpstreamAccountDailyUsage(Base):
+    """Per API key usage/revenue retained for filtering channel history."""
+
+    __tablename__ = "upstream_account_daily_usages"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_id",
+            "sub2api_account_id",
+            "usage_date",
+            name="uq_upstream_account_daily_usage_channel_account_date",
+        ),
+        Index(
+            "ix_upstream_account_daily_usage_channel_date",
+            "channel_id",
+            "usage_date",
+        ),
+        Index(
+            "ix_upstream_account_daily_usage_account_date",
+            "sub2api_account_id",
+            "usage_date",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    sub2api_account_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    upstream_api_key_record_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    account_name: Mapped[str | None] = mapped_column(String(200))
+    remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    usage_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    upstream_usage: Mapped[float | None] = mapped_column(Float)
+    upstream_usage_unit: Mapped[str | None] = mapped_column(String(32))
+    upstream_usage_source: Mapped[str | None] = mapped_column(String(64))
+    income: Mapped[float | None] = mapped_column(Float)
+    income_unit: Mapped[str | None] = mapped_column(String(32))
+    finalized: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False, index=True
+    )
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class UpstreamChannelUsageTotal(Base):
+    """Lifetime aggregates which deliberately survive daily-detail pruning."""
+
+    __tablename__ = "upstream_channel_usage_totals"
+
+    channel_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_name: Mapped[str | None] = mapped_column(String(200))
+    total_balance_used: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    total_balance_used_adjusted: Mapped[float] = mapped_column(
+        Float, default=0, nullable=False
+    )
+    total_upstream_api_key_usage: Mapped[float] = mapped_column(
+        Float, default=0, nullable=False
+    )
+    total_income: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class UpstreamPriorityInterval(Base):

@@ -13,6 +13,7 @@ from app.services.runtime_config import RuntimeConfigService, get_runtime_config
 from app.services.sub2api import Sub2ApiClient
 from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
 from app.services.upstream_rate_logs import prune_upstream_rate_change_logs
+from app.services.upstream_usage_history import prune_upstream_usage_history
 
 
 UPSTREAM_RATE_SYNC_TIMEOUT_SECONDS = 300
@@ -314,6 +315,16 @@ class UpstreamRateSyncService:
 
     async def _run_once(self) -> None:
         retention_days = await self.runtime_config.get_upstream_rate_log_retention_days()
+        usage_retention_getter = getattr(
+            self.runtime_config,
+            "get_upstream_usage_data_retention_days",
+            None,
+        )
+        usage_retention_days = (
+            int(await usage_retention_getter())
+            if callable(usage_retention_getter)
+            else None
+        )
         async with AsyncSessionLocal() as db:
             await prune_upstream_rate_change_logs(
                 db,
@@ -323,6 +334,17 @@ class UpstreamRateSyncService:
                 db,
                 retention_days=retention_days,
             )
+            if (
+                usage_retention_days is not None
+                and callable(getattr(db, "execute", None))
+            ):
+                await prune_upstream_usage_history(
+                    db,
+                    retention_days=usage_retention_days,
+                )
+                commit = getattr(db, "commit", None)
+                if callable(commit):
+                    await commit()
 
         enabled = await self.runtime_config.get_upstream_sync_enabled()
         paused = await self.runtime_config.get_automation_paused()

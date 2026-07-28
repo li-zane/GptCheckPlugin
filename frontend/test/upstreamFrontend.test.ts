@@ -8,6 +8,7 @@ import {
   upstreamLegacyBindingCounts,
   upstreamChangeLogsPath,
   upstreamRateChangeLogsPath,
+  upstreamUsageHistoryPath,
 } from "../src/api.ts";
 import {
   automationDurationDisplayValue,
@@ -2778,6 +2779,24 @@ test("upstream change log query includes cursor, inclusive date filters, and dis
     new URL(upstreamRateChangeLogsPath(25, 80), "http://localhost").pathname,
     "/api/upstream-accounts/rate-change-logs",
   );
+});
+
+test("upstream usage history query encodes channel, date, account, and display time zone filters", () => {
+  const path = upstreamUsageHistoryPath(42, {
+    startDate: "2026-07-01",
+    endDate: "2026-07-28",
+    apiKeyAccountId: 88,
+    timeZone: "Asia/Shanghai",
+  });
+  const url = new URL(path, "http://localhost");
+  assert.equal(url.pathname, "/api/upstream-channels/42/usage-history");
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    start_date: "2026-07-01",
+    end_date: "2026-07-28",
+    api_key_account_id: "88",
+    time_zone: "Asia/Shanghai",
+  });
+  assert.equal(upstreamUsageHistoryPath("channel / 1"), "/api/upstream-channels/channel%20%2F%201/usage-history");
 });
 
 test("upstream change API prefers the new ledger and falls back only when unavailable", async () => {

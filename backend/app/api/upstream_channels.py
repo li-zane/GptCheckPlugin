@@ -1,13 +1,15 @@
 import asyncio
 import logging
+from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import require_admin
+from app.models import UpstreamChannel
 from app.schemas import (
     MessageResponse,
     UpstreamChannelDiscoverAllRequest,
@@ -16,6 +18,7 @@ from app.schemas import (
     UpstreamChannelOut,
     UpstreamChannelUpdate,
     UpstreamOverviewOut,
+    UpstreamUsageHistoryOut,
 )
 from app.services.upstream_accounts import UpstreamAccountServiceError
 from app.services.upstream_channels import (
@@ -25,6 +28,11 @@ from app.services.upstream_channels import (
 )
 from app.services.events import elapsed_ms, record_event
 from app.services.runtime_config import get_runtime_config_service
+from app.services.upstream_usage_history import (
+    normalize_history_time_zone,
+    usage_day,
+    usage_history,
+)
 
 
 router = APIRouter()
@@ -69,6 +77,48 @@ async def upstream_channel_overview(
         return await service.overview(db, sync_inventory=False)
     except UpstreamAccountServiceError as exc:
         raise _http_error(exc) from None
+
+
+@router.get("/{channel_id}/usage-history", response_model=UpstreamUsageHistoryOut)
+async def upstream_channel_usage_history(
+    channel_id: ChannelId,
+    start_date: Annotated[date | None, Query()] = None,
+    end_date: Annotated[date | None, Query()] = None,
+    api_key_account_id: Annotated[
+        int | None,
+        Query(ge=1, le=9_007_199_254_740_991),
+    ] = None,
+    time_zone: Annotated[str | None, Query(max_length=80)] = None,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UpstreamUsageHistoryOut:
+    try:
+        normalized_time_zone = normalize_history_time_zone(time_zone)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    today = usage_day(datetime.now(timezone.utc), normalized_time_zone)
+    effective_end = end_date or today
+    effective_start = start_date or effective_end - timedelta(days=29)
+    if effective_end < effective_start:
+        raise HTTPException(
+            status_code=422,
+            detail="The end date must not be earlier than the start date.",
+        )
+    channel = await db.get(UpstreamChannel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Upstream channel not found.")
+    try:
+        history = await usage_history(
+            db,
+            channel=channel,
+            start_date=effective_start,
+            end_date=effective_end,
+            api_key_account_id=api_key_account_id,
+            time_zone=normalized_time_zone,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return UpstreamUsageHistoryOut(**history)
 
 
 @router.post("/sync-inventory", response_model=UpstreamOverviewOut)

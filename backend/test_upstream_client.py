@@ -2361,6 +2361,24 @@ class UpstreamClientTests(unittest.TestCase):
                 self.assertIsNone(result.yesterday_balance_unit)
                 self.assertEqual(result.yesterday_balance_status, expected_status)
 
+    def test_finalized_yesterday_can_skip_the_upstream_usage_stats_request(self) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.path)
+            if request_target(request) == "/api/v1/groups/available":
+                return httpx.Response(200, json={"code": 0, "data": []})
+            return httpx.Response(404)
+
+        self.run_discovery(
+            handler,
+            upstream_type="sub2api",
+            access_token="sub2api-login-token",
+            include_yesterday_usage=False,
+        )
+
+        self.assertNotIn(SUB2API_USAGE_STATS_ENDPOINT, seen)
+
     def test_sub2api_today_key_usage_accepts_authoritative_zero(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             target = request_target(request)

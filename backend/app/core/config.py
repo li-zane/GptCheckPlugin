@@ -102,6 +102,7 @@ class Settings(BaseSettings):
     priority_assign_disabled_api_key_accounts: bool = False
     priority_share_same_composite_multiplier: bool = False
     upstream_rate_log_retention_days: int = Field(default=90, ge=1, le=3650)
+    upstream_usage_data_retention_days: int = Field(default=90, ge=1, le=3650)
     discord_bot_notifications_enabled: bool = False
     discord_bot_token: str = ""
     discord_bot_channel_id: str = ""

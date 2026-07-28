@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -579,6 +579,7 @@ class AppSettingsOut(BaseModel):
     notify_upstream_balance_low: bool = False
     notify_upstream_token_invalid: bool = False
     upstream_rate_log_retention_days: int
+    upstream_usage_data_retention_days: int = 90
     usage_limit_sample_five_hour_threshold_percent: float
     usage_limit_sample_seven_day_threshold_percent: float
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges]
@@ -683,6 +684,7 @@ class AppSettingsUpdate(BaseModel):
     notify_upstream_balance_low: bool | None = None
     notify_upstream_token_invalid: bool | None = None
     upstream_rate_log_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    upstream_usage_data_retention_days: int | None = Field(default=None, ge=1, le=3650)
     usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges] | None = None
@@ -1337,6 +1339,7 @@ class UpstreamChannelOut(BaseModel):
     today_balance_unit: str | None = None
     today_balance_status: str | None = None
     today_balance_checked_at: datetime | None = None
+    today_recharge_adjusted_balance_used: float | None = None
     yesterday_balance_used: float | None = None
     yesterday_balance_unit: str | None = None
     yesterday_balance_status: str | None = None
@@ -1357,6 +1360,63 @@ class UpstreamChannelOut(BaseModel):
     updated_at: datetime | None = None
     account_count: int = Field(default=0, ge=0)
     accounts: list["UpstreamAccountOut"] = Field(default_factory=list)
+
+
+class UpstreamUsageHistoryAccountOut(BaseModel):
+    sub2api_account_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    account_name: str | None = None
+    upstream_api_key_record_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=JS_SAFE_INTEGER_MAX,
+    )
+    upstream_usage: float | None = None
+    upstream_usage_adjusted: float | None = None
+    upstream_usage_unit: str | None = None
+    upstream_usage_source: str | None = None
+    income: float | None = None
+    income_unit: str | None = None
+
+
+class UpstreamUsageHistoryDayOut(BaseModel):
+    date: date
+    balance_used: float | None = None
+    balance_used_adjusted: float | None = None
+    balance_unit: str | None = None
+    recharge_multiplier: float | None = None
+    upstream_api_key_usage: float | None = None
+    income: float | None = None
+    income_unit: str | None = None
+    cost: float | None = None
+    cost_adjusted: float | None = None
+    finalized: bool = False
+    api_key_accounts: list[UpstreamUsageHistoryAccountOut] = Field(default_factory=list)
+
+
+class UpstreamUsageHistoryTotalsOut(BaseModel):
+    balance_used: float = 0.0
+    balance_used_adjusted: float = 0.0
+    upstream_api_key_usage: float = 0.0
+    income: float = 0.0
+    cost: float | None = None
+    cost_adjusted: float | None = None
+
+
+class UpstreamUsageHistoryOut(BaseModel):
+    channel_id: int = Field(ge=1, le=JS_SAFE_INTEGER_MAX)
+    channel_name: str
+    time_zone: str
+    start_date: date
+    end_date: date
+    api_key_account_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=JS_SAFE_INTEGER_MAX,
+    )
+    api_key_accounts: list[UpstreamUsageHistoryAccountOut] = Field(default_factory=list)
+    days: list[UpstreamUsageHistoryDayOut] = Field(default_factory=list)
+    totals: UpstreamUsageHistoryTotalsOut
+    lifetime_totals: UpstreamUsageHistoryTotalsOut
 
 
 class UpstreamChannelMonitorsOut(BaseModel):

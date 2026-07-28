@@ -445,6 +445,10 @@ export type AppSettings = {
   priority_assign_disabled_api_key_accounts: boolean;
   priority_share_same_composite_multiplier: boolean;
   upstream_rate_log_retention_days: number;
+  /** Number of days to keep per-day upstream usage detail. Lifetime totals are retained separately. */
+  upstream_usage_data_retention_days?: number;
+  /** Compatibility alias returned by earlier backend builds. */
+  upstream_data_retention_days?: number;
   discord_bot_notifications_enabled: boolean;
   discord_bot_token_set: boolean;
   discord_bot_token_hint: string | null;
@@ -521,6 +525,9 @@ export type AppSettingsUpdate = {
   priority_assign_disabled_api_key_accounts?: boolean;
   priority_share_same_composite_multiplier?: boolean;
   upstream_rate_log_retention_days?: number;
+  upstream_usage_data_retention_days?: number;
+  /** Compatibility alias accepted by earlier backend builds. */
+  upstream_data_retention_days?: number;
   discord_bot_notifications_enabled?: boolean;
   discord_bot_token?: string;
   clear_discord_bot_token?: boolean;
@@ -873,6 +880,7 @@ export type UpstreamChannel = {
   balance_checked_at?: string | null;
   recharge_adjusted_balance?: number | null;
   today_balance_used?: number | null;
+  today_recharge_adjusted_balance_used?: number | null;
   today_balance_unit?: string | null;
   today_balance_status?: string | null;
   today_balance_checked_at?: string | null;
@@ -912,6 +920,68 @@ export type UpstreamChannelsResponse = {
   priority_intervals?: PriorityInterval[];
   channels: UpstreamChannel[];
   unassigned_accounts: UpstreamAccount[];
+};
+
+export type UpstreamUsageHistoryAccount = {
+  sub2api_account_id: number | string;
+  account_name: string | null;
+  upstream_api_key_record_id?: number | string | null;
+};
+
+export type UpstreamUsageHistoryAccountDay = UpstreamUsageHistoryAccount & {
+  upstream_usage: number | null;
+  upstream_usage_adjusted?: number | null;
+  upstream_usage_unit?: string | null;
+  upstream_usage_source?: string | null;
+  income: number | null;
+  income_unit?: string | null;
+};
+
+export type UpstreamUsageHistoryDay = {
+  date: string;
+  /** Channel-level wallet consumption; it is not apportioned to an API key filter. */
+  balance_used: number | null;
+  balance_used_adjusted: number | null;
+  balance_unit?: string | null;
+  recharge_multiplier?: number | null;
+  /** Linked sub2api API-key consumption, optionally filtered by account. */
+  upstream_api_key_usage: number | null;
+  income: number | null;
+  income_unit?: string | null;
+  /** Cost is channel balance consumption without a key filter, otherwise that key's consumption. */
+  cost: number | null;
+  cost_adjusted: number | null;
+  finalized?: boolean;
+  api_key_accounts: UpstreamUsageHistoryAccountDay[];
+};
+
+export type UpstreamUsageHistoryTotals = {
+  balance_used: number | null;
+  balance_used_adjusted: number | null;
+  upstream_api_key_usage: number | null;
+  income: number | null;
+  cost: number | null;
+  cost_adjusted: number | null;
+};
+
+export type UpstreamUsageHistory = {
+  channel_id: number | string;
+  channel_name: string | null;
+  time_zone: string;
+  start_date: string;
+  end_date: string;
+  api_key_account_id?: number | string | null;
+  api_key_accounts: UpstreamUsageHistoryAccount[];
+  days: UpstreamUsageHistoryDay[];
+  totals: UpstreamUsageHistoryTotals;
+  lifetime_totals: UpstreamUsageHistoryTotals;
+};
+
+export type UpstreamUsageHistoryFilters = {
+  startDate?: string;
+  endDate?: string;
+  apiKeyAccountId?: number | string | null;
+  timeZone?: string;
 };
 
 export type UpstreamChannelDiscoverAllResult = {

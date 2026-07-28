@@ -1,0 +1,558 @@
+from __future__ import annotations
+
+import math
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import (
+    UpstreamAccountConfig,
+    UpstreamAccountDailyUsage,
+    UpstreamChannel,
+    UpstreamChannelDailyUsage,
+    UpstreamChannelUsageTotal,
+)
+
+
+DEFAULT_TIME_ZONE = "Asia/Shanghai"
+VALID_DAILY_USAGE_STATUSES = frozenset({"ok", "stale", "estimated", "stored"})
+MAX_HISTORY_DAYS = 3660
+
+
+def usage_day(now: datetime, time_zone: str) -> date:
+    """Return the configured local calendar day, falling back deterministically."""
+
+    normalized_now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+    try:
+        zone = ZoneInfo(str(time_zone or "").strip())
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        zone = ZoneInfo(DEFAULT_TIME_ZONE)
+    return normalized_now.astimezone(zone).date()
+
+
+def normalize_history_time_zone(value: str | None) -> str:
+    candidate = str(value or "").strip() or DEFAULT_TIME_ZONE
+    try:
+        ZoneInfo(candidate)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("The time zone is invalid.") from exc
+    return candidate
+
+
+def _finite_amount(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if math.isfinite(amount) and amount >= 0 else None
+
+
+def _safe_text(value: Any, *, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized[:limit] if normalized else None
+
+
+def _snapshot_multiplier(channel: UpstreamChannel, existing: float | None = None) -> float | None:
+    return _finite_amount(
+        existing
+        if existing is not None
+        else channel.effective_recharge_multiplier
+        if channel.effective_recharge_multiplier is not None
+        else channel.last_known_recharge_multiplier
+    )
+
+
+def _adjusted(amount: float | None, multiplier: float | None) -> float | None:
+    if amount is None or multiplier is None:
+        return None
+    adjusted = amount * multiplier
+    return adjusted if math.isfinite(adjusted) else None
+
+
+def _total_values(row: UpstreamChannelDailyUsage | None) -> dict[str, float | None]:
+    return {
+        "balance_used": row.balance_used if row is not None else None,
+        "balance_used_adjusted": row.balance_used_adjusted if row is not None else None,
+        "upstream_api_key_usage": row.upstream_api_key_usage if row is not None else None,
+        "income": row.income if row is not None else None,
+    }
+
+
+async def _daily_row(
+    db: AsyncSession,
+    *,
+    channel_id: int,
+    day: date,
+) -> UpstreamChannelDailyUsage | None:
+    return await db.scalar(
+        select(UpstreamChannelDailyUsage).where(
+            UpstreamChannelDailyUsage.channel_id == channel_id,
+            UpstreamChannelDailyUsage.usage_date == day,
+        )
+    )
+
+
+async def _account_daily_row(
+    db: AsyncSession,
+    *,
+    channel_id: int,
+    account_id: int,
+    day: date,
+) -> UpstreamAccountDailyUsage | None:
+    return await db.scalar(
+        select(UpstreamAccountDailyUsage).where(
+            UpstreamAccountDailyUsage.channel_id == channel_id,
+            UpstreamAccountDailyUsage.sub2api_account_id == account_id,
+            UpstreamAccountDailyUsage.usage_date == day,
+        )
+    )
+
+
+async def _refresh_daily_account_aggregates(
+    db: AsyncSession,
+    row: UpstreamChannelDailyUsage,
+) -> None:
+    sums = (
+        await db.execute(
+            select(
+                func.sum(UpstreamAccountDailyUsage.upstream_usage),
+                func.sum(UpstreamAccountDailyUsage.income),
+            ).where(
+                UpstreamAccountDailyUsage.channel_id == row.channel_id,
+                UpstreamAccountDailyUsage.usage_date == row.usage_date,
+            )
+        )
+    ).one()
+    upstream_usage = _finite_amount(sums[0])
+    income = _finite_amount(sums[1])
+    if upstream_usage is not None:
+        row.upstream_api_key_usage = upstream_usage
+    if income is not None:
+        row.income = income
+        row.income_unit = "CNY"
+
+
+async def _apply_lifetime_delta(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    before: dict[str, float | None],
+    after: dict[str, float | None],
+) -> None:
+    changed = any(before[name] != after[name] for name in before)
+    if not changed:
+        return
+    total = await db.get(UpstreamChannelUsageTotal, channel.id)
+    if total is None:
+        total = UpstreamChannelUsageTotal(
+            channel_id=channel.id,
+            channel_name=_safe_text(channel.display_name, limit=200),
+        )
+        db.add(total)
+    else:
+        total.channel_name = _safe_text(channel.display_name, limit=200)
+    for field, total_field in (
+        ("balance_used", "total_balance_used"),
+        ("balance_used_adjusted", "total_balance_used_adjusted"),
+        ("upstream_api_key_usage", "total_upstream_api_key_usage"),
+        ("income", "total_income"),
+    ):
+        old_value = before[field]
+        new_value = after[field]
+        if new_value is None:
+            continue
+        old_number = old_value if old_value is not None else 0.0
+        next_total = float(getattr(total, total_field) or 0.0) + new_value - old_number
+        setattr(total, total_field, max(0.0, next_total))
+
+
+async def should_fetch_yesterday_usage(
+    db: AsyncSession,
+    *,
+    channel_id: int,
+    now: datetime,
+    time_zone: str,
+) -> bool:
+    yesterday = usage_day(now, time_zone) - timedelta(days=1)
+    row = await _daily_row(db, channel_id=channel_id, day=yesterday)
+    return row is None or not row.finalized
+
+
+async def hydrate_yesterday_usage(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    now: datetime,
+    time_zone: str,
+) -> bool:
+    """Expose a finalized local day in the existing channel-card compatibility fields."""
+
+    yesterday = usage_day(now, time_zone) - timedelta(days=1)
+    row = await _daily_row(db, channel_id=channel.id, day=yesterday)
+    if row is None or not row.finalized or _finite_amount(row.balance_used) is None:
+        return False
+    channel.yesterday_balance_used = row.balance_used
+    channel.yesterday_balance_unit = row.balance_unit or "USD"
+    channel.yesterday_balance_status = "stored"
+    channel.yesterday_balance_checked_at = row.finalized_at or row.observed_at or now
+    return True
+
+
+async def snapshot_today_usage(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    configs: Iterable[UpstreamAccountConfig],
+    income_by_account: dict[int, float],
+    now: datetime,
+    time_zone: str,
+) -> UpstreamChannelDailyUsage | None:
+    """Upsert the current local day without ever adding duplicate lifetime totals."""
+
+    day = usage_day(now, time_zone)
+    row = await _daily_row(db, channel_id=channel.id, day=day)
+    if row is None:
+        row = UpstreamChannelDailyUsage(
+            channel_id=channel.id,
+            channel_name=_safe_text(channel.display_name, limit=200),
+            usage_date=day,
+        )
+        db.add(row)
+        await db.flush()
+    before = _total_values(row)
+    row.channel_name = _safe_text(channel.display_name, limit=200)
+    row.observed_at = now
+    if (
+        str(channel.today_balance_status or "").strip().lower()
+        in VALID_DAILY_USAGE_STATUSES
+    ):
+        balance_used = _finite_amount(channel.today_balance_used)
+        if balance_used is not None:
+            multiplier = _snapshot_multiplier(channel, row.recharge_multiplier)
+            row.balance_used = balance_used
+            row.balance_unit = _safe_text(channel.today_balance_unit, limit=32) or "USD"
+            row.recharge_multiplier = multiplier
+            row.balance_used_adjusted = _adjusted(balance_used, multiplier)
+
+    for config in configs:
+        account_id = int(config.sub2api_account_id)
+        account_row = await _account_daily_row(
+            db,
+            channel_id=channel.id,
+            account_id=account_id,
+            day=day,
+        )
+        if account_row is None:
+            account_row = UpstreamAccountDailyUsage(
+                channel_id=channel.id,
+                sub2api_account_id=account_id,
+                usage_date=day,
+            )
+            db.add(account_row)
+        account_row.upstream_api_key_record_id = config.upstream_api_key_record_id
+        account_row.account_name = _safe_text(config.remote_name, limit=200)
+        account_row.remote_identity_fingerprint = _safe_text(
+            config.remote_identity_fingerprint,
+            limit=64,
+        )
+        account_row.observed_at = now
+        upstream_status = str(config.today_upstream_usage_status or "").strip().lower()
+        upstream_usage = _finite_amount(config.today_upstream_usage_amount)
+        if upstream_usage is not None and upstream_status in VALID_DAILY_USAGE_STATUSES:
+            account_row.upstream_usage = upstream_usage
+            account_row.upstream_usage_unit = (
+                _safe_text(config.today_upstream_usage_unit, limit=32) or "USD"
+            )
+            account_row.upstream_usage_source = _safe_text(
+                config.today_upstream_usage_source,
+                limit=64,
+            )
+        income = _finite_amount(income_by_account.get(account_id))
+        if income is not None:
+            account_row.income = income
+            account_row.income_unit = "CNY"
+
+    await db.flush()
+    await _refresh_daily_account_aggregates(db, row)
+    await _apply_lifetime_delta(
+        db,
+        channel=channel,
+        before=before,
+        after=_total_values(row),
+    )
+    return row
+
+
+async def finalize_yesterday_usage(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    now: datetime,
+    time_zone: str,
+) -> bool:
+    """Store the final upstream yesterday reading once, then reuse it indefinitely."""
+
+    yesterday = usage_day(now, time_zone) - timedelta(days=1)
+    status = str(channel.yesterday_balance_status or "").strip().lower()
+    balance_used = _finite_amount(channel.yesterday_balance_used)
+    if status not in {"ok", "stored"} or balance_used is None:
+        return await hydrate_yesterday_usage(
+            db,
+            channel=channel,
+            now=now,
+            time_zone=time_zone,
+        )
+
+    row = await _daily_row(db, channel_id=channel.id, day=yesterday)
+    if row is None:
+        row = UpstreamChannelDailyUsage(
+            channel_id=channel.id,
+            channel_name=_safe_text(channel.display_name, limit=200),
+            usage_date=yesterday,
+        )
+        db.add(row)
+        await db.flush()
+    before = _total_values(row)
+    multiplier = _snapshot_multiplier(channel, row.recharge_multiplier)
+    row.channel_name = _safe_text(channel.display_name, limit=200)
+    row.balance_used = balance_used
+    row.balance_unit = _safe_text(channel.yesterday_balance_unit, limit=32) or "USD"
+    row.recharge_multiplier = multiplier
+    row.balance_used_adjusted = _adjusted(balance_used, multiplier)
+    row.observed_at = channel.yesterday_balance_checked_at or now
+    row.finalized = True
+    row.finalized_at = now
+    await db.execute(
+        UpstreamAccountDailyUsage.__table__.update()
+        .where(
+            UpstreamAccountDailyUsage.channel_id == channel.id,
+            UpstreamAccountDailyUsage.usage_date == yesterday,
+        )
+        .values(finalized=True)
+    )
+    await db.flush()
+    await _refresh_daily_account_aggregates(db, row)
+    await _apply_lifetime_delta(
+        db,
+        channel=channel,
+        before=before,
+        after=_total_values(row),
+    )
+    await hydrate_yesterday_usage(db, channel=channel, now=now, time_zone=time_zone)
+    return True
+
+
+async def prune_upstream_usage_history(
+    db: AsyncSession,
+    *,
+    retention_days: int,
+    now: datetime | None = None,
+) -> None:
+    if not 1 <= retention_days <= 3650:
+        raise ValueError("retention_days must be between 1 and 3650.")
+    reference = now or datetime.now(timezone.utc)
+    cutoff = reference.date() - timedelta(days=retention_days)
+    await db.execute(
+        delete(UpstreamAccountDailyUsage).where(UpstreamAccountDailyUsage.usage_date < cutoff)
+    )
+    await db.execute(
+        delete(UpstreamChannelDailyUsage).where(UpstreamChannelDailyUsage.usage_date < cutoff)
+    )
+
+
+async def usage_history(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    start_date: date,
+    end_date: date,
+    api_key_account_id: int | None = None,
+    time_zone: str = DEFAULT_TIME_ZONE,
+) -> dict[str, Any]:
+    if end_date < start_date:
+        raise ValueError("end_date must not be earlier than start_date.")
+    if (end_date - start_date).days + 1 > MAX_HISTORY_DAYS:
+        raise ValueError(f"A history request can cover at most {MAX_HISTORY_DAYS} days.")
+
+    daily_rows = list(
+        (
+            await db.execute(
+                select(UpstreamChannelDailyUsage)
+                .where(
+                    UpstreamChannelDailyUsage.channel_id == channel.id,
+                    UpstreamChannelDailyUsage.usage_date >= start_date,
+                    UpstreamChannelDailyUsage.usage_date <= end_date,
+                )
+                .order_by(UpstreamChannelDailyUsage.usage_date)
+            )
+        ).scalars()
+    )
+    daily_by_date = {item.usage_date: item for item in daily_rows}
+    account_statement = (
+        select(UpstreamAccountDailyUsage)
+        .where(
+            UpstreamAccountDailyUsage.channel_id == channel.id,
+            UpstreamAccountDailyUsage.usage_date >= start_date,
+            UpstreamAccountDailyUsage.usage_date <= end_date,
+        )
+        .order_by(
+            UpstreamAccountDailyUsage.usage_date,
+            UpstreamAccountDailyUsage.sub2api_account_id,
+        )
+    )
+    if api_key_account_id is not None:
+        account_statement = account_statement.where(
+            UpstreamAccountDailyUsage.sub2api_account_id == api_key_account_id
+        )
+    account_rows = list((await db.execute(account_statement)).scalars())
+    accounts_by_date: dict[date, list[UpstreamAccountDailyUsage]] = {}
+    for row in account_rows:
+        accounts_by_date.setdefault(row.usage_date, []).append(row)
+
+    configured_accounts = list(
+        (
+            await db.execute(
+                select(UpstreamAccountConfig)
+                .where(UpstreamAccountConfig.channel_id == channel.id)
+                .order_by(UpstreamAccountConfig.sub2api_account_id)
+            )
+        ).scalars()
+    )
+    accounts: dict[int, dict[str, Any]] = {
+        int(config.sub2api_account_id): {
+            "sub2api_account_id": int(config.sub2api_account_id),
+            "account_name": _safe_text(config.remote_name, limit=200),
+            "upstream_api_key_record_id": config.upstream_api_key_record_id,
+        }
+        for config in configured_accounts
+    }
+    for row in account_rows:
+        accounts.setdefault(
+            int(row.sub2api_account_id),
+            {
+                "sub2api_account_id": int(row.sub2api_account_id),
+                "account_name": row.account_name,
+                "upstream_api_key_record_id": row.upstream_api_key_record_id,
+            },
+        )
+
+    days: list[dict[str, Any]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        channel_row = daily_by_date.get(cursor)
+        account_day_rows = accounts_by_date.get(cursor, [])
+        multiplier = channel_row.recharge_multiplier if channel_row is not None else None
+        account_items = [
+            {
+                "sub2api_account_id": int(item.sub2api_account_id),
+                "account_name": item.account_name,
+                "upstream_api_key_record_id": item.upstream_api_key_record_id,
+                "upstream_usage": item.upstream_usage,
+                "upstream_usage_adjusted": _adjusted(item.upstream_usage, multiplier),
+                "upstream_usage_unit": item.upstream_usage_unit,
+                "upstream_usage_source": item.upstream_usage_source,
+                "income": item.income,
+                "income_unit": item.income_unit,
+            }
+            for item in account_day_rows
+        ]
+        account_usage = sum(
+            item.upstream_usage for item in account_day_rows if item.upstream_usage is not None
+        )
+        has_account_usage = any(item.upstream_usage is not None for item in account_day_rows)
+        income = sum(item.income for item in account_day_rows if item.income is not None)
+        has_income = any(item.income is not None for item in account_day_rows)
+        channel_balance = channel_row.balance_used if channel_row is not None else None
+        channel_adjusted = (
+            channel_row.balance_used_adjusted if channel_row is not None else None
+        )
+        # A key filter switches the cost series to that key's observed upstream
+        # usage.  Without a filter, the authoritative channel-wallet reading is
+        # the cost series requested by the balance card.
+        # Once a specific API key is selected, never substitute the whole
+        # channel-wallet expense for a missing per-key reading.  Doing so
+        # makes the filtered income and cost series describe different scopes.
+        filtered_account_cost = account_usage if has_account_usage else None
+        cost_raw = (
+            filtered_account_cost
+            if api_key_account_id is not None
+            else channel_balance
+        )
+        cost_adjusted = (
+            _adjusted(cost_raw, multiplier) if api_key_account_id is not None else channel_adjusted
+        )
+        days.append(
+            {
+                "date": cursor,
+                "balance_used": channel_balance,
+                "balance_used_adjusted": channel_adjusted,
+                "balance_unit": channel_row.balance_unit if channel_row is not None else None,
+                "recharge_multiplier": multiplier,
+                "upstream_api_key_usage": account_usage if has_account_usage else None,
+                "income": income if has_income else None,
+                "income_unit": "CNY" if has_income else None,
+                "cost": cost_raw,
+                "cost_adjusted": cost_adjusted,
+                "finalized": bool(channel_row.finalized) if channel_row is not None else False,
+                "api_key_accounts": account_items,
+            }
+        )
+        cursor += timedelta(days=1)
+
+    def sum_days(field: str) -> float:
+        return sum(float(item[field]) for item in days if item[field] is not None)
+
+    total = await db.get(UpstreamChannelUsageTotal, channel.id)
+    return {
+        "channel_id": channel.id,
+        "channel_name": channel.display_name,
+        "time_zone": time_zone,
+        "start_date": start_date,
+        "end_date": end_date,
+        "api_key_account_id": api_key_account_id,
+        "api_key_accounts": list(accounts.values()),
+        "days": days,
+        "totals": {
+            "balance_used": sum_days("balance_used"),
+            "balance_used_adjusted": sum_days("balance_used_adjusted"),
+            "upstream_api_key_usage": sum_days("upstream_api_key_usage"),
+            "income": sum_days("income"),
+            "cost": sum_days("cost"),
+            "cost_adjusted": sum_days("cost_adjusted"),
+        },
+        "lifetime_totals": {
+            "balance_used": float(total.total_balance_used) if total is not None else 0.0,
+            "balance_used_adjusted": (
+                float(total.total_balance_used_adjusted) if total is not None else 0.0
+            ),
+            "upstream_api_key_usage": (
+                float(total.total_upstream_api_key_usage) if total is not None else 0.0
+            ),
+            "income": float(total.total_income) if total is not None else 0.0,
+            "cost": float(total.total_balance_used) if total is not None else 0.0,
+            "cost_adjusted": (
+                float(total.total_balance_used_adjusted) if total is not None else 0.0
+            ),
+        },
+    }
+
+
+__all__ = [
+    "DEFAULT_TIME_ZONE",
+    "MAX_HISTORY_DAYS",
+    "finalize_yesterday_usage",
+    "hydrate_yesterday_usage",
+    "normalize_history_time_zone",
+    "prune_upstream_usage_history",
+    "should_fetch_yesterday_usage",
+    "snapshot_today_usage",
+    "usage_day",
+    "usage_history",
+]
