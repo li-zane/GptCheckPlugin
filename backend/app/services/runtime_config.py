@@ -116,6 +116,7 @@ KEY_NOTIFY_UPSTREAM_BALANCE_LOW = "notify_upstream_balance_low"
 KEY_NOTIFY_UPSTREAM_TOKEN_INVALID = "notify_upstream_token_invalid"
 KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS = "upstream_rate_log_retention_days"
 KEY_UPSTREAM_USAGE_DATA_RETENTION_DAYS = "upstream_usage_data_retention_days"
+KEY_CHANGE_LOG_PAGE_SIZE = "change_log_page_size"
 KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
 KEY_USAGE_LIMIT_DEFAULT_RANGES = "usage_limit_default_ranges"
@@ -609,6 +610,13 @@ class RuntimeConfigService:
             3650,
         )
 
+    async def get_change_log_page_size(self) -> int:
+        values = await self._load_values()
+        return _change_log_page_size_or_default(
+            values.get(KEY_CHANGE_LOG_PAGE_SIZE),
+            int(getattr(self.settings, "change_log_page_size", 50)),
+        )
+
     async def get_usage_limit_sample_thresholds(self) -> dict[str, float]:
         values = await self._load_values()
         return {
@@ -1008,6 +1016,10 @@ class RuntimeConfigService:
                 1,
                 3650,
             ),
+            "change_log_page_size": _change_log_page_size_or_default(
+                values.get(KEY_CHANGE_LOG_PAGE_SIZE),
+                int(getattr(self.settings, "change_log_page_size", 50)),
+            ),
             "usage_limit_sample_five_hour_threshold_percent": _threshold_or_settings_default(
                 values.get(KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT),
                 self.settings.usage_limit_sample_five_hour_threshold_percent,
@@ -1334,6 +1346,13 @@ class RuntimeConfigService:
                     db,
                     retention_days=retention_days,
                     time_zone=usage_history_time_zone,
+                )
+
+            if payload.get("change_log_page_size") is not None:
+                await self._put(
+                    db,
+                    KEY_CHANGE_LOG_PAGE_SIZE,
+                    str(int(payload["change_log_page_size"])),
                 )
 
             if payload.get("usage_limit_sample_five_hour_threshold_percent") is not None:
@@ -1804,6 +1823,7 @@ class RuntimeConfigService:
             "UPSTREAM_USAGE_DATA_RETENTION_DAYS": str(
                 int(settings.get("upstream_usage_data_retention_days", 90))
             ),
+            "CHANGE_LOG_PAGE_SIZE": str(int(settings.get("change_log_page_size", 50))),
             "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(
                 float(settings["usage_limit_sample_five_hour_threshold_percent"])
             ),
@@ -1907,6 +1927,12 @@ def _bounded_int_or_default(value: str | None, default: int, minimum: int, maxim
     if result > maximum:
         return maximum
     return result
+
+
+def _change_log_page_size_or_default(value: str | None, default: int = 50) -> int:
+    allowed = {20, 50, 100, 200}
+    result = _int_or_default(value, default)
+    return result if result in allowed else (default if default in allowed else 50)
 
 
 def _float_or_default(value: str | None, default: float) -> float:

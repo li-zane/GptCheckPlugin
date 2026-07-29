@@ -3,7 +3,7 @@ import type {
   UpstreamChannelChangeEvent,
 } from "./types";
 
-export const changeLogCacheVersion = 1;
+export const changeLogCacheVersion = 2;
 const cacheKeyPrefix = "sub2api-at-change-log:";
 const maxCachedItems = 200;
 
@@ -18,6 +18,9 @@ export type ChangeLogCacheEntry<T extends ChangeLogItem> = {
   hasMore: boolean;
   unreadCount: number;
   lastReadId: number;
+  totalCount: number;
+  page: number;
+  pageSize: number;
   storedAt: number;
 };
 
@@ -37,9 +40,11 @@ export function changeLogCacheKey(
   startDate: string,
   endDate: string,
   timeZone: string,
+  page = 1,
+  pageSize = 50,
 ) {
   const scope = normalizeBaseUrl(baseUrl);
-  const filters = `${startDate.trim()}|${endDate.trim()}|${timeZone.trim() || "UTC"}`;
+  const filters = `${startDate.trim()}|${endDate.trim()}|${timeZone.trim() || "UTC"}|${page}|${pageSize}`;
   return `${cacheKeyPrefix}v${changeLogCacheVersion}:${encodeURIComponent(scope)}:${category}:${encodeURIComponent(filters)}`;
 }
 
@@ -66,13 +71,21 @@ export function readChangeLogCache<T extends ChangeLogItem>(
 export function writeChangeLogCache<T extends ChangeLogItem>(
   storage: StorageLike | null,
   key: string,
-  entry: Omit<ChangeLogCacheEntry<T>, "storedAt"> & { storedAt?: number },
+  entry: Omit<ChangeLogCacheEntry<T>, "storedAt" | "totalCount" | "page" | "pageSize"> & {
+    totalCount?: number;
+    page?: number;
+    pageSize?: number;
+    storedAt?: number;
+  },
 ) {
   const safeEntry: ChangeLogCacheEntry<T> = {
     items: mergeChangeLogItems([], entry.items),
     hasMore: Boolean(entry.hasMore),
     unreadCount: nonNegativeInteger(entry.unreadCount),
     lastReadId: nonNegativeInteger(entry.lastReadId),
+    totalCount: nonNegativeInteger(entry.totalCount ?? entry.items.length),
+    page: positiveInteger(entry.page, 1),
+    pageSize: positiveInteger(entry.pageSize, 50),
     storedAt: Number.isFinite(entry.storedAt) ? Number(entry.storedAt) : Date.now(),
   };
   memoryCache.set(key, cloneEntry(safeEntry));
@@ -171,6 +184,12 @@ function isCacheEntry(value: unknown): value is ChangeLogCacheEntry<ChangeLogIte
     && Number(entry.unreadCount) >= 0
     && Number.isSafeInteger(entry.lastReadId)
     && Number(entry.lastReadId) >= 0
+    && Number.isSafeInteger(entry.totalCount)
+    && Number(entry.totalCount) >= 0
+    && Number.isSafeInteger(entry.page)
+    && Number(entry.page) >= 1
+    && Number.isSafeInteger(entry.pageSize)
+    && Number(entry.pageSize) >= 1
     && typeof entry.storedAt === "number"
     && Number.isFinite(entry.storedAt);
 }
@@ -182,6 +201,10 @@ function isChangeLogItem(value: unknown): value is ChangeLogItem {
     && Number(item.id) > 0
     && typeof item.created_at === "string"
     && typeof item.unread === "boolean";
+}
+
+function positiveInteger(value: unknown, fallback: number) {
+  return Number.isSafeInteger(value) && Number(value) >= 1 ? Number(value) : fallback;
 }
 
 function nonNegativeInteger(value: unknown) {

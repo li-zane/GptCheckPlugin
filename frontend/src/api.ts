@@ -124,9 +124,11 @@ function upstreamChangeLogsQuery(
   limit = 50,
   beforeId?: number | null,
   filters?: UpstreamChangeLogFilters,
+  page?: number | null,
 ) {
   const params = new URLSearchParams({ limit: String(limit) });
   if (beforeId) params.set("before_id", String(beforeId));
+  if (page) params.set("page", String(page));
   if (filters?.startDate) params.set("start_date", filters.startDate);
   if (filters?.endDate) params.set("end_date", filters.endDate);
   if (filters?.timeZone) params.set("time_zone", filters.timeZone);
@@ -401,15 +403,17 @@ export const api = {
     beforeId?: number | null,
     filters?: UpstreamChangeLogFilters,
     category: "all" | "upstream" | "account_rate" = "all",
+    page = 1,
   ) => request<ChangeLogPage<UpstreamChannelChangeEvent>>(
-    `/api/upstream-accounts/channel-change-events?${upstreamChangeLogsQuery(limit, beforeId, filters)}${category === "all" ? "" : `&category=${category}`}`,
+    `/api/upstream-accounts/channel-change-events?${upstreamChangeLogsQuery(limit, beforeId, filters, page)}${category === "all" ? "" : `&category=${category}`}`,
   ),
   accountSchedulingChangeEvents: (
     limit = 50,
     beforeId?: number | null,
     filters?: UpstreamChangeLogFilters,
+    page = 1,
   ) => request<ChangeLogPage<AccountSchedulingChangeEvent>>(
-    `/api/upstream-accounts/scheduling-change-events?${upstreamChangeLogsQuery(limit, beforeId, filters)}`,
+    `/api/upstream-accounts/scheduling-change-events?${upstreamChangeLogsQuery(limit, beforeId, filters, page)}`,
   ),
   changeLogUnreadCounts: () => request<ChangeLogUnreadCounts>(
     "/api/upstream-accounts/change-log-unread-counts",

@@ -621,7 +621,7 @@ test("API key change pages expose separate ledgers and unread highlighting", () 
   assert.match(source, /className="api-key-change-identity-route"/);
   assert.match(source, /<span>上游 <b>[\s\S]*?<span>\{subjectLabel\}/s);
   assert.doesNotMatch(source, /<i aria-hidden="true">\|<\/i>/);
-  assert.match(source, /api-key-change-message-line--primary">\s*<span>\{upstreamChannelChangeEventLabel\(log\.event_type\)\}<\/span>\s*<\/div>\s*<div className="api-key-change-message-line api-key-change-message-line--detail">\s*\{nameEvent \? \(\s*<div className="api-key-rate-log-flow">/s);
+  assert.match(source, /api-key-change-message-line--primary">\s*<span>\{upstreamChannelChangeEventLabel\(log\.event_type\)\}<\/span>[\s\S]*?<div className="api-key-change-message-line api-key-change-message-line--detail">\s*\{nameEvent \? \(\s*<div className="api-key-rate-log-flow">/s);
   assert.match(source, /\(nameEvent \|\| groupAddedEvent\) && groupMultiplierValue !== null/);
   assert.match(source, /className="api-key-change-message-line api-key-change-message-line--detail"/);
   assert.match(source, /api-key-change-event-row api-key-scheduling-event-row/);
@@ -978,6 +978,10 @@ test("change log cache restores, merges, and marks records read without crossing
     "Asia/Shanghai",
   );
   assert.notEqual(key, accountRateKey);
+  assert.notEqual(
+    key,
+    changeLogCacheKey("https://sub2api.example.com/", "upstream", "2026-07-01", "", "Asia/Shanghai", 2, 50),
+  );
 
   const older = {
     id: 10,
@@ -1012,6 +1016,8 @@ test("change log cache restores, merges, and marks records read without crossing
   clearChangeLogMemoryCache();
   const restored = readChangeLogCache(storage, key);
   assert.deepEqual(restored?.items.map((item) => item.id), [11, 10]);
+  assert.equal(restored?.page, 1);
+  assert.equal(restored?.pageSize, 50);
   assert.equal(readChangeLogCache(storage, accountRateKey), null);
 
   markChangeLogCacheRead(storage, key, 11);
@@ -2917,7 +2923,7 @@ test("separate change ledger APIs include filters, unread counts, and mark-read 
       ? { upstream_changes: 2, account_scheduling_changes: 3 }
       : path.includes("mark-read")
         ? { message: "ok" }
-        : { items: [], unread_count: 0, last_read_id: 0 };
+        : { items: [], unread_count: 0, last_read_id: 0, total_count: 0, page: 1, page_size: 50 };
     return new Response(JSON.stringify(body), {
       headers: { "Content-Type": "application/json" },
       status: 200,
@@ -2928,7 +2934,7 @@ test("separate change ledger APIs include filters, unread counts, and mark-read 
       startDate: "2026-07-01",
       endDate: "2026-07-21",
       timeZone: "Asia/Shanghai",
-    });
+    }, "account_rate", 3);
     await api.accountSchedulingChangeEvents(10);
     await api.changeLogUnreadCounts();
     await api.markUpstreamChannelChangesRead(91);
@@ -2939,11 +2945,15 @@ test("separate change ledger APIs include filters, unread counts, and mark-read 
     assert.deepEqual(Object.fromEntries(channelUrl.searchParams), {
       limit: "25",
       before_id: "80",
+      page: "3",
       start_date: "2026-07-01",
       end_date: "2026-07-21",
       time_zone: "Asia/Shanghai",
+      category: "account_rate",
     });
-    assert.match(calls[1].path, /\/api\/upstream-accounts\/scheduling-change-events\?/);
+    const schedulingUrl = new URL(calls[1].path, "http://localhost");
+    assert.equal(schedulingUrl.pathname, "/api/upstream-accounts/scheduling-change-events");
+    assert.deepEqual(Object.fromEntries(schedulingUrl.searchParams), { limit: "10", page: "1" });
     assert.equal(calls[2].path, "/api/upstream-accounts/change-log-unread-counts");
     assert.equal(calls[3].init?.method, "POST");
     assert.deepEqual(JSON.parse(String(calls[3].init?.body)), { through_id: 91 });
@@ -2953,6 +2963,22 @@ test("separate change ledger APIs include filters, unread counts, and mark-read 
     globalThis.window = originalWindow;
     globalThis.fetch = originalFetch;
   }
+});
+
+test("change ledgers show account-rate reasons and use numbered pagination", () => {
+  const viewSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const typeSource = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
+
+  assert.match(viewSource, /upstream_group_change: "上游分组倍率变化"/);
+  assert.match(viewSource, /upstream_group_assignment_change: "修改上游分组"/);
+  assert.match(viewSource, /原因：\{rateChangeReason\}/);
+  assert.match(viewSource, /function ChangeLogPagination/);
+  assert.match(viewSource, /每页展示条数/);
+  assert.doesNotMatch(viewSource, /加载更多/);
+  assert.match(appSource, /变化记录默认每页条数/);
+  assert.match(appSource, /change_log_page_size: changeLogPageSize/);
+  assert.match(typeSource, /total_count: number;\s+page: number;\s+page_size: number;/);
 });
 
 class MemoryStorage {

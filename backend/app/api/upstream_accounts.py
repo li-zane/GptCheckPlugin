@@ -144,6 +144,7 @@ async def list_upstream_rate_logs(
 @router.get("/channel-change-events", response_model=UpstreamChannelChangePageOut)
 async def list_channel_change_events(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    page: Annotated[int, Query(ge=1)] = 1,
     before_id: Annotated[int | None, Query(ge=1)] = None,
     start_date: Annotated[date | None, Query()] = None,
     end_date: Annotated[date | None, Query()] = None,
@@ -157,10 +158,11 @@ async def list_channel_change_events(
 ) -> UpstreamChannelChangePageOut:
     start_at, end_at = _rate_log_date_bounds(start_date, end_date, time_zone)
     retention_days = await get_runtime_config_service().get_upstream_rate_log_retention_days()
-    rows, last_read_id, unread_count = await list_upstream_channel_changes(
+    rows, last_read_id, unread_count, total_count = await list_upstream_channel_changes(
         db,
         retention_days=retention_days,
         limit=limit,
+        page=page,
         before_id=before_id,
         start_at=start_at,
         end_at=end_at,
@@ -175,12 +177,16 @@ async def list_channel_change_events(
         items=items,
         unread_count=unread_count,
         last_read_id=last_read_id,
+        total_count=total_count,
+        page=page,
+        page_size=limit,
     )
 
 
 @router.get("/scheduling-change-events", response_model=AccountSchedulingChangePageOut)
 async def list_scheduling_change_events(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    page: Annotated[int, Query(ge=1)] = 1,
     before_id: Annotated[int | None, Query(ge=1)] = None,
     start_date: Annotated[date | None, Query()] = None,
     end_date: Annotated[date | None, Query()] = None,
@@ -190,10 +196,11 @@ async def list_scheduling_change_events(
 ) -> AccountSchedulingChangePageOut:
     start_at, end_at = _rate_log_date_bounds(start_date, end_date, time_zone)
     retention_days = await get_runtime_config_service().get_upstream_rate_log_retention_days()
-    rows, last_read_id, unread_count = await list_account_scheduling_changes(
+    rows, last_read_id, unread_count, total_count = await list_account_scheduling_changes(
         db,
         retention_days=retention_days,
         limit=limit,
+        page=page,
         before_id=before_id,
         start_at=start_at,
         end_at=end_at,
@@ -208,6 +215,9 @@ async def list_scheduling_change_events(
         items=items,
         unread_count=unread_count,
         last_read_id=last_read_id,
+        total_count=total_count,
+        page=page,
+        page_size=limit,
     )
 
 

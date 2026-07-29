@@ -213,7 +213,7 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.db.commit()
 
-        page, cursor, unread = await list_upstream_channel_changes(
+        page, cursor, unread, total = await list_upstream_channel_changes(
             self.db,
             retention_days=90,
             limit=2,
@@ -221,7 +221,8 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event.id for event in page], [3, 2])
         self.assertEqual(cursor, 0)
         self.assertEqual(unread, 3)
-        scheduling_page, scheduling_cursor, scheduling_unread = (
+        self.assertEqual(total, 3)
+        scheduling_page, scheduling_cursor, scheduling_unread, scheduling_total = (
             await list_account_scheduling_changes(
                 self.db,
                 retention_days=90,
@@ -231,6 +232,7 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(scheduling_page), 2)
         self.assertEqual(scheduling_cursor, 0)
         self.assertEqual(scheduling_unread, 2)
+        self.assertEqual(scheduling_total, 2)
 
         self.assertEqual(await mark_upstream_changes_read(self.db, 999_999), 3)
         self.assertEqual(await change_log_unread_counts(self.db), (3, 0, 2))
@@ -294,14 +296,15 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.db.commit()
 
-        page, cursor, unread = await list_upstream_channel_changes(
+        page, cursor, unread, total = await list_upstream_channel_changes(
             self.db,
             retention_days=90,
             limit=1,
         )
         self.assertFalse(page[0].legacy_imported)
         self.assertEqual((cursor, unread), (0, 1))
-        older, _, older_unread = await list_upstream_channel_changes(
+        self.assertEqual(total, 2)
+        older, _, older_unread, older_total = await list_upstream_channel_changes(
             self.db,
             retention_days=90,
             limit=1,
@@ -309,6 +312,7 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(older[0].legacy_imported)
         self.assertEqual(older_unread, 1)
+        self.assertEqual(older_total, 2)
 
     async def test_read_paths_do_not_prune_history_or_repair_persisted_cursors(self) -> None:
         old_event = UpstreamChannelChangeEvent(
@@ -323,23 +327,48 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         ])
         await self.db.commit()
 
-        page, cursor, unread = await list_upstream_channel_changes(
+        page, cursor, unread, total = await list_upstream_channel_changes(
             self.db,
             retention_days=1,
             limit=10,
         )
         self.assertEqual([event.id for event in page], [old_event.id])
         self.assertEqual((cursor, unread), (0, 1))
+        self.assertEqual(total, 1)
         self.assertIsNotNone(await self.db.get(UpstreamChannelChangeEvent, old_event.id))
         cursor_setting = await self.db.get(AppSetting, "upstream_change_event_last_read_id")
         self.assertEqual(cursor_setting.value, "999")
-
         self.assertEqual(
             await change_log_unread_counts(self.db, retention_days=1),
             (1, 0, 0),
         )
         self.assertIsNotNone(await self.db.get(UpstreamChannelChangeEvent, old_event.id))
         self.assertEqual(cursor_setting.value, "999")
+
+    async def test_numbered_pages_use_offset_and_return_filtered_total(self) -> None:
+        self.db.add_all(
+            [
+                UpstreamChannelChangeEvent(
+                    channel_id=1,
+                    event_type="group_added" if index < 4 else "account_rate_changed",
+                    group_id=f"group-{index}",
+                    created_at=datetime(2026, 7, index + 1, tzinfo=timezone.utc),
+                )
+                for index in range(5)
+            ]
+        )
+        await self.db.commit()
+
+        rows, _, _, total = await list_upstream_channel_changes(
+            self.db,
+            retention_days=90,
+            limit=2,
+            page=2,
+            category="upstream",
+        )
+
+        self.assertEqual([row.group_id for row in rows], ["group-1", "group-0"])
+        self.assertEqual(total, 4)
 
 
 if __name__ == "__main__":

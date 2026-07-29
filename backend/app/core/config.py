@@ -103,6 +103,7 @@ class Settings(BaseSettings):
     priority_share_same_composite_multiplier: bool = False
     upstream_rate_log_retention_days: int = Field(default=90, ge=1, le=3650)
     upstream_usage_data_retention_days: int = Field(default=90, ge=1, le=3650)
+    change_log_page_size: int = 50
     discord_bot_notifications_enabled: bool = False
     discord_bot_token: str = ""
     discord_bot_channel_id: str = ""
@@ -172,6 +173,13 @@ class Settings(BaseSettings):
     def ensure_leading_slash(cls, value: str) -> str:
         if not value.startswith("/"):
             return f"/{value}"
+        return value
+
+    @field_validator("change_log_page_size")
+    @classmethod
+    def validate_change_log_page_size(cls, value: int) -> int:
+        if value not in {20, 50, 100, 200}:
+            raise ValueError("change_log_page_size must be 20, 50, 100, or 200")
         return value
 
     @model_validator(mode="after")

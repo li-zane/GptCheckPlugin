@@ -288,6 +288,7 @@ const emptySettings: AppSettings = {
   priority_assign_disabled_api_key_accounts: false,
   priority_share_same_composite_multiplier: false,
   upstream_rate_log_retention_days: 90,
+  change_log_page_size: 50,
   upstream_usage_data_retention_days: 90,
   discord_bot_notifications_enabled: false,
   discord_bot_token_set: false,
@@ -1255,6 +1256,7 @@ function App() {
                   ? [settings.channel_monitor_fallback_test_model]
                   : []}
               displayTimeZone={settings.display_timezone || defaultTimeZone}
+              changeLogPageSize={settings.change_log_page_size || 50}
               globallyBusy={busy || apiKeySyncBusy || pageRefreshing}
               key={upstreamOverviewCacheScope(settings.sub2api_base_url)}
               onCacheChange={cacheApiKeyAccounts}
@@ -5137,6 +5139,9 @@ function SettingsView({
   const [upstreamRateLogRetentionDays, setUpstreamRateLogRetentionDays] = useState(
     String(settings.upstream_rate_log_retention_days || 90),
   );
+  const [changeLogPageSize, setChangeLogPageSize] = useState<20 | 50 | 100 | 200>(
+    settings.change_log_page_size || 50,
+  );
   const [upstreamUsageDataRetentionDays, setUpstreamUsageDataRetentionDays] = useState(
     String(settings.upstream_usage_data_retention_days ?? settings.upstream_data_retention_days ?? 90),
   );
@@ -5253,6 +5258,7 @@ function SettingsView({
     setNotifyUpstreamBalanceLow(settings.notify_upstream_balance_low ?? false);
     setNotifyUpstreamTokenInvalid(settings.notify_upstream_token_invalid ?? false);
     setUpstreamRateLogRetentionDays(String(settings.upstream_rate_log_retention_days || 90));
+    setChangeLogPageSize(settings.change_log_page_size || 50);
     setUpstreamUsageDataRetentionDays(
       String(settings.upstream_usage_data_retention_days ?? settings.upstream_data_retention_days ?? 90),
     );
@@ -5334,6 +5340,7 @@ function SettingsView({
     settings.usage_refresh_interval_seconds,
     settings.usage_refresh_max_concurrency,
     settings.upstream_rate_log_retention_days,
+    settings.change_log_page_size,
     settings.upstream_usage_data_retention_days,
     settings.upstream_data_retention_days,
     settings.upstream_rate_sync_enabled,
@@ -5553,6 +5560,7 @@ function SettingsView({
       priority_assign_disabled_api_key_accounts: priorityAssignDisabledAccounts,
       priority_share_same_composite_multiplier: priorityShareSameCompositeMultiplier,
       upstream_rate_log_retention_days: upstreamRateLogRetentionDaysNumber,
+      change_log_page_size: changeLogPageSize,
       upstream_usage_data_retention_days: upstreamUsageDataRetentionDaysNumber,
       discord_bot_notifications_enabled: discordNotificationsEnabled,
       discord_bot_channel_id: cleanDiscordChannelId,
@@ -6307,6 +6315,19 @@ function SettingsView({
                   type="number"
                   value={upstreamRateLogRetentionDays}
                 />
+              </label>
+              <label>
+                变化记录默认每页条数
+                <select
+                  onChange={(event) => setChangeLogPageSize(Number(event.target.value) as 20 | 50 | 100 | 200)}
+                  value={changeLogPageSize}
+                >
+                  <option value={20}>20 条</option>
+                  <option value={50}>50 条</option>
+                  <option value={100}>100 条</option>
+                  <option value={200}>200 条</option>
+                </select>
+                <small>统一应用到三个变化记录页面，并随服务端配置保存。</small>
               </label>
               <label>
                 上游数据存储天数

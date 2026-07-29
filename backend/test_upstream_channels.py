@@ -44,6 +44,7 @@ from app.services.upstream_accounts import (
 from app.services.upstream_channels import (
     UpstreamChannelService,
     UpstreamDiscoveryOptions,
+    _account_group_rate_change_reason,
     get_upstream_channel_service,
 )
 from app.services.upstream_client import (
@@ -210,6 +211,28 @@ class FakeSub2Api(Sub2ApiClient):
 
 
 class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_account_group_rate_reason_prioritizes_assignment_over_multiplier(self) -> None:
+        self.assertEqual(
+            _account_group_rate_change_reason(
+                previous_group_id="old",
+                current_group_id="new",
+                previous_group_name="Old",
+                current_group_name="New",
+                multiplier_changed=True,
+            ),
+            "upstream_group_assignment_change",
+        )
+        self.assertEqual(
+            _account_group_rate_change_reason(
+                previous_group_id="same",
+                current_group_id="same",
+                previous_group_name="Same",
+                current_group_name="Same",
+                multiplier_changed=True,
+            ),
+            "upstream_group_change",
+        )
+
     async def asyncSetUp(self) -> None:
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         async with self.engine.begin() as connection:
@@ -2710,7 +2733,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(events), 1)
         self.assertEqual((events[0].old_value, events[0].new_value), (1.0, 1.25))
-        self.assertEqual(events[0].details["reason"], "external_observed")
+        self.assertEqual(events[0].details["reason"], "upstream_recharge_change")
+        self.assertEqual(events[0].details["transition_reason"], "external_observed")
         notification = await self.db.scalar(
             select(NotificationOutbox).where(
                 NotificationOutbox.event_type == "api_key_rate_changed"
@@ -3554,7 +3578,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [item.reason for item in logs],
             [
-                "upstream_group_change",
+                "upstream_group_assignment_change",
                 "upstream_group_change",
                 "upstream_recharge_change",
                 "local_recharge_change",

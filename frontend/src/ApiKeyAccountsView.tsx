@@ -8,6 +8,10 @@ import {
   CalendarDays,
   ChartNoAxesCombined,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   CircleOff,
   ExternalLink,
   Globe2,
@@ -60,7 +64,6 @@ import {
   changeLogCacheKey,
   getChangeLogSessionStorage,
   markChangeLogCacheRead,
-  mergeChangeLogItems,
   readChangeLogCache,
   writeChangeLogCache,
 } from "./changeLogCache";
@@ -248,9 +251,19 @@ const emptyPriorityIntervalForm: PriorityIntervalForm = {
   rateAbsoluteThreshold: "1",
 };
 
+const CHANGE_LOG_PAGE_SIZE_OPTIONS = [20, 50, 100, 200] as const;
+type ChangeLogPageSize = (typeof CHANGE_LOG_PAGE_SIZE_OPTIONS)[number];
+
+function normalizeChangeLogPageSize(value: number): ChangeLogPageSize {
+  return CHANGE_LOG_PAGE_SIZE_OPTIONS.includes(value as ChangeLogPageSize)
+    ? value as ChangeLogPageSize
+    : 50;
+}
+
 export function ApiKeyAccountsView({
   cacheBaseUrl,
   cachedData,
+  changeLogPageSize,
   channelMonitorFallbackTestModels,
   displayTimeZone,
   globallyBusy,
@@ -265,6 +278,7 @@ export function ApiKeyAccountsView({
 }: {
   cacheBaseUrl: string;
   cachedData: UpstreamChannelsResponse | null;
+  changeLogPageSize: number;
   channelMonitorFallbackTestModels: string[];
   displayTimeZone: string;
   globallyBusy: boolean;
@@ -296,14 +310,18 @@ export function ApiKeyAccountsView({
   const [rateLogsLoaded, setRateLogsLoaded] = useState(false);
   const [rateLogsLoading, setRateLogsLoading] = useState(false);
   const [rateLogsError, setRateLogsError] = useState("");
-  const [rateLogsHasMore, setRateLogsHasMore] = useState(false);
+  const [rateLogPage, setRateLogPage] = useState(1);
+  const [rateLogPageSize, setRateLogPageSize] = useState<ChangeLogPageSize>(() => normalizeChangeLogPageSize(changeLogPageSize));
+  const [rateLogTotalCount, setRateLogTotalCount] = useState(0);
   const [rateLogDraftFilters, setRateLogDraftFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
   const [rateLogFilters, setRateLogFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
   const [scheduleLogs, setScheduleLogs] = useState<AccountSchedulingChangeEvent[]>([]);
   const [scheduleLogsLoaded, setScheduleLogsLoaded] = useState(false);
   const [scheduleLogsLoading, setScheduleLogsLoading] = useState(false);
   const [scheduleLogsError, setScheduleLogsError] = useState("");
-  const [scheduleLogsHasMore, setScheduleLogsHasMore] = useState(false);
+  const [scheduleLogPage, setScheduleLogPage] = useState(1);
+  const [scheduleLogPageSize, setScheduleLogPageSize] = useState<ChangeLogPageSize>(() => normalizeChangeLogPageSize(changeLogPageSize));
+  const [scheduleLogTotalCount, setScheduleLogTotalCount] = useState(0);
   const [scheduleLogDraftFilters, setScheduleLogDraftFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
   const [scheduleLogFilters, setScheduleLogFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
   const [changeLogUnreadCounts, setChangeLogUnreadCounts] = useState<ChangeLogUnreadCounts>({
@@ -421,8 +439,10 @@ export function ApiKeyAccountsView({
       rateLogFilters.startDate,
       rateLogFilters.endDate,
       displayTimeZone,
+      rateLogPage,
+      rateLogPageSize,
     )
-  ), [cacheBaseUrl, displayTimeZone, rateLogFilters.endDate, rateLogFilters.startDate]);
+  ), [cacheBaseUrl, displayTimeZone, rateLogFilters.endDate, rateLogFilters.startDate, rateLogPage, rateLogPageSize]);
   const schedulingLogCacheKey = useCallback(() => (
     changeLogCacheKey(
       cacheBaseUrl,
@@ -430,8 +450,10 @@ export function ApiKeyAccountsView({
       scheduleLogFilters.startDate,
       scheduleLogFilters.endDate,
       displayTimeZone,
+      scheduleLogPage,
+      scheduleLogPageSize,
     )
-  ), [cacheBaseUrl, displayTimeZone, scheduleLogFilters.endDate, scheduleLogFilters.startDate]);
+  ), [cacheBaseUrl, displayTimeZone, scheduleLogFilters.endDate, scheduleLogFilters.startDate, scheduleLogPage, scheduleLogPageSize]);
   const localMutationBusy = savingDialog
     || priorityIntervalsBusy
     || bulkDiscovering
@@ -575,7 +597,7 @@ export function ApiKeyAccountsView({
     }
   }, [cachedData, commitData, loadData, refreshVersion]);
 
-  const loadRateLogs = useCallback(async (append = false) => {
+  const loadRateLogs = useCallback(async () => {
     const logSubview = subview === "account-rate-log" ? "account-rate-log" : "rate-log";
     const category = logSubview === "account-rate-log" ? "account_rate" : "upstream";
     const cacheKey = rateLogCacheKey(category);
@@ -584,31 +606,34 @@ export function ApiKeyAccountsView({
     setRateLogsLoading(true);
     setRateLogsError("");
     try {
-      const beforeId = append && rateLogsRef.current.length
-        ? rateLogsRef.current[rateLogsRef.current.length - 1].id
-        : null;
-      const page = await api.upstreamChannelChangeEvents(50, beforeId, {
+      const page = await api.upstreamChannelChangeEvents(rateLogPageSize, null, {
         startDate: rateLogFilters.startDate || undefined,
         endDate: rateLogFilters.endDate || undefined,
         timeZone: displayTimeZone,
-      }, category);
+      }, category, rateLogPage);
       if (
         sequence !== rateLogsRequestSequence.current
         || !componentMountedRef.current
         || previousSubviewRef.current !== logSubview
         || (logSubview === "rate-log" && previousSubviewRef.current !== "rate-log")
       ) return;
+      const totalPages = Math.max(1, Math.ceil(page.total_count / page.page_size));
+      if (rateLogPage > totalPages) {
+        setRateLogPage(totalPages);
+        return;
+      }
       const next = page.items;
-      const merged = mergeChangeLogItems(rateLogsRef.current, next);
-      const hasMore = next.length === 50;
-      rateLogsRef.current = merged;
-      setRateLogs(merged);
-      setRateLogsHasMore(hasMore);
+      rateLogsRef.current = next;
+      setRateLogs(next);
+      setRateLogTotalCount(page.total_count);
       writeChangeLogCache(getChangeLogSessionStorage(), cacheKey, {
-        items: merged,
-        hasMore,
+        items: next,
+        hasMore: rateLogPage < totalPages,
         unreadCount: page.unread_count,
         lastReadId: page.last_read_id,
+        totalCount: page.total_count,
+        page: page.page,
+        pageSize: page.page_size,
       });
       const pendingRef = category === "account_rate"
         ? pendingAccountRateLogReadThroughIdRef
@@ -617,12 +642,10 @@ export function ApiKeyAccountsView({
         pendingRef.current,
         next,
       );
-      if (!append) {
-        setChangeLogUnreadCounts((current) => ({
-          ...current,
-          [category === "account_rate" ? "account_rate_changes" : "upstream_changes"]: page.unread_count,
-        }));
-      }
+      setChangeLogUnreadCounts((current) => ({
+        ...current,
+        [category === "account_rate" ? "account_rate_changes" : "upstream_changes"]: page.unread_count,
+      }));
       setRateLogsLoaded(true);
     } catch (reason) {
       if (sequence === rateLogsRequestSequence.current) {
@@ -635,50 +658,51 @@ export function ApiKeyAccountsView({
     } finally {
       if (sequence === rateLogsRequestSequence.current) setRateLogsLoading(false);
     }
-  }, [displayTimeZone, rateLogCacheKey, rateLogFilters, subview]);
+  }, [displayTimeZone, rateLogCacheKey, rateLogFilters, rateLogPage, rateLogPageSize, subview]);
 
-  const loadScheduleLogs = useCallback(async (append = false) => {
+  const loadScheduleLogs = useCallback(async () => {
     const cacheKey = schedulingLogCacheKey();
     scheduleLogCacheKeyRef.current = cacheKey;
     const sequence = ++scheduleLogsRequestSequence.current;
     setScheduleLogsLoading(true);
     setScheduleLogsError("");
     try {
-      const beforeId = append && scheduleLogsRef.current.length
-        ? scheduleLogsRef.current[scheduleLogsRef.current.length - 1].id
-        : null;
-      const page = await api.accountSchedulingChangeEvents(50, beforeId, {
+      const page = await api.accountSchedulingChangeEvents(scheduleLogPageSize, null, {
         startDate: scheduleLogFilters.startDate || undefined,
         endDate: scheduleLogFilters.endDate || undefined,
         timeZone: displayTimeZone,
-      });
+      }, scheduleLogPage);
       if (
         sequence !== scheduleLogsRequestSequence.current
         || !componentMountedRef.current
         || previousSubviewRef.current !== "schedule-log"
       ) return;
+      const totalPages = Math.max(1, Math.ceil(page.total_count / page.page_size));
+      if (scheduleLogPage > totalPages) {
+        setScheduleLogPage(totalPages);
+        return;
+      }
       const next = page.items;
-      const merged = mergeChangeLogItems(scheduleLogsRef.current, next);
-      const hasMore = next.length === 50;
-      scheduleLogsRef.current = merged;
-      setScheduleLogs(merged);
-      setScheduleLogsHasMore(hasMore);
+      scheduleLogsRef.current = next;
+      setScheduleLogs(next);
+      setScheduleLogTotalCount(page.total_count);
       writeChangeLogCache(getChangeLogSessionStorage(), cacheKey, {
-        items: merged,
-        hasMore,
+        items: next,
+        hasMore: scheduleLogPage < totalPages,
         unreadCount: page.unread_count,
         lastReadId: page.last_read_id,
+        totalCount: page.total_count,
+        page: page.page,
+        pageSize: page.page_size,
       });
       pendingScheduleLogReadThroughIdRef.current = pendingReadThroughId(
         pendingScheduleLogReadThroughIdRef.current,
         next,
       );
-      if (!append) {
-        setChangeLogUnreadCounts((current) => ({
-          ...current,
-          account_scheduling_changes: page.unread_count,
-        }));
-      }
+      setChangeLogUnreadCounts((current) => ({
+        ...current,
+        account_scheduling_changes: page.unread_count,
+      }));
       setScheduleLogsLoaded(true);
     } catch (reason) {
       if (sequence === scheduleLogsRequestSequence.current) {
@@ -688,32 +712,37 @@ export function ApiKeyAccountsView({
     } finally {
       if (sequence === scheduleLogsRequestSequence.current) setScheduleLogsLoading(false);
     }
-  }, [displayTimeZone, scheduleLogFilters, schedulingLogCacheKey]);
+  }, [displayTimeZone, scheduleLogFilters, scheduleLogPage, scheduleLogPageSize, schedulingLogCacheKey]);
 
   const warmDefaultChangeLogCaches = useCallback(async () => {
     const storage = getChangeLogSessionStorage();
     const filters = { timeZone: displayTimeZone };
-    const upstreamCacheKey = changeLogCacheKey(cacheBaseUrl, "upstream", "", "", displayTimeZone);
-    const accountRateCacheKey = changeLogCacheKey(cacheBaseUrl, "account_rate", "", "", displayTimeZone);
-    const schedulingCacheKey = changeLogCacheKey(cacheBaseUrl, "scheduling", "", "", displayTimeZone);
+    const defaultPageSize = normalizeChangeLogPageSize(changeLogPageSize);
+    const upstreamCacheKey = changeLogCacheKey(cacheBaseUrl, "upstream", "", "", displayTimeZone, 1, defaultPageSize);
+    const accountRateCacheKey = changeLogCacheKey(cacheBaseUrl, "account_rate", "", "", displayTimeZone, 1, defaultPageSize);
+    const schedulingCacheKey = changeLogCacheKey(cacheBaseUrl, "scheduling", "", "", displayTimeZone, 1, defaultPageSize);
     const warmRateCache = async (category: "upstream" | "account_rate", cacheKey: string) => {
-      const page = await api.upstreamChannelChangeEvents(50, null, filters, category);
-      const cached = readChangeLogCache<UpstreamChannelChangeEvent>(storage, cacheKey);
+      const page = await api.upstreamChannelChangeEvents(defaultPageSize, null, filters, category, 1);
       writeChangeLogCache(storage, cacheKey, {
-        items: mergeChangeLogItems(cached?.items || [], page.items),
-        hasMore: page.items.length === 50,
+        items: page.items,
+        hasMore: page.items.length < page.total_count,
         unreadCount: page.unread_count,
         lastReadId: page.last_read_id,
+        totalCount: page.total_count,
+        page: page.page,
+        pageSize: page.page_size,
       });
     };
     const warmSchedulingCache = async () => {
-      const page = await api.accountSchedulingChangeEvents(50, null, filters);
-      const cached = readChangeLogCache<AccountSchedulingChangeEvent>(storage, schedulingCacheKey);
+      const page = await api.accountSchedulingChangeEvents(defaultPageSize, null, filters, 1);
       writeChangeLogCache(storage, schedulingCacheKey, {
-        items: mergeChangeLogItems(cached?.items || [], page.items),
-        hasMore: page.items.length === 50,
+        items: page.items,
+        hasMore: page.items.length < page.total_count,
         unreadCount: page.unread_count,
         lastReadId: page.last_read_id,
+        totalCount: page.total_count,
+        page: page.page,
+        pageSize: page.page_size,
       });
     };
     const tasks: Array<Promise<void>> = [];
@@ -721,7 +750,7 @@ export function ApiKeyAccountsView({
     if (subview !== "account-rate-log") tasks.push(warmRateCache("account_rate", accountRateCacheKey));
     if (subview !== "schedule-log") tasks.push(warmSchedulingCache());
     await Promise.allSettled(tasks);
-  }, [cacheBaseUrl, displayTimeZone, subview]);
+  }, [cacheBaseUrl, changeLogPageSize, displayTimeZone, subview]);
 
   const markRateLogsReadOnLeave = useCallback(async (
     category: "upstream" | "account_rate",
@@ -852,7 +881,7 @@ export function ApiKeyAccountsView({
     const items = cached?.items || [];
     rateLogsRef.current = items;
     setRateLogs(items);
-    setRateLogsHasMore(cached?.hasMore || false);
+    setRateLogTotalCount(cached?.totalCount || 0);
     setRateLogsLoaded(Boolean(cached));
     setRateLogsLoading(false);
     setRateLogsError("");
@@ -880,7 +909,7 @@ export function ApiKeyAccountsView({
     const items = cached?.items || [];
     scheduleLogsRef.current = items;
     setScheduleLogs(items);
-    setScheduleLogsHasMore(cached?.hasMore || false);
+    setScheduleLogTotalCount(cached?.totalCount || 0);
     setScheduleLogsLoaded(Boolean(cached));
     setScheduleLogsLoading(false);
     setScheduleLogsError("");
@@ -926,7 +955,8 @@ export function ApiKeyAccountsView({
     rateLogsRequestSequence.current += 1;
     setRateLogs([]);
     setRateLogsLoading(false);
-    setRateLogsHasMore(false);
+    setRateLogPage(1);
+    setRateLogTotalCount(0);
     setRateLogFilters(rateLogDraftFilters);
     setRateLogsLoaded(false);
   }, [rateLogDraftFilters]);
@@ -938,7 +968,8 @@ export function ApiKeyAccountsView({
     rateLogsRequestSequence.current += 1;
     setRateLogs([]);
     setRateLogsLoading(false);
-    setRateLogsHasMore(false);
+    setRateLogPage(1);
+    setRateLogTotalCount(0);
     setRateLogFilters(emptyFilters);
     setRateLogsLoaded(false);
   }, []);
@@ -956,7 +987,8 @@ export function ApiKeyAccountsView({
     scheduleLogsRequestSequence.current += 1;
     setScheduleLogs([]);
     setScheduleLogsLoading(false);
-    setScheduleLogsHasMore(false);
+    setScheduleLogPage(1);
+    setScheduleLogTotalCount(0);
     setScheduleLogFilters(scheduleLogDraftFilters);
     setScheduleLogsLoaded(false);
   }, [scheduleLogDraftFilters]);
@@ -968,7 +1000,8 @@ export function ApiKeyAccountsView({
     scheduleLogsRequestSequence.current += 1;
     setScheduleLogs([]);
     setScheduleLogsLoading(false);
-    setScheduleLogsHasMore(false);
+    setScheduleLogPage(1);
+    setScheduleLogTotalCount(0);
     setScheduleLogFilters(emptyFilters);
     setScheduleLogsLoaded(false);
   }, []);
@@ -978,11 +1011,19 @@ export function ApiKeyAccountsView({
   }, [refreshChangeLogUnreadCounts, refreshVersion]);
 
   useEffect(() => {
-    const scope = `${cacheBaseUrl}|${displayTimeZone}`;
+    const nextPageSize = normalizeChangeLogPageSize(changeLogPageSize);
+    setRateLogPageSize(nextPageSize);
+    setScheduleLogPageSize(nextPageSize);
+    setRateLogPage(1);
+    setScheduleLogPage(1);
+  }, [changeLogPageSize]);
+
+  useEffect(() => {
+    const scope = `${cacheBaseUrl}|${displayTimeZone}|${changeLogPageSize}`;
     if (warmedChangeLogCacheScopeRef.current === scope) return;
     warmedChangeLogCacheScopeRef.current = scope;
     void warmDefaultChangeLogCaches();
-  }, [cacheBaseUrl, displayTimeZone, warmDefaultChangeLogCaches]);
+  }, [cacheBaseUrl, changeLogPageSize, displayTimeZone, warmDefaultChangeLogCaches]);
 
   useEffect(() => {
     const refreshWhenVisible = () => {
@@ -1694,7 +1735,8 @@ export function ApiKeyAccountsView({
       rateLogsRequestSequence.current += 1;
       setRateLogs([]);
       setRateLogsLoading(false);
-      setRateLogsHasMore(false);
+      setRateLogPage(1);
+      setRateLogTotalCount(0);
       setRateLogsLoaded(false);
       setError("");
       setNotice(
@@ -1726,7 +1768,8 @@ export function ApiKeyAccountsView({
       rateLogsRequestSequence.current += 1;
       setRateLogs([]);
       setRateLogsLoading(false);
-      setRateLogsHasMore(false);
+      setRateLogPage(1);
+      setRateLogTotalCount(0);
       setRateLogsLoaded(false);
       setNotice(channelDiscoverySuccessMessage(rateWritesEnabled, channelDisplayName(channel)));
     } catch (reason) {
@@ -1794,7 +1837,8 @@ export function ApiKeyAccountsView({
       rateLogsRequestSequence.current += 1;
       setRateLogs([]);
       setRateLogsLoading(false);
-      setRateLogsHasMore(false);
+      setRateLogPage(1);
+      setRateLogTotalCount(0);
       setRateLogsLoaded(false);
       setNotice(apiAccountSyncMessage(result, rateWritesEnabled));
     } catch (reason) {
@@ -1970,7 +2014,8 @@ export function ApiKeyAccountsView({
       rateLogsRequestSequence.current += 1;
       setRateLogs([]);
       setRateLogsLoading(false);
-      setRateLogsHasMore(false);
+      setRateLogPage(1);
+      setRateLogTotalCount(0);
       setRateLogsLoaded(false);
       setNotice("已从 sub2api 删除 " + accountDisplayName(account) + "。");
     } catch (reason) {
@@ -2972,15 +3017,21 @@ export function ApiKeyAccountsView({
           draftFilters={rateLogDraftFilters}
           error={rateLogsError}
           filtersApplied={Boolean(rateLogFilters.startDate || rateLogFilters.endDate)}
-          hasMore={rateLogsHasMore}
           loading={rateLogsLoading}
           logs={rateLogs}
           channels={data.channels}
           kind={subview === "account-rate-log" ? "account_rate" : "upstream"}
+          page={rateLogPage}
+          pageSize={rateLogPageSize}
+          totalCount={rateLogTotalCount}
           onApplyFilters={applyRateLogFilters}
           onClearFilters={clearRateLogFilters}
           onDraftFiltersChange={setRateLogDraftFilters}
-          onLoadMore={() => void loadRateLogs(true)}
+          onPageChange={setRateLogPage}
+          onPageSizeChange={(pageSize) => {
+            setRateLogPageSize(pageSize);
+            setRateLogPage(1);
+          }}
           onRefresh={() => void loadRateLogs()}
         />
       ) : (
@@ -2989,13 +3040,19 @@ export function ApiKeyAccountsView({
           draftFilters={scheduleLogDraftFilters}
           error={scheduleLogsError}
           filtersApplied={Boolean(scheduleLogFilters.startDate || scheduleLogFilters.endDate)}
-          hasMore={scheduleLogsHasMore}
           loading={scheduleLogsLoading}
           logs={scheduleLogs}
+          page={scheduleLogPage}
+          pageSize={scheduleLogPageSize}
+          totalCount={scheduleLogTotalCount}
           onApplyFilters={applyScheduleLogFilters}
           onClearFilters={clearScheduleLogFilters}
           onDraftFiltersChange={setScheduleLogDraftFilters}
-          onLoadMore={() => void loadScheduleLogs(true)}
+          onPageChange={setScheduleLogPage}
+          onPageSizeChange={(pageSize) => {
+            setScheduleLogPageSize(pageSize);
+            setScheduleLogPage(1);
+          }}
           onRefresh={() => void loadScheduleLogs()}
         />
       )}
@@ -4743,14 +4800,17 @@ function RateChangeLogView({
   draftFilters,
   error,
   filtersApplied,
-  hasMore,
   kind,
   loading,
   logs,
+  page,
+  pageSize,
+  totalCount,
   onApplyFilters,
   onClearFilters,
   onDraftFiltersChange,
-  onLoadMore,
+  onPageChange,
+  onPageSizeChange,
   onRefresh,
 }: {
   channels: UpstreamChannel[];
@@ -4758,14 +4818,17 @@ function RateChangeLogView({
   draftFilters: RateLogFilters;
   error: string;
   filtersApplied: boolean;
-  hasMore: boolean;
   kind: "upstream" | "account_rate";
   loading: boolean;
   logs: UpstreamChannelChangeEvent[];
+  page: number;
+  pageSize: ChangeLogPageSize;
+  totalCount: number;
   onApplyFilters: () => void;
   onClearFilters: () => void;
   onDraftFiltersChange: (filters: RateLogFilters) => void;
-  onLoadMore: () => void;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (pageSize: ChangeLogPageSize) => void;
   onRefresh: () => void;
 }) {
   const accountRateView = kind === "account_rate";
@@ -4892,6 +4955,7 @@ function RateChangeLogView({
                 : log.event_type === "channel_multiplier_changed" ? "充值倍率" : "状态";
             const groupMultiplierValue = groupRate.newGroupMultiplier ?? groupRate.oldGroupMultiplier;
             const compositeMultiplierValue = groupRate.newCompositeMultiplier ?? groupRate.oldCompositeMultiplier;
+            const rateChangeReason = accountRateView ? accountRateChangeReasonLabel(log) : null;
             return (
               <article
                 className={`api-key-rate-log-row api-key-change-event-row api-key-change-event-row--${category.tone}${log.unread ? " is-unread" : ""}`}
@@ -4911,6 +4975,7 @@ function RateChangeLogView({
                 <div className="api-key-rate-log-cell api-key-rate-log-cell--primary">
                   <div className="api-key-change-message-line api-key-change-message-line--primary">
                     <span>{upstreamChannelChangeEventLabel(log.event_type)}</span>
+                    {rateChangeReason ? <span className="api-key-rate-change-reason">原因：{rateChangeReason}</span> : null}
                   </div>
                   <div className="api-key-change-message-line api-key-change-message-line--detail">
                     {nameEvent ? (
@@ -4973,14 +5038,14 @@ function RateChangeLogView({
         </div>
       )}
 
-      {hasMore ? (
-        <div className="api-key-rate-log-more">
-          <button className="api-key-button api-key-button--secondary" disabled={loading} onClick={onLoadMore} type="button">
-            <History size={15} />
-            <span>{loading ? "读取中" : "加载更多"}</span>
-          </button>
-        </div>
-      ) : null}
+      <ChangeLogPagination
+        loading={loading}
+        onPageChange={onPageChange}
+        onPageSizeChange={onPageSizeChange}
+        page={page}
+        pageSize={pageSize}
+        totalCount={totalCount}
+      />
     </section>
   );
 }
@@ -4990,26 +5055,32 @@ function SchedulingChangeLogView({
   draftFilters,
   error,
   filtersApplied,
-  hasMore,
   loading,
   logs,
+  page,
+  pageSize,
+  totalCount,
   onApplyFilters,
   onClearFilters,
   onDraftFiltersChange,
-  onLoadMore,
+  onPageChange,
+  onPageSizeChange,
   onRefresh,
 }: {
   displayTimeZone: string;
   draftFilters: RateLogFilters;
   error: string;
   filtersApplied: boolean;
-  hasMore: boolean;
   loading: boolean;
   logs: AccountSchedulingChangeEvent[];
+  page: number;
+  pageSize: ChangeLogPageSize;
+  totalCount: number;
   onApplyFilters: () => void;
   onClearFilters: () => void;
   onDraftFiltersChange: (filters: RateLogFilters) => void;
-  onLoadMore: () => void;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (pageSize: ChangeLogPageSize) => void;
   onRefresh: () => void;
 }) {
   return (
@@ -5157,16 +5228,91 @@ function SchedulingChangeLogView({
         </div>
       )}
 
-      {hasMore ? (
-        <div className="api-key-rate-log-more">
-          <button className="api-key-button api-key-button--secondary" disabled={loading} onClick={onLoadMore} type="button">
-            <History size={15} />
-            <span>{loading ? "读取中" : "加载更多"}</span>
-          </button>
-        </div>
-      ) : null}
+      <ChangeLogPagination
+        loading={loading}
+        onPageChange={onPageChange}
+        onPageSizeChange={onPageSizeChange}
+        page={page}
+        pageSize={pageSize}
+        totalCount={totalCount}
+      />
     </section>
   );
+}
+
+function ChangeLogPagination({
+  loading,
+  onPageChange,
+  onPageSizeChange,
+  page,
+  pageSize,
+  totalCount,
+}: {
+  loading: boolean;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (pageSize: ChangeLogPageSize) => void;
+  page: number;
+  pageSize: ChangeLogPageSize;
+  totalCount: number;
+}) {
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const currentPage = Math.min(Math.max(1, page), totalPages);
+  return (
+    <nav aria-label="变化记录分页" className="api-key-change-pagination">
+      <span className="api-key-change-pagination-total">共 {totalCount} 条</span>
+      <div className="api-key-change-pagination-nav">
+        <button aria-label="第一页" disabled={loading || currentPage <= 1} onClick={() => onPageChange(1)} title="第一页" type="button">
+          <ChevronsLeft size={16} />
+        </button>
+        <button aria-label="上一页" disabled={loading || currentPage <= 1} onClick={() => onPageChange(currentPage - 1)} title="上一页" type="button">
+          <ChevronLeft size={16} />
+        </button>
+        <span>第 {currentPage} / {totalPages} 页</span>
+        <button aria-label="下一页" disabled={loading || currentPage >= totalPages} onClick={() => onPageChange(currentPage + 1)} title="下一页" type="button">
+          <ChevronRight size={16} />
+        </button>
+        <button aria-label="最后一页" disabled={loading || currentPage >= totalPages} onClick={() => onPageChange(totalPages)} title="最后一页" type="button">
+          <ChevronsRight size={16} />
+        </button>
+      </div>
+      <label className="api-key-change-page-size">
+        <span>每页</span>
+        <select
+          aria-label="每页展示条数"
+          disabled={loading}
+          onChange={(event) => onPageSizeChange(normalizeChangeLogPageSize(Number(event.target.value)))}
+          value={pageSize}
+        >
+          {CHANGE_LOG_PAGE_SIZE_OPTIONS.map((size) => <option key={size} value={size}>{size} 条</option>)}
+        </select>
+      </label>
+    </nav>
+  );
+}
+
+export function accountRateChangeReasonLabel(log: UpstreamChannelChangeEvent) {
+  const reason = String(log.details?.reason || "").trim();
+  const transitionReason = String(log.details?.transition_reason || "").trim();
+  const labels: Record<string, string> = {
+    upstream_group_change: "上游分组倍率变化",
+    upstream_group_assignment_change: "修改上游分组",
+    upstream_group_name_change: "上游分组名称变化",
+    upstream_recharge_change: "上游充值倍率变化",
+    local_recharge_change: "本地充值成本变化",
+    target_recalculated: "目标倍率重新计算",
+    upstream_key_status_change: "上游令牌状态变化",
+    upstream_key_recovered: "上游令牌恢复",
+    upstream_group_status_change: "上游分组状态变化",
+    upstream_group_recovered: "上游分组恢复",
+    upstream_auto_disable: "上游异常自动暂停",
+    automatic_pause_restored: "上游恢复后自动恢复",
+    rate_drift: "账号倍率被外部修改",
+    external_observed: "账号倍率被外部修改",
+    automatic_apply: "自动同步目标倍率",
+  };
+  if (labels[reason]) return labels[reason];
+  if (labels[transitionReason]) return labels[transitionReason];
+  return reason || transitionReason || "账号倍率同步";
 }
 
 function upstreamChannelChangeEventLabel(eventType: UpstreamChannelChangeEvent["event_type"]) {

@@ -101,6 +101,23 @@ API_KEY_EXPORT_BATCH_SIZE = 200
 logger = logging.getLogger(__name__)
 
 
+def _account_group_rate_change_reason(
+    *,
+    previous_group_id: str | None,
+    current_group_id: str | None,
+    previous_group_name: str | None,
+    current_group_name: str | None,
+    multiplier_changed: bool,
+) -> str | None:
+    if previous_group_id != current_group_id:
+        return "upstream_group_assignment_change"
+    if previous_group_name != current_group_name:
+        return "upstream_group_name_change"
+    if multiplier_changed:
+        return "upstream_group_change"
+    return None
+
+
 @dataclass(frozen=True)
 class UpstreamDiscoveryOptions:
     """Optional task inclusion overrides for one upstream discovery run."""
@@ -3446,6 +3463,13 @@ class UpstreamChannelService:
             (key_status_changed or group_status_changed)
             and not initial_non_invalid_health
         )
+        group_rate_change_reason = _account_group_rate_change_reason(
+            previous_group_id=previous_group_id,
+            current_group_id=config.selected_group_id,
+            previous_group_name=previous_group_name,
+            current_group_name=config.selected_group_name,
+            multiplier_changed=group_changed,
+        )
         old_upstream_multiplier = self._upstream_multiplier(
             previous_group_multiplier,
             previous_upstream_recharge_multiplier,
@@ -3487,12 +3511,8 @@ class UpstreamChannelService:
             and health_transition.old_group_status in INVALID_UPSTREAM_GROUP_STATUSES
             else "upstream_group_status_change"
             if group_status_changed
-            else "upstream_group_change"
-            if group_changed
-            else "upstream_group_assignment_change"
-            if previous_group_id != config.selected_group_id
-            else "upstream_group_name_change"
-            if previous_group_name != config.selected_group_name
+            else group_rate_change_reason
+            if group_rate_change_reason is not None
             else "upstream_recharge_change"
             if upstream_recharge_changed
             else "local_recharge_change"
@@ -3676,7 +3696,11 @@ class UpstreamChannelService:
                     ),
                     old_value=float(transition_old),
                     new_value=float(transition_new),
-                    details={**change_details, "reason": transition_reason},
+                    details={
+                        **change_details,
+                        "reason": reason,
+                        "transition_reason": transition_reason,
+                    },
                     created_at=change_observed_at,
                 )
             )

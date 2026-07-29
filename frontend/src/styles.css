@@ -7088,6 +7088,60 @@ button.api-key-group-chip--more {
   width: 100%;
 }
 
+.api-key-change-pagination {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-height: 54px;
+  padding: 8px 12px;
+}
+
+.api-key-change-pagination-total,
+.api-key-change-pagination-nav > span,
+.api-key-change-page-size > span {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.api-key-change-pagination-nav,
+.api-key-change-page-size {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.api-key-change-pagination-nav button {
+  align-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--ink);
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  padding: 0;
+  width: 32px;
+}
+
+.api-key-change-pagination-nav button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.api-key-change-pagination-nav button:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.api-key-change-page-size select {
+  min-height: 34px;
+  min-width: 82px;
+  padding-block: 5px;
+}
+
 .api-key-segmented--two {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -9312,6 +9366,20 @@ button.api-key-group-chip--more {
   font-weight: 700;
 }
 
+.api-key-rate-change-reason {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink) !important;
+  font-size: 12px !important;
+  font-weight: 750 !important;
+  min-width: 0;
+  overflow: hidden;
+  padding: 2px 6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .api-key-change-message-line .api-key-rate-log-flow {
   flex: 0 1 auto;
   overflow: hidden;
@@ -9479,6 +9547,16 @@ button.api-key-group-chip--more {
   .api-key-change-event-row .api-key-rate-log-identity {
     border-bottom: 1px solid var(--line);
     padding-bottom: 7px;
+  }
+
+  .api-key-change-pagination {
+    flex-wrap: wrap;
+  }
+
+  .api-key-change-pagination-nav {
+    flex: 1 1 100%;
+    justify-content: center;
+    order: 3;
   }
 }
 

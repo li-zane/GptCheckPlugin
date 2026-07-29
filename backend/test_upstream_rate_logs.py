@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.upstream_accounts import router
 from app.core.database import Base, get_db
 from app.core.security import require_admin
-from app.models import UpstreamRateChangeLog, utcnow
+from app.models import UpstreamChannelChangeEvent, UpstreamRateChangeLog, utcnow
 from app.schemas import UpstreamRateChangeLogOut
 from app.services.upstream_rate_logs import (
     list_upstream_rate_change_logs,
@@ -223,6 +223,67 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpstreamRateChangeLogApiTests(unittest.TestCase):
+    def test_channel_change_route_returns_numbered_page_metadata(self) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api/upstream-accounts")
+        fake_db = AsyncMock()
+
+        async def db_override():
+            yield fake_db
+
+        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
+        app.dependency_overrides[get_db] = db_override
+        row = UpstreamChannelChangeEvent(
+            channel_id=3,
+            channel_name="Example upstream",
+            event_type="account_rate_changed",
+            old_value=1.0,
+            new_value=1.2,
+            details={"reason": "upstream_group_change"},
+            created_at=utcnow(),
+        )
+        row.id = 9
+        runtime = SimpleNamespace(
+            get_upstream_rate_log_retention_days=AsyncMock(return_value=90)
+        )
+        list_logs = AsyncMock(return_value=([row], 2, 3, 17))
+
+        with (
+            patch(
+                "app.api.upstream_accounts.get_runtime_config_service",
+                return_value=runtime,
+            ),
+            patch(
+                "app.api.upstream_accounts.list_upstream_channel_changes",
+                new=list_logs,
+            ),
+            TestClient(app) as client,
+        ):
+            response = client.get(
+                "/api/upstream-accounts/channel-change-events"
+                "?limit=20&page=2&category=account_rate"
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            {
+                key: response.json()[key]
+                for key in ("total_count", "page", "page_size", "unread_count")
+            },
+            {"total_count": 17, "page": 2, "page_size": 20, "unread_count": 3},
+        )
+        self.assertTrue(response.json()["items"][0]["unread"])
+        list_logs.assert_awaited_once_with(
+            fake_db,
+            retention_days=90,
+            limit=20,
+            page=2,
+            before_id=None,
+            start_at=None,
+            end_at=None,
+            category="account_rate",
+        )
+
     def test_route_uses_retention_setting_and_cursor(self) -> None:
         app = FastAPI()
         app.include_router(router, prefix="/api/upstream-accounts")

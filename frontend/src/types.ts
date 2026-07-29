@@ -445,6 +445,7 @@ export type AppSettings = {
   priority_assign_disabled_api_key_accounts: boolean;
   priority_share_same_composite_multiplier: boolean;
   upstream_rate_log_retention_days: number;
+  change_log_page_size: 20 | 50 | 100 | 200;
   /** Number of days to keep per-day upstream usage detail. Lifetime totals are retained separately. */
   upstream_usage_data_retention_days?: number;
   /** Compatibility alias returned by earlier backend builds. */
@@ -525,6 +526,7 @@ export type AppSettingsUpdate = {
   priority_assign_disabled_api_key_accounts?: boolean;
   priority_share_same_composite_multiplier?: boolean;
   upstream_rate_log_retention_days?: number;
+  change_log_page_size?: 20 | 50 | 100 | 200;
   upstream_usage_data_retention_days?: number;
   /** Compatibility alias accepted by earlier backend builds. */
   upstream_data_retention_days?: number;
@@ -1117,6 +1119,9 @@ export type ChangeLogPage<T> = {
   items: T[];
   unread_count: number;
   last_read_id: number;
+  total_count: number;
+  page: number;
+  page_size: number;
 };
 
 export type ChangeLogUnreadCounts = {

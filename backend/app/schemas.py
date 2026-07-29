@@ -580,6 +580,7 @@ class AppSettingsOut(BaseModel):
     notify_upstream_token_invalid: bool = False
     upstream_rate_log_retention_days: int
     upstream_usage_data_retention_days: int = 90
+    change_log_page_size: Literal[20, 50, 100, 200] = 50
     usage_limit_sample_five_hour_threshold_percent: float
     usage_limit_sample_seven_day_threshold_percent: float
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges]
@@ -685,6 +686,7 @@ class AppSettingsUpdate(BaseModel):
     notify_upstream_token_invalid: bool | None = None
     upstream_rate_log_retention_days: int | None = Field(default=None, ge=1, le=3650)
     upstream_usage_data_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    change_log_page_size: Literal[20, 50, 100, 200] | None = None
     usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges] | None = None
@@ -1130,12 +1132,18 @@ class UpstreamChannelChangePageOut(BaseModel):
     items: list[UpstreamChannelChangeEventOut] = Field(default_factory=list)
     unread_count: int = Field(default=0, ge=0)
     last_read_id: int = Field(default=0, ge=0, le=JS_SAFE_INTEGER_MAX)
+    total_count: int = Field(default=0, ge=0)
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=200)
 
 
 class AccountSchedulingChangePageOut(BaseModel):
     items: list[AccountSchedulingChangeLogOut] = Field(default_factory=list)
     unread_count: int = Field(default=0, ge=0)
     last_read_id: int = Field(default=0, ge=0, le=JS_SAFE_INTEGER_MAX)
+    total_count: int = Field(default=0, ge=0)
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=200)
 
 
 class ChangeLogUnreadCountsOut(BaseModel):

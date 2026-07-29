@@ -177,16 +177,19 @@ async def _list_page(
     *,
     retention_days: int,
     limit: int,
+    page: int,
     before_id: int | None,
     start_at: datetime | None,
     end_at: datetime | None,
     where_clause: Any | None = None,
     cursor_fallback_key: str | None = None,
-) -> tuple[list[Any], int, int]:
+) -> tuple[list[Any], int, int, int]:
     if not 1 <= limit <= 200:
         raise ValueError("limit must be between 1 and 200.")
     if before_id is not None and before_id < 1:
         raise ValueError("before_id must be positive.")
+    if page < 1:
+        raise ValueError("page must be positive.")
     if start_at is not None and end_at is not None and start_at >= end_at:
         raise ValueError("start_at must be earlier than end_at.")
     if not 1 <= retention_days <= 3650:
@@ -199,8 +202,17 @@ async def _list_page(
         repair=False,
     )
     statement = select(model)
+    count_statement = select(func.count()).select_from(model)
     if where_clause is not None:
         statement = statement.where(where_clause)
+        count_statement = count_statement.where(where_clause)
+    if start_at is not None:
+        statement = statement.where(model.created_at >= start_at)
+        count_statement = count_statement.where(model.created_at >= start_at)
+    if end_at is not None:
+        statement = statement.where(model.created_at < end_at)
+        count_statement = count_statement.where(model.created_at < end_at)
+    total_count = int(await db.scalar(count_statement) or 0)
     if before_id is not None:
         boundary = await db.get(model, before_id)
         if boundary is None:
@@ -210,10 +222,8 @@ async def _list_page(
                 (model.created_at < boundary.created_at)
                 | ((model.created_at == boundary.created_at) & (model.id < boundary.id))
             )
-    if start_at is not None:
-        statement = statement.where(model.created_at >= start_at)
-    if end_at is not None:
-        statement = statement.where(model.created_at < end_at)
+    else:
+        statement = statement.offset((page - 1) * limit)
     rows = list(
         (
             await db.execute(
@@ -229,7 +239,7 @@ async def _list_page(
             UpstreamChannelChangeEvent.legacy_imported.is_(False)
         )
     unread_count = int(await db.scalar(unread_statement) or 0)
-    return rows, cursor, unread_count
+    return rows, cursor, unread_count, total_count
 
 
 async def list_upstream_channel_changes(
@@ -237,11 +247,12 @@ async def list_upstream_channel_changes(
     *,
     retention_days: int,
     limit: int = 100,
+    page: int = 1,
     before_id: int | None = None,
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     category: str = "all",
-) -> tuple[list[UpstreamChannelChangeEvent], int, int]:
+) -> tuple[list[UpstreamChannelChangeEvent], int, int, int]:
     if category not in {"all", "upstream", "account_rate"}:
         raise ValueError("Unsupported upstream change category.")
     where_clause = (
@@ -261,6 +272,7 @@ async def list_upstream_channel_changes(
         ),
         retention_days=retention_days,
         limit=limit,
+        page=page,
         before_id=before_id,
         start_at=start_at,
         end_at=end_at,
@@ -276,16 +288,18 @@ async def list_account_scheduling_changes(
     *,
     retention_days: int,
     limit: int = 100,
+    page: int = 1,
     before_id: int | None = None,
     start_at: datetime | None = None,
     end_at: datetime | None = None,
-) -> tuple[list[AccountSchedulingChangeLog], int, int]:
+) -> tuple[list[AccountSchedulingChangeLog], int, int, int]:
     return await _list_page(
         db,
         AccountSchedulingChangeLog,
         ACCOUNT_SCHEDULING_READ_CURSOR,
         retention_days=retention_days,
         limit=limit,
+        page=page,
         before_id=before_id,
         start_at=start_at,
         end_at=end_at,
