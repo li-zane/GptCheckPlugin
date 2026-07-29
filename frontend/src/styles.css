@@ -7294,7 +7294,7 @@ button.api-key-group-chip--more {
   align-items: center;
   color: var(--muted);
   display: flex;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 700;
   gap: 6px;
   line-height: 1.3;
@@ -7405,7 +7405,7 @@ button.api-key-group-chip--more {
 
 .api-key-channel-section-label > span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 750;
 }
 
@@ -7413,7 +7413,7 @@ button.api-key-group-chip--more {
   background: var(--panel-2);
   border-radius: 999px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 750;
   padding: 2px 6px;
 }
@@ -9078,7 +9078,7 @@ button.api-key-group-chip--more {
 .api-key-channel-stat {
   gap: 4px;
   min-height: 0;
-  padding: 7px 6px;
+  padding: 7px 3px;
 }
 
 .api-key-channel-stat--balance {
@@ -9091,7 +9091,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-stat-label {
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -9104,16 +9104,26 @@ button.api-key-group-chip--more {
   white-space: nowrap;
 }
 
+.api-key-channel-stat--balance .api-key-channel-stat-label {
+  flex-wrap: wrap;
+  overflow: visible;
+  row-gap: 2px;
+}
+
+.api-key-channel-stat--balance .api-key-channel-stat-label > span:first-of-type {
+  flex: 0 0 auto;
+}
+
 .api-key-channel-stat-label svg {
-  height: 14px;
-  width: 14px;
+  height: 12px;
+  width: 12px;
 }
 
 .api-key-channel-stat-label .api-key-chip {
-  flex: 0 1 auto;
-  font-size: 9px;
-  min-height: 16px;
-  padding: 1px 4px;
+  flex: 0 0 auto;
+  font-size: 11px;
+  min-height: 19px;
+  padding: 2px 4px;
 }
 
 .api-key-channel-stat-value strong {

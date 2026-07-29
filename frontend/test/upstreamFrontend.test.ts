@@ -1232,7 +1232,13 @@ test("API key dense views keep readable type and collapse change records on narr
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(styles, /\.api-key-rate-log-row \.api-key-rate-log-identity > strong\s*\{[^}]*font-size: 14px;/s);
   assert.match(styles, /\.api-key-upstream-transition > span:first-child\s*\{[^}]*font-size: 11px;/s);
-  assert.match(styles, /\.api-key-channel-stat-label\s*\{[^}]*font-size: 12px;/s);
+  assert.match(styles, /\.api-key-channel-stat-label\s*\{[^}]*font-size: 13px;/s);
+  assert.match(
+    styles,
+    /\.api-key-channel-stat-label \.api-key-chip\s*\{[^}]*flex: 0 0 auto;[^}]*font-size: 11px;[^}]*min-height: 19px;[^}]*padding: 2px 4px;/s,
+  );
+  assert.match(styles, /\.api-key-channel-section-label > span\s*\{[^}]*font-size: 13px;/s);
+  assert.match(styles, /\.api-key-channel-section-label small\s*\{[^}]*font-size: 12px;/s);
   assert.match(styles, /\.api-key-account-group-label > span:first-child\s*\{[^}]*font-size: 12px;/s);
   assert.match(styles, /\.api-key-priority-card-stats span\s*\{[^}]*font-size: 11px;/s);
   assert.match(styles, /@media \(max-width: 520px\)\s*\{\s*\.api-key-rate-log-filters,\s*\.api-key-rate-log-row\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/s);
