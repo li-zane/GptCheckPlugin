@@ -9072,7 +9072,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-stats {
-  grid-template-columns: minmax(0, 1fr) 100px 76px;
+  grid-template-columns: minmax(0, 1fr) max-content max-content;
 }
 
 .api-key-channel-stat {
@@ -9123,28 +9123,24 @@ button.api-key-group-chip--more {
   white-space: nowrap;
 }
 
-.api-key-channel-stat--probe .api-key-channel-stat-value strong {
-  font-size: 10px;
-}
-
 .api-key-channel-stat--balance .api-key-channel-balance-chips {
   gap: 3px;
 }
 
 .api-key-channel-stat--balance .api-key-channel-balance-chip {
-  font-size: 10px;
+  font-size: 11px;
   gap: 3px;
 }
 
 .api-key-channel-stat--balance .api-key-channel-balance-chip > b {
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .api-key-channel-stat--balance .help-popover-trigger.api-key-balance-kind {
-  font-size: 9px;
-  height: 18px;
-  min-height: 18px;
-  width: 18px;
+  font-size: 10px;
+  height: 20px;
+  min-height: 20px;
+  width: 20px;
 }
 
 .api-key-channel-balance-chip {

@@ -1199,10 +1199,11 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
   assert.match(styles, /\.api-key-channel-stat--balance\s*\{[^}]*grid-column: 1 \/ -1;/s);
   assert.doesNotMatch(styles, /\.api-key-channel-stat:last-child\s*\{/);
-  assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\) 100px 76px;/s);
+  assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\) max-content max-content;/s);
   assert.match(styles, /\.api-key-channel-stat--balance\s*\{[^}]*grid-column: auto;/s);
   assert.match(styles, /\.api-key-channel-stat-value strong\s*\{[^}]*white-space: nowrap;/s);
-  assert.match(styles, /\.api-key-channel-stat--probe \.api-key-channel-stat-value strong\s*\{[^}]*font-size: 10px;/s);
+  assert.doesNotMatch(styles, /\.api-key-channel-stat--probe \.api-key-channel-stat-value strong\s*\{[^}]*font-size:/s);
+  assert.match(styles, /\.api-key-channel-stat--balance \.api-key-channel-balance-chip > b\s*\{[^}]*font-size: 11px;/s);
   assert.match(styles, /\.api-key-channel-daily-usage\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
   assert.match(dailyBalanceFormatter, /value:\s*adjustedValue,/);
   assert.doesNotMatch(dailyBalanceFormatter, /value:\s*`原 /);
