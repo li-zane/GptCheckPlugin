@@ -9117,7 +9117,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-stat-value strong {
-  font-size: 11px;
+  font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -9128,12 +9128,12 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-stat--balance .api-key-channel-balance-chip {
-  font-size: 11px;
+  font-size: 13px;
   gap: 3px;
 }
 
 .api-key-channel-stat--balance .api-key-channel-balance-chip > b {
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .api-key-channel-stat--balance .help-popover-trigger.api-key-balance-kind {
@@ -9158,7 +9158,7 @@ button.api-key-group-chip--more {
 .api-key-channel-balance-chip > b {
   color: inherit;
   display: block;
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.25;
   min-width: 0;
   overflow: hidden;
