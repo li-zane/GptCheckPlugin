@@ -9059,6 +9059,82 @@ button.api-key-group-chip--more {
   min-width: 0;
 }
 
+.api-key-channel-stats {
+  grid-template-columns: minmax(0, 1fr) 100px 76px;
+}
+
+.api-key-channel-stat {
+  gap: 4px;
+  min-height: 0;
+  padding: 7px 6px;
+}
+
+.api-key-channel-stat--balance {
+  border-bottom: 0;
+  grid-column: auto;
+}
+
+.api-key-channel-stat--balance + .api-key-channel-stat {
+  border-left: 1px solid var(--line);
+}
+
+.api-key-channel-stat-label {
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.api-key-channel-stat-label > span:first-of-type {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-key-channel-stat-label svg {
+  height: 14px;
+  width: 14px;
+}
+
+.api-key-channel-stat-label .api-key-chip {
+  flex: 0 1 auto;
+  font-size: 9px;
+  min-height: 16px;
+  padding: 1px 4px;
+}
+
+.api-key-channel-stat-value strong {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-key-channel-stat--probe .api-key-channel-stat-value strong {
+  font-size: 10px;
+}
+
+.api-key-channel-stat--balance .api-key-channel-balance-chips {
+  gap: 3px;
+}
+
+.api-key-channel-stat--balance .api-key-channel-balance-chip {
+  font-size: 10px;
+  gap: 3px;
+}
+
+.api-key-channel-stat--balance .api-key-channel-balance-chip > b {
+  font-size: 10px;
+}
+
+.api-key-channel-stat--balance .help-popover-trigger.api-key-balance-kind {
+  font-size: 9px;
+  height: 18px;
+  min-height: 18px;
+  width: 18px;
+}
+
 .api-key-channel-balance-chip {
   align-items: center;
   display: flex;
