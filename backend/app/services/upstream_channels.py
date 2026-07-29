@@ -1491,6 +1491,9 @@ class UpstreamChannelService:
                 channel.management_base_url or channel.canonical_base_url
             )
             identity_changed = False
+            identity_metadata_changed = False
+            credential_changed = False
+            manual_multiplier_changed = False
             base_url_changed = False
 
             if "base_url" in fields:
@@ -1511,34 +1514,52 @@ class UpstreamChannelService:
                     )
                 base_url_changed = canonical_url != channel.canonical_base_url
                 identity_changed = base_url_changed
+                identity_metadata_changed = base_url_changed
                 channel.canonical_base_url = canonical_url
             if "management_base_url" in fields:
                 management_base_url = payload.management_base_url
-                identity_changed = identity_changed or management_base_url != channel.management_base_url
+                management_url_changed = management_base_url != channel.management_base_url
+                identity_changed = identity_changed or management_url_changed
+                identity_metadata_changed = identity_metadata_changed or management_url_changed
                 channel.management_base_url = management_base_url
             if "display_name" in fields:
                 channel.display_name = payload.display_name or self._default_name(channel.canonical_base_url)
             if "upstream_type" in fields:
-                identity_changed = identity_changed or payload.upstream_type != channel.upstream_type
+                upstream_type_changed = payload.upstream_type != channel.upstream_type
+                identity_changed = identity_changed or upstream_type_changed
+                identity_metadata_changed = identity_metadata_changed or upstream_type_changed
                 channel.upstream_type = payload.upstream_type
             if "probe_enabled" in fields and payload.probe_enabled is not None:
                 channel.probe_enabled = payload.probe_enabled
             if "upstream_user_id" in fields:
-                identity_changed = identity_changed or payload.upstream_user_id != channel.upstream_user_id
+                upstream_user_changed = payload.upstream_user_id != channel.upstream_user_id
+                identity_changed = identity_changed or upstream_user_changed
+                identity_metadata_changed = identity_metadata_changed or upstream_user_changed
                 channel.upstream_user_id = payload.upstream_user_id
             if payload.clear_access_token:
-                identity_changed = identity_changed or current_token is not None
+                access_token_changed = current_token is not None
+                identity_changed = identity_changed or access_token_changed
+                credential_changed = credential_changed or access_token_changed
                 channel.encrypted_access_token = None
             elif payload.access_token:
-                identity_changed = identity_changed or payload.access_token != current_token
+                access_token_changed = payload.access_token != current_token
+                identity_changed = identity_changed or access_token_changed
+                credential_changed = credential_changed or access_token_changed
                 channel.encrypted_access_token = encrypt_text(payload.access_token)
             if payload.clear_refresh_token:
-                identity_changed = identity_changed or current_refresh_token is not None
+                refresh_token_changed = current_refresh_token is not None
+                identity_changed = identity_changed or refresh_token_changed
+                credential_changed = credential_changed or refresh_token_changed
                 channel.encrypted_refresh_token = None
             elif payload.refresh_token:
-                identity_changed = identity_changed or payload.refresh_token != current_refresh_token
+                refresh_token_changed = payload.refresh_token != current_refresh_token
+                identity_changed = identity_changed or refresh_token_changed
+                credential_changed = credential_changed or refresh_token_changed
                 channel.encrypted_refresh_token = encrypt_text(payload.refresh_token)
             if "manual_recharge_multiplier" in fields:
+                manual_multiplier_changed = (
+                    payload.manual_recharge_multiplier != channel.manual_recharge_multiplier
+                )
                 channel.manual_recharge_multiplier = payload.manual_recharge_multiplier
             if "channel_monitor_test_models" in fields:
                 channel.channel_monitor_test_models = dict(
@@ -1568,6 +1589,14 @@ class UpstreamChannelService:
                 )
             )
             linked_configs = list(linked_configs_result.scalars().all())
+            # Rotating credentials does not change the upstream identity. Keep
+            # the last known channel metrics visible until the next discovery
+            # finishes; URL/type/user changes still invalidate them immediately.
+            credential_only_change = (
+                credential_changed
+                and not identity_metadata_changed
+                and not manual_multiplier_changed
+            )
             if identity_changed:
                 for config in linked_configs:
                     self.accounts.archive_data_before_invalidation(
@@ -1580,7 +1609,18 @@ class UpstreamChannelService:
                     await NotificationService(db).cancel_unsent(
                         dedupe_key=self._balance_guard_notification_key(channel)
                     )
-                self._invalidate_channel(channel)
+                if not credential_only_change:
+                    self._invalidate_channel(channel)
+                else:
+                    # The cached wallet remains useful after a token rotation,
+                    # but an old guard episode must not carry over to the new
+                    # credential and suppress a fresh evaluation.
+                    channel.balance_guard_state = "not_checked"
+                    channel.balance_guard_basis = None
+                    channel.balance_guard_value = None
+                    channel.balance_guard_checked_at = None
+                    channel.balance_guard_episode_id = None
+                    channel.balance_guard_paused_count = 0
             account_values: dict[str, Any] = {
                 "base_url": channel.canonical_base_url,
                 "upstream_type": channel.upstream_type,

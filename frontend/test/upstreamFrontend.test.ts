@@ -588,7 +588,7 @@ test("automation durations keep a seconds payload while allowing manual units", 
   assert.match(accountSource, /综合倍率严格大于阈值时暂停，等于或低于阈值时不暂停/);
 });
 
-test("API key operation feedback uses the title bar and upstream cards keep fixed desktop widths", () => {
+test("API key operation feedback uses the title bar and upstream cards fill four desktop columns", () => {
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
@@ -596,7 +596,9 @@ test("API key operation feedback uses the title bar and upstream cards keep fixe
   assert.match(appSource, /onNotice=\{setNotice\}/);
   assert.match(accountSource, /const setNotice = onNotice/);
   assert.doesNotMatch(accountSource, /<Feedback tone="success"/);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 300px\), 300px\)\);[^}]*justify-content: start;[^}]*max-width: 1230px;/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);[^}]*justify-content: stretch;[^}]*width: 100%;/s);
+  assert.match(styles, /@media \(max-width: 1180px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\);/s);
+  assert.match(styles, /@media \(max-width: 900px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
   assert.doesNotMatch(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fit,/s);
 });
 
@@ -870,7 +872,7 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(styles, /\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 371px;/);
   assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 440px;/);
   assert.doesNotMatch(styles, /\.api-key-channel-accounts\s*\{[^}]*margin-top:\s*auto;/s);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 300px\), 300px\)\);/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);/s);
   assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);[^}]*max-width: 360px;[^}]*width: 100%;/s);
   assert.doesNotMatch(styles, /api-key-channel-card--groups-expanded/);
   assert.match(accountSource, /trigger=\{<span>原<\/span>\}/);
@@ -1193,7 +1195,7 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(styles, /\.api-key-channel-address\s*\{[^}]*overflow: hidden;[^}]*white-space: nowrap;/s);
   assert.match(styles, /\.api-key-group-chips\s*\{[^}]*max-height: 55px;[^}]*padding-bottom: 2px;/s);
   assert.match(styles, /\.api-key-channel-head\s*\{[^}]*background: color-mix[^}]*border-bottom: 1px solid var\(--line\);/s);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 300px\), 300px\)\);/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);/s);
   assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
   assert.match(styles, /\.api-key-channel-stat--balance\s*\{[^}]*grid-column: 1 \/ -1;/s);
   assert.doesNotMatch(styles, /\.api-key-channel-stat:last-child\s*\{/);

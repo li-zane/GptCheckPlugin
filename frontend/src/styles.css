@@ -7081,11 +7081,11 @@ button.api-key-group-chip--more {
   align-items: stretch;
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 300px));
-  justify-content: start;
-  max-width: 1230px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  justify-content: stretch;
   min-width: 0;
   padding-top: 10px;
+  width: 100%;
 }
 
 .api-key-segmented--two {
@@ -7630,6 +7630,18 @@ button.api-key-group-chip--more {
 
 .api-key-channel-form {
   max-width: 100%;
+}
+
+@media (max-width: 1180px) {
+  .api-key-channel-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .api-key-channel-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 760px) {

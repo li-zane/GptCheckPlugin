@@ -1578,17 +1578,23 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.update_channel(
             self.db,
             channel_id,
-            UpstreamChannelUpdate(access_token=secret),
+            UpstreamChannelUpdate(
+                access_token=secret,
+                manual_recharge_multiplier=None,
+            ),
         )
 
         refreshed_channel = await self.db.get(UpstreamChannel, channel_id)
         await self.db.refresh(refreshed_channel)
-        self.assertIsNone(refreshed_channel.resolved_upstream_type)
-        self.assertEqual(refreshed_channel.group_options, [])
-        self.assertIsNone(refreshed_channel.effective_recharge_multiplier)
-        self.assertEqual(refreshed_channel.recharge_multiplier_status, "not_discovered")
-        self.assertIsNone(refreshed_channel.balance_remaining)
-        self.assertEqual(refreshed_channel.balance_status, "not_checked")
+        self.assertEqual(refreshed_channel.resolved_upstream_type, "newapi")
+        self.assertEqual(
+            refreshed_channel.group_options,
+            [{"id": "default", "name": "Default", "multiplier": 1.0}],
+        )
+        self.assertEqual(refreshed_channel.effective_recharge_multiplier, 0.1)
+        self.assertEqual(refreshed_channel.recharge_multiplier_status, "ok")
+        self.assertEqual(refreshed_channel.balance_remaining, 12.5)
+        self.assertEqual(refreshed_channel.balance_status, "ok")
         self.assertEqual(refreshed_channel.balance_guard_state, "not_checked")
         self.assertIsNone(refreshed_channel.balance_guard_basis)
         self.assertIsNone(refreshed_channel.balance_guard_value)
