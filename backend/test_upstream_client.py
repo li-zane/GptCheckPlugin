@@ -2198,6 +2198,134 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertIn("/api/user/self/groups", targets)
         self.assertFalse(any(target.startswith("/api/v1/api/") for target in targets))
 
+    def test_newapi_fetches_today_usage_for_each_unique_bound_token_name(self) -> None:
+        usage_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            if target == "/api/user/self/groups":
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"default": {"ratio": 1}}},
+                )
+            if target == "/api/token/?p=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 11,
+                                    "key": "sk-newapi-pro",
+                                    "name": "pro",
+                                    "group": "default",
+                                    "status": 1,
+                                },
+                                {
+                                    "id": 12,
+                                    "key": "sk-newapi-pro-plus",
+                                    "name": "pro+",
+                                    "group": "default",
+                                    "status": 1,
+                                },
+                            ],
+                            "total": 2,
+                        },
+                    },
+                )
+            if target == "/api/status":
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"quota_per_unit": 500_000}},
+                )
+            if request.url.path == NEWAPI_TODAY_USAGE_ENDPOINT:
+                token_name = request.url.params.get("token_name")
+                if token_name is not None:
+                    usage_requests.append(request)
+                quota = {
+                    "pro": 500_000,
+                    "pro+": 2_516,
+                }.get(token_name, 0)
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"quota": quota}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            access_token="newapi-console-token",
+            new_api_user=17,
+            account_api_keys={
+                7: "sk-newapi-pro",
+                8: "sk-newapi-pro-plus",
+            },
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.account_upstream_states[7].usage_amount, 1.0)
+        self.assertAlmostEqual(
+            result.account_upstream_states[8].usage_amount or 0,
+            0.005032,
+        )
+        self.assertEqual(
+            sorted(request.url.params["token_name"] for request in usage_requests),
+            ["pro", "pro+"],
+        )
+        for request in usage_requests:
+            self.assertEqual(
+                request.headers.get("Authorization"),
+                "Bearer newapi-console-token",
+            )
+            self.assertEqual(request.headers.get("New-Api-User"), "17")
+            self.assertIn("start_timestamp", request.url.params)
+            self.assertIn("end_timestamp", request.url.params)
+
+    def test_newapi_skips_per_key_usage_when_token_names_are_duplicated(self) -> None:
+        named_usage_requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal named_usage_requests
+            target = request_target(request)
+            if target == "/api/user/self/groups":
+                return httpx.Response(200, json={"success": True, "data": {}})
+            if target == "/api/token/?p=1&page_size=200":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "items": [
+                                {"id": 11, "key": "sk-one", "name": "duplicate"},
+                                {"id": 12, "key": "sk-two", "name": "duplicate"},
+                            ],
+                            "total": 2,
+                        },
+                    },
+                )
+            if request.url.path == NEWAPI_TODAY_USAGE_ENDPOINT:
+                if request.url.params.get("token_name") is not None:
+                    named_usage_requests += 1
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"quota": 500_000}},
+                )
+            return httpx.Response(404)
+
+        result = self.run_discovery(
+            handler,
+            upstream_type="newapi",
+            access_token="newapi-console-token",
+            new_api_user=17,
+            account_api_keys={7: "sk-one"},
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.account_upstream_states[7].usage_amount)
+        self.assertEqual(named_usage_requests, 0)
+
     def test_sub2api_reports_disabled_key_and_available_group_authoritatively(self) -> None:
         seen_today_headers: list[tuple[str | None, str | None]] = []
         seen_today_requests: list[httpx.Request] = []

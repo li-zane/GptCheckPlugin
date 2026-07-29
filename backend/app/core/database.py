@@ -744,6 +744,199 @@ async def _migrate_notification_outbox(conn: AsyncConnection) -> None:
     )
 
 
+async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
+    """Upgrade pre-identity usage tables without discarding accounting data."""
+
+    channel_columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_channel_daily_usages)"))
+        ).fetchall()
+    }
+    channel_identity_missing = bool(channel_columns) and "channel_identity" not in channel_columns
+    if channel_identity_missing:
+        await conn.execute(
+            text(
+                "ALTER TABLE upstream_channel_daily_usages "
+                "ADD COLUMN channel_identity VARCHAR(500)"
+            )
+        )
+    if channel_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_daily_usages SET channel_identity = COALESCE("
+                "NULLIF(TRIM(channel_identity), ''), "
+                "(SELECT canonical_base_url FROM upstream_channels "
+                "WHERE upstream_channels.id = upstream_channel_daily_usages.channel_id), "
+                "'channel:' || channel_id)"
+            )
+        )
+
+    if channel_identity_missing:
+        # SQLite cannot drop the legacy UNIQUE(channel_id, usage_date)
+        # constraint. Rebuild the table so a deleted channel ID can be reused
+        # without mixing or blocking the previous upstream's history.
+        await conn.execute(text("DROP TABLE IF EXISTS upstream_channel_daily_usages_new"))
+        await conn.execute(
+            text(
+                "CREATE TABLE upstream_channel_daily_usages_new ("
+                "id INTEGER NOT NULL PRIMARY KEY, "
+                "channel_id INTEGER NOT NULL, "
+                "channel_identity VARCHAR(500) NOT NULL, "
+                "channel_name VARCHAR(200), "
+                "usage_date DATE NOT NULL, "
+                "balance_used FLOAT, "
+                "balance_used_adjusted FLOAT, "
+                "balance_unit VARCHAR(32), "
+                "recharge_multiplier FLOAT, "
+                "upstream_api_key_usage FLOAT, "
+                "income FLOAT, "
+                "income_unit VARCHAR(32), "
+                "finalized BOOLEAN NOT NULL DEFAULT 0, "
+                "observed_at DATETIME, "
+                "finalized_at DATETIME, "
+                "created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL, "
+                "CONSTRAINT uq_upstream_channel_daily_usage_identity_date "
+                "UNIQUE (channel_identity, usage_date))"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT OR REPLACE INTO upstream_channel_daily_usages_new ("
+                "id, channel_id, channel_identity, channel_name, usage_date, "
+                "balance_used, balance_used_adjusted, balance_unit, recharge_multiplier, "
+                "upstream_api_key_usage, income, income_unit, finalized, observed_at, "
+                "finalized_at, created_at, updated_at) "
+                "SELECT id, channel_id, channel_identity, channel_name, usage_date, "
+                "balance_used, balance_used_adjusted, balance_unit, recharge_multiplier, "
+                "upstream_api_key_usage, income, income_unit, finalized, observed_at, "
+                "finalized_at, created_at, updated_at "
+                "FROM upstream_channel_daily_usages ORDER BY id"
+            )
+        )
+        await conn.execute(text("DROP TABLE upstream_channel_daily_usages"))
+        await conn.execute(
+            text(
+                "ALTER TABLE upstream_channel_daily_usages_new "
+                "RENAME TO upstream_channel_daily_usages"
+            )
+        )
+
+    if channel_columns:
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS ix_upstream_channel_daily_usage_identity_date "
+            "ON upstream_channel_daily_usages (channel_identity, usage_date)",
+            "CREATE INDEX IF NOT EXISTS ix_upstream_channel_daily_usage_channel_date "
+            "ON upstream_channel_daily_usages (channel_id, usage_date)",
+            "CREATE INDEX IF NOT EXISTS ix_upstream_channel_daily_usages_channel_id "
+            "ON upstream_channel_daily_usages (channel_id)",
+            "CREATE INDEX IF NOT EXISTS ix_upstream_channel_daily_usages_channel_identity "
+            "ON upstream_channel_daily_usages (channel_identity)",
+            "CREATE INDEX IF NOT EXISTS ix_upstream_channel_daily_usages_usage_date "
+            "ON upstream_channel_daily_usages (usage_date)",
+            "CREATE INDEX IF NOT EXISTS ix_upstream_channel_daily_usages_finalized "
+            "ON upstream_channel_daily_usages (finalized)",
+        ):
+            await conn.execute(text(statement))
+
+    account_columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_account_daily_usages)"))
+        ).fetchall()
+    }
+    if account_columns and "channel_identity" not in account_columns:
+        await conn.execute(
+            text(
+                "ALTER TABLE upstream_account_daily_usages "
+                "ADD COLUMN channel_identity VARCHAR(500)"
+            )
+        )
+    if account_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_account_daily_usages SET channel_identity = COALESCE("
+                "NULLIF(TRIM(channel_identity), ''), "
+                "(SELECT canonical_base_url FROM upstream_channels "
+                "WHERE upstream_channels.id = upstream_account_daily_usages.channel_id), "
+                "(SELECT channel_identity FROM upstream_channel_daily_usages "
+                "WHERE upstream_channel_daily_usages.channel_id = "
+                "upstream_account_daily_usages.channel_id "
+                "ORDER BY usage_date DESC, id DESC LIMIT 1), "
+                "'channel:' || channel_id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_upstream_account_daily_usage_identity_date "
+                "ON upstream_account_daily_usages (channel_identity, usage_date)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_upstream_account_daily_usages_channel_identity "
+                "ON upstream_account_daily_usages (channel_identity)"
+            )
+        )
+
+    total_columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_channel_usage_totals)"))
+        ).fetchall()
+    }
+    if total_columns and "channel_identity" not in total_columns:
+        await conn.execute(text("DROP TABLE IF EXISTS upstream_channel_usage_totals_new"))
+        await conn.execute(
+            text(
+                "CREATE TABLE upstream_channel_usage_totals_new ("
+                "channel_identity VARCHAR(500) NOT NULL PRIMARY KEY, "
+                "channel_id INTEGER NOT NULL, "
+                "channel_name VARCHAR(200), "
+                "total_balance_used FLOAT NOT NULL, "
+                "total_balance_used_adjusted FLOAT NOT NULL, "
+                "total_upstream_api_key_usage FLOAT NOT NULL, "
+                "total_income FLOAT NOT NULL, "
+                "created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL)"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO upstream_channel_usage_totals_new ("
+                "channel_identity, channel_id, channel_name, total_balance_used, "
+                "total_balance_used_adjusted, total_upstream_api_key_usage, total_income, "
+                "created_at, updated_at) "
+                "SELECT COALESCE((SELECT canonical_base_url FROM upstream_channels "
+                "WHERE upstream_channels.id = upstream_channel_usage_totals.channel_id), "
+                "'channel:' || channel_id), MAX(channel_id), MAX(channel_name), "
+                "SUM(COALESCE(total_balance_used, 0)), "
+                "SUM(COALESCE(total_balance_used_adjusted, 0)), "
+                "SUM(COALESCE(total_upstream_api_key_usage, 0)), "
+                "SUM(COALESCE(total_income, 0)), MIN(created_at), MAX(updated_at) "
+                "FROM upstream_channel_usage_totals "
+                "GROUP BY COALESCE((SELECT canonical_base_url FROM upstream_channels "
+                "WHERE upstream_channels.id = upstream_channel_usage_totals.channel_id), "
+                "'channel:' || channel_id)"
+            )
+        )
+        await conn.execute(text("DROP TABLE upstream_channel_usage_totals"))
+        await conn.execute(
+            text(
+                "ALTER TABLE upstream_channel_usage_totals_new "
+                "RENAME TO upstream_channel_usage_totals"
+            )
+        )
+    if total_columns:
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_upstream_channel_usage_totals_channel_id "
+                "ON upstream_channel_usage_totals (channel_id)"
+            )
+        )
+
+
 async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
     await conn.execute(
         text(
@@ -1177,6 +1370,7 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         if is_sqlite:
             await _migrate_upstream_channels(conn)
+            await _migrate_upstream_usage_history(conn)
             await _migrate_upstream_rate_change_logs(conn)
             await _migrate_legacy_rate_logs_to_change_events(conn)
             await _migrate_recharge_multiplier_change_baselines(conn)

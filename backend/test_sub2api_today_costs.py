@@ -13,9 +13,9 @@ class Sub2ApiTodayCostsTests(unittest.TestCase):
                 "stats": {
                     "1": {"today_actual_cost": "1.25"},
                     "2": {"accountId": 2, "todayActualCost": 2.5},
-                    "3": {"cost": 3},
-                    "4": {"today_cost": 4.75},
-                    "5": {"todayCost": 5},
+                    "3": {"actual_cost": 3},
+                    "4": {"actualCost": 4.75},
+                    "5": {"cost": 5},
                     "6": {"today_actual_cost": None, "cost": 6.5},
                 }
             },
@@ -28,8 +28,6 @@ class Sub2ApiTodayCostsTests(unittest.TestCase):
                 2: 2.5,
                 3: 3.0,
                 4: 4.75,
-                5: 5.0,
-                6: 6.5,
             },
         )
 
@@ -40,6 +38,7 @@ class Sub2ApiTodayCostsTests(unittest.TestCase):
                 "history": [
                     {"date": "2026-07-27", "actual_cost": "4.5"},
                     {"date": "2026-07-28T00:00:00Z", "actualCost": 6},
+                    {"date": "2026-07-26", "cost": 8},
                     {"date": "invalid", "actual_cost": 9},
                     {"date": "2026-07-29", "actual_cost": -1},
                 ]

@@ -9697,7 +9697,7 @@ button.api-key-group-chip--more {
 .api-key-usage-history-totals {
   display: grid;
   gap: 7px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .api-key-usage-history-metric {
@@ -9800,7 +9800,7 @@ button.api-key-group-chip--more {
   background: var(--green);
 }
 
-.api-key-usage-history-chart svg {
+.api-key-usage-history-chart > svg {
   display: block;
   height: 236px;
   overflow: visible;
@@ -9973,7 +9973,7 @@ button.api-key-group-chip--more {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .api-key-usage-history-chart svg {
+  .api-key-usage-history-chart > svg {
     height: 205px;
   }
 

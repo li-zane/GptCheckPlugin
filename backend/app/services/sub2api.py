@@ -334,9 +334,8 @@ def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int
                     for field in (
                         "today_actual_cost",
                         "todayActualCost",
-                        "cost",
-                        "today_cost",
-                        "todayCost",
+                        "actual_cost",
+                        "actualCost",
                     )
                     if raw.get(field) is not None
                 ),
@@ -385,7 +384,6 @@ def _parse_account_daily_costs(payload: Any) -> dict[date, float]:
                     "actualCost",
                     "today_actual_cost",
                     "todayActualCost",
-                    "cost",
                 )
                 if item.get(field) is not None
             ),

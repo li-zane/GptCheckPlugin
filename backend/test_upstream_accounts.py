@@ -842,8 +842,13 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
                 "code": 0,
                 "data": {
                     "stats": {
-                        "7": {"account_id": 7, "cost": 1.25, "quota_used": 999},
-                        "8": {"account_id": 999, "cost": 2.5},
+                        "7": {
+                            "account_id": 7,
+                            "actual_cost": 1.25,
+                            "cost": 9.5,
+                            "quota_used": 999,
+                        },
+                        "8": {"account_id": 999, "actual_cost": 2.5},
                     }
                 },
             },
@@ -2444,8 +2449,12 @@ class Sub2ApiKeyManagementClientTests(unittest.IsolatedAsyncioTestCase):
             return_value={
                 "code": 0,
                 "data": {
-                    "17": {"account_id": 17, "cost": 3.5},
-                    "99": {"account_id": 99, "cost": 999},
+                    "17": {
+                        "account_id": 17,
+                        "actual_cost": 3.5,
+                        "cost": 99,
+                    },
+                    "99": {"account_id": 99, "actual_cost": 999},
                 },
             }
         )

@@ -38,6 +38,7 @@ DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
 # large upstream accounts remain supported without unbounded request fan-out.
 MAX_AUTOMATIC_KEY_REVEALS = 200
 KEY_REVEAL_CONCURRENCY = 20
+NEWAPI_API_KEY_USAGE_CONCURRENCY = 4
 SUB2API_API_KEY_USAGE_BATCH_SIZE = 100
 SUB2API_API_KEY_PAGE_SIZE = 200
 SUB2API_API_KEY_PAGE_CONCURRENCY = 5
@@ -448,6 +449,7 @@ class UpstreamClient:
         sub2api_api_key_usage_by_key: dict[str, float] = {}
         cached_api_key_records_by_account: dict[int, dict[str, Any]] = {}
         sub2api_api_key_usage_by_account: dict[int, float] = {}
+        newapi_api_key_usage_by_account: dict[int, float] = {}
         sub2api_channel_monitor_details: dict[int, _FetchResult] = {}
         try:
             for address in pinned_addresses:
@@ -600,6 +602,7 @@ class UpstreamClient:
                         dict[str, float],
                         dict[int, dict[str, Any]],
                         dict[int, float],
+                        dict[int, float],
                     ]:
                         if (
                             monitor_only
@@ -609,7 +612,7 @@ class UpstreamClient:
                                 and not normalized_account_api_key_record_ids
                             )
                         ):
-                            return {}, {}, {}, {}, {}
+                            return {}, {}, {}, {}, {}, {}
                         candidate_endpoints = (
                             NEWAPI_ENDPOINTS if candidate_type == "newapi" else SUB2API_ENDPOINTS
                         )
@@ -755,12 +758,41 @@ class UpstreamClient:
                                 revealed_records=revealed_records,
                             )
                         )
+                        newapi_usage_by_account: dict[int, float] = {}
+                        if candidate_type == "newapi":
+                            records_by_account = dict(cached_records_by_account)
+                            for account_id, account_key in fallback_account_api_keys.items():
+                                record = (
+                                    revealed_records.get(account_key)
+                                    or _find_unique_api_key_record(
+                                        candidate_type,
+                                        candidate_payloads,
+                                        account_key,
+                                    )
+                                )
+                                if record is not None:
+                                    records_by_account[account_id] = record
+                            try:
+                                newapi_usage_by_account = (
+                                    await self._fetch_newapi_api_key_usage_by_account(
+                                        client,
+                                        normalized_url,
+                                        payloads=candidate_payloads,
+                                        records_by_account=records_by_account,
+                                        access_token=access_token,
+                                        new_api_user=new_api_user,
+                                        usage_params=newapi_today_usage_params,
+                                    )
+                                )
+                            except Exception:
+                                newapi_usage_by_account = {}
                         return (
                             page_payloads,
                             revealed_records,
                             usage_by_key,
                             cached_records_by_account,
                             cached_usage_by_account,
+                            newapi_usage_by_account,
                         )
 
                     (
@@ -778,6 +810,7 @@ class UpstreamClient:
                         sub2api_api_key_usage_by_key,
                         cached_api_key_records_by_account,
                         sub2api_api_key_usage_by_account,
+                        newapi_api_key_usage_by_account,
                     ) = api_key_context
                 # A status code proves that this pinned address completed an
                 # HTTP exchange. Do not route any request to another address
@@ -948,7 +981,13 @@ class UpstreamClient:
                 )
                 if cached_state is not None:
                     account_upstream_states[account_id] = cached_state
-            if active_type == "sub2api":
+            if active_type == "newapi":
+                for account_id, usage_amount in newapi_api_key_usage_by_account.items():
+                    account_upstream_states[account_id] = _state_with_usage(
+                        account_upstream_states.get(account_id),
+                        usage_amount,
+                    )
+            elif active_type == "sub2api":
                 matched_account_state = _state_with_usage(
                     matched_account_state,
                     sub2api_api_key_usage_by_key.get(normalized_api_key or ""),
@@ -1667,6 +1706,111 @@ class UpstreamClient:
             ):
                 payloads_by_endpoint[item[0]] = item[1]
         return payloads_by_endpoint
+
+    async def _fetch_newapi_api_key_usage_by_account(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        payloads: dict[str, Any],
+        records_by_account: Mapping[int, dict[str, Any]],
+        access_token: str | None,
+        new_api_user: str | int | None,
+        usage_params: Mapping[str, str | int],
+    ) -> dict[int, float]:
+        token = _clean_secret(access_token)
+        user_id = _clean_new_api_user(new_api_user)
+        if token is None or user_id is None or not records_by_account:
+            return {}
+
+        records_by_identity: dict[tuple[str, int | str], dict[str, Any]] = {}
+        all_records = [
+            *_deduplicated_api_key_records("newapi", payloads),
+            *records_by_account.values(),
+        ]
+        for index, record in enumerate(all_records):
+            record_id = _api_key_record_id(record)
+            record_key = _canonical_api_key(
+                "newapi",
+                _clean_secret(
+                    _first_value(record, ("key", "api_key", "apiKey", "token", "value"))
+                ),
+            )
+            identity: tuple[str, int | str] = (
+                ("id", record_id)
+                if record_id is not None
+                else ("key", record_key)
+                if record_key is not None
+                else ("record", index)
+            )
+            records_by_identity[identity] = {
+                **records_by_identity.get(identity, {}),
+                **record,
+            }
+
+        name_counts: dict[str, int] = {}
+        for record in records_by_identity.values():
+            name = _api_key_record_name(record)
+            if name is not None:
+                normalized_name = name.casefold()
+                name_counts[normalized_name] = name_counts.get(normalized_name, 0) + 1
+
+        account_names: dict[int, str] = {}
+        for account_id, record in records_by_account.items():
+            record_id = _api_key_record_id(record)
+            merged_record = (
+                records_by_identity.get(("id", record_id), record)
+                if record_id is not None
+                else record
+            )
+            name = _api_key_record_name(merged_record)
+            if name is not None and name_counts.get(name.casefold()) == 1:
+                account_names[account_id] = name
+        if not account_names:
+            return {}
+
+        quota_per_unit = DEFAULT_NEWAPI_QUOTA_PER_UNIT
+        status_data = _unwrap(payloads.get("/api/status"))
+        if isinstance(status_data, dict):
+            discovered_quota_per_unit = _positive_number(status_data.get("quota_per_unit"))
+            if discovered_quota_per_unit is not None:
+                quota_per_unit = discovered_quota_per_unit
+
+        headers = _build_headers(
+            access_token=token,
+            api_key=None,
+            new_api_user=user_id,
+        )
+        semaphore = asyncio.Semaphore(NEWAPI_API_KEY_USAGE_CONCURRENCY)
+
+        async def fetch_account(account_id: int, token_name: str) -> tuple[int, float | None]:
+            params = dict(usage_params)
+            params["token_name"] = token_name
+            async with semaphore:
+                result = await self._request_json(
+                    client,
+                    base_url,
+                    NEWAPI_TODAY_USAGE_ENDPOINT,
+                    headers=headers,
+                    params=params,
+                    timeout_seconds=max(
+                        self.timeout_seconds,
+                        UPSTREAM_USAGE_TIMEOUT_SECONDS,
+                    ),
+                )
+            return account_id, _parse_newapi_usage_amount(result, quota_per_unit)
+
+        results = await asyncio.gather(
+            *(
+                fetch_account(account_id, token_name)
+                for account_id, token_name in account_names.items()
+            )
+        )
+        return {
+            account_id: amount
+            for account_id, amount in results
+            if amount is not None
+        }
 
     async def _fetch_sub2api_api_key_usage(
         self,
@@ -2920,6 +3064,25 @@ def _parse_sub2api_api_key_usage_batch(
     return parsed
 
 
+def _parse_newapi_usage_amount(
+    result: _FetchResult,
+    quota_per_unit: float,
+) -> float | None:
+    if not result.ok or not _payload_succeeded(result.payload):
+        return None
+    data = _unwrap(result.payload)
+    if not isinstance(data, dict):
+        return None
+    quota = _finite_number(data.get("quota"))
+    if quota is None or quota < 0:
+        return None
+    try:
+        amount = quota / quota_per_unit
+    except (OverflowError, ZeroDivisionError):
+        return None
+    return amount if math.isfinite(amount) else None
+
+
 def _deduplicated_api_key_records(
     upstream_type: str,
     payloads: dict[str, Any],
@@ -3023,6 +3186,16 @@ def _api_key_record_matches_account(
         # even when one candidate appears unique in the currently loaded pages.
         return False
     return _api_keys_equal(upstream_type, record_key, normalized_key)
+
+
+def _api_key_record_name(record: Mapping[str, Any]) -> str | None:
+    return _clean_text(
+        _first_value(
+            record,
+            ("name", "token_name", "tokenName", "key_name", "keyName"),
+        ),
+        200,
+    )
 
 
 def _available_group_refs(

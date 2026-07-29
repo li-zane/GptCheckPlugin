@@ -23,6 +23,7 @@ from app.models import (
     NotificationOutbox,
     UpstreamAccountDataArchive,
     UpstreamAccountConfig,
+    UpstreamAccountDailyUsage,
     UpstreamChannel,
     UpstreamChannelChangeEvent,
     UpstreamPriorityInterval,
@@ -2343,6 +2344,14 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             "local_sub2api_today_cost_converted",
         )
         self.assertEqual(account.today_upstream_usage_status, "estimated")
+        daily_income = await self.db.scalar(
+            select(UpstreamAccountDailyUsage).where(
+                UpstreamAccountDailyUsage.sub2api_account_id == 7
+            )
+        )
+        self.assertIsNotNone(daily_income)
+        self.assertAlmostEqual(daily_income.income, 0.3)
+        self.assertEqual(daily_income.income_unit, "CNY")
 
     async def test_successful_discovery_keeps_same_day_usage_when_upstream_omits_a_key(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id

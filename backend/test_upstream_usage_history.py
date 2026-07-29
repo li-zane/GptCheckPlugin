@@ -4,10 +4,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.core.database import Base
+from app.core.database import Base, _migrate_upstream_usage_history
 from app.models import (
     UpstreamAccountConfig,
     UpstreamAccountDailyUsage,
@@ -493,3 +493,99 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(total.total_balance_used, 8.0)
         self.assertEqual(total.total_balance_used_adjusted, 16.0)
+
+
+class UpstreamUsageHistoryMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_channel_id_tables_upgrade_without_losing_totals(self) -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                for statement in (
+                    "CREATE TABLE upstream_channels ("
+                    "id INTEGER NOT NULL PRIMARY KEY, canonical_base_url VARCHAR(500) NOT NULL)",
+                    "CREATE TABLE upstream_channel_daily_usages ("
+                    "id INTEGER NOT NULL PRIMARY KEY, channel_id INTEGER NOT NULL, "
+                    "channel_name VARCHAR(200), usage_date DATE NOT NULL, "
+                    "balance_used FLOAT, balance_used_adjusted FLOAT, balance_unit VARCHAR(32), "
+                    "recharge_multiplier FLOAT, upstream_api_key_usage FLOAT, income FLOAT, "
+                    "income_unit VARCHAR(32), finalized BOOLEAN NOT NULL DEFAULT 0, "
+                    "observed_at DATETIME, finalized_at DATETIME, created_at DATETIME NOT NULL, "
+                    "updated_at DATETIME NOT NULL, UNIQUE (channel_id, usage_date))",
+                    "CREATE TABLE upstream_account_daily_usages ("
+                    "id INTEGER NOT NULL PRIMARY KEY, channel_id INTEGER NOT NULL, "
+                    "sub2api_account_id BIGINT NOT NULL, upstream_api_key_record_id BIGINT, "
+                    "account_name VARCHAR(200), remote_identity_fingerprint VARCHAR(64), "
+                    "usage_date DATE NOT NULL, upstream_usage FLOAT, "
+                    "upstream_usage_unit VARCHAR(32), upstream_usage_source VARCHAR(64), "
+                    "income FLOAT, income_unit VARCHAR(32), finalized BOOLEAN NOT NULL DEFAULT 0, "
+                    "observed_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                    "UNIQUE (sub2api_account_id, usage_date))",
+                    "CREATE TABLE upstream_channel_usage_totals ("
+                    "channel_id INTEGER NOT NULL PRIMARY KEY, channel_name VARCHAR(200), "
+                    "total_balance_used FLOAT NOT NULL, total_balance_used_adjusted FLOAT NOT NULL, "
+                    "total_upstream_api_key_usage FLOAT NOT NULL, total_income FLOAT NOT NULL, "
+                    "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)",
+                    "INSERT INTO upstream_channels VALUES (1, 'https://usage.example/v1')",
+                    "INSERT INTO upstream_channel_daily_usages VALUES ("
+                    "1, 1, 'Legacy', '2026-07-28', 4, 8, 'USD', 2, 3, 5, 'CNY', "
+                    "1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                    "INSERT INTO upstream_account_daily_usages VALUES ("
+                    "1, 1, 7, 101, 'Key account', NULL, '2026-07-28', 3, 'USD', "
+                    "'upstream_api_key_actual_cost', 5, 'CNY', 1, CURRENT_TIMESTAMP, "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                    "INSERT INTO upstream_channel_usage_totals VALUES ("
+                    "1, 'Legacy', 4, 8, 3, 5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                ):
+                    await connection.execute(text(statement))
+
+                await _migrate_upstream_usage_history(connection)
+                await _migrate_upstream_usage_history(connection)
+
+                daily_identity = (
+                    await connection.execute(
+                        text("SELECT channel_identity FROM upstream_channel_daily_usages")
+                    )
+                ).scalar_one()
+                account_identity = (
+                    await connection.execute(
+                        text("SELECT channel_identity FROM upstream_account_daily_usages")
+                    )
+                ).scalar_one()
+                total = (
+                    await connection.execute(
+                        text(
+                            "SELECT channel_identity, total_balance_used, "
+                            "total_balance_used_adjusted, total_upstream_api_key_usage, total_income "
+                            "FROM upstream_channel_usage_totals"
+                        )
+                    )
+                ).one()
+                total_columns = (
+                    await connection.execute(text("PRAGMA table_info(upstream_channel_usage_totals)"))
+                ).fetchall()
+
+                self.assertEqual(daily_identity, "https://usage.example/v1")
+                self.assertEqual(account_identity, "https://usage.example/v1")
+                self.assertEqual(tuple(total), ("https://usage.example/v1", 4.0, 8.0, 3.0, 5.0))
+                self.assertEqual(
+                    next(row[5] for row in total_columns if row[1] == "channel_identity"),
+                    1,
+                )
+
+                await connection.execute(
+                    text(
+                        "INSERT INTO upstream_channel_daily_usages ("
+                        "id, channel_id, channel_identity, channel_name, usage_date, finalized, "
+                        "created_at, updated_at) VALUES ("
+                        "2, 1, 'https://replacement.example/v1', 'Replacement', '2026-07-28', 0, "
+                        "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    )
+                )
+                count = (
+                    await connection.execute(
+                        text("SELECT COUNT(*) FROM upstream_channel_daily_usages")
+                    )
+                ).scalar_one()
+                self.assertEqual(count, 2)
+        finally:
+            await engine.dispose()

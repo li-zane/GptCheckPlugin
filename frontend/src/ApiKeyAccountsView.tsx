@@ -3466,7 +3466,6 @@ function UpstreamUsageHistoryDialog({
     : null;
   const totals = history?.totals || null;
   const lifetimeTotals = history?.lifetime_totals || null;
-  const costUnit = historyCostUnit(days, selectedAccountId);
   const totalNet = historyNetIncome(totals);
   const lifetimeNet = historyNetIncome(lifetimeTotals);
   const appliedRange = history
@@ -3572,8 +3571,7 @@ function UpstreamUsageHistoryDialog({
       {history && days.length ? (
         <>
           <div className="api-key-usage-history-totals" aria-label="筛选期间汇总">
-            <UsageHistoryMetric label="原始成本" value={formatHistoryAmount(totals?.cost, costUnit)} />
-            <UsageHistoryMetric label="综合成本" tone="cost" value={formatHistoryAmount(totals?.cost_adjusted, "CNY")} />
+            <UsageHistoryMetric label="成本" tone="cost" value={formatHistoryAmount(totals?.cost_adjusted, "CNY")} />
             <UsageHistoryMetric label="收入" tone="income" value={formatHistoryAmount(totals?.income, historyIncomeUnit(days))} />
             <UsageHistoryMetric label="净收入" tone={totalNet !== null && totalNet < 0 ? "negative" : "income"} value={formatHistorySignedAmount(totalNet, historyIncomeUnit(days))} />
           </div>
@@ -3590,18 +3588,16 @@ function UpstreamUsageHistoryDialog({
                 <tr>
                   <th scope="col">日期</th>
                   <th scope="col">用量</th>
-                  <th scope="col">成本（原始 / 综合）</th>
+                  <th scope="col">成本（人民币）</th>
                   <th scope="col">收入</th>
                   <th scope="col">净收入</th>
                 </tr>
               </thead>
               <tbody>
                 {days.map((day) => {
-                  const dailyCost = historyDayCost(day, selectedAccountId);
                   const dailyAdjustedCost = historyDayAdjustedCost(day, selectedAccountId);
                   const dailyNet = historyNetIncome({
                     income: day.income,
-                    cost: dailyCost,
                     cost_adjusted: dailyAdjustedCost,
                   });
                   return (
@@ -3609,8 +3605,7 @@ function UpstreamUsageHistoryDialog({
                       <th scope="row">{formatUsageHistoryDate(day.date, displayTimeZone)}</th>
                       <td>{formatHistoryUsage(historyDayUsage(day, selectedAccountId), historyDayUsageUnit(day, selectedAccountId))}</td>
                       <td>
-                        <span>{formatHistoryAmount(dailyCost, historyDayCostUnit(day, selectedAccountId))}</span>
-                        <small>{formatHistoryAmount(dailyAdjustedCost, "CNY")}</small>
+                        <span>{formatHistoryAmount(dailyAdjustedCost, "CNY")}</span>
                       </td>
                       <td>{formatHistoryAmount(day.income, day.income_unit || historyIncomeUnit(days))}</td>
                       <td className={dailyNet !== null && dailyNet < 0 ? "is-negative" : "is-positive"}>
@@ -3659,10 +3654,9 @@ function UsageHistoryLineChart({
 }) {
   const series = days.map((day) => ({
     date: day.date,
-    original: historyDayUsage(day, selectedAccountId),
-    adjusted: historyDayAdjustedUsage(day, selectedAccountId),
+    cost: historyDayAdjustedUsage(day, selectedAccountId),
   }));
-  const values = series.flatMap((point) => [point.original, point.adjusted]).filter((value): value is number => value !== null);
+  const values = series.map((point) => point.cost).filter((value): value is number => value !== null);
   if (!values.length) {
     return (
       <section className="api-key-usage-history-chart api-key-usage-history-chart--empty" aria-label={title}>
@@ -3681,9 +3675,9 @@ function UsageHistoryLineChart({
   const yMaximum = maximum === 0 ? 1 : maximum * 1.08;
   const xFor = (index: number) => padding.left + (series.length <= 1 ? chartWidth / 2 : (index / (series.length - 1)) * chartWidth);
   const yFor = (value: number | null) => value === null ? null : padding.top + chartHeight - (value / yMaximum) * chartHeight;
-  const pointsFor = (key: "original" | "adjusted") => series
+  const points = series
     .map((point, index) => {
-      const y = yFor(point[key]);
+      const y = yFor(point.cost);
       return y === null ? null : `${xFor(index).toFixed(1)},${y.toFixed(1)}`;
     })
     .filter((point): point is string => point !== null)
@@ -3696,8 +3690,7 @@ function UsageHistoryLineChart({
       <div className="api-key-usage-history-chart-head">
         <div><ChartNoAxesCombined size={16} /><strong>{title}</strong></div>
         <div className="api-key-usage-history-chart-legend">
-          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--original" />原始</span>
-          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--adjusted" />综合</span>
+          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--adjusted" />人民币综合成本</span>
         </div>
       </div>
       <svg preserveAspectRatio="none" role="img" viewBox={`0 0 ${width} ${height}`}>
@@ -3713,16 +3706,13 @@ function UsageHistoryLineChart({
             </g>
           );
         })}
-        {pointsFor("original") ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--original" points={pointsFor("original")} /> : null}
-        {pointsFor("adjusted") ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--adjusted" points={pointsFor("adjusted")} /> : null}
+        {points ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--adjusted" points={points} /> : null}
         {series.map((point, index) => {
-          const originalY = yFor(point.original);
-          const adjustedY = yFor(point.adjusted);
+          const costY = yFor(point.cost);
           const x = xFor(index);
           return (
             <g key={point.date}>
-              {originalY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--original" cx={x} cy={originalY} r={3}><title>{`${point.date} 原始 ${formatHistoryUsage(point.original)}`}</title></circle> : null}
-              {adjustedY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--adjusted" cx={x} cy={adjustedY} r={3}><title>{`${point.date} 综合 ${formatHistoryUsage(point.adjusted)}`}</title></circle> : null}
+              {costY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--adjusted" cx={x} cy={costY} r={3}><title>{`${point.date} 成本 ${formatHistoryAmount(point.cost, "CNY")}`}</title></circle> : null}
               {labelIndexes.has(index) ? <text className="api-key-usage-history-chart-axis" textAnchor="middle" x={x} y={height - 10}>{shortUsageHistoryDate(point.date)}</text> : null}
             </g>
           );
@@ -6223,31 +6213,15 @@ function historyDayUsageUnit(day: UpstreamUsageHistory["days"][number], selected
   return usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage_unit || day.balance_unit || null;
 }
 
-function historyDayCost(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
-  return finiteNumber(day.cost) ?? historyDayUsage(day, selectedAccountId);
-}
-
 function historyDayAdjustedCost(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
   return finiteNumber(day.cost_adjusted) ?? historyDayAdjustedUsage(day, selectedAccountId);
-}
-
-function historyDayCostUnit(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
-  return historyDayUsageUnit(day, selectedAccountId);
-}
-
-function historyCostUnit(days: UpstreamUsageHistory["days"], selectedAccountId: string | null) {
-  return days.map((day) => historyDayCostUnit(day, selectedAccountId)).find(Boolean) || historyBalanceUnit(days);
-}
-
-function historyBalanceUnit(days: UpstreamUsageHistory["days"]) {
-  return days.find((day) => day.balance_unit)?.balance_unit || null;
 }
 
 function historyIncomeUnit(days: UpstreamUsageHistory["days"]) {
   return days.find((day) => day.income_unit)?.income_unit || "CNY";
 }
 
-function historyNetIncome(value: Pick<UpstreamUsageHistory["totals"], "income" | "cost" | "cost_adjusted"> | null) {
+function historyNetIncome(value: Pick<UpstreamUsageHistory["totals"], "income" | "cost_adjusted"> | null) {
   const income = finiteNumber(value?.income);
   // Sub2API income is recorded in CNY, so only the recharge-adjusted cost can form a net value.
   const cost = finiteNumber(value?.cost_adjusted);
