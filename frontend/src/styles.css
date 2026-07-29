@@ -7921,9 +7921,9 @@ button.api-key-group-chip--more {
 .api-key-channel-stat-value .api-key-channel-usage-chip {
   align-items: center;
   display: flex;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 750;
-  gap: 3px;
+  gap: 2px;
   justify-content: space-between;
   line-height: 1.25;
   max-width: 100%;
@@ -7938,7 +7938,7 @@ button.api-key-group-chip--more {
   color: inherit;
   display: inline;
   flex: 0 0 auto;
-  font-size: 12px;
+  font-size: 13px;
   line-height: inherit;
   overflow: visible;
   white-space: nowrap;
@@ -7947,7 +7947,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-channel-stat-value .api-key-channel-usage-chip > b {
-  font-size: 12px;
+  font-size: 13px;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
