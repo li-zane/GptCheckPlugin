@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -15,10 +16,14 @@ from app.models import (
     UpstreamChannelUsageTotal,
 )
 from app.schemas import UpstreamUsageHistoryOut
+from app.services.upstream_channels import UpstreamChannelService
+from app.services.upstream_client import DailyUsageResult
 from app.services.upstream_usage_history import (
     channel_identity,
+    finalize_cached_yesterday_usage,
     finalize_yesterday_usage,
     hydrate_yesterday_usage,
+    missing_finalized_usage_dates,
     prune_upstream_usage_history,
     should_fetch_yesterday_usage,
     snapshot_today_usage,
@@ -148,6 +153,45 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         total = await self.db.get(UpstreamChannelUsageTotal, channel_identity(self.channel))
         self.assertEqual(total.total_balance_used, 6.0)
         self.assertEqual(total.total_balance_used_adjusted, 12.0)
+
+    async def test_yesterday_snapshot_is_finalized_without_an_upstream_refetch(self) -> None:
+        yesterday_now = self.now - timedelta(days=1)
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            income_by_account={7: 3.0},
+            now=yesterday_now,
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+
+        self.assertFalse(
+            await should_fetch_yesterday_usage(
+                self.db,
+                channel=self.channel,
+                now=self.now,
+                time_zone="Asia/Shanghai",
+            )
+        )
+        cached = await finalize_cached_yesterday_usage(
+            self.db,
+            channel=self.channel,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+
+        self.assertTrue(cached)
+        daily = (
+            await self.db.execute(select(UpstreamChannelDailyUsage))
+        ).scalar_one()
+        account = (
+            await self.db.execute(select(UpstreamAccountDailyUsage))
+        ).scalar_one()
+        self.assertTrue(daily.finalized)
+        self.assertTrue(account.finalized)
+        self.assertEqual(self.channel.yesterday_balance_status, "stored")
+        self.assertEqual(self.channel.yesterday_balance_used, 2.0)
 
     async def test_history_uses_key_cost_when_an_account_filter_is_selected(self) -> None:
         await snapshot_today_usage(
@@ -358,3 +402,94 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         total = await self.db.get(UpstreamChannelUsageTotal, channel_identity(self.channel))
         self.assertEqual(total.total_balance_used, 6.0)
         self.assertEqual(total.total_balance_used_adjusted, 12.0)
+
+    async def test_history_backfill_fetches_only_missing_dates_then_reuses_database(
+        self,
+    ) -> None:
+        first_day = self.now.date() - timedelta(days=2)
+        missing_day = self.now.date() - timedelta(days=1)
+        self.channel.resolved_upstream_type = "sub2api"
+        self.channel.today_balance_used = 3.0
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            income_by_account={7: 4.0},
+            now=self.now - timedelta(days=2),
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+        fetch = AsyncMock(
+            return_value={
+                missing_day: DailyUsageResult(
+                    usage_date=missing_day,
+                    amount=5.0,
+                    unit="USD",
+                    status="ok",
+                )
+            }
+        )
+        service = UpstreamChannelService(session_factory=self.session_factory)
+
+        with (
+            patch("app.services.upstream_channels.decrypt_text", return_value="token"),
+            patch(
+                "app.services.upstream_channels.fetch_upstream_daily_usages",
+                new=fetch,
+            ),
+        ):
+            stored = await service.backfill_missing_usage_history(
+                self.db,
+                self.channel.id,
+                start_date=first_day,
+                end_date=missing_day,
+                time_zone="Asia/Shanghai",
+            )
+            cached = await service.backfill_missing_usage_history(
+                self.db,
+                self.channel.id,
+                start_date=first_day,
+                end_date=missing_day,
+                time_zone="Asia/Shanghai",
+            )
+
+        self.assertEqual(stored, 1)
+        self.assertEqual(cached, 0)
+        fetch.assert_awaited_once()
+        self.assertEqual(fetch.await_args.args[1], [missing_day])
+        self.assertEqual(
+            await missing_finalized_usage_dates(
+                self.db,
+                channel=self.channel,
+                start_date=first_day,
+                end_date=missing_day,
+            ),
+            [],
+        )
+        account_row = (
+            await self.db.execute(select(UpstreamAccountDailyUsage))
+        ).scalar_one()
+        self.assertTrue(account_row.finalized)
+        rows = list(
+            (
+                await self.db.execute(
+                    select(UpstreamChannelDailyUsage).order_by(
+                        UpstreamChannelDailyUsage.usage_date
+                    )
+                )
+            ).scalars()
+        )
+        self.assertEqual(
+            [(row.usage_date, row.balance_used) for row in rows],
+            [
+                (first_day, 3.0),
+                (missing_day, 5.0),
+            ],
+        )
+        self.assertTrue(all(row.finalized for row in rows))
+        total = await self.db.get(
+            UpstreamChannelUsageTotal,
+            channel_identity(self.channel),
+        )
+        self.assertEqual(total.total_balance_used, 8.0)
+        self.assertEqual(total.total_balance_used_adjusted, 16.0)

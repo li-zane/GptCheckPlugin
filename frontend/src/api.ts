@@ -462,7 +462,11 @@ export const api = {
   upstreamChannels: (refresh = false) =>
     request<UpstreamChannelsResponse>(`/api/upstream-channels?refresh=${refresh ? "true" : "false"}`),
   upstreamUsageHistory: (channelId: number | string, filters?: UpstreamUsageHistoryFilters) =>
-    request<UpstreamUsageHistory>(upstreamUsageHistoryPath(channelId, filters)),
+    request<UpstreamUsageHistory>(
+      upstreamUsageHistoryPath(channelId, filters),
+      {},
+      90_000,
+    ),
   syncApiKeyInventory: () =>
     request<UpstreamChannelsResponse>(
       "/api/upstream-channels/sync-inventory",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -1054,6 +1054,103 @@ class UpstreamClientTests(unittest.TestCase):
                     datetime(2026, 7, 19, 0, 0, tzinfo=zone).timestamp()
                 ) - 1,
             },
+        )
+
+    def test_sub2api_daily_history_fetch_uses_one_request_per_requested_date(
+        self,
+    ) -> None:
+        requested: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, SUB2API_USAGE_STATS_ENDPOINT)
+            self.assertEqual(request.headers.get("Authorization"), "Bearer history-token")
+            requested.append(request)
+            amount = (
+                1.25 if request.url.params["start_date"] == "2026-07-26" else 2.5
+            )
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"total_actual_cost": amount}},
+            )
+
+        client = UpstreamClient(
+            transport=httpx.MockTransport(handler),
+            resolver=public_resolver,
+        )
+        first_day = date(2026, 7, 26)
+        second_day = date(2026, 7, 27)
+        results = asyncio.run(
+            client.fetch_daily_usages(
+                "https://upstream.example",
+                [second_day, first_day, second_day],
+                upstream_type="sub2api",
+                access_token="history-token",
+                time_zone="Asia/Shanghai",
+            )
+        )
+
+        self.assertEqual(results[first_day].amount, 1.25)
+        self.assertEqual(results[second_day].amount, 2.5)
+        self.assertEqual(
+            [request.url.params["start_date"] for request in requested],
+            ["2026-07-26", "2026-07-27"],
+        )
+        self.assertTrue(
+            all(
+                request.url.params["start_date"] == request.url.params["end_date"]
+                for request in requested
+            )
+        )
+        self.assertTrue(
+            all(
+                request.url.params["timezone"] == "Asia/Shanghai"
+                for request in requested
+            )
+        )
+
+    def test_newapi_daily_history_fetch_uses_status_quota_conversion(self) -> None:
+        usage_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/status":
+                return httpx.Response(
+                    200,
+                    json={"success": True, "data": {"quota_per_unit": 100}},
+                )
+            self.assertEqual(request.url.path, NEWAPI_TODAY_USAGE_ENDPOINT)
+            self.assertEqual(request.headers.get("Authorization"), "history-token")
+            self.assertEqual(request.headers.get("New-Api-User"), "17")
+            usage_requests.append(request)
+            return httpx.Response(200, json={"success": True, "data": {"quota": 250}})
+
+        client = UpstreamClient(
+            transport=httpx.MockTransport(handler),
+            resolver=public_resolver,
+        )
+        usage_date = date(2026, 7, 26)
+        result = asyncio.run(
+            client.fetch_daily_usages(
+                "https://upstream.example",
+                [usage_date],
+                upstream_type="newapi",
+                access_token="history-token",
+                new_api_user=17,
+                time_zone="Asia/Shanghai",
+            )
+        )[usage_date]
+
+        expected_start = datetime(2026, 7, 26, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(result.amount, 2.5)
+        self.assertEqual(result.unit, "USD")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(usage_requests), 1)
+        self.assertEqual(
+            int(usage_requests[0].url.params["start_timestamp"]),
+            int(expected_start.timestamp()),
+        )
+        self.assertEqual(
+            int(usage_requests[0].url.params["end_timestamp"]),
+            int((expected_start + timedelta(days=1)).timestamp()) - 1,
         )
 
     def test_newapi_balance_falls_back_to_default_quota_unit_and_accepts_used_alias(self) -> None:

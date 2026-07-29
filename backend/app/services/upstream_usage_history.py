@@ -184,7 +184,109 @@ async def should_fetch_yesterday_usage(
 ) -> bool:
     yesterday = usage_day(now, time_zone) - timedelta(days=1)
     row = await _daily_row(db, identity=channel_identity(channel), day=yesterday)
-    return row is None or not row.finalized
+    return row is None or _finite_amount(row.balance_used) is None
+
+
+async def finalize_cached_yesterday_usage(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    now: datetime,
+    time_zone: str,
+) -> bool:
+    """Finalize yesterday's last local snapshot without another upstream read."""
+
+    yesterday = usage_day(now, time_zone) - timedelta(days=1)
+    row = await _daily_row(
+        db,
+        identity=channel_identity(channel),
+        day=yesterday,
+    )
+    if row is None or _finite_amount(row.balance_used) is None:
+        return False
+    if not row.finalized:
+        row.finalized = True
+        row.finalized_at = now
+        account_rows = list(
+            (
+                await db.execute(
+                    select(UpstreamAccountDailyUsage).where(
+                        UpstreamAccountDailyUsage.channel_identity
+                        == row.channel_identity,
+                        UpstreamAccountDailyUsage.usage_date == yesterday,
+                    )
+                )
+            ).scalars()
+        )
+        for account_row in account_rows:
+            account_row.finalized = True
+        await db.flush()
+    return await hydrate_yesterday_usage(
+        db,
+        channel=channel,
+        now=now,
+        time_zone=time_zone,
+    )
+
+
+async def missing_finalized_usage_dates(
+    db: AsyncSession,
+    *,
+    channel: UpstreamChannel,
+    start_date: date,
+    end_date: date,
+) -> list[date]:
+    if end_date < start_date:
+        return []
+    rows = list(
+        (
+            await db.execute(
+                select(UpstreamChannelDailyUsage).where(
+                    UpstreamChannelDailyUsage.channel_identity == channel_identity(channel),
+                    UpstreamChannelDailyUsage.usage_date >= start_date,
+                    UpstreamChannelDailyUsage.usage_date <= end_date,
+                )
+            )
+        ).scalars()
+    )
+    cached_rows = {
+        row.usage_date: row
+        for row in rows
+        if _finite_amount(row.balance_used) is not None
+    }
+    newly_finalized_dates = {
+        usage_date
+        for usage_date, row in cached_rows.items()
+        if not row.finalized
+    }
+    if newly_finalized_dates:
+        finalized_at = datetime.now(timezone.utc)
+        for usage_date in newly_finalized_dates:
+            row = cached_rows[usage_date]
+            row.finalized = True
+            row.finalized_at = row.finalized_at or finalized_at
+        account_rows = list(
+            (
+                await db.execute(
+                    select(UpstreamAccountDailyUsage).where(
+                        UpstreamAccountDailyUsage.channel_identity
+                        == channel_identity(channel),
+                        UpstreamAccountDailyUsage.usage_date.in_(newly_finalized_dates),
+                    )
+                )
+            ).scalars()
+        )
+        for account_row in account_rows:
+            account_row.finalized = True
+        await db.flush()
+    cached_dates = set(cached_rows)
+    missing: list[date] = []
+    cursor = start_date
+    while cursor <= end_date:
+        if cursor not in cached_dates:
+            missing.append(cursor)
+        cursor += timedelta(days=1)
+    return missing
 
 
 async def hydrate_yesterday_usage(
@@ -630,8 +732,10 @@ __all__ = [
     "DEFAULT_TIME_ZONE",
     "MAX_HISTORY_DAYS",
     "channel_identity",
+    "finalize_cached_yesterday_usage",
     "finalize_yesterday_usage",
     "hydrate_yesterday_usage",
+    "missing_finalized_usage_dates",
     "normalize_history_time_zone",
     "prune_upstream_usage_history",
     "should_fetch_yesterday_usage",

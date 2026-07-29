@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence
 from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -31,6 +31,7 @@ DEFAULT_TIMEOUT_SECONDS = 3.5
 # Some upstream deployments aggregate usage on demand. Keep this isolated
 # from balance/group/status probes while preserving longer caller timeouts.
 UPSTREAM_USAGE_TIMEOUT_SECONDS = 60.0
+UPSTREAM_HISTORY_FETCH_CONCURRENCY = 4
 DEFAULT_NEWAPI_QUOTA_PER_UNIT = 500_000.0
 DEFAULT_TODAY_TIME_ZONE = "Asia/Shanghai"
 # Bound list pagination, detail discovery, and usage batches independently so
@@ -217,6 +218,15 @@ class DiscoveryResult:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DailyUsageResult:
+    usage_date: date
+    amount: float | None = None
+    unit: str | None = None
+    status: str = "unknown"
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1062,6 +1072,170 @@ class UpstreamClient:
             )
         )
 
+    async def fetch_daily_usages(
+        self,
+        base_url: str,
+        usage_dates: Iterable[date],
+        *,
+        upstream_type: UpstreamType | str,
+        access_token: str | None,
+        new_api_user: str | int | None = None,
+        time_zone: str = DEFAULT_TODAY_TIME_ZONE,
+    ) -> dict[date, DailyUsageResult]:
+        """Fetch only explicitly requested calendar days for history backfill."""
+
+        days = sorted({value for value in usage_dates if isinstance(value, date)})
+        if not days:
+            return {}
+        requested_type = _clean_upstream_type(upstream_type)
+        if requested_type not in {"newapi", "sub2api"}:
+            return {
+                day: DailyUsageResult(
+                    day,
+                    status="unsupported",
+                    error="unsupported_upstream_type",
+                )
+                for day in days
+            }
+
+        endpoint = (
+            NEWAPI_TODAY_USAGE_ENDPOINT
+            if requested_type == "newapi"
+            else SUB2API_USAGE_STATS_ENDPOINT
+        )
+        try:
+            normalized_url, hostname = _normalize_base_url(base_url)
+            if urlparse(normalized_url).scheme != "https":
+                raise ValueError("insecure URL")
+            headers = _headers_for_endpoint(
+                endpoint,
+                requested_type=requested_type,
+                access_token=access_token,
+                api_key=None,
+                new_api_user=new_api_user,
+            )
+            if headers is None:
+                return {
+                    day: DailyUsageResult(
+                        day,
+                        status="credentials_missing",
+                        error="credentials_missing",
+                    )
+                    for day in days
+                }
+            pinned_addresses = await self._resolve_public_addresses(hostname)
+        except Exception:
+            return {
+                day: DailyUsageResult(day, status="error", error="invalid_request")
+                for day in days
+            }
+
+        fetched_by_day: dict[date, _FetchResult] = {}
+        status_result: _FetchResult | None = None
+        try:
+            for address in pinned_addresses:
+                pinned_transport = _PinnedAsyncTransport(
+                    hostname=hostname,
+                    address=address,
+                    inner=self.transport,
+                    close_inner=self.transport is None,
+                )
+                async with httpx.AsyncClient(
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "gpt-check-upstream-discovery/1.0",
+                    },
+                    timeout=httpx.Timeout(self.timeout_seconds),
+                    transport=pinned_transport,
+                    trust_env=False,
+                    follow_redirects=False,
+                ) as client:
+                    if requested_type == "newapi":
+                        status_result = await self._request_json(
+                            client,
+                            normalized_url,
+                            "/api/status",
+                            headers={},
+                        )
+                    semaphore = asyncio.Semaphore(UPSTREAM_HISTORY_FETCH_CONCURRENCY)
+
+                    async def fetch_day(day: date) -> tuple[date, _FetchResult]:
+                        async with semaphore:
+                            params: Mapping[str, str | int] = (
+                                _newapi_usage_params_for_date(day, time_zone)
+                                if requested_type == "newapi"
+                                else _sub2api_usage_params_for_date(day, time_zone)
+                            )
+                            result = await self._request_json(
+                                client,
+                                normalized_url,
+                                endpoint,
+                                headers=headers,
+                                params=params,
+                                timeout_seconds=max(
+                                    self.timeout_seconds,
+                                    UPSTREAM_USAGE_TIMEOUT_SECONDS,
+                                ),
+                            )
+                            return day, result
+
+                    fetched_by_day = dict(
+                        await asyncio.gather(*(fetch_day(day) for day in days))
+                    )
+                if any(
+                    result.status_code is not None
+                    for result in fetched_by_day.values()
+                ):
+                    break
+            if (
+                self.cache_dns
+                and fetched_by_day
+                and not any(result.status_code is not None for result in fetched_by_day.values())
+            ):
+                _invalidate_dns_cache(hostname)
+        except Exception:
+            fetched_by_day = {}
+        finally:
+            if self.transport is not None:
+                await self.transport.aclose()
+
+        results: dict[date, DailyUsageResult] = {}
+        for day in days:
+            fetched = fetched_by_day.get(day)
+            if fetched is None:
+                results[day] = DailyUsageResult(
+                    day,
+                    status="error",
+                    error="response_missing",
+                )
+                continue
+            responses = {endpoint: fetched}
+            if status_result is not None:
+                responses["/api/status"] = status_result
+            if requested_type == "newapi":
+                amount, unit, status = _discover_newapi_period_usage(responses, endpoint)
+            else:
+                amount, unit, status = _discover_sub2api_yesterday_usage(responses)
+            error = None
+            if status != "ok":
+                error = (
+                    fetched.error_kind
+                    or (
+                        f"http_{fetched.status_code}"
+                        if fetched.status_code is not None
+                        else None
+                    )
+                    or "invalid_payload"
+                )
+            results[day] = DailyUsageResult(
+                usage_date=day,
+                amount=amount,
+                unit=unit,
+                status=status,
+                error=error,
+            )
+        return results
+
     async def _reveal_api_key_records(
         self,
         client: httpx.AsyncClient,
@@ -1821,6 +1995,33 @@ async def discover_upstream(
         monitor_only=monitor_only,
         today_timezone=today_timezone,
         include_yesterday_usage=include_yesterday_usage,
+    )
+
+
+async def fetch_upstream_daily_usages(
+    base_url: str,
+    usage_dates: Iterable[date],
+    *,
+    upstream_type: UpstreamType | str,
+    access_token: str | None,
+    new_api_user: str | int | None = None,
+    time_zone: str = DEFAULT_TODAY_TIME_ZONE,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    transport: httpx.AsyncBaseTransport | None = None,
+    resolver: Resolver | None = None,
+) -> dict[date, DailyUsageResult]:
+    client = UpstreamClient(
+        timeout_seconds=timeout_seconds,
+        transport=transport,
+        resolver=resolver,
+    )
+    return await client.fetch_daily_usages(
+        base_url,
+        usage_dates,
+        upstream_type=upstream_type,
+        access_token=access_token,
+        new_api_user=new_api_user,
+        time_zone=time_zone,
     )
 
 
@@ -4090,6 +4291,21 @@ def _newapi_today_usage_params(
     }
 
 
+def _newapi_usage_params_for_date(usage_date: date, time_zone: str) -> dict[str, int]:
+    _, reference_start = _newapi_usage_day(time_zone)
+    start = datetime(
+        usage_date.year,
+        usage_date.month,
+        usage_date.day,
+        tzinfo=reference_start.tzinfo,
+    )
+    end = start + timedelta(days=1)
+    return {
+        "start_timestamp": int(start.timestamp()),
+        "end_timestamp": int(end.timestamp()) - 1,
+    }
+
+
 def _newapi_usage_day(
     time_zone: str,
     *,
@@ -4134,6 +4350,16 @@ def _sub2api_yesterday_usage_params(
         "start_date": date_text,
         "end_date": date_text,
         "timezone": str(today_start.tzinfo),
+    }
+
+
+def _sub2api_usage_params_for_date(usage_date: date, time_zone: str) -> dict[str, str]:
+    _, reference_start = _newapi_usage_day(time_zone)
+    date_text = usage_date.isoformat()
+    return {
+        "start_date": date_text,
+        "end_date": date_text,
+        "timezone": str(reference_start.tzinfo),
     }
 
 
@@ -4435,6 +4661,7 @@ __all__ = [
     "AccountUpstreamState",
     "DEFAULT_TODAY_TIME_ZONE",
     "DEFAULT_TIMEOUT_SECONDS",
+    "DailyUsageResult",
     "DiscoveryResult",
     "GroupOption",
     "MAX_RESPONSE_BYTES",
@@ -4449,9 +4676,11 @@ __all__ = [
     "SUB2API_TODAY_USAGE_ENDPOINT",
     "SUB2API_USAGE_STATS_ENDPOINT",
     "UPSTREAM_USAGE_TIMEOUT_SECONDS",
+    "UPSTREAM_HISTORY_FETCH_CONCURRENCY",
     "Sub2ApiTokenPair",
     "UpstreamClient",
     "UpstreamDiscoveryClient",
     "discover_upstream",
+    "fetch_upstream_daily_usages",
     "refresh_sub2api_tokens",
 ]

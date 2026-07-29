@@ -7,7 +7,7 @@ import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
@@ -81,13 +81,16 @@ from app.services.upstream_client import (
     DEFAULT_TODAY_TIME_ZONE,
     MAX_UPSTREAM_TOKEN_LENGTH,
     discover_upstream,
+    fetch_upstream_daily_usages,
     refresh_sub2api_tokens,
 )
 from app.services.upstream_usage_history import (
+    finalize_cached_yesterday_usage,
     finalize_yesterday_usage,
     hydrate_yesterday_usage,
-    should_fetch_yesterday_usage,
+    missing_finalized_usage_dates,
     snapshot_today_usage,
+    upsert_historical_channel_usage,
     usage_day,
 )
 from app.services.workflow_coordination import get_workflow_coordinator
@@ -95,6 +98,7 @@ from app.services.workflow_coordination import get_workflow_coordinator
 
 TOKEN_INVALID_STATUS = "token_invalid"
 TOKEN_INVALID_ERROR = "Upstream channel token is invalid."
+UPSTREAM_HISTORY_BACKFILL_TIMEOUT_SECONDS = 75.0
 
 
 API_KEY_EXPORT_BATCH_SIZE = 200
@@ -3973,19 +3977,19 @@ class UpstreamChannelService:
                 pass
             usage_snapshot_now = _utcnow()
             try:
-                include_yesterday_usage = (
-                    not monitor_details_only
-                    and await should_fetch_yesterday_usage(
+                include_yesterday_usage = False
+                if not monitor_details_only:
+                    cached_yesterday = await finalize_cached_yesterday_usage(
                         db,
                         channel=channel,
                         now=usage_snapshot_now,
                         time_zone=today_timezone,
                     )
-                )
+                    include_yesterday_usage = not cached_yesterday
             except Exception:
                 # Keep the existing upstream read behavior if an early upgrade
                 # has not created the local daily-usage tables yet.
-                include_yesterday_usage = True
+                include_yesterday_usage = not monitor_details_only
 
             async def run_discovery(active_access_token: str | None, active_type: str) -> Any:
                 discovery_kwargs: dict[str, Any] = {
@@ -4171,6 +4175,13 @@ class UpstreamChannelService:
                 refresh_channel_monitors=refresh_channel_monitors,
                 time_zone=today_timezone,
             )
+            if not include_yesterday_usage:
+                await hydrate_yesterday_usage(
+                    db,
+                    channel=channel,
+                    now=usage_snapshot_now,
+                    time_zone=today_timezone,
+                )
             if token_invalid:
                 await enqueue_upstream_channel_token_invalid(
                     db,
@@ -4777,6 +4788,77 @@ class UpstreamChannelService:
         if found is None:
             raise UpstreamAccountServiceError("The upstream channel has no API key accounts.", status_code=409)
         return found
+
+    async def backfill_missing_usage_history(
+        self,
+        db: AsyncSession,
+        channel_id: int,
+        *,
+        start_date: date,
+        end_date: date,
+        time_zone: str,
+    ) -> int:
+        """Fetch and persist only missing finalized channel-usage days."""
+
+        if end_date < start_date:
+            return 0
+        lock = await self._lock_for(channel_id)
+        async with lock:
+            channel = await self._load_channel(db, channel_id)
+            if not channel.probe_enabled:
+                return 0
+            missing_dates = await missing_finalized_usage_dates(
+                db,
+                channel=channel,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if not missing_dates:
+                return 0
+            resolved_type = str(channel.resolved_upstream_type or "").strip().lower()
+            configured_type = str(channel.upstream_type or "").strip().lower()
+            upstream_type = (
+                resolved_type
+                if resolved_type in {"newapi", "sub2api"}
+                else configured_type
+            )
+            if upstream_type not in {"newapi", "sub2api"}:
+                return 0
+            results = await asyncio.wait_for(
+                fetch_upstream_daily_usages(
+                    channel.management_base_url or channel.canonical_base_url,
+                    missing_dates,
+                    upstream_type=upstream_type,
+                    access_token=decrypt_text(channel.encrypted_access_token),
+                    new_api_user=channel.upstream_user_id,
+                    time_zone=time_zone,
+                ),
+                timeout=UPSTREAM_HISTORY_BACKFILL_TIMEOUT_SECONDS,
+            )
+            stored = 0
+            for usage_date in missing_dates:
+                result = results.get(usage_date)
+                amount = _balance_number(getattr(result, "amount", None))
+                if (
+                    result is None
+                    or str(result.status or "").strip().lower() != "ok"
+                    or amount is None
+                    or amount < 0
+                ):
+                    continue
+                await upsert_historical_channel_usage(
+                    db,
+                    channel=channel,
+                    usage_date=usage_date,
+                    balance_used=amount,
+                    balance_unit=result.unit or "USD",
+                    recharge_multiplier=channel.effective_recharge_multiplier,
+                    observed_at=_utcnow(),
+                )
+                stored += 1
+            if stored:
+                await db.commit()
+            return stored
 
     async def discover_channel(
         self,
