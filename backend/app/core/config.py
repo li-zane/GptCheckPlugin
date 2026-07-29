@@ -103,7 +103,12 @@ class Settings(BaseSettings):
     priority_share_same_composite_multiplier: bool = False
     upstream_rate_log_retention_days: int = Field(default=90, ge=1, le=3650)
     upstream_usage_data_retention_days: int = Field(default=90, ge=1, le=3650)
-    change_log_page_size: int = 50
+    change_log_page_size: int = Field(default=50, ge=1, le=200)
+    change_log_page_size_options: list[int] = Field(
+        default_factory=lambda: [20, 50, 100, 200],
+        min_length=1,
+        max_length=20,
+    )
     discord_bot_notifications_enabled: bool = False
     discord_bot_token: str = ""
     discord_bot_channel_id: str = ""
@@ -175,12 +180,18 @@ class Settings(BaseSettings):
             return f"/{value}"
         return value
 
-    @field_validator("change_log_page_size")
+    @field_validator("change_log_page_size_options")
     @classmethod
-    def validate_change_log_page_size(cls, value: int) -> int:
-        if value not in {20, 50, 100, 200}:
-            raise ValueError("change_log_page_size must be 20, 50, 100, or 200")
-        return value
+    def validate_change_log_page_size_options(cls, value: list[int]) -> list[int]:
+        if any(isinstance(item, bool) or item < 1 or item > 200 for item in value):
+            raise ValueError("change_log_page_size_options must contain integers from 1 to 200")
+        return sorted(set(value))
+
+    @model_validator(mode="after")
+    def validate_change_log_pagination(self) -> "Settings":
+        if self.change_log_page_size not in self.change_log_page_size_options:
+            raise ValueError("change_log_page_size must be included in change_log_page_size_options")
+        return self
 
     @model_validator(mode="after")
     def validate_production_security(self) -> "Settings":

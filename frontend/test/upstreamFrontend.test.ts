@@ -48,6 +48,11 @@ import {
   writeChangeLogCache,
 } from "../src/changeLogCache.ts";
 import {
+  normalizeChangeLogPageSize,
+  normalizeChangeLogPageSizeOptions,
+  parseChangeLogPageSizeOptions,
+} from "../src/changeLogPageSize.ts";
+import {
   isGenericUpstreamChannelError,
   partitionUpstreamChannels,
   upstreamChannelTokenInvalid,
@@ -2979,8 +2984,32 @@ test("change ledgers show account-rate reasons and use numbered pagination", () 
   assert.match(viewSource, /每页展示条数/);
   assert.doesNotMatch(viewSource, /加载更多/);
   assert.match(appSource, /变化记录默认每页条数/);
+  assert.match(appSource, /每页条数可选项/);
+  const dataManagementSection = appSource.slice(
+    appSource.indexOf('id="settings-data-management"'),
+    appSource.indexOf('id="settings-notifications"'),
+  );
+  const displaySecuritySection = appSource.slice(
+    appSource.indexOf('id="settings-display-security"'),
+    appSource.indexOf('</form>', appSource.indexOf('id="settings-display-security"')),
+  );
+  assert.doesNotMatch(dataManagementSection, /变化记录默认每页条数/);
+  assert.match(displaySecuritySection, /变化记录默认每页条数/);
+  assert.match(displaySecuritySection, /每页条数可选项/);
   assert.match(appSource, /change_log_page_size: changeLogPageSize/);
+  assert.match(appSource, /change_log_page_size_options: changeLogPageSizeOptions/);
+  assert.match(viewSource, /pageSizeOptions\.map/);
   assert.match(typeSource, /total_count: number;\s+page: number;\s+page_size: number;/);
+});
+
+test("change log page sizes accept configurable persisted options", () => {
+  assert.deepEqual(normalizeChangeLogPageSizeOptions([100, 10, 50, 10]), [10, 50, 100]);
+  assert.deepEqual(parseChangeLogPageSizeOptions("100, 10 50，10"), [10, 50, 100]);
+  assert.equal(parseChangeLogPageSizeOptions("0, 50"), null);
+  assert.equal(parseChangeLogPageSizeOptions("20, 201"), null);
+  assert.equal(normalizeChangeLogPageSize(50, [10, 25, 50]), 50);
+  assert.equal(normalizeChangeLogPageSize(20, [10, 25, 50]), 50);
+  assert.equal(normalizeChangeLogPageSize(20, [10, 25]), 10);
 });
 
 class MemoryStorage {

@@ -68,6 +68,10 @@ import {
   writeChangeLogCache,
 } from "./changeLogCache";
 import {
+  normalizeChangeLogPageSize,
+  normalizeChangeLogPageSizeOptions,
+} from "./changeLogPageSize";
+import {
   isGenericUpstreamChannelError,
   partitionUpstreamChannels,
   upstreamChannelTokenInvalid,
@@ -251,19 +255,11 @@ const emptyPriorityIntervalForm: PriorityIntervalForm = {
   rateAbsoluteThreshold: "1",
 };
 
-const CHANGE_LOG_PAGE_SIZE_OPTIONS = [20, 50, 100, 200] as const;
-type ChangeLogPageSize = (typeof CHANGE_LOG_PAGE_SIZE_OPTIONS)[number];
-
-function normalizeChangeLogPageSize(value: number): ChangeLogPageSize {
-  return CHANGE_LOG_PAGE_SIZE_OPTIONS.includes(value as ChangeLogPageSize)
-    ? value as ChangeLogPageSize
-    : 50;
-}
-
 export function ApiKeyAccountsView({
   cacheBaseUrl,
   cachedData,
   changeLogPageSize,
+  changeLogPageSizeOptions,
   channelMonitorFallbackTestModels,
   displayTimeZone,
   globallyBusy,
@@ -279,6 +275,7 @@ export function ApiKeyAccountsView({
   cacheBaseUrl: string;
   cachedData: UpstreamChannelsResponse | null;
   changeLogPageSize: number;
+  changeLogPageSizeOptions: number[];
   channelMonitorFallbackTestModels: string[];
   displayTimeZone: string;
   globallyBusy: boolean;
@@ -291,6 +288,11 @@ export function ApiKeyAccountsView({
   shareSameCompositePriority: boolean;
   subview: ApiKeySubview;
 }) {
+  const availableChangeLogPageSizes = useMemo(
+    () => normalizeChangeLogPageSizeOptions(changeLogPageSizeOptions),
+    [changeLogPageSizeOptions],
+  );
+  const changeLogPageSizeOptionsKey = availableChangeLogPageSizes.join(",");
   const [data, setData] = useState<UpstreamChannelsResponse>(cachedData || emptyData);
   const [loading, setLoading] = useState(!cachedData);
   const [refreshing, setRefreshing] = useState(Boolean(cachedData));
@@ -311,7 +313,7 @@ export function ApiKeyAccountsView({
   const [rateLogsLoading, setRateLogsLoading] = useState(false);
   const [rateLogsError, setRateLogsError] = useState("");
   const [rateLogPage, setRateLogPage] = useState(1);
-  const [rateLogPageSize, setRateLogPageSize] = useState<ChangeLogPageSize>(() => normalizeChangeLogPageSize(changeLogPageSize));
+  const [rateLogPageSize, setRateLogPageSize] = useState(() => normalizeChangeLogPageSize(changeLogPageSize, availableChangeLogPageSizes));
   const [rateLogTotalCount, setRateLogTotalCount] = useState(0);
   const [rateLogDraftFilters, setRateLogDraftFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
   const [rateLogFilters, setRateLogFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
@@ -320,7 +322,7 @@ export function ApiKeyAccountsView({
   const [scheduleLogsLoading, setScheduleLogsLoading] = useState(false);
   const [scheduleLogsError, setScheduleLogsError] = useState("");
   const [scheduleLogPage, setScheduleLogPage] = useState(1);
-  const [scheduleLogPageSize, setScheduleLogPageSize] = useState<ChangeLogPageSize>(() => normalizeChangeLogPageSize(changeLogPageSize));
+  const [scheduleLogPageSize, setScheduleLogPageSize] = useState(() => normalizeChangeLogPageSize(changeLogPageSize, availableChangeLogPageSizes));
   const [scheduleLogTotalCount, setScheduleLogTotalCount] = useState(0);
   const [scheduleLogDraftFilters, setScheduleLogDraftFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
   const [scheduleLogFilters, setScheduleLogFilters] = useState<RateLogFilters>({ startDate: "", endDate: "" });
@@ -717,7 +719,7 @@ export function ApiKeyAccountsView({
   const warmDefaultChangeLogCaches = useCallback(async () => {
     const storage = getChangeLogSessionStorage();
     const filters = { timeZone: displayTimeZone };
-    const defaultPageSize = normalizeChangeLogPageSize(changeLogPageSize);
+    const defaultPageSize = normalizeChangeLogPageSize(changeLogPageSize, availableChangeLogPageSizes);
     const upstreamCacheKey = changeLogCacheKey(cacheBaseUrl, "upstream", "", "", displayTimeZone, 1, defaultPageSize);
     const accountRateCacheKey = changeLogCacheKey(cacheBaseUrl, "account_rate", "", "", displayTimeZone, 1, defaultPageSize);
     const schedulingCacheKey = changeLogCacheKey(cacheBaseUrl, "scheduling", "", "", displayTimeZone, 1, defaultPageSize);
@@ -750,7 +752,7 @@ export function ApiKeyAccountsView({
     if (subview !== "account-rate-log") tasks.push(warmRateCache("account_rate", accountRateCacheKey));
     if (subview !== "schedule-log") tasks.push(warmSchedulingCache());
     await Promise.allSettled(tasks);
-  }, [cacheBaseUrl, changeLogPageSize, displayTimeZone, subview]);
+  }, [availableChangeLogPageSizes, cacheBaseUrl, changeLogPageSize, displayTimeZone, subview]);
 
   const markRateLogsReadOnLeave = useCallback(async (
     category: "upstream" | "account_rate",
@@ -1011,19 +1013,19 @@ export function ApiKeyAccountsView({
   }, [refreshChangeLogUnreadCounts, refreshVersion]);
 
   useEffect(() => {
-    const nextPageSize = normalizeChangeLogPageSize(changeLogPageSize);
+    const nextPageSize = normalizeChangeLogPageSize(changeLogPageSize, availableChangeLogPageSizes);
     setRateLogPageSize(nextPageSize);
     setScheduleLogPageSize(nextPageSize);
     setRateLogPage(1);
     setScheduleLogPage(1);
-  }, [changeLogPageSize]);
+  }, [availableChangeLogPageSizes, changeLogPageSize]);
 
   useEffect(() => {
-    const scope = `${cacheBaseUrl}|${displayTimeZone}|${changeLogPageSize}`;
+    const scope = `${cacheBaseUrl}|${displayTimeZone}|${changeLogPageSize}|${changeLogPageSizeOptionsKey}`;
     if (warmedChangeLogCacheScopeRef.current === scope) return;
     warmedChangeLogCacheScopeRef.current = scope;
     void warmDefaultChangeLogCaches();
-  }, [cacheBaseUrl, changeLogPageSize, displayTimeZone, warmDefaultChangeLogCaches]);
+  }, [cacheBaseUrl, changeLogPageSize, changeLogPageSizeOptionsKey, displayTimeZone, warmDefaultChangeLogCaches]);
 
   useEffect(() => {
     const refreshWhenVisible = () => {
@@ -3023,6 +3025,7 @@ export function ApiKeyAccountsView({
           kind={subview === "account-rate-log" ? "account_rate" : "upstream"}
           page={rateLogPage}
           pageSize={rateLogPageSize}
+          pageSizeOptions={availableChangeLogPageSizes}
           totalCount={rateLogTotalCount}
           onApplyFilters={applyRateLogFilters}
           onClearFilters={clearRateLogFilters}
@@ -3044,6 +3047,7 @@ export function ApiKeyAccountsView({
           logs={scheduleLogs}
           page={scheduleLogPage}
           pageSize={scheduleLogPageSize}
+          pageSizeOptions={availableChangeLogPageSizes}
           totalCount={scheduleLogTotalCount}
           onApplyFilters={applyScheduleLogFilters}
           onClearFilters={clearScheduleLogFilters}
@@ -4805,6 +4809,7 @@ function RateChangeLogView({
   logs,
   page,
   pageSize,
+  pageSizeOptions,
   totalCount,
   onApplyFilters,
   onClearFilters,
@@ -4822,13 +4827,14 @@ function RateChangeLogView({
   loading: boolean;
   logs: UpstreamChannelChangeEvent[];
   page: number;
-  pageSize: ChangeLogPageSize;
+  pageSize: number;
+  pageSizeOptions: number[];
   totalCount: number;
   onApplyFilters: () => void;
   onClearFilters: () => void;
   onDraftFiltersChange: (filters: RateLogFilters) => void;
   onPageChange: (page: number) => void;
-  onPageSizeChange: (pageSize: ChangeLogPageSize) => void;
+  onPageSizeChange: (pageSize: number) => void;
   onRefresh: () => void;
 }) {
   const accountRateView = kind === "account_rate";
@@ -5044,6 +5050,7 @@ function RateChangeLogView({
         onPageSizeChange={onPageSizeChange}
         page={page}
         pageSize={pageSize}
+        pageSizeOptions={pageSizeOptions}
         totalCount={totalCount}
       />
     </section>
@@ -5059,6 +5066,7 @@ function SchedulingChangeLogView({
   logs,
   page,
   pageSize,
+  pageSizeOptions,
   totalCount,
   onApplyFilters,
   onClearFilters,
@@ -5074,13 +5082,14 @@ function SchedulingChangeLogView({
   loading: boolean;
   logs: AccountSchedulingChangeEvent[];
   page: number;
-  pageSize: ChangeLogPageSize;
+  pageSize: number;
+  pageSizeOptions: number[];
   totalCount: number;
   onApplyFilters: () => void;
   onClearFilters: () => void;
   onDraftFiltersChange: (filters: RateLogFilters) => void;
   onPageChange: (page: number) => void;
-  onPageSizeChange: (pageSize: ChangeLogPageSize) => void;
+  onPageSizeChange: (pageSize: number) => void;
   onRefresh: () => void;
 }) {
   return (
@@ -5234,6 +5243,7 @@ function SchedulingChangeLogView({
         onPageSizeChange={onPageSizeChange}
         page={page}
         pageSize={pageSize}
+        pageSizeOptions={pageSizeOptions}
         totalCount={totalCount}
       />
     </section>
@@ -5246,13 +5256,15 @@ function ChangeLogPagination({
   onPageSizeChange,
   page,
   pageSize,
+  pageSizeOptions,
   totalCount,
 }: {
   loading: boolean;
   onPageChange: (page: number) => void;
-  onPageSizeChange: (pageSize: ChangeLogPageSize) => void;
+  onPageSizeChange: (pageSize: number) => void;
   page: number;
-  pageSize: ChangeLogPageSize;
+  pageSize: number;
+  pageSizeOptions: number[];
   totalCount: number;
 }) {
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
@@ -5280,10 +5292,10 @@ function ChangeLogPagination({
         <select
           aria-label="每页展示条数"
           disabled={loading}
-          onChange={(event) => onPageSizeChange(normalizeChangeLogPageSize(Number(event.target.value)))}
+          onChange={(event) => onPageSizeChange(normalizeChangeLogPageSize(Number(event.target.value), pageSizeOptions))}
           value={pageSize}
         >
-          {CHANGE_LOG_PAGE_SIZE_OPTIONS.map((size) => <option key={size} value={size}>{size} 条</option>)}
+          {pageSizeOptions.map((size) => <option key={size} value={size}>{size} 条</option>)}
         </select>
       </label>
     </nav>

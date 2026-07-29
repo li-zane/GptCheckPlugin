@@ -580,7 +580,12 @@ class AppSettingsOut(BaseModel):
     notify_upstream_token_invalid: bool = False
     upstream_rate_log_retention_days: int
     upstream_usage_data_retention_days: int = 90
-    change_log_page_size: Literal[20, 50, 100, 200] = 50
+    change_log_page_size: int = Field(default=50, ge=1, le=200)
+    change_log_page_size_options: list[int] = Field(
+        default_factory=lambda: [20, 50, 100, 200],
+        min_length=1,
+        max_length=20,
+    )
     usage_limit_sample_five_hour_threshold_percent: float
     usage_limit_sample_seven_day_threshold_percent: float
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges]
@@ -686,7 +691,12 @@ class AppSettingsUpdate(BaseModel):
     notify_upstream_token_invalid: bool | None = None
     upstream_rate_log_retention_days: int | None = Field(default=None, ge=1, le=3650)
     upstream_usage_data_retention_days: int | None = Field(default=None, ge=1, le=3650)
-    change_log_page_size: Literal[20, 50, 100, 200] | None = None
+    change_log_page_size: int | None = Field(default=None, ge=1, le=200)
+    change_log_page_size_options: list[int] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=20,
+    )
     usage_limit_sample_five_hour_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_sample_seven_day_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     usage_limit_default_ranges: dict[str, UsageLimitPlanRanges] | None = None
@@ -722,6 +732,28 @@ class AppSettingsUpdate(BaseModel):
                 seen.add(model)
                 normalized.append(model)
         return normalized
+
+    @field_validator("change_log_page_size_options")
+    @classmethod
+    def validate_change_log_page_size_options(
+        cls,
+        value: list[int] | None,
+    ) -> list[int] | None:
+        if value is None:
+            return None
+        if any(isinstance(item, bool) or item < 1 or item > 200 for item in value):
+            raise ValueError("change_log_page_size_options must contain integers from 1 to 200")
+        return sorted(set(value))
+
+    @model_validator(mode="after")
+    def validate_change_log_pagination(self) -> "AppSettingsUpdate":
+        if (
+            self.change_log_page_size is not None
+            and self.change_log_page_size_options is not None
+            and self.change_log_page_size not in self.change_log_page_size_options
+        ):
+            raise ValueError("change_log_page_size must be included in change_log_page_size_options")
+        return self
 
     @field_validator("sub2api_base_url")
     @classmethod

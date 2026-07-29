@@ -117,6 +117,7 @@ KEY_NOTIFY_UPSTREAM_TOKEN_INVALID = "notify_upstream_token_invalid"
 KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS = "upstream_rate_log_retention_days"
 KEY_UPSTREAM_USAGE_DATA_RETENTION_DAYS = "upstream_usage_data_retention_days"
 KEY_CHANGE_LOG_PAGE_SIZE = "change_log_page_size"
+KEY_CHANGE_LOG_PAGE_SIZE_OPTIONS = "change_log_page_size_options"
 KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_hour_threshold_percent"
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
 KEY_USAGE_LIMIT_DEFAULT_RANGES = "usage_limit_default_ranges"
@@ -612,9 +613,21 @@ class RuntimeConfigService:
 
     async def get_change_log_page_size(self) -> int:
         values = await self._load_values()
+        options = _change_log_page_size_options_or_default(
+            values.get(KEY_CHANGE_LOG_PAGE_SIZE_OPTIONS),
+            getattr(self.settings, "change_log_page_size_options", None),
+        )
         return _change_log_page_size_or_default(
             values.get(KEY_CHANGE_LOG_PAGE_SIZE),
+            options,
             int(getattr(self.settings, "change_log_page_size", 50)),
+        )
+
+    async def get_change_log_page_size_options(self) -> list[int]:
+        values = await self._load_values()
+        return _change_log_page_size_options_or_default(
+            values.get(KEY_CHANGE_LOG_PAGE_SIZE_OPTIONS),
+            getattr(self.settings, "change_log_page_size_options", None),
         )
 
     async def get_usage_limit_sample_thresholds(self) -> dict[str, float]:
@@ -701,6 +714,15 @@ class RuntimeConfigService:
         notification = await self.get_notification_config()
         logo_data = values.get(KEY_SITE_LOGO_DATA)
         logo_version = hashlib.sha256(logo_data.encode("ascii")).hexdigest()[:12] if logo_data else None
+        change_log_page_size_options = _change_log_page_size_options_or_default(
+            values.get(KEY_CHANGE_LOG_PAGE_SIZE_OPTIONS),
+            getattr(self.settings, "change_log_page_size_options", None),
+        )
+        change_log_page_size = _change_log_page_size_or_default(
+            values.get(KEY_CHANGE_LOG_PAGE_SIZE),
+            change_log_page_size_options,
+            int(getattr(self.settings, "change_log_page_size", 50)),
+        )
         return {
             "sub2api_base_url": base_url,
             "sub2api_port": _port_from_url(base_url),
@@ -1016,10 +1038,8 @@ class RuntimeConfigService:
                 1,
                 3650,
             ),
-            "change_log_page_size": _change_log_page_size_or_default(
-                values.get(KEY_CHANGE_LOG_PAGE_SIZE),
-                int(getattr(self.settings, "change_log_page_size", 50)),
-            ),
+            "change_log_page_size": change_log_page_size,
+            "change_log_page_size_options": change_log_page_size_options,
             "usage_limit_sample_five_hour_threshold_percent": _threshold_or_settings_default(
                 values.get(KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT),
                 self.settings.usage_limit_sample_five_hour_threshold_percent,
@@ -1097,6 +1117,33 @@ class RuntimeConfigService:
                 "A site logo cannot be set and cleared in the same request."
             )
         current_values = await self._load_values()
+        requested_page_size_options = payload.get("change_log_page_size_options")
+        if requested_page_size_options is not None:
+            normalized_page_size_options = _parse_change_log_page_size_options(
+                requested_page_size_options
+            )
+            if not normalized_page_size_options:
+                raise RuntimeConfigServiceError(
+                    "Change log page size options must contain 1 to 20 unique integers from 1 to 200."
+                )
+        else:
+            normalized_page_size_options = _change_log_page_size_options_or_default(
+                current_values.get(KEY_CHANGE_LOG_PAGE_SIZE_OPTIONS),
+                getattr(self.settings, "change_log_page_size_options", None),
+            )
+        requested_page_size = payload.get("change_log_page_size")
+        if requested_page_size is not None:
+            normalized_page_size = int(requested_page_size)
+        else:
+            normalized_page_size = _change_log_page_size_or_default(
+                current_values.get(KEY_CHANGE_LOG_PAGE_SIZE),
+                normalized_page_size_options,
+                int(getattr(self.settings, "change_log_page_size", 50)),
+            )
+        if normalized_page_size not in normalized_page_size_options:
+            raise RuntimeConfigServiceError(
+                "The default change log page size must be included in its selectable options."
+            )
         usage_history_time_zone = _clean_timezone(
             str(
                 payload.get("display_timezone")
@@ -1352,7 +1399,14 @@ class RuntimeConfigService:
                 await self._put(
                     db,
                     KEY_CHANGE_LOG_PAGE_SIZE,
-                    str(int(payload["change_log_page_size"])),
+                    str(normalized_page_size),
+                )
+
+            if payload.get("change_log_page_size_options") is not None:
+                await self._put(
+                    db,
+                    KEY_CHANGE_LOG_PAGE_SIZE_OPTIONS,
+                    json.dumps(normalized_page_size_options, separators=(",", ":")),
                 )
 
             if payload.get("usage_limit_sample_five_hour_threshold_percent") is not None:
@@ -1824,6 +1878,10 @@ class RuntimeConfigService:
                 int(settings.get("upstream_usage_data_retention_days", 90))
             ),
             "CHANGE_LOG_PAGE_SIZE": str(int(settings.get("change_log_page_size", 50))),
+            "CHANGE_LOG_PAGE_SIZE_OPTIONS": json.dumps(
+                settings.get("change_log_page_size_options", [20, 50, 100, 200]),
+                separators=(",", ":"),
+            ),
             "USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT": _format_number(
                 float(settings["usage_limit_sample_five_hour_threshold_percent"])
             ),
@@ -1929,10 +1987,41 @@ def _bounded_int_or_default(value: str | None, default: int, minimum: int, maxim
     return result
 
 
-def _change_log_page_size_or_default(value: str | None, default: int = 50) -> int:
-    allowed = {20, 50, 100, 200}
+def _parse_change_log_page_size_options(value: object) -> list[int]:
+    raw = value
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(raw, (list, tuple)) or not 1 <= len(raw) <= 20:
+        return []
+    normalized: list[int] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1 or item > 200:
+            return []
+        normalized.append(item)
+    return sorted(set(normalized))
+
+
+def _change_log_page_size_options_or_default(
+    value: object,
+    default: object = None,
+) -> list[int]:
+    return (
+        _parse_change_log_page_size_options(value)
+        or _parse_change_log_page_size_options(default)
+        or [20, 50, 100, 200]
+    )
+
+
+def _change_log_page_size_or_default(
+    value: str | None,
+    options: list[int],
+    default: int = 50,
+) -> int:
     result = _int_or_default(value, default)
-    return result if result in allowed else (default if default in allowed else 50)
+    return result if result in options else (default if default in options else options[0])
 
 
 def _float_or_default(value: str | None, default: float) -> float:
