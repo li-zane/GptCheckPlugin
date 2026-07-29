@@ -5308,11 +5308,11 @@ export function accountRateChangeReasonLabel(log: UpstreamChannelChangeEvent) {
     automatic_pause_restored: "上游恢复后自动恢复",
     rate_drift: "账号倍率被外部修改",
     external_observed: "账号倍率被外部修改",
-    automatic_apply: "自动同步目标倍率",
+    automatic_apply: "历史记录未记录具体原因",
   };
   if (labels[reason]) return labels[reason];
   if (labels[transitionReason]) return labels[transitionReason];
-  return reason || transitionReason || "账号倍率同步";
+  return reason || transitionReason || "历史记录未记录具体原因";
 }
 
 function upstreamChannelChangeEventLabel(eventType: UpstreamChannelChangeEvent["event_type"]) {

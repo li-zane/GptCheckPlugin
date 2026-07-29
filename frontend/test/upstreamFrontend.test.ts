@@ -2972,6 +2972,8 @@ test("change ledgers show account-rate reasons and use numbered pagination", () 
 
   assert.match(viewSource, /upstream_group_change: "上游分组倍率变化"/);
   assert.match(viewSource, /upstream_group_assignment_change: "修改上游分组"/);
+  assert.match(viewSource, /automatic_apply: "历史记录未记录具体原因"/);
+  assert.doesNotMatch(viewSource, /automatic_apply: "自动同步目标倍率"/);
   assert.match(viewSource, /原因：\{rateChangeReason\}/);
   assert.match(viewSource, /function ChangeLogPagination/);
   assert.match(viewSource, /每页展示条数/);
