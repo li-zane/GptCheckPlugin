@@ -2350,6 +2350,8 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertIsNotNone(daily_income)
+        self.assertAlmostEqual(daily_income.sub2api_actual_cost, 3.0)
+        self.assertAlmostEqual(daily_income.local_recharge_multiplier, 0.1)
         self.assertAlmostEqual(daily_income.income, 0.3)
         self.assertEqual(daily_income.income_unit, "CNY")
 

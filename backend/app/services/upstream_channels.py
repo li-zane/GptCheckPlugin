@@ -122,27 +122,6 @@ def _account_group_rate_change_reason(
     return None
 
 
-def _account_charges_to_cny(
-    charges_by_account: dict[int, float],
-    local_recharge_multiplier: float | None,
-) -> dict[int, float]:
-    multiplier = _decimal_multiplier(local_recharge_multiplier)
-    if multiplier is None:
-        return {}
-    converted: dict[int, float] = {}
-    for account_id, raw_charge in charges_by_account.items():
-        charge = _balance_number(raw_charge)
-        if charge is None or charge < 0:
-            continue
-        try:
-            income = _balance_number(Decimal(str(charge)) * multiplier)
-        except DecimalException:
-            continue
-        if income is not None and income >= 0:
-            converted[account_id] = income
-    return converted
-
-
 @dataclass(frozen=True)
 class UpstreamDiscoveryOptions:
     """Optional task inclusion overrides for one upstream discovery run."""
@@ -4777,26 +4756,20 @@ class UpstreamChannelService:
                     if config.channel_id == channel.id
                 ]
                 if discovery_succeeded:
-                    today_income_by_account = _account_charges_to_cny(
-                        local_today_costs,
-                        local_recharge,
-                    )
-                    finalized_income_by_account = _account_charges_to_cny(
-                        yesterday_income_by_account,
-                        local_recharge,
-                    )
                     await snapshot_today_usage(
                         db,
                         channel=channel,
                         configs=history_configs,
-                        income_by_account=today_income_by_account,
+                        income_actual_cost_by_account=local_today_costs,
+                        local_recharge_multiplier=local_recharge,
                         now=history_now,
                         time_zone=today_timezone,
                     )
                     await finalize_yesterday_usage(
                         db,
                         channel=channel,
-                        income_by_account=finalized_income_by_account,
+                        income_actual_cost_by_account=yesterday_income_by_account,
+                        local_recharge_multiplier=local_recharge,
                         now=history_now,
                         time_zone=today_timezone,
                     )

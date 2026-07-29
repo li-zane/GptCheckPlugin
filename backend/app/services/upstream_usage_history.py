@@ -82,11 +82,31 @@ def _adjusted(amount: float | None, multiplier: float | None) -> float | None:
     return adjusted if math.isfinite(adjusted) else None
 
 
+def _record_account_income(
+    row: UpstreamAccountDailyUsage,
+    actual_cost: Any,
+    current_recharge_multiplier: Any,
+) -> None:
+    charge = _finite_amount(actual_cost)
+    if charge is None:
+        return
+    multiplier = _finite_amount(row.local_recharge_multiplier)
+    if multiplier is None:
+        multiplier = _finite_amount(current_recharge_multiplier)
+    row.sub2api_actual_cost = charge
+    if multiplier is None:
+        return
+    row.local_recharge_multiplier = multiplier
+    row.income = _adjusted(charge, multiplier)
+    row.income_unit = "CNY"
+
+
 def _total_values(row: UpstreamChannelDailyUsage | None) -> dict[str, float | None]:
     return {
         "balance_used": row.balance_used if row is not None else None,
         "balance_used_adjusted": row.balance_used_adjusted if row is not None else None,
         "upstream_api_key_usage": row.upstream_api_key_usage if row is not None else None,
+        "sub2api_actual_cost": row.sub2api_actual_cost if row is not None else None,
         "income": row.income if row is not None else None,
     }
 
@@ -127,7 +147,10 @@ async def _refresh_daily_account_aggregates(
         await db.execute(
             select(
                 func.sum(UpstreamAccountDailyUsage.upstream_usage),
+                func.sum(UpstreamAccountDailyUsage.sub2api_actual_cost),
                 func.sum(UpstreamAccountDailyUsage.income),
+                func.min(UpstreamAccountDailyUsage.local_recharge_multiplier),
+                func.max(UpstreamAccountDailyUsage.local_recharge_multiplier),
             ).where(
                 UpstreamAccountDailyUsage.channel_identity == row.channel_identity,
                 UpstreamAccountDailyUsage.usage_date == row.usage_date,
@@ -135,9 +158,18 @@ async def _refresh_daily_account_aggregates(
         )
     ).one()
     upstream_usage = _finite_amount(sums[0])
-    income = _finite_amount(sums[1])
+    actual_cost = _finite_amount(sums[1])
+    income = _finite_amount(sums[2])
+    minimum_multiplier = _finite_amount(sums[3])
+    maximum_multiplier = _finite_amount(sums[4])
     row.upstream_api_key_usage = upstream_usage
+    row.sub2api_actual_cost = actual_cost
     row.income = income
+    row.income_recharge_multiplier = (
+        minimum_multiplier
+        if minimum_multiplier is not None and minimum_multiplier == maximum_multiplier
+        else None
+    )
     row.income_unit = "CNY" if income is not None else None
 
 
@@ -167,6 +199,7 @@ async def _apply_lifetime_delta(
         ("balance_used", "total_balance_used"),
         ("balance_used_adjusted", "total_balance_used_adjusted"),
         ("upstream_api_key_usage", "total_upstream_api_key_usage"),
+        ("sub2api_actual_cost", "total_sub2api_actual_cost"),
         ("income", "total_income"),
     ):
         old_number = before[field] if before[field] is not None else 0.0
@@ -314,7 +347,8 @@ async def snapshot_today_usage(
     *,
     channel: UpstreamChannel,
     configs: Iterable[UpstreamAccountConfig],
-    income_by_account: dict[int, float],
+    income_actual_cost_by_account: dict[int, float],
+    local_recharge_multiplier: float | None,
     now: datetime,
     time_zone: str,
 ) -> UpstreamChannelDailyUsage | None:
@@ -388,10 +422,11 @@ async def snapshot_today_usage(
                 config.today_upstream_usage_source,
                 limit=64,
             )
-        income = _finite_amount(income_by_account.get(account_id))
-        if income is not None:
-            account_row.income = income
-            account_row.income_unit = "CNY"
+        _record_account_income(
+            account_row,
+            income_actual_cost_by_account.get(account_id),
+            local_recharge_multiplier,
+        )
 
     await db.flush()
     await _refresh_daily_account_aggregates(db, row)
@@ -408,7 +443,8 @@ async def finalize_yesterday_usage(
     db: AsyncSession,
     *,
     channel: UpstreamChannel,
-    income_by_account: dict[int, float] | None = None,
+    income_actual_cost_by_account: dict[int, float] | None = None,
+    local_recharge_multiplier: float | None = None,
     now: datetime,
     time_zone: str,
 ) -> bool:
@@ -459,10 +495,11 @@ async def finalize_yesterday_usage(
         ).scalars()
     )
     for account_row in account_rows:
-        income = _finite_amount((income_by_account or {}).get(account_row.sub2api_account_id))
-        if income is not None:
-            account_row.income = income
-            account_row.income_unit = "CNY"
+        _record_account_income(
+            account_row,
+            (income_actual_cost_by_account or {}).get(account_row.sub2api_account_id),
+            local_recharge_multiplier,
+        )
         account_row.finalized = True
     await db.flush()
     await _refresh_daily_account_aggregates(db, row)
@@ -642,6 +679,8 @@ async def usage_history(
                 "upstream_usage_adjusted": _adjusted(item.upstream_usage, multiplier),
                 "upstream_usage_unit": item.upstream_usage_unit,
                 "upstream_usage_source": item.upstream_usage_source,
+                "sub2api_actual_cost": item.sub2api_actual_cost,
+                "local_recharge_multiplier": item.local_recharge_multiplier,
                 "income": item.income,
                 "income_unit": item.income_unit,
             }
@@ -653,6 +692,19 @@ async def usage_history(
         has_account_usage = any(item.upstream_usage is not None for item in account_day_rows)
         income = sum(item.income for item in account_day_rows if item.income is not None)
         has_income = any(item.income is not None for item in account_day_rows)
+        income_actual_cost = sum(
+            item.sub2api_actual_cost
+            for item in account_day_rows
+            if item.sub2api_actual_cost is not None
+        )
+        has_income_actual_cost = any(
+            item.sub2api_actual_cost is not None for item in account_day_rows
+        )
+        income_multipliers = {
+            float(item.local_recharge_multiplier)
+            for item in account_day_rows
+            if item.local_recharge_multiplier is not None
+        }
         channel_balance = channel_row.balance_used if channel_row is not None else None
         channel_adjusted = (
             channel_row.balance_used_adjusted if channel_row is not None else None
@@ -680,6 +732,10 @@ async def usage_history(
                 "balance_unit": channel_row.balance_unit if channel_row is not None else None,
                 "recharge_multiplier": multiplier,
                 "upstream_api_key_usage": account_usage if has_account_usage else None,
+                "income_actual_cost": income_actual_cost if has_income_actual_cost else None,
+                "income_recharge_multiplier": (
+                    next(iter(income_multipliers)) if len(income_multipliers) == 1 else None
+                ),
                 "income": income if has_income else None,
                 "income_unit": "CNY" if has_income else None,
                 "cost": cost_raw,
@@ -707,6 +763,7 @@ async def usage_history(
             "balance_used": sum_days("balance_used"),
             "balance_used_adjusted": sum_days("balance_used_adjusted"),
             "upstream_api_key_usage": sum_days("upstream_api_key_usage"),
+            "income_actual_cost": sum_days("income_actual_cost"),
             "income": sum_days("income"),
             "cost": sum_days("cost"),
             "cost_adjusted": sum_days("cost_adjusted"),
@@ -718,6 +775,9 @@ async def usage_history(
             ),
             "upstream_api_key_usage": (
                 float(total.total_upstream_api_key_usage) if total is not None else 0.0
+            ),
+            "income_actual_cost": (
+                float(total.total_sub2api_actual_cost) if total is not None else 0.0
             ),
             "income": float(total.total_income) if total is not None else 0.0,
             "cost": float(total.total_balance_used) if total is not None else 0.0,

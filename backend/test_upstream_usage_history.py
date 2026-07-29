@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select, text
@@ -74,7 +74,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 3.0},
+            income_actual_cost_by_account={7: 3.0},
+            local_recharge_multiplier=1.0,
             now=self.now,
             time_zone="Asia/Shanghai",
         )
@@ -86,7 +87,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 5.0},
+            income_actual_cost_by_account={7: 5.0},
+            local_recharge_multiplier=1.0,
             now=self.now + timedelta(minutes=20),
             time_zone="Asia/Shanghai",
         )
@@ -104,6 +106,78 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(total.total_balance_used_adjusted, 8.0)
         self.assertEqual(total.total_upstream_api_key_usage, 2.0)
         self.assertEqual(total.total_income, 5.0)
+
+    async def test_income_history_freezes_each_days_recharge_multiplier(self) -> None:
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            income_actual_cost_by_account={7: 100.0},
+            local_recharge_multiplier=0.1,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            income_actual_cost_by_account={7: 120.0},
+            local_recharge_multiplier=0.2,
+            now=self.now + timedelta(minutes=20),
+            time_zone="Asia/Shanghai",
+        )
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            income_actual_cost_by_account={7: 50.0},
+            local_recharge_multiplier=0.2,
+            now=self.now + timedelta(days=1),
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+
+        accounts = list(
+            (
+                await self.db.execute(
+                    select(UpstreamAccountDailyUsage).order_by(
+                        UpstreamAccountDailyUsage.usage_date
+                    )
+                )
+            ).scalars()
+        )
+        self.assertEqual(
+            [
+                (
+                    row.usage_date,
+                    row.sub2api_actual_cost,
+                    row.local_recharge_multiplier,
+                    row.income,
+                )
+                for row in accounts
+            ],
+            [
+                (date(2026, 7, 28), 120.0, 0.1, 12.0),
+                (date(2026, 7, 29), 50.0, 0.2, 10.0),
+            ],
+        )
+        total = await self.db.get(UpstreamChannelUsageTotal, channel_identity(self.channel))
+        self.assertEqual(total.total_sub2api_actual_cost, 170.0)
+        self.assertEqual(total.total_income, 22.0)
+
+        history = await usage_history(
+            self.db,
+            channel=self.channel,
+            start_date=date(2026, 7, 28),
+            end_date=date(2026, 7, 29),
+            api_key_account_id=None,
+            time_zone="Asia/Shanghai",
+        )
+        self.assertEqual(history["days"][0]["income_actual_cost"], 120.0)
+        self.assertEqual(history["days"][0]["income_recharge_multiplier"], 0.1)
+        self.assertEqual(history["days"][0]["income"], 12.0)
+        self.assertEqual(history["days"][1]["income_recharge_multiplier"], 0.2)
+        self.assertEqual(history["lifetime_totals"]["income_actual_cost"], 170.0)
 
     async def test_finalized_yesterday_is_reused_and_detail_pruning_keeps_total(self) -> None:
         self.channel.yesterday_balance_used = 6.0
@@ -160,7 +234,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 3.0},
+            income_actual_cost_by_account={7: 3.0},
+            local_recharge_multiplier=1.0,
             now=yesterday_now,
             time_zone="Asia/Shanghai",
         )
@@ -198,7 +273,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 4.0},
+            income_actual_cost_by_account={7: 4.0},
+            local_recharge_multiplier=1.0,
             now=self.now,
             time_zone="Asia/Shanghai",
         )
@@ -229,7 +305,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 4.0},
+            income_actual_cost_by_account={7: 4.0},
+            local_recharge_multiplier=1.0,
             now=self.now,
             time_zone="Asia/Shanghai",
         )
@@ -256,7 +333,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 3.0},
+            income_actual_cost_by_account={7: 3.0},
+            local_recharge_multiplier=1.0,
             now=yesterday_now,
             time_zone="Asia/Shanghai",
         )
@@ -268,7 +346,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         await finalize_yesterday_usage(
             self.db,
             channel=self.channel,
-            income_by_account={7: 5.0},
+            income_actual_cost_by_account={7: 5.0},
+            local_recharge_multiplier=1.0,
             now=self.now,
             time_zone="Asia/Shanghai",
         )
@@ -291,7 +370,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 3.0},
+            income_actual_cost_by_account={7: 3.0},
+            local_recharge_multiplier=1.0,
             now=self.now,
             time_zone="Asia/Shanghai",
         )
@@ -302,7 +382,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 8.0},
+            income_actual_cost_by_account={7: 8.0},
+            local_recharge_multiplier=1.0,
             now=self.now + timedelta(minutes=1),
             time_zone="Asia/Shanghai",
         )
@@ -343,7 +424,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 3.0},
+            income_actual_cost_by_account={7: 3.0},
+            local_recharge_multiplier=1.0,
             now=self.now,
             time_zone="Asia/Shanghai",
         )
@@ -353,7 +435,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=second_channel,
             configs=[self.config],
-            income_by_account={7: 9.0},
+            income_actual_cost_by_account={7: 9.0},
+            local_recharge_multiplier=1.0,
             now=self.now + timedelta(minutes=1),
             time_zone="Asia/Shanghai",
         )
@@ -414,7 +497,8 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             channel=self.channel,
             configs=[self.config],
-            income_by_account={7: 4.0},
+            income_actual_cost_by_account={7: 4.0},
+            local_recharge_multiplier=1.0,
             now=self.now - timedelta(days=2),
             time_zone="Asia/Shanghai",
         )
@@ -555,18 +639,42 @@ class UpstreamUsageHistoryMigrationTests(unittest.IsolatedAsyncioTestCase):
                     await connection.execute(
                         text(
                             "SELECT channel_identity, total_balance_used, "
-                            "total_balance_used_adjusted, total_upstream_api_key_usage, total_income "
+                            "total_balance_used_adjusted, total_upstream_api_key_usage, "
+                            "total_sub2api_actual_cost, total_income "
                             "FROM upstream_channel_usage_totals"
                         )
                     )
                 ).one()
+                channel_columns = (
+                    await connection.execute(
+                        text("PRAGMA table_info(upstream_channel_daily_usages)")
+                    )
+                ).fetchall()
+                account_columns = (
+                    await connection.execute(
+                        text("PRAGMA table_info(upstream_account_daily_usages)")
+                    )
+                ).fetchall()
                 total_columns = (
                     await connection.execute(text("PRAGMA table_info(upstream_channel_usage_totals)"))
                 ).fetchall()
 
                 self.assertEqual(daily_identity, "https://usage.example/v1")
                 self.assertEqual(account_identity, "https://usage.example/v1")
-                self.assertEqual(tuple(total), ("https://usage.example/v1", 4.0, 8.0, 3.0, 5.0))
+                self.assertEqual(
+                    tuple(total),
+                    ("https://usage.example/v1", 4.0, 8.0, 3.0, 0.0, 5.0),
+                )
+                self.assertTrue(
+                    {"sub2api_actual_cost", "income_recharge_multiplier"}.issubset(
+                        {str(row[1]) for row in channel_columns}
+                    )
+                )
+                self.assertTrue(
+                    {"sub2api_actual_cost", "local_recharge_multiplier"}.issubset(
+                        {str(row[1]) for row in account_columns}
+                    )
+                )
                 self.assertEqual(
                     next(row[5] for row in total_columns if row[1] == "channel_identity"),
                     1,
@@ -587,5 +695,68 @@ class UpstreamUsageHistoryMigrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ).scalar_one()
                 self.assertEqual(count, 2)
+        finally:
+            await engine.dispose()
+
+    async def test_identity_schema_adds_income_snapshot_columns_in_place(self) -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                for statement in (
+                    "CREATE TABLE upstream_channels ("
+                    "id INTEGER NOT NULL PRIMARY KEY, canonical_base_url VARCHAR(500) NOT NULL)",
+                    "CREATE TABLE upstream_channel_daily_usages ("
+                    "id INTEGER NOT NULL PRIMARY KEY, channel_id INTEGER NOT NULL, "
+                    "channel_identity VARCHAR(500) NOT NULL, usage_date DATE NOT NULL, "
+                    "finalized BOOLEAN NOT NULL DEFAULT 0, "
+                    "UNIQUE (channel_identity, usage_date))",
+                    "CREATE TABLE upstream_account_daily_usages ("
+                    "id INTEGER NOT NULL PRIMARY KEY, channel_id INTEGER NOT NULL, "
+                    "channel_identity VARCHAR(500) NOT NULL, usage_date DATE NOT NULL)",
+                    "CREATE TABLE upstream_channel_usage_totals ("
+                    "channel_identity VARCHAR(500) NOT NULL PRIMARY KEY, "
+                    "channel_id INTEGER NOT NULL)",
+                ):
+                    await connection.execute(text(statement))
+
+                await _migrate_upstream_usage_history(connection)
+                await _migrate_upstream_usage_history(connection)
+
+                channel_columns = {
+                    str(row[1])
+                    for row in (
+                        await connection.execute(
+                            text("PRAGMA table_info(upstream_channel_daily_usages)")
+                        )
+                    ).fetchall()
+                }
+                account_columns = {
+                    str(row[1])
+                    for row in (
+                        await connection.execute(
+                            text("PRAGMA table_info(upstream_account_daily_usages)")
+                        )
+                    ).fetchall()
+                }
+                total_columns = {
+                    str(row[1])
+                    for row in (
+                        await connection.execute(
+                            text("PRAGMA table_info(upstream_channel_usage_totals)")
+                        )
+                    ).fetchall()
+                }
+
+                self.assertTrue(
+                    {"sub2api_actual_cost", "income_recharge_multiplier"}.issubset(
+                        channel_columns
+                    )
+                )
+                self.assertTrue(
+                    {"sub2api_actual_cost", "local_recharge_multiplier"}.issubset(
+                        account_columns
+                    )
+                )
+                self.assertIn("total_sub2api_actual_cost", total_columns)
         finally:
             await engine.dispose()

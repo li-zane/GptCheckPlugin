@@ -343,7 +343,9 @@ class UpstreamChannelDailyUsage(Base):
     balance_unit: Mapped[str | None] = mapped_column(String(32))
     recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     upstream_api_key_usage: Mapped[float | None] = mapped_column(Float)
+    sub2api_actual_cost: Mapped[float | None] = mapped_column(Float)
     income: Mapped[float | None] = mapped_column(Float)
+    income_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     income_unit: Mapped[str | None] = mapped_column(String(32))
     finalized: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False, index=True
@@ -389,6 +391,8 @@ class UpstreamAccountDailyUsage(Base):
     upstream_usage: Mapped[float | None] = mapped_column(Float)
     upstream_usage_unit: Mapped[str | None] = mapped_column(String(32))
     upstream_usage_source: Mapped[str | None] = mapped_column(String(64))
+    sub2api_actual_cost: Mapped[float | None] = mapped_column(Float)
+    local_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     income: Mapped[float | None] = mapped_column(Float)
     income_unit: Mapped[str | None] = mapped_column(String(32))
     finalized: Mapped[bool] = mapped_column(
@@ -416,6 +420,7 @@ class UpstreamChannelUsageTotal(Base):
     total_upstream_api_key_usage: Mapped[float] = mapped_column(
         Float, default=0, nullable=False
     )
+    total_sub2api_actual_cost: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     total_income: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

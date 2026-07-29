@@ -790,7 +790,9 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "balance_unit VARCHAR(32), "
                 "recharge_multiplier FLOAT, "
                 "upstream_api_key_usage FLOAT, "
+                "sub2api_actual_cost FLOAT, "
                 "income FLOAT, "
+                "income_recharge_multiplier FLOAT, "
                 "income_unit VARCHAR(32), "
                 "finalized BOOLEAN NOT NULL DEFAULT 0, "
                 "observed_at DATETIME, "
@@ -823,6 +825,21 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             )
         )
 
+    channel_columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_channel_daily_usages)"))
+        ).fetchall()
+    }
+    for column_name in ("sub2api_actual_cost", "income_recharge_multiplier"):
+        if channel_columns and column_name not in channel_columns:
+            await conn.execute(
+                text(
+                    f"ALTER TABLE upstream_channel_daily_usages "
+                    f"ADD COLUMN {column_name} FLOAT"
+                )
+            )
+
     if channel_columns:
         for statement in (
             "CREATE INDEX IF NOT EXISTS ix_upstream_channel_daily_usage_identity_date "
@@ -853,6 +870,14 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "ADD COLUMN channel_identity VARCHAR(500)"
             )
         )
+    for column_name in ("sub2api_actual_cost", "local_recharge_multiplier"):
+        if account_columns and column_name not in account_columns:
+            await conn.execute(
+                text(
+                    f"ALTER TABLE upstream_account_daily_usages "
+                    f"ADD COLUMN {column_name} FLOAT"
+                )
+            )
     if account_columns:
         await conn.execute(
             text(
@@ -897,6 +922,7 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "total_balance_used FLOAT NOT NULL, "
                 "total_balance_used_adjusted FLOAT NOT NULL, "
                 "total_upstream_api_key_usage FLOAT NOT NULL, "
+                "total_sub2api_actual_cost FLOAT NOT NULL DEFAULT 0, "
                 "total_income FLOAT NOT NULL, "
                 "created_at DATETIME NOT NULL, "
                 "updated_at DATETIME NOT NULL)"
@@ -906,7 +932,8 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             text(
                 "INSERT INTO upstream_channel_usage_totals_new ("
                 "channel_identity, channel_id, channel_name, total_balance_used, "
-                "total_balance_used_adjusted, total_upstream_api_key_usage, total_income, "
+                "total_balance_used_adjusted, total_upstream_api_key_usage, "
+                "total_sub2api_actual_cost, total_income, "
                 "created_at, updated_at) "
                 "SELECT COALESCE((SELECT canonical_base_url FROM upstream_channels "
                 "WHERE upstream_channels.id = upstream_channel_usage_totals.channel_id), "
@@ -914,7 +941,7 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "SUM(COALESCE(total_balance_used, 0)), "
                 "SUM(COALESCE(total_balance_used_adjusted, 0)), "
                 "SUM(COALESCE(total_upstream_api_key_usage, 0)), "
-                "SUM(COALESCE(total_income, 0)), MIN(created_at), MAX(updated_at) "
+                "0, SUM(COALESCE(total_income, 0)), MIN(created_at), MAX(updated_at) "
                 "FROM upstream_channel_usage_totals "
                 "GROUP BY COALESCE((SELECT canonical_base_url FROM upstream_channels "
                 "WHERE upstream_channels.id = upstream_channel_usage_totals.channel_id), "
@@ -926,6 +953,19 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             text(
                 "ALTER TABLE upstream_channel_usage_totals_new "
                 "RENAME TO upstream_channel_usage_totals"
+            )
+        )
+    total_columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_channel_usage_totals)"))
+        ).fetchall()
+    }
+    if total_columns and "total_sub2api_actual_cost" not in total_columns:
+        await conn.execute(
+            text(
+                "ALTER TABLE upstream_channel_usage_totals "
+                "ADD COLUMN total_sub2api_actual_cost FLOAT NOT NULL DEFAULT 0"
             )
         )
     if total_columns:

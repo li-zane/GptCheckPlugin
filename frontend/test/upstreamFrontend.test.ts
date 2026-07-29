@@ -2875,6 +2875,15 @@ test("usage history net income uses recharge-adjusted cost in the revenue curren
   );
 });
 
+test("usage history income explains the persisted charge and recharge multiplier", () => {
+  const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /function historyIncomeBreakdownTitle\([^]*?account\?\.sub2api_actual_cost[^]*?account\?\.local_recharge_multiplier[^]*?day\.income_recharge_multiplier/,
+  );
+  assert.match(source, /title=\{historyIncomeBreakdownTitle\(day, selectedAccountId\)\}/);
+});
+
 test("upstream change API prefers the new ledger and falls back only when unavailable", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;

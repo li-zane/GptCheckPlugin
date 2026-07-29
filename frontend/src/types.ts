@@ -937,6 +937,8 @@ export type UpstreamUsageHistoryAccountDay = UpstreamUsageHistoryAccount & {
   upstream_usage_adjusted?: number | null;
   upstream_usage_unit?: string | null;
   upstream_usage_source?: string | null;
+  sub2api_actual_cost?: number | null;
+  local_recharge_multiplier?: number | null;
   income: number | null;
   income_unit?: string | null;
 };
@@ -950,6 +952,8 @@ export type UpstreamUsageHistoryDay = {
   recharge_multiplier?: number | null;
   /** Linked sub2api API-key consumption, optionally filtered by account. */
   upstream_api_key_usage: number | null;
+  income_actual_cost?: number | null;
+  income_recharge_multiplier?: number | null;
   income: number | null;
   income_unit?: string | null;
   /** Cost is channel balance consumption without a key filter, otherwise that key's consumption. */
@@ -963,6 +967,7 @@ export type UpstreamUsageHistoryTotals = {
   balance_used: number | null;
   balance_used_adjusted: number | null;
   upstream_api_key_usage: number | null;
+  income_actual_cost?: number | null;
   income: number | null;
   cost: number | null;
   cost_adjusted: number | null;

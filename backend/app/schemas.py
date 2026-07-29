@@ -1414,6 +1414,8 @@ class UpstreamUsageHistoryAccountOut(BaseModel):
     upstream_usage_adjusted: float | None = None
     upstream_usage_unit: str | None = None
     upstream_usage_source: str | None = None
+    sub2api_actual_cost: float | None = None
+    local_recharge_multiplier: float | None = None
     income: float | None = None
     income_unit: str | None = None
 
@@ -1425,6 +1427,8 @@ class UpstreamUsageHistoryDayOut(BaseModel):
     balance_unit: str | None = None
     recharge_multiplier: float | None = None
     upstream_api_key_usage: float | None = None
+    income_actual_cost: float | None = None
+    income_recharge_multiplier: float | None = None
     income: float | None = None
     income_unit: str | None = None
     cost: float | None = None
@@ -1437,6 +1441,7 @@ class UpstreamUsageHistoryTotalsOut(BaseModel):
     balance_used: float = 0.0
     balance_used_adjusted: float = 0.0
     upstream_api_key_usage: float = 0.0
+    income_actual_cost: float = 0.0
     income: float = 0.0
     cost: float | None = None
     cost_adjusted: float | None = None

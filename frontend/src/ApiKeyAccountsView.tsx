@@ -3607,7 +3607,9 @@ function UpstreamUsageHistoryDialog({
                       <td>
                         <span>{formatHistoryAmount(dailyAdjustedCost, "CNY")}</span>
                       </td>
-                      <td>{formatHistoryAmount(day.income, day.income_unit || historyIncomeUnit(days))}</td>
+                      <td title={historyIncomeBreakdownTitle(day, selectedAccountId)}>
+                        {formatHistoryAmount(day.income, day.income_unit || historyIncomeUnit(days))}
+                      </td>
                       <td className={dailyNet !== null && dailyNet < 0 ? "is-negative" : "is-positive"}>
                         {formatHistorySignedAmount(dailyNet, day.income_unit || historyIncomeUnit(days))}
                       </td>
@@ -6156,6 +6158,7 @@ function normalizeUsageHistory(history: UpstreamUsageHistory): UpstreamUsageHist
     balance_used: 0,
     balance_used_adjusted: 0,
     upstream_api_key_usage: 0,
+    income_actual_cost: 0,
     income: 0,
     cost: null,
     cost_adjusted: null,
@@ -6219,6 +6222,22 @@ function historyDayAdjustedCost(day: UpstreamUsageHistory["days"][number], selec
 
 function historyIncomeUnit(days: UpstreamUsageHistory["days"]) {
   return days.find((day) => day.income_unit)?.income_unit || "CNY";
+}
+
+function historyIncomeBreakdownTitle(
+  day: UpstreamUsageHistory["days"][number],
+  selectedAccountId: string | null,
+) {
+  const account = usageHistoryDayAccount(day, selectedAccountId);
+  const actualCost = finiteNumber(
+    selectedAccountId ? account?.sub2api_actual_cost : day.income_actual_cost,
+  );
+  const multiplier = finiteNumber(
+    selectedAccountId ? account?.local_recharge_multiplier : day.income_recharge_multiplier,
+  );
+  const income = finiteNumber(selectedAccountId ? account?.income : day.income);
+  if (actualCost === null || multiplier === null || income === null) return undefined;
+  return `用户实际扣费 ${formatHistoryAmount(actualCost, "USD")} × 当日充值倍率 ${formatCostPerUsd(multiplier)} = ${formatHistoryAmount(income, "CNY")}`;
 }
 
 function historyNetIncome(value: Pick<UpstreamUsageHistory["totals"], "income" | "cost_adjusted"> | null) {
