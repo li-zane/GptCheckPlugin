@@ -15,9 +15,9 @@ export function accountRateLimitShouldBeVisible(
   usage: CachedAccountRateLimit | undefined,
   currentAccountHasError: boolean,
 ) {
-  if (account.deactive || currentAccountHasError) return false;
+  if (account.deactive) return false;
   if (currentAccountHasRateLimit(account)) return true;
-  if (usage?.error) return false;
+  if (currentAccountHasError || usage?.error) return false;
   return Boolean(
     usage?.rate_limited
       || usage?.rate_limited_windows.length

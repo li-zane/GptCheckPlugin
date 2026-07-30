@@ -2771,6 +2771,7 @@ function AccountRow({
   const rateLimitStatusLabel = rateLimitDetails.length ? rateLimitDetails.map((detail) => detail.label).join("/") : "";
   const rateLimitStatusText = `${statusText} | ${rateLimitStatusLabel ? `${rateLimitStatusLabel}限流` : "限流"}`;
   const rateLimitStatusTone = rateLimitDetails[0]?.tone || "warn";
+  const displayedStatusTone = statusTone === "error" ? statusTone : rateLimited ? rateLimitStatusTone : statusTone;
   const windowRefreshTags = accountWindowRefreshTags(usage, timeZone, now);
   const errorSummary = accountErrorSummary(account);
   const refreshLocked = accountHasError(account) && account.auto_refresh_locked;
@@ -2869,7 +2870,7 @@ function AccountRow({
       <td>
         <div className="status-stack">
           <div className="status-badge-row">
-            <Badge className="status-column-badge" tone={rateLimited ? rateLimitStatusTone : statusTone}>{rateLimited ? rateLimitStatusText : statusText}</Badge>
+            <Badge className="status-column-badge" tone={displayedStatusTone}>{rateLimited ? rateLimitStatusText : statusText}</Badge>
             {!rateLimited && manuallyPaused ? <Badge className="status-column-badge" tone="ink">主动暂停</Badge> : null}
           </div>
           {windowRefreshTags.length ? (

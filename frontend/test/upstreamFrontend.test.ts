@@ -357,8 +357,15 @@ test("current 5h limit remains visible when the usage cache still has an old err
 
   assert.equal(accountRateLimitShouldBeVisible(currentAccount, staleUsage, false), true);
   assert.equal(accountEstimateHasEffectiveError(currentAccount, staleUsage, false), false);
-  assert.equal(accountRateLimitShouldBeVisible(currentAccount, staleUsage, true), false);
+  assert.equal(accountRateLimitShouldBeVisible(currentAccount, staleUsage, true), true);
   assert.equal(accountEstimateHasEffectiveError(currentAccount, staleUsage, true), true);
+
+  const currentErrorWithoutLimit = {
+    ...currentAccount,
+    rate_limited: false,
+    rate_limited_windows: [],
+  };
+  assert.equal(accountRateLimitShouldBeVisible(currentErrorWithoutLimit, staleUsage, true), false);
 });
 
 test("view routes canonicalize paths and keep every dashboard view addressable", () => {
