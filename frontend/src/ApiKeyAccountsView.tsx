@@ -3109,7 +3109,7 @@ function ChannelCard({
   const error = channelDisplayError(channel);
   const busy = Boolean(busyAction) || globallyDisabled;
   const discoveryCopy = upstreamDiscoveryCopy(rateWritesEnabled);
-  const balanceDetails = balanceDetail(channel, displayTimeZone);
+  const balanceDetails = balanceDetail(channel);
   const todayUsage = formatDailyBalanceUsed(channel, "today", displayTimeZone);
   const yesterdayUsage = formatDailyBalanceUsed(channel, "yesterday", displayTimeZone);
   return (
@@ -5580,7 +5580,9 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
   const rechargeMultiplier = finiteNumber(channel.effective_recharge_multiplier);
   const platformBalanceNote = hasCurrentPlatformBalance(channel)
     ? `平台余额：${platformBalance}`
-    : "平台余额：当前没有可信的上游余额";
+    : hasCachedPlatformBalance(channel)
+      ? `上次成功读取的平台余额：${platformBalance}`
+      : "平台余额：当前没有可信的上游余额";
   const adjustedBalanceNote = adjustedBalance === "—"
     ? "综合余额：当前无法按上游充值倍率计算"
     : `综合余额：平台余额 × 充值倍率${rechargeMultiplier === null ? "" : ` ${rechargeMultiplier.toLocaleString("zh-CN", { maximumFractionDigits: 6 })}`} = ${adjustedBalance}`;
@@ -6051,17 +6053,9 @@ function channelMonitorMessage(channel: UpstreamChannel) {
   return channel.channel_monitor_message || "渠道状态由上游监控接口同步。";
 }
 
-function balanceDetail(channel: UpstreamChannel, timeZone: string) {
+function balanceDetail(channel: UpstreamChannel) {
   const details: string[] = [];
   if (!hasCurrentPlatformBalance(channel)) {
-    const previous = finiteNumber(channel.balance_remaining);
-    if (
-      previous !== null
-      && channel.balance_checked_at
-      && channel.balance_source === "upstream_wallet"
-    ) {
-      details.push(`上次成功余额 ${formatUpstreamBalance(previous, channel.balance_unit, 2)} · ${formatDate(channel.balance_checked_at, timeZone)}`);
-    }
     if (channel.balance_source === "local_api_key") {
       details.push("仅取得本站 API Key 余额，未取得上游钱包余额");
     }
@@ -6084,14 +6078,20 @@ function hasCurrentPlatformBalance(channel: UpstreamChannel) {
     && Boolean(channel.balance_checked_at);
 }
 
+function hasCachedPlatformBalance(channel: UpstreamChannel) {
+  return channel.balance_source === "upstream_wallet"
+    && finiteNumber(channel.balance_remaining) !== null
+    && Boolean(channel.balance_checked_at);
+}
+
 function formatCurrentPlatformBalance(channel: UpstreamChannel) {
-  return hasCurrentPlatformBalance(channel)
+  return hasCachedPlatformBalance(channel)
     ? formatUpstreamBalance(channel.balance_remaining, channel.balance_unit, 2)
     : "—";
 }
 
 function formatCurrentRechargeAdjustedBalance(channel: UpstreamChannel) {
-  if (!hasCurrentPlatformBalance(channel)) return "—";
+  if (!hasCachedPlatformBalance(channel)) return "—";
   return formatRechargeAdjustedBalance(
     channel.recharge_adjusted_balance,
     channel.balance_remaining,

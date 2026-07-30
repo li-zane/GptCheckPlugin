@@ -875,7 +875,7 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(styles, /\.notice > button\s*\{/);
   assert.match(styles, /\.api-key-monitor-current--success/);
   assert.match(styles, /\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 371px;/);
-  assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 440px;/);
+  assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 0;/);
   assert.doesNotMatch(styles, /\.api-key-channel-accounts\s*\{[^}]*margin-top:\s*auto;/s);
   assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);/s);
   assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);[^}]*max-width: 360px;[^}]*width: 100%;/s);
@@ -884,6 +884,8 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(accountSource, /trigger=\{<span>综<\/span>\}/);
   assert.match(accountSource, /上游钱包原始余额，直接读取自上游站点的钱包余额/);
   assert.match(accountSource, /综合余额等于上游钱包原始余额乘以上游充值倍率/);
+  assert.match(accountSource, /function hasCachedPlatformBalance\(channel: UpstreamChannel\)/);
+  assert.doesNotMatch(accountSource, /上次成功余额 \$\{formatUpstreamBalance/);
   assert.match(accountSource, /onClick=\{onShowGroups\}/);
   assert.match(accountSource, /<ChannelGroupList channel=\{channelGroupDialog\} \/>/);
   assert.match(styles, /\.api-key-group-dialog-list\s*\{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 210px\), 240px\)\);/s);

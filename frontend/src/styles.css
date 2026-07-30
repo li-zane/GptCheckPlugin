@@ -9515,7 +9515,7 @@ button.api-key-group-chip--more {
 
   .api-key-channel-card {
     height: auto;
-    min-height: 440px;
+    min-height: 0;
   }
 
   .api-key-ledger-sticky {
@@ -9531,7 +9531,7 @@ button.api-key-group-chip--more {
 @media (max-width: 420px) {
   .api-key-channel-card {
     height: auto;
-    min-height: 440px;
+    min-height: 0;
   }
 }
 

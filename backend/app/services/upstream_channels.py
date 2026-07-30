@@ -1184,21 +1184,28 @@ class UpstreamChannelService:
                 item.sub2api_account_id,
             ),
         )
+        effective_recharge = _decimal_multiplier(channel.effective_recharge_multiplier)
+        using_cached_recharge = effective_recharge is None
+        if effective_recharge is None:
+            effective_recharge = _decimal_multiplier(channel.last_known_recharge_multiplier)
+        effective_recharge_value = (
+            float(effective_recharge) if effective_recharge is not None else None
+        )
         recharge_adjusted_balance = None
         if (
             channel.balance_remaining is not None
-            and channel.effective_recharge_multiplier is not None
+            and effective_recharge_value is not None
         ):
             recharge_adjusted_balance = (
-                channel.balance_remaining * channel.effective_recharge_multiplier
+                channel.balance_remaining * effective_recharge_value
             )
         today_recharge_adjusted_balance_used = None
         if (
             channel.today_balance_used is not None
-            and channel.effective_recharge_multiplier is not None
+            and effective_recharge_value is not None
         ):
             today_recharge_adjusted_balance_used = (
-                channel.today_balance_used * channel.effective_recharge_multiplier
+                channel.today_balance_used * effective_recharge_value
             )
         monitors = channel.channel_monitors if isinstance(channel.channel_monitors, list) else []
         return UpstreamChannelOut(
@@ -1228,9 +1235,17 @@ class UpstreamChannelService:
             ),
             group_options=self._group_options_out(channel),
             discovered_recharge_multiplier=channel.discovered_recharge_multiplier,
-            effective_recharge_multiplier=channel.effective_recharge_multiplier,
-            recharge_multiplier_source=channel.recharge_multiplier_source,
-            recharge_multiplier_status=channel.recharge_multiplier_status,
+            effective_recharge_multiplier=effective_recharge_value,
+            recharge_multiplier_source=(
+                channel.recharge_multiplier_source
+                if not using_cached_recharge
+                else "cached" if effective_recharge_value is not None else None
+            ),
+            recharge_multiplier_status=(
+                channel.recharge_multiplier_status
+                if not using_cached_recharge
+                else "stale" if effective_recharge_value is not None else channel.recharge_multiplier_status
+            ),
             balance_remaining=channel.balance_remaining,
             balance_total=channel.balance_total,
             balance_used=channel.balance_used,
@@ -1793,16 +1808,21 @@ class UpstreamChannelService:
                 "Credentials may only be sent to an HTTPS upstream URL.", status_code=422
             )
         if status != "ok":
-            channel.discovered_recharge_multiplier = None
-            manual_recharge = _decimal_multiplier(channel.manual_recharge_multiplier)
-            if manual_recharge is not None:
-                channel.effective_recharge_multiplier = float(manual_recharge)
-                channel.recharge_multiplier_source = "manual"
-                channel.recharge_multiplier_status = "fallback_manual"
-            else:
-                channel.effective_recharge_multiplier = None
-                channel.recharge_multiplier_source = None
-                channel.recharge_multiplier_status = "discovery_failed"
+            cached_recharge = _decimal_multiplier(channel.effective_recharge_multiplier)
+            if cached_recharge is None:
+                cached_recharge = _decimal_multiplier(channel.last_known_recharge_multiplier)
+                if cached_recharge is not None:
+                    channel.effective_recharge_multiplier = float(cached_recharge)
+                    channel.recharge_multiplier_source = channel.recharge_multiplier_source or "cached"
+                    channel.recharge_multiplier_status = "stale"
+            if cached_recharge is None:
+                manual_recharge = _decimal_multiplier(channel.manual_recharge_multiplier)
+                if manual_recharge is not None:
+                    channel.effective_recharge_multiplier = float(manual_recharge)
+                    channel.recharge_multiplier_source = "manual"
+                    channel.recharge_multiplier_status = "fallback_manual"
+                else:
+                    channel.recharge_multiplier_status = "discovery_failed"
             channel.balance_status = (
                 TOKEN_INVALID_STATUS
                 if token_invalid

@@ -2695,6 +2695,58 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.channels[0].balance_remaining, -3.5)
         self.assertEqual(result.channels[0].balance_source, "upstream_wallet")
 
+    async def test_failed_discovery_preserves_cached_channel_recharge_and_balance(self) -> None:
+        channel = (await self.service.overview(self.db)).channels[0]
+        stored = await self.db.get(UpstreamChannel, channel.id)
+        checked_at = datetime(2026, 7, 28, 0, 43, tzinfo=timezone.utc)
+        stored.discovered_recharge_multiplier = 0.0621
+        stored.effective_recharge_multiplier = 0.0621
+        stored.last_known_recharge_multiplier = 0.0621
+        stored.recharge_multiplier_source = "payment.config"
+        stored.recharge_multiplier_status = "ok"
+        stored.balance_remaining = 83.38
+        stored.balance_total = 100.0
+        stored.balance_used = 16.62
+        stored.balance_unit = "USD"
+        stored.balance_source = "upstream_wallet"
+        stored.balance_status = "ok"
+        stored.balance_checked_at = checked_at
+
+        succeeded = self.service._apply_discovery_to_channel(
+            stored,
+            self._discovery_result(status="error"),
+        )
+
+        self.assertFalse(succeeded)
+        self.assertEqual(stored.discovered_recharge_multiplier, 0.0621)
+        self.assertEqual(stored.effective_recharge_multiplier, 0.0621)
+        self.assertEqual(stored.recharge_multiplier_source, "payment.config")
+        self.assertEqual(stored.recharge_multiplier_status, "ok")
+        self.assertEqual(stored.balance_remaining, 83.38)
+        self.assertEqual(stored.balance_total, 100.0)
+        self.assertEqual(stored.balance_used, 16.62)
+        self.assertEqual(stored.balance_unit, "USD")
+        self.assertEqual(stored.balance_source, "upstream_wallet")
+        self.assertEqual(stored.balance_checked_at, checked_at)
+        self.assertEqual(stored.balance_status, "error")
+
+    async def test_channel_output_recovers_cleared_recharge_from_last_known_value(self) -> None:
+        channel = (await self.service.overview(self.db)).channels[0]
+        stored = await self.db.get(UpstreamChannel, channel.id)
+        stored.effective_recharge_multiplier = None
+        stored.last_known_recharge_multiplier = 1.0
+        stored.recharge_multiplier_source = None
+        stored.recharge_multiplier_status = "discovery_failed"
+        stored.balance_remaining = 83.38
+        stored.balance_unit = "USD"
+
+        output = self.service._channel_out(stored, [])
+
+        self.assertEqual(output.effective_recharge_multiplier, 1.0)
+        self.assertEqual(output.recharge_multiplier_source, "cached")
+        self.assertEqual(output.recharge_multiplier_status, "stale")
+        self.assertEqual(output.recharge_adjusted_balance, 83.38)
+
     async def test_failed_management_discovery_uses_one_api_key_balance_without_summing(self) -> None:
         channel = (await self.service.overview(self.db)).channels[0]
         self.sub2api.balance_results = {
