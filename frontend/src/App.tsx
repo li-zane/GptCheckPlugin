@@ -67,6 +67,10 @@ import {
   MAX_LIVENESS_ACCOUNTS,
 } from "./accountLiveness";
 import { accountFilterFacetCandidates } from "./accountFilterFacets";
+import {
+  accountEstimateHasEffectiveError,
+  accountRateLimitShouldBeVisible,
+} from "./accountRateLimitPresentation";
 import { sortAccountsForTable } from "./accountTableSort";
 import {
   firstUnusedFallbackModel,
@@ -7451,12 +7455,11 @@ function accountRateLimited(account: Account | AccountUsageEstimate, usage?: Acc
 }
 
 function accountShowsRateLimit(account: Account, usage?: AccountUsageEstimate) {
-  if (accountEstimateExcludedByError(account, usage)) return false;
-  return accountRateLimited(account, usage);
+  return accountRateLimitShouldBeVisible(account, usage, accountHasError(account));
 }
 
 function accountEstimateExcludedByError(account: Account, usage?: AccountUsageEstimate) {
-  return Boolean(accountHasError(account) || usage?.error);
+  return accountEstimateHasEffectiveError(account, usage, accountHasError(account));
 }
 
 function accountIsManuallyPaused(

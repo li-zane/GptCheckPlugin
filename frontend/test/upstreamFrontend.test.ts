@@ -21,6 +21,10 @@ import {
   MAX_LIVENESS_ACCOUNTS,
 } from "../src/accountLiveness.ts";
 import { accountFilterFacetCandidates } from "../src/accountFilterFacets.ts";
+import {
+  accountEstimateHasEffectiveError,
+  accountRateLimitShouldBeVisible,
+} from "../src/accountRateLimitPresentation.ts";
 import { sortAccountsForTable } from "../src/accountTableSort.ts";
 import {
   buildUpstreamAccountUpdatePayload,
@@ -335,6 +339,26 @@ test("usage estimate presentation filters accounts and rebuilds aggregates", () 
   assert.equal(displayed.overall.five_hour.estimated_limit, 10);
   assert.equal(displayed.overall.five_hour.remaining, 8);
   assert.equal(usageProblemAccountUnusedQuota(estimate.accounts).accountCount, 1);
+});
+
+test("current 5h limit remains visible when the usage cache still has an old error state", () => {
+  const currentAccount = {
+    deactive: false,
+    rate_limited: true,
+    rate_limited_windows: ["five_hour"],
+  };
+  const staleUsage = {
+    error: true,
+    rate_limited: true,
+    rate_limited_windows: ["five_hour"],
+    five_hour: { rate_limited: true },
+    seven_day: { rate_limited: false },
+  } as AccountUsageEstimate;
+
+  assert.equal(accountRateLimitShouldBeVisible(currentAccount, staleUsage, false), true);
+  assert.equal(accountEstimateHasEffectiveError(currentAccount, staleUsage, false), false);
+  assert.equal(accountRateLimitShouldBeVisible(currentAccount, staleUsage, true), false);
+  assert.equal(accountEstimateHasEffectiveError(currentAccount, staleUsage, true), true);
 });
 
 test("view routes canonicalize paths and keep every dashboard view addressable", () => {
