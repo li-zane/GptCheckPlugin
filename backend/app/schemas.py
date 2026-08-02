@@ -238,11 +238,33 @@ class UsageLimitWindowSamplesOut(BaseModel):
 
 class UsageLimitSamplesOut(BaseModel):
     updated_at: datetime
-    target_sample_count: int
+    target_sample_count: int | None = None
     full_percent_threshold: float
     five_hour_threshold_percent: float
     seven_day_threshold_percent: float
     windows: list[UsageLimitWindowSamplesOut]
+
+
+class UsageLimitSampleDeleteRequest(BaseModel):
+    sample_ids: list[int] = Field(min_length=1, max_length=50_000)
+
+    @field_validator("sample_ids")
+    @classmethod
+    def validate_sample_ids(cls, value: list[int]) -> list[int]:
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for sample_id in value:
+            if not 0 < sample_id <= JS_SAFE_INTEGER_MAX:
+                raise ValueError("sample_ids must contain positive safe integers")
+            if sample_id not in seen:
+                normalized.append(sample_id)
+                seen.add(sample_id)
+        return normalized
+
+
+class UsageLimitSampleDeleteResult(MessageResponse):
+    requested_count: int
+    deleted_count: int
 
 
 class UsageLimitRangeSettings(BaseModel):

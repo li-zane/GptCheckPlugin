@@ -363,11 +363,17 @@ export type UsageLimitWindowSamples = {
 
 export type UsageLimitSamples = {
   updated_at: string;
-  target_sample_count: number;
+  target_sample_count: number | null;
   full_percent_threshold: number;
   five_hour_threshold_percent: number;
   seven_day_threshold_percent: number;
   windows: UsageLimitWindowSamples[];
+};
+
+export type UsageLimitSampleDeleteResult = {
+  message: string;
+  requested_count: number;
+  deleted_count: number;
 };
 
 export type UsageLimitRangeSettings = {

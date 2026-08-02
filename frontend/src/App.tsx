@@ -102,7 +102,11 @@ import {
   type UpstreamHealthKind,
 } from "./upstreamLabels";
 import {
+  filterUsageLimitSamples,
   sortUsageLimitSamples,
+  usageSampleDatePresets,
+  usageSampleDateRangeForPreset,
+  type UsageSampleDatePreset,
   type UsageSampleSortDirection,
   type UsageSampleSortField,
 } from "./usageSampleSort";
@@ -379,6 +383,7 @@ function App() {
   const [settingsFormInvalid, setSettingsFormInvalid] = useState(false);
   const siteName = settings.site_name?.trim() || defaultSiteName;
   const siteLogoUrl = settings.site_logo_url?.trim() || "/logo.png";
+  const siteFaviconUrl = versionedSiteLogoUrl(siteLogoUrl, settings.site_logo_updated_at);
   const now = useRefreshClock();
   const lastOAuthSyncEvent = useMemo(() => latestEventByKinds(events, ["manual_sync", "monitor_sync"]), [events]);
   const lastApiKeySyncEvent = useMemo(
@@ -824,6 +829,12 @@ function App() {
   useEffect(() => {
     document.title = siteName;
   }, [siteName]);
+
+  useEffect(() => {
+    const favicon = ensureFaviconLink();
+    favicon.type = "image/png";
+    favicon.href = siteFaviconUrl;
+  }, [siteFaviconUrl]);
 
   const runAction = async (action: () => Promise<unknown>, success: string) => {
     setBusy(true);
@@ -1302,13 +1313,20 @@ function App() {
           <UsageLimitSamplesView
             data={usageLimitSamples}
             error={usageLimitSamplesError}
-            loading={usageLimitSamplesLoading}
+            loading={usageLimitSamplesLoading || busy}
             onDelete={(sampleId) =>
               runAction(async () => {
                 const result = await api.deleteUsageLimitSample(sampleId);
                 await loadUsageLimitSamples();
                 return result;
               }, "额度样本已删除")
+            }
+            onDeleteMany={(sampleIds) =>
+              runAction(async () => {
+                const result = await api.deleteUsageLimitSamples(sampleIds);
+                await loadUsageLimitSamples();
+                return result;
+              }, `已删除 ${sampleIds.length} 条额度样本`)
             }
             onRefresh={loadUsageLimitSamples}
           />
@@ -3500,12 +3518,14 @@ function UsageLimitSamplesView({
   loading,
   error,
   onDelete,
+  onDeleteMany,
   onRefresh,
 }: {
   data: UsageLimitSamples | null;
   loading: boolean;
   error: string;
   onDelete: (sampleId: number) => Promise<void> | void;
+  onDeleteMany: (sampleIds: number[]) => Promise<void> | void;
   onRefresh: () => Promise<unknown>;
 }) {
   const timeZone = useDisplayTimeZone();
@@ -3564,10 +3584,45 @@ function UsageLimitSamplesView({
   );
   const [sampleSortField, setSampleSortField] = useState<UsageSampleSortField>("quota");
   const [sampleSortDirection, setSampleSortDirection] = useState<UsageSampleSortDirection>("asc");
-  const sortedSamples = useMemo(
-    () => sortUsageLimitSamples(selectedSubscription?.samples || [], sampleSortField, sampleSortDirection),
-    [sampleSortDirection, sampleSortField, selectedSubscription?.samples],
+  const [sampleStartDate, setSampleStartDate] = useState("");
+  const [sampleEndDate, setSampleEndDate] = useState("");
+  const [sampleDatePreset, setSampleDatePreset] = useState<UsageSampleDatePreset | null>(null);
+  const [selectedSampleIds, setSelectedSampleIds] = useState<Set<number>>(() => new Set());
+  const selectAllSamplesRef = useRef<HTMLInputElement>(null);
+  const sampleDateRangeInvalid = Boolean(sampleStartDate && sampleEndDate && sampleStartDate > sampleEndDate);
+  const filteredSamples = useMemo(
+    () => sampleDateRangeInvalid
+      ? []
+      : filterUsageLimitSamples(
+        selectedSubscription?.samples || [],
+        sampleStartDate,
+        sampleEndDate,
+        timeZone,
+      ),
+    [sampleDateRangeInvalid, sampleEndDate, sampleStartDate, selectedSubscription?.samples, timeZone],
   );
+  const sortedSamples = useMemo(
+    () => sortUsageLimitSamples(filteredSamples, sampleSortField, sampleSortDirection),
+    [filteredSamples, sampleSortDirection, sampleSortField],
+  );
+  const allVisibleSamplesSelected = sortedSamples.length > 0
+    && sortedSamples.every((sample) => selectedSampleIds.has(sample.id));
+  const someVisibleSamplesSelected = sortedSamples.some((sample) => selectedSampleIds.has(sample.id));
+  useEffect(() => {
+    setSelectedSampleIds(new Set());
+  }, [sampleEndDate, sampleStartDate, selectedSubscriptionKey, selectedWindowKey]);
+  useEffect(() => {
+    const availableIds = new Set((selectedSubscription?.samples || []).map((sample) => sample.id));
+    setSelectedSampleIds((current) => {
+      const next = new Set([...current].filter((sampleId) => availableIds.has(sampleId)));
+      return next.size === current.size ? current : next;
+    });
+  }, [selectedSubscription?.samples]);
+  useEffect(() => {
+    if (selectAllSamplesRef.current) {
+      selectAllSamplesRef.current.indeterminate = someVisibleSamplesSelected && !allVisibleSamplesSelected;
+    }
+  }, [allVisibleSamplesSelected, someVisibleSamplesSelected]);
   const toggleSampleSort = (field: UsageSampleSortField) => {
     if (field === sampleSortField) {
       setSampleSortDirection((current) => current === "asc" ? "desc" : "asc");
@@ -3575,6 +3630,43 @@ function UsageLimitSamplesView({
     }
     setSampleSortField(field);
     setSampleSortDirection(field === "recorded_at" ? "desc" : "asc");
+  };
+  const applySampleDatePreset = (preset: UsageSampleDatePreset) => {
+    const range = usageSampleDateRangeForPreset(preset, timeZone);
+    setSampleStartDate(range.startDate);
+    setSampleEndDate(range.endDate);
+    setSampleDatePreset(preset);
+  };
+  const clearSampleDateFilter = () => {
+    setSampleStartDate("");
+    setSampleEndDate("");
+    setSampleDatePreset(null);
+  };
+  const toggleVisibleSamples = () => {
+    setSelectedSampleIds((current) => {
+      const next = new Set(current);
+      if (allVisibleSamplesSelected) {
+        sortedSamples.forEach((sample) => next.delete(sample.id));
+      } else {
+        sortedSamples.forEach((sample) => next.add(sample.id));
+      }
+      return next;
+    });
+  };
+  const toggleSampleSelection = (sampleId: number) => {
+    setSelectedSampleIds((current) => {
+      const next = new Set(current);
+      if (next.has(sampleId)) next.delete(sampleId);
+      else next.add(sampleId);
+      return next;
+    });
+  };
+  const deleteSelectedSamples = () => {
+    const sampleIds = [...selectedSampleIds];
+    if (!sampleIds.length) return;
+    if (window.confirm(`确定删除选中的 ${sampleIds.length} 条额度样本吗？此操作不可撤销。`)) {
+      void onDeleteMany(sampleIds);
+    }
   };
 
   return (
@@ -3584,7 +3676,7 @@ function UsageLimitSamplesView({
           <div>
             <PanelTitle title="额度样本" icon={Radar} />
             <p className="panel-subtitle">
-              展示本地保存、用于推断官方窗口额度的限流样本；每个窗口最多保留中间 {data?.target_sample_count ?? 100} 条。
+              展示本地保存、用于推断官方窗口额度的限流样本；样本持续累积，仅在手动选择后删除。
             </p>
           </div>
           <button className="secondary-button" disabled={loading} onClick={() => onRefresh().catch(() => undefined)} type="button">
@@ -3645,6 +3737,81 @@ function UsageLimitSamplesView({
               ))}
             </div>
           ) : null}
+          {selectedSubscription ? (
+            <section className="usage-sample-management" aria-label="样本日期筛选与批量管理">
+              <div className="usage-sample-date-fields">
+                <label>
+                  <span>开始日期</span>
+                  <input
+                    aria-invalid={sampleDateRangeInvalid}
+                    max={sampleEndDate || undefined}
+                    onChange={(event) => {
+                      setSampleStartDate(event.target.value);
+                      setSampleDatePreset(null);
+                    }}
+                    type="date"
+                    value={sampleStartDate}
+                  />
+                </label>
+                <label>
+                  <span>结束日期</span>
+                  <input
+                    aria-invalid={sampleDateRangeInvalid}
+                    min={sampleStartDate || undefined}
+                    onChange={(event) => {
+                      setSampleEndDate(event.target.value);
+                      setSampleDatePreset(null);
+                    }}
+                    type="date"
+                    value={sampleEndDate}
+                  />
+                </label>
+              </div>
+              <div className="usage-sample-quick-filters" role="group" aria-label="快捷日期筛选">
+                {usageSampleDatePresets.map((preset) => (
+                  <button
+                    aria-pressed={sampleDatePreset === preset.id}
+                    className={sampleDatePreset === preset.id ? "usage-sample-filter-chip active" : "usage-sample-filter-chip"}
+                    key={preset.id}
+                    onClick={() => applySampleDatePreset(preset.id)}
+                    type="button"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+                {sampleStartDate || sampleEndDate ? (
+                  <button className="usage-sample-filter-clear" onClick={clearSampleDateFilter} type="button">
+                    <X size={14} />
+                    <span>清除日期</span>
+                  </button>
+                ) : null}
+              </div>
+              <div className="usage-sample-selection-actions">
+                <span>
+                  显示 <strong>{sortedSamples.length}</strong> / 共 {selectedSubscription.samples.length} 条 · 已选 {selectedSampleIds.size} 条
+                </span>
+                <button
+                  className="secondary-button"
+                  disabled={loading || sortedSamples.length === 0}
+                  onClick={toggleVisibleSamples}
+                  type="button"
+                >
+                  {allVisibleSamplesSelected ? <X size={16} /> : <CheckCircle2 size={16} />}
+                  <span>{allVisibleSamplesSelected ? "取消全选" : "全选当前"}</span>
+                </button>
+                <button
+                  className="danger-button"
+                  disabled={loading || selectedSampleIds.size === 0}
+                  onClick={deleteSelectedSamples}
+                  type="button"
+                >
+                  <Trash2 size={16} />
+                  <span>删除已选</span>
+                </button>
+              </div>
+              {sampleDateRangeInvalid ? <span className="form-error">开始日期不能晚于结束日期</span> : null}
+            </section>
+          ) : null}
           <div className="usage-samples-grid">
             {selectedSubscription ? (
               <section className="panel usage-sample-window" key={`${selectedSubscription.window_key}:${selectedSubscription.plan_cohort}`}>
@@ -3652,8 +3819,8 @@ function UsageLimitSamplesView({
                   <div>
                     <PanelTitle title={`${selectedSubscription.label} 样本 · ${selectedSubscription.plan_label}`} icon={TimerReset} />
                     <p className="panel-subtitle">
-                      {selectedSubscription.calibration.source === "sigma" ? "当前使用统计区间" : "当前使用默认区间"} · {selectedSubscription.samples.length}/
-                      {data.target_sample_count} 条 · 更新 {formatDate(data.updated_at, timeZone)}
+                      {selectedSubscription.calibration.source === "sigma" ? "当前使用统计区间" : "当前使用默认区间"} · 共 {selectedSubscription.samples.length} 条 ·
+                      当前显示 {sortedSamples.length} 条 · 更新 {formatDate(data.updated_at, timeZone)}
                     </p>
                   </div>
                   <div className="usage-sample-calibration">
@@ -3669,6 +3836,16 @@ function UsageLimitSamplesView({
                   <table className="usage-sample-table">
                   <thead>
                     <tr>
+                      <th className="usage-sample-select-cell">
+                        <input
+                          aria-label="全选当前筛选样本"
+                          checked={allVisibleSamplesSelected}
+                          disabled={loading || sortedSamples.length === 0}
+                          onChange={toggleVisibleSamples}
+                          ref={selectAllSamplesRef}
+                          type="checkbox"
+                        />
+                      </th>
                       <th>#</th>
                       <th>套餐</th>
                       <th>邮箱</th>
@@ -3704,7 +3881,16 @@ function UsageLimitSamplesView({
                   </thead>
                   <tbody>
                     {sortedSamples.map((sample, index) => (
-                      <tr key={sample.id}>
+                      <tr className={selectedSampleIds.has(sample.id) ? "is-selected" : ""} key={sample.id}>
+                        <td className="usage-sample-select-cell">
+                          <input
+                            aria-label={`选择额度样本 ${sample.id}`}
+                            checked={selectedSampleIds.has(sample.id)}
+                            disabled={loading}
+                            onChange={() => toggleSampleSelection(sample.id)}
+                            type="checkbox"
+                          />
+                        </td>
                         <td className="mono muted">{index + 1}</td>
                         <td>{sample.plan_cohort}</td>
                         <td>
@@ -3736,6 +3922,13 @@ function UsageLimitSamplesView({
                         </td>
                       </tr>
                     ))}
+                    {!sortedSamples.length ? (
+                      <tr>
+                        <td className="usage-sample-filter-empty" colSpan={10}>
+                          {sampleDateRangeInvalid ? "请调整日期范围" : "当前日期范围内没有样本"}
+                        </td>
+                      </tr>
+                    ) : null}
                   </tbody>
                   </table>
                 </div>
@@ -6939,6 +7132,29 @@ function fallbackSiteLogo(event: { currentTarget: HTMLImageElement }) {
   const image = event.currentTarget;
   if (image.getAttribute("src") === "/logo.png") return;
   image.src = "/logo.png";
+}
+
+function ensureFaviconLink() {
+  const existing = document.querySelector<HTMLLinkElement>('link[rel~="icon"]');
+  if (existing) return existing;
+  const favicon = document.createElement("link");
+  favicon.rel = "icon";
+  document.head.appendChild(favicon);
+  return favicon;
+}
+
+function versionedSiteLogoUrl(url: string, updatedAt: string | null | undefined) {
+  const value = url.trim() || "/logo.png";
+  if (!updatedAt || value.startsWith("data:") || value.startsWith("blob:")) return value;
+  try {
+    const next = new URL(value, window.location.origin);
+    next.searchParams.set("v", updatedAt);
+    return value.startsWith("http://") || value.startsWith("https://")
+      ? next.toString()
+      : `${next.pathname}${next.search}${next.hash}`;
+  } catch {
+    return value;
+  }
 }
 
 function formatTokenCount(value: number | null | undefined) {

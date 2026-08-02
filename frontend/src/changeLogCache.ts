@@ -120,6 +120,33 @@ export function markChangeLogCacheRead(
   });
 }
 
+export function markChangeLogCategoryCachesRead(
+  storage: (StorageLike & EnumerableStorageLike) | null,
+  baseUrl: string,
+  category: ChangeLogCacheCategory,
+  throughId: number,
+) {
+  const prefix = categoryCacheKeyPrefix(baseUrl, category);
+  const markedKeys = new Set<string>();
+  for (const key of memoryCache.keys()) {
+    if (key.startsWith(prefix)) {
+      markChangeLogCacheRead(storage, key, throughId);
+      markedKeys.add(key);
+    }
+  }
+  if (!storage) return;
+  try {
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (key?.startsWith(prefix) && !markedKeys.has(key)) {
+        markChangeLogCacheRead(storage, key, throughId);
+      }
+    }
+  } catch {
+    // Restricted browser contexts may reject storage enumeration.
+  }
+}
+
 export function mergeChangeLogItems<T extends ChangeLogItem>(
   current: ReadonlyArray<T>,
   incoming: ReadonlyArray<T>,
@@ -201,6 +228,10 @@ function isChangeLogItem(value: unknown): value is ChangeLogItem {
     && Number(item.id) > 0
     && typeof item.created_at === "string"
     && typeof item.unread === "boolean";
+}
+
+function categoryCacheKeyPrefix(baseUrl: string, category: ChangeLogCacheCategory) {
+  return `${cacheKeyPrefix}v${changeLogCacheVersion}:${encodeURIComponent(normalizeBaseUrl(baseUrl))}:${category}:`;
 }
 
 function positiveInteger(value: unknown, fallback: number) {

@@ -29,6 +29,7 @@ import type {
   SyncResult,
   UsageEstimate,
   UsageLimitSamples,
+  UsageLimitSampleDeleteResult,
   UsageRefreshResult,
   UpstreamAccount,
   UpstreamAccountAvailabilityTestResult,
@@ -226,6 +227,11 @@ export const api = {
   usageLimitSamples: () => request<UsageLimitSamples>("/api/accounts/usage-limit-samples"),
   deleteUsageLimitSample: (id: number) =>
     request<{ message: string }>(`/api/accounts/usage-limit-samples/${id}`, { method: "DELETE" }),
+  deleteUsageLimitSamples: (ids: number[]) =>
+    request<UsageLimitSampleDeleteResult>("/api/accounts/usage-limit-samples", {
+      method: "DELETE",
+      body: JSON.stringify({ sample_ids: ids }),
+    }),
   refreshUsageWindows: () =>
     request<UsageRefreshResult>("/api/accounts/usage-refresh", { method: "POST" }, 180_000),
   refreshSubscriptions: () =>

@@ -44,6 +44,8 @@ from app.schemas import (
     Sub2ApiSyncResult,
     UsageEstimateOut,
     UsageLimitCalibrationOut,
+    UsageLimitSampleDeleteRequest,
+    UsageLimitSampleDeleteResult,
     UsageLimitSampleOut,
     UsageLimitSamplesOut,
     UsageLimitWindowSamplesOut,
@@ -70,7 +72,6 @@ from app.services.sub2api import (
 from app.services.subscription_refresh import refresh_subscriptions
 from app.services.usage_estimate import (
     LIMIT_SAMPLE_FULL_PERCENT,
-    LIMIT_SAMPLE_TARGET,
     SAMPLE_WINDOWS,
     _default_limit_bounds,
     _default_sample_plan_cohorts,
@@ -858,11 +859,32 @@ async def usage_limit_samples(
             )
     return UsageLimitSamplesOut(
         updated_at=utcnow(),
-        target_sample_count=LIMIT_SAMPLE_TARGET,
+        target_sample_count=None,
         full_percent_threshold=LIMIT_SAMPLE_FULL_PERCENT,
         five_hour_threshold_percent=five_hour_threshold,
         seven_day_threshold_percent=seven_day_threshold,
         windows=windows,
+    )
+
+
+@router.delete("/usage-limit-samples", response_model=UsageLimitSampleDeleteResult)
+async def delete_usage_limit_samples(
+    payload: UsageLimitSampleDeleteRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UsageLimitSampleDeleteResult:
+    deleted_count = 0
+    for start in range(0, len(payload.sample_ids), 500):
+        batch = payload.sample_ids[start : start + 500]
+        result = await db.execute(delete(UsageLimitSample).where(UsageLimitSample.id.in_(batch)))
+        rowcount = getattr(result, "rowcount", 0)
+        if isinstance(rowcount, int) and rowcount > 0:
+            deleted_count += rowcount
+    await db.commit()
+    return UsageLimitSampleDeleteResult(
+        message=f"已删除 {deleted_count} 条额度样本",
+        requested_count=len(payload.sample_ids),
+        deleted_count=deleted_count,
     )
 
 

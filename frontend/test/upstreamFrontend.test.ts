@@ -46,6 +46,7 @@ import {
   changeLogCacheKey,
   clearChangeLogCache,
   clearChangeLogMemoryCache,
+  markChangeLogCategoryCachesRead,
   markChangeLogCacheRead,
   mergeChangeLogItems,
   readChangeLogCache,
@@ -128,7 +129,12 @@ import {
   upstreamMutationControlsDisabled,
   upstreamRateWritesAllowed,
 } from "../src/upstreamSyncPresentation.ts";
-import { sortUsageLimitSamples } from "../src/usageSampleSort.ts";
+import {
+  filterUsageLimitSamples,
+  sortUsageLimitSamples,
+  usageSampleDatePresets,
+  usageSampleDateRangeForPreset,
+} from "../src/usageSampleSort.ts";
 import {
   apiKeySubviewPaths,
   normalizePathname,
@@ -630,11 +636,14 @@ test("API key operation feedback uses the title bar and upstream cards fill four
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 
   assert.match(appSource, /onNotice=\{setNotice\}/);
+  assert.match(appSource, /const siteFaviconUrl = versionedSiteLogoUrl\(siteLogoUrl, settings\.site_logo_updated_at\)/);
+  assert.match(appSource, /document\.querySelector<HTMLLinkElement>\('link\[rel~=\"icon\"\]'\)/);
+  assert.match(appSource, /favicon\.href = siteFaviconUrl/);
   assert.match(accountSource, /const setNotice = onNotice/);
   assert.doesNotMatch(accountSource, /<Feedback tone="success"/);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);[^}]*justify-content: stretch;[^}]*width: 100%;/s);
-  assert.match(styles, /@media \(max-width: 1180px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\);/s);
-  assert.match(styles, /@media \(max-width: 900px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(260px, 1fr\)\);[^}]*justify-content: stretch;[^}]*width: 100%;/s);
+  assert.match(styles, /@media \(max-width: 1180px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(300px, 1fr\)\);/s);
+  assert.match(styles, /@media \(max-width: 900px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(280px, 1fr\)\);/s);
   assert.doesNotMatch(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(auto-fit,/s);
 });
 
@@ -677,7 +686,7 @@ test("API key change pages expose separate ledgers and unread highlighting", () 
   assert.match(styles, /\.api-key-scheduling-evidence/);
 });
 
-test("change ledger badges clear immediately for the open subview", () => {
+test("change ledger badges remain visible until the user leaves the subview", () => {
   assert.deepEqual(CHANGE_LOG_READ_RETRY_DELAYS_MS, [1_000, 2_000, 4_000]);
   assert.equal(pendingReadThroughId(null, [
     { id: 11, unread: false },
@@ -700,18 +709,9 @@ test("change ledger badges clear immediately for the open subview", () => {
     account_rate_changes: 2,
     account_scheduling_changes: 1,
   };
-  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "rate-log"), {
-    ...unreadCounts,
-    upstream_changes: 0,
-  });
-  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "schedule-log"), {
-    ...unreadCounts,
-    account_scheduling_changes: 0,
-  });
-  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "account-rate-log"), {
-    ...unreadCounts,
-    account_rate_changes: 0,
-  });
+  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "rate-log"), unreadCounts);
+  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "schedule-log"), unreadCounts);
+  assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "account-rate-log"), unreadCounts);
   assert.deepEqual(visibleChangeLogUnreadCounts(unreadCounts, "accounts"), unreadCounts);
 
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
@@ -723,6 +723,8 @@ test("change ledger badges clear immediately for the open subview", () => {
   assert.match(source, /const nextRoute = routeFromPath\(window\.location\.pathname\)/);
   assert.match(source, /const stillViewingSameLog = nextRoute\.view === "api-keys"/);
   assert.match(source, /visibleChangeLogUnreadCounts\(changeLogUnreadCounts, subview\)/);
+  assert.match(source, /markChangeLogCategoryCachesRead\(storage, cacheBaseUrl, category, throughId\)/);
+  assert.match(source, /markChangeLogCategoryCachesRead\(storage, cacheBaseUrl, "scheduling", throughId\)/);
   assert.match(source, /await refreshChangeLogUnreadCounts\(\);/);
   assert.match(source, /await api\.discoverUpstreamChannel\(channel\.id\);[\s\S]*?await refreshChangeLogUnreadCounts\(\);/);
   assert.match(source, /const result = await api\.syncApiKeyAccounts[\s\S]*?await refreshChangeLogUnreadCounts\(\);/);
@@ -908,8 +910,8 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(styles, /\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 371px;/);
   assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 0;/);
   assert.doesNotMatch(styles, /\.api-key-channel-accounts\s*\{[^}]*margin-top:\s*auto;/s);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);/s);
-  assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);[^}]*max-width: 360px;[^}]*width: 100%;/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(260px, 1fr\)\);/s);
+  assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.api-key-channel-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);[^}]*max-width: 420px;[^}]*width: 100%;/s);
   assert.doesNotMatch(styles, /api-key-channel-card--groups-expanded/);
   assert.match(accountSource, /trigger=\{<span>原<\/span>\}/);
   assert.match(accountSource, /trigger=\{<span>综<\/span>\}/);
@@ -1056,7 +1058,16 @@ test("change log cache restores, merges, and marks records read without crossing
   assert.deepEqual(restored?.items.map((item) => item.id), [11, 10]);
   assert.equal(restored?.page, 1);
   assert.equal(restored?.pageSize, 50);
-  assert.equal(readChangeLogCache(storage, accountRateKey), null);
+  writeChangeLogCache(storage, accountRateKey, {
+    items: [{ ...newer, id: 12 }],
+    hasMore: false,
+    unreadCount: 1,
+    lastReadId: 0,
+  });
+  markChangeLogCategoryCachesRead(storage, "https://sub2api.example.com/", "upstream", 11);
+  clearChangeLogMemoryCache();
+  assert.equal(readChangeLogCache(storage, key)?.unreadCount, 0);
+  assert.equal(readChangeLogCache(storage, accountRateKey)?.unreadCount, 1);
 
   markChangeLogCacheRead(storage, key, 11);
   clearChangeLogMemoryCache();
@@ -1239,7 +1250,7 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(styles, /\.api-key-channel-address\s*\{[^}]*overflow: hidden;[^}]*white-space: nowrap;/s);
   assert.match(styles, /\.api-key-group-chips\s*\{[^}]*max-height: 55px;[^}]*padding-bottom: 2px;/s);
   assert.match(styles, /\.api-key-channel-head\s*\{[^}]*background: color-mix[^}]*border-bottom: 1px solid var\(--line\);/s);
-  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);/s);
+  assert.match(styles, /\.api-key-channel-grid\s*\{[^}]*grid-template-columns: repeat\(4, minmax\(260px, 1fr\)\);/s);
   assert.match(styles, /\.api-key-channel-stats\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s);
   assert.match(styles, /\.api-key-channel-stat--balance\s*\{[^}]*grid-column: 1 \/ -1;/s);
   assert.doesNotMatch(styles, /\.api-key-channel-stat:last-child\s*\{/);
@@ -1365,6 +1376,37 @@ test("usage samples switch between quota and recorded-time directions", () => {
   assert.deepEqual(sortUsageLimitSamples(usageSamples, "quota", "desc").map((sample) => sample.id), [2, 1]);
   assert.deepEqual(sortUsageLimitSamples(usageSamples, "recorded_at", "asc").map((sample) => sample.id), [2, 1]);
   assert.deepEqual(sortUsageLimitSamples(usageSamples, "recorded_at", "desc").map((sample) => sample.id), [1, 2]);
+});
+
+test("usage samples support date presets, date ranges, and bulk selection management", () => {
+  const now = Date.parse("2026-08-02T04:00:00Z");
+  assert.deepEqual(usageSampleDateRangeForPreset("last-7", "Asia/Shanghai", now), {
+    startDate: "2026-07-27",
+    endDate: "2026-08-02",
+  });
+  assert.deepEqual(usageSampleDateRangeForPreset("before-30", "Asia/Shanghai", now), {
+    startDate: "",
+    endDate: "2026-07-03",
+  });
+  assert.deepEqual(
+    filterUsageLimitSamples(usageSamples, "2026-07-15", "2026-07-15", "Asia/Shanghai").map((sample) => sample.id),
+    [2, 1],
+  );
+  assert.deepEqual(filterUsageLimitSamples(usageSamples, "2026-07-16", "", "Asia/Shanghai"), []);
+
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.deepEqual(usageSampleDatePresets.map((preset) => preset.label), [
+    "近一周", "近一个月", "近两个月", "一周前", "一个月前", "两个月前",
+  ]);
+  assert.match(appSource, /aria-label="全选当前筛选样本"/);
+  assert.match(appSource, /aria-label={`选择额度样本 \$\{sample\.id\}`}/);
+  assert.match(appSource, /api\.deleteUsageLimitSamples\(sampleIds\)/);
+  assert.doesNotMatch(appSource, /每个窗口最多保留中间/);
+  assert.match(apiSource, /method: "DELETE",\s*body: JSON\.stringify\(\{ sample_ids: ids \}\)/s);
+  assert.match(styles, /\.usage-sample-management\s*\{/);
+  assert.match(styles, /\.usage-sample-table tbody tr\.is-selected td\s*\{/);
 });
 
 test("long-running workflows rely on backend deadlines and explicit cancellation", () => {

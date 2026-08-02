@@ -1036,13 +1036,13 @@ class UsageEstimateTests(unittest.TestCase):
                         "sub2api_account_id": f"old-{index}",
                         "plan_cohort": "team",
                         "window_key": "seven_day",
-                        "reset_key": f"reset:2099-01-{index + 1:02d}T00:00:00Z",
-                        "reset_at": f"2099-01-{index + 1:02d}T00:00:00Z",
+                        "reset_key": f"reset:{index}",
+                        "reset_at": f"2099-01-{index % 28 + 1:02d}T00:00:00Z",
                         "observed_limit": 180.0,
                         "raw_spent": 180.0,
                         "used_percent": 100.0,
                     }
-                    for index in range(10)
+                    for index in range(125)
                 ]
 
                 await _save_usage_limit_samples(samples)
@@ -1051,7 +1051,7 @@ class UsageEstimateTests(unittest.TestCase):
                 team_calibration = calibrations["seven_day"]["team"]
 
                 self.assertEqual(team_calibration["source"], "sigma")
-                self.assertEqual(team_calibration["sample_count"], 10)
+                self.assertEqual(team_calibration["sample_count"], 125)
                 self.assertAlmostEqual(team_calibration["lower"], 180.0)
                 self.assertAlmostEqual(team_calibration["upper"], 180.0)
             finally:

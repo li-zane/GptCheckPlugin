@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
 from app.models import (
@@ -45,7 +45,6 @@ WINDOWS = {
 UNGROUPED_ID = "ungrouped"
 UNGROUPED_NAME = "未分组"
 EPSILON = 1e-9
-LIMIT_SAMPLE_TARGET = 100
 LIMIT_SAMPLE_STATISTICS_MIN_COUNT = 10
 LIMIT_SAMPLE_FULL_PERCENT = 99.0
 LIMIT_SAMPLE_RESET_TOLERANCE_SECONDS = 120
@@ -891,22 +890,11 @@ async def _prune_usage_limit_samples(
                 .order_by(UsageLimitSample.plan_cohort, UsageLimitSample.observed_limit, UsageLimitSample.updated_at)
             )
             rows = list(result.scalars().all())
-            rows_by_cohort: dict[str, list[UsageLimitSample]] = defaultdict(list)
             for row in rows:
                 if not _usage_limit_sample_allowed(
                     row.window_key, row.plan_cohort, row.observed_limit, default_ranges
                 ):
                     await db.delete(row)
-                    continue
-                rows_by_cohort[_normalize_plan_cohort(row.plan_cohort)].append(row)
-            for cohort_rows in rows_by_cohort.values():
-                if len(cohort_rows) <= LIMIT_SAMPLE_TARGET:
-                    continue
-                start = (len(cohort_rows) - LIMIT_SAMPLE_TARGET) // 2
-                keep_ids = {row.id for row in cohort_rows[start : start + LIMIT_SAMPLE_TARGET]}
-                delete_ids = [row.id for row in cohort_rows if row.id not in keep_ids]
-                if delete_ids:
-                    await db.execute(delete(UsageLimitSample).where(UsageLimitSample.id.in_(delete_ids)))
         await db.commit()
 
 

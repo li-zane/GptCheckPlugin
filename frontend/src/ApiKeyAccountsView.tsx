@@ -63,6 +63,7 @@ import {
 import {
   changeLogCacheKey,
   getChangeLogSessionStorage,
+  markChangeLogCategoryCachesRead,
   markChangeLogCacheRead,
   readChangeLogCache,
   writeChangeLogCache,
@@ -774,9 +775,9 @@ export function ApiKeyAccountsView({
       pendingRef.current = null;
       try {
         await api.markUpstreamChannelChangesRead(throughId, category);
-        if (cacheKey) {
-          markChangeLogCacheRead(getChangeLogSessionStorage(), cacheKey, throughId);
-        }
+        const storage = getChangeLogSessionStorage();
+        markChangeLogCategoryCachesRead(storage, cacheBaseUrl, category, throughId);
+        if (cacheKey) markChangeLogCacheRead(storage, cacheKey, throughId);
         await refreshChangeLogUnreadCounts();
         if (
           !updateLocalState
@@ -806,7 +807,7 @@ export function ApiKeyAccountsView({
         await new Promise<void>((resolve) => window.setTimeout(resolve, retryDelay));
       }
     }
-  }, [refreshChangeLogUnreadCounts]);
+  }, [cacheBaseUrl, refreshChangeLogUnreadCounts]);
 
   const markScheduleLogsReadOnLeave = useCallback(async (updateLocalState = true) => {
     for (let retryAttempt = 0; ; retryAttempt += 1) {
@@ -821,9 +822,9 @@ export function ApiKeyAccountsView({
       pendingScheduleLogReadThroughIdRef.current = null;
       try {
         await api.markAccountSchedulingChangesRead(throughId);
-        if (cacheKey) {
-          markChangeLogCacheRead(getChangeLogSessionStorage(), cacheKey, throughId);
-        }
+        const storage = getChangeLogSessionStorage();
+        markChangeLogCategoryCachesRead(storage, cacheBaseUrl, "scheduling", throughId);
+        if (cacheKey) markChangeLogCacheRead(storage, cacheKey, throughId);
         await refreshChangeLogUnreadCounts();
         if (
           !updateLocalState
@@ -847,7 +848,7 @@ export function ApiKeyAccountsView({
         await new Promise<void>((resolve) => window.setTimeout(resolve, retryDelay));
       }
     }
-  }, [refreshChangeLogUnreadCounts]);
+  }, [cacheBaseUrl, refreshChangeLogUnreadCounts]);
 
   useLayoutEffect(() => {
     const previousSubview = previousSubviewRef.current;
