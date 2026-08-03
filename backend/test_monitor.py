@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.services.monitor import MonitorService
+from app.services.mailbox_notes import parse_noted_mailbox_binding
 from app.services.sub2api import Sub2ApiClient
 from app.core.database import Base
 from app.core.crypto import decrypt_text, encrypt_text
@@ -28,6 +29,73 @@ class _SessionContext:
 
 
 class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_mailbox_note_parser_accepts_matching_url_record(self) -> None:
+        binding = parse_noted_mailbox_binding(
+            "邮箱记录: User@Example.com----https://mail.example/messages/token/user%40example.com",
+            "user@example.com",
+        )
+
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.gpt_email, "user@example.com")
+        self.assertEqual(binding.mailbox_email, "user@example.com")
+        self.assertEqual(
+            binding.custom_fetch_url,
+            "https://mail.example/messages/token/user%40example.com",
+        )
+
+    def test_mailbox_note_parser_rejects_mismatched_account_and_unsafe_url(self) -> None:
+        self.assertIsNone(
+            parse_noted_mailbox_binding(
+                "邮箱记录: other@example.com----https://mail.example/messages/token",
+                "user@example.com",
+            )
+        )
+        self.assertIsNone(
+            parse_noted_mailbox_binding(
+                "邮箱记录: user@example.com----https://name:secret@mail.example/messages/token",
+                "user@example.com",
+            )
+        )
+
+    async def test_account_note_creates_missing_url_mailbox_without_overwriting_existing(self) -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        service = object.__new__(MonitorService)
+        service.sub2api = Sub2ApiClient()
+        account = {
+            "notes": "邮箱记录: user@example.com----https://mail.example/messages/token/user%40example.com"
+        }
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                await service._ensure_noted_mailbox("user@example.com", account, db=db)
+                await db.commit()
+                credential = await db.scalar(
+                    select(MailboxCredential).where(MailboxCredential.gpt_email == "user@example.com")
+                )
+                self.assertIsNotNone(credential)
+                assert credential is not None
+                self.assertEqual(credential.provider, "url")
+                self.assertEqual(credential.mailbox_email, "user@example.com")
+                self.assertEqual(
+                    credential.custom_fetch_url,
+                    "https://mail.example/messages/token/user%40example.com",
+                )
+
+                account["notes"] = (
+                    "邮箱记录: user@example.com----https://mail.example/messages/replacement/user%40example.com"
+                )
+                await service._ensure_noted_mailbox("user@example.com", account, db=db)
+                await db.commit()
+                self.assertEqual(
+                    credential.custom_fetch_url,
+                    "https://mail.example/messages/token/user%40example.com",
+                )
+        finally:
+            await engine.dispose()
+
     async def test_missing_remote_account_cleanup_deletes_snapshot_and_mailbox(self) -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -190,6 +258,7 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
         service.refresh_service = SimpleNamespace()
         service._upsert_snapshot = AsyncMock(return_value=(False, False, False))  # type: ignore[method-assign]
         service._ensure_routed_mailbox = AsyncMock()  # type: ignore[method-assign]
+        service._ensure_noted_mailbox = AsyncMock()  # type: ignore[method-assign]
         service._clear_account_exceptions = AsyncMock()  # type: ignore[method-assign]
         service._delete_missing_remote_accounts = AsyncMock(  # type: ignore[method-assign]
             return_value=(0, 0)
@@ -240,6 +309,7 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
         service.refresh_service = SimpleNamespace()
         service._upsert_snapshot = AsyncMock(return_value=(False, False, False))  # type: ignore[method-assign]
         service._ensure_routed_mailbox = AsyncMock()  # type: ignore[method-assign]
+        service._ensure_noted_mailbox = AsyncMock()  # type: ignore[method-assign]
         service._clear_account_exceptions = AsyncMock()  # type: ignore[method-assign]
         service._delete_missing_remote_accounts = AsyncMock(return_value=(0, 0))  # type: ignore[method-assign]
         service._sync_oauth_available_models = AsyncMock(return_value=0)  # type: ignore[method-assign]

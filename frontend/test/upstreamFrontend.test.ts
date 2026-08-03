@@ -1242,6 +1242,25 @@ test("subscription presentation keeps free and seat-based plans visible", () => 
   assert.match(subscriptionCell, /<span>到期 /);
 });
 
+test("OAuth account actions wrap and stop covering account data on phones", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+  assert.match(appSource, /className="row-actions account-row-actions"/);
+  assert.match(
+    styles,
+    /\.account-row-actions\s*\{[^}]*grid-template-columns:\s*repeat\(3, 36px\)/s,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 760px\)[\s\S]*?\.account-row-actions\s*\{[^}]*grid-template-columns:\s*repeat\(2, 36px\)/,
+  );
+  assert.match(
+    styles,
+    /\.sticky-action-column,\s*\.sticky-action-cell\s*\{\s*position:\s*static;/,
+  );
+});
+
 test("upstream channels expose occupied, no-enabled, and empty upstream filters", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(source, /useState<ChannelOccupancyFilter>\("occupied"\)/);

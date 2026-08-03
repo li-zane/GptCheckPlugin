@@ -3111,7 +3111,7 @@ function AccountRow({
         )}
       </td>
       <td className="right sticky-action-cell">
-        <div className="row-actions">
+        <div className="row-actions account-row-actions">
           {mailbox ? (
             <button className="icon-button" disabled={busy} onClick={() => onOpenMailbox?.(mailbox)} title="查看邮件" type="button">
               <MailOpen size={16} />

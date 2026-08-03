@@ -13,6 +13,7 @@ from app.models import AccountSnapshot, MailboxCredential, PhoneAccountBinding, 
 from app.schemas import Sub2ApiSyncResult
 from app.services.account_exceptions import clear_account_exception, upsert_account_exception
 from app.services.events import elapsed_ms, record_event
+from app.services.mailbox_notes import parse_noted_mailbox_binding
 from app.services.phone_numbers import bind_phone_to_account, extract_phone_row_from_note, find_reconcilable_placeholder, note_marker
 from app.services.refresh import RefreshService, get_refresh_service
 from app.services.routed_mail_config import get_routed_mail_config_service
@@ -257,6 +258,7 @@ class MonitorService:
                 if initial_subscription_check:
                     initial_subscription_candidates.append(account)
                 await self._ensure_routed_mailbox(normalized, db=inventory_db)
+                await self._ensure_noted_mailbox(normalized, account, db=inventory_db)
 
                 if is_error or is_deactive:
                     await self._record_sync_exception(
@@ -713,6 +715,35 @@ class MonitorService:
                 provider="gmail",
                 encrypted_password=encrypt_text(binding.password),
                 proxy_url=binding.proxy_url,
+                disabled=False,
+                last_error=None,
+            )
+        )
+
+    async def _ensure_noted_mailbox(
+        self,
+        email: str,
+        account: dict[str, Any],
+        *,
+        db: AsyncSession | None = None,
+    ) -> None:
+        if db is None:
+            async with AsyncSessionLocal() as owned_db:
+                await self._ensure_noted_mailbox(email, account, db=owned_db)
+                await owned_db.commit()
+                return
+        credential = await db.scalar(select(MailboxCredential).where(MailboxCredential.gpt_email == email))
+        if credential is not None:
+            return
+        binding = parse_noted_mailbox_binding(self.sub2api.account_notes(account), email)
+        if binding is None:
+            return
+        db.add(
+            MailboxCredential(
+                gpt_email=binding.gpt_email,
+                mailbox_email=binding.mailbox_email,
+                provider="url",
+                custom_fetch_url=binding.custom_fetch_url,
                 disabled=False,
                 last_error=None,
             )

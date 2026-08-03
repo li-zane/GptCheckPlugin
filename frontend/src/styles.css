@@ -1827,7 +1827,7 @@ table {
 }
 
 .accounts-table {
-  min-width: 1972px;
+  min-width: 1844px;
   table-layout: fixed;
 }
 
@@ -1880,7 +1880,7 @@ table {
 }
 
 .accounts-col-actions {
-  width: 264px;
+  width: 136px;
 }
 
 .mailbox-table {
@@ -2286,6 +2286,13 @@ tbody tr:hover:not(.account-jump-highlight) {
   display: inline-flex;
   gap: 8px;
   justify-content: flex-end;
+}
+
+.account-row-actions {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(3, 36px);
+  width: 120px;
 }
 
 .resource-select-cell {
@@ -2826,13 +2833,13 @@ tbody tr:hover:not(.account-jump-highlight) {
 
 .sticky-action-column {
   background: var(--sticky-head-bg);
-  min-width: 188px;
+  min-width: 136px;
 }
 
 .sticky-action-cell {
   background: var(--sticky-cell-bg);
   box-shadow: -10px 0 18px rgba(23, 35, 31, 0.04);
-  min-width: 188px;
+  min-width: 136px;
 }
 
 .duplicate-row .sticky-action-cell {
@@ -3931,6 +3938,27 @@ select:focus {
     height: auto;
     overflow: visible;
     padding: 18px;
+  }
+
+  .accounts-table {
+    min-width: 1804px;
+  }
+
+  .accounts-col-actions,
+  .sticky-action-column,
+  .sticky-action-cell {
+    min-width: 96px;
+    width: 96px;
+  }
+
+  .sticky-action-column,
+  .sticky-action-cell {
+    position: static;
+  }
+
+  .account-row-actions {
+    grid-template-columns: repeat(2, 36px);
+    width: 78px;
   }
 
   .topbar {

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import Settings, get_settings
 from app.core.crypto import decrypt_text, encrypt_text
@@ -55,6 +56,8 @@ OAUTH_PHONE_VERIFICATION_STOPPED_REASON = (
 )
 logger = logging.getLogger(__name__)
 _UNSET = object()
+LOCAL_TOKEN_STORE_MAX_ATTEMPTS = 2
+LOCAL_TOKEN_STORE_RETRY_DELAY_SECONDS = 0.25
 
 
 def _phone_hint_from_oauth_outcome(outcome: OpenAiOAuthOutcome) -> str | None:
@@ -1259,21 +1262,33 @@ class RefreshService:
         client_id: str | None | object = _UNSET,
         expires_at: datetime | None | object = _UNSET,
     ) -> None:
-        async with AsyncSessionLocal() as db:
-            snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
-            if snapshot is None:
+        for attempt in range(LOCAL_TOKEN_STORE_MAX_ATTEMPTS):
+            try:
+                async with AsyncSessionLocal() as db:
+                    snapshot = await db.scalar(select(AccountSnapshot).where(AccountSnapshot.email == email))
+                    if snapshot is None:
+                        return
+                    if refresh_token is not _UNSET:
+                        snapshot.encrypted_openai_refresh_token = encrypt_text(
+                            refresh_token if isinstance(refresh_token, str) else None
+                        )
+                    if access_token is not _UNSET:
+                        snapshot.encrypted_openai_access_token = encrypt_text(
+                            access_token if isinstance(access_token, str) else None
+                        )
+                    if id_token is not _UNSET:
+                        snapshot.encrypted_openai_id_token = encrypt_text(id_token if isinstance(id_token, str) else None)
+                    if client_id is not _UNSET:
+                        snapshot.encrypted_openai_client_id = encrypt_text(client_id if isinstance(client_id, str) else None)
+                    if expires_at is not _UNSET:
+                        snapshot.openai_token_expires_at = expires_at if isinstance(expires_at, datetime) else None
+                    await db.commit()
                 return
-            if refresh_token is not _UNSET:
-                snapshot.encrypted_openai_refresh_token = encrypt_text(refresh_token if isinstance(refresh_token, str) else None)
-            if access_token is not _UNSET:
-                snapshot.encrypted_openai_access_token = encrypt_text(access_token if isinstance(access_token, str) else None)
-            if id_token is not _UNSET:
-                snapshot.encrypted_openai_id_token = encrypt_text(id_token if isinstance(id_token, str) else None)
-            if client_id is not _UNSET:
-                snapshot.encrypted_openai_client_id = encrypt_text(client_id if isinstance(client_id, str) else None)
-            if expires_at is not _UNSET:
-                snapshot.openai_token_expires_at = expires_at if isinstance(expires_at, datetime) else None
-            await db.commit()
+            except OperationalError as exc:
+                is_locked = "database is locked" in str(exc).lower()
+                if not is_locked or attempt + 1 >= LOCAL_TOKEN_STORE_MAX_ATTEMPTS:
+                    raise
+                await asyncio.sleep(LOCAL_TOKEN_STORE_RETRY_DELAY_SECONDS)
 
     async def _load_bound_phone(self, email: str) -> BoundPhone | None:
         async with AsyncSessionLocal() as db:

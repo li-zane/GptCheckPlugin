@@ -1,8 +1,9 @@
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
 
 from app.core.crypto import decrypt_text, encrypt_text
 from app.models import AccountSnapshot
@@ -201,6 +202,45 @@ class RefreshStateMachineTests(unittest.IsolatedAsyncioTestCase):
             "temporary token endpoint error",
             invalid=True,
         )
+
+    async def test_local_token_store_retries_once_when_sqlite_is_locked(self) -> None:
+        service = object.__new__(RefreshService)
+        snapshot = AccountSnapshot(
+            email="oauth@example.com",
+            encrypted_openai_refresh_token=encrypt_text("old-token"),
+        )
+        locked_db = AsyncMock()
+        locked_db.scalar.return_value = snapshot
+        locked_db.commit.side_effect = OperationalError(
+            "UPDATE account_snapshots",
+            {},
+            RuntimeError("database is locked"),
+        )
+        retry_db = AsyncMock()
+        retry_db.scalar.return_value = snapshot
+        locked_context = MagicMock()
+        locked_context.__aenter__ = AsyncMock(return_value=locked_db)
+        locked_context.__aexit__ = AsyncMock(return_value=None)
+        retry_context = MagicMock()
+        retry_context.__aenter__ = AsyncMock(return_value=retry_db)
+        retry_context.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "app.services.refresh.AsyncSessionLocal",
+                side_effect=[locked_context, retry_context],
+            ),
+            patch("app.services.refresh.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            await service._store_local_openai_tokens(
+                "oauth@example.com",
+                refresh_token=None,
+            )
+
+        locked_db.commit.assert_awaited_once()
+        retry_db.commit.assert_awaited_once()
+        sleep.assert_awaited_once()
+        self.assertIsNone(snapshot.encrypted_openai_refresh_token)
 
 
 class OAuthRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
