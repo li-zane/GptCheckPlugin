@@ -786,9 +786,19 @@ h2 {
   padding: 6px 10px;
 }
 
+.resource-bulk-copy,
 .resource-bulk-export {
   min-height: 36px;
   padding: 6px 10px;
+}
+
+.resource-action-message {
+  background: var(--green-tint);
+  border: 1px solid color-mix(in srgb, var(--green) 32%, var(--line));
+  border-radius: 7px;
+  color: var(--green);
+  font-size: 13px;
+  padding: 9px 12px;
 }
 
 .accounts-panel-toolbar {
@@ -1872,7 +1882,7 @@ table {
 }
 
 .mailbox-table {
-  min-width: 1160px;
+  min-width: 1204px;
   table-layout: fixed;
 }
 
@@ -1898,7 +1908,7 @@ table {
 }
 
 .mailbox-col-actions {
-  width: 164px;
+  width: 208px;
 }
 
 .mailbox-field-copy {

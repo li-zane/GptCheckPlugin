@@ -307,7 +307,6 @@ class RefreshService:
 
         oauth_login_mode = await self.runtime_config.get_oauth_login_mode()
         stop_on_phone_verification = await self.runtime_config.get_oauth_stop_on_phone_verification()
-        oauth_source = oauth_login_mode
         if oauth_login_mode == "browser":
             oauth_outcome = await self._oauth_with_browser_slot(
                 job_id,
@@ -317,37 +316,18 @@ class RefreshService:
             )
         else:
             oauth_outcome = await self._oauth_with_protocol_slot(job_id, email, fetch_code)
-            if (
-                oauth_outcome is not None
-                and oauth_outcome.status == "failed"
-                and is_protocol_edge_verification_blocked(oauth_outcome.error)
-            ):
-                await self._record_openai_oauth_warning(
-                    job_id,
-                    email,
-                    oauth_outcome.error or OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE,
-                    will_fallback=True,
-                    fallback_target="headless browser",
-                )
-                oauth_source = "browser"
-                oauth_outcome = await self._oauth_with_browser_slot(
-                    job_id,
-                    email,
-                    fetch_code,
-                    stop_on_phone_verification=stop_on_phone_verification,
-                )
         if oauth_outcome is None:
             return
         if stop_on_phone_verification and _oauth_outcome_requires_phone(oauth_outcome):
             await self._finish_oauth_phone_verification_stopped(
                 job_id,
                 email,
-                oauth_source,
+                oauth_login_mode,
                 oauth_outcome.error,
             )
             return
         if oauth_outcome.status in {"ok", "deactive", "add_phone"}:
-            await self._handle_oauth_outcome(job_id, email, account, oauth_outcome, source=oauth_source)
+            await self._handle_oauth_outcome(job_id, email, account, oauth_outcome, source=oauth_login_mode)
             return
         preferred_failure_reason = self._preferred_openai_failure_reason(oauth_outcome.error)
         await self._record_openai_oauth_warning(
@@ -1622,8 +1602,8 @@ class RefreshService:
                 "OpenAI OAuth protocol login was blocked by edge verification; falling back to "
                 f"{fallback_target}."
                 if will_fallback
-                else "OpenAI OAuth protocol login was blocked by edge verification; switch OAuth login mode to "
-                "headless browser in Settings and retry."
+                else "OpenAI OAuth protocol login was blocked by edge verification; review "
+                "OPENAI_OAUTH_PROTOCOL_IMPERSONATES and retry protocol OAuth."
             )
             if edge_blocked
             else (

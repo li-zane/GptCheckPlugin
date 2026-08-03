@@ -143,6 +143,11 @@ class Settings(BaseSettings):
     openai_oauth_redirect_uri: str = "http://localhost:1455/auth/callback"
     openai_oauth_scopes: str = "openid profile email offline_access"
     openai_oauth_user_agent: str = "codex_cli_rs/0.104.0"
+    openai_oauth_protocol_impersonates: list[str] = Field(
+        default_factory=lambda: ["chrome142", "safari184", "firefox135"],
+        min_length=1,
+        max_length=8,
+    )
     verification_code_timeout_seconds: int = 180
     verification_code_poll_seconds: int = 6
     verification_code_lookup_grace_seconds: int = 900
@@ -189,6 +194,20 @@ class Settings(BaseSettings):
         if any(isinstance(item, bool) or item < 1 or item > 200 for item in value):
             raise ValueError("change_log_page_size_options must contain integers from 1 to 200")
         return sorted(set(value))
+
+    @field_validator("openai_oauth_protocol_impersonates")
+    @classmethod
+    def validate_openai_oauth_protocol_impersonates(cls, value: list[str]) -> list[str]:
+        profiles: list[str] = []
+        for item in value:
+            profile = str(item).strip()
+            if not profile or len(profile) > 64:
+                raise ValueError("openai_oauth_protocol_impersonates contains an invalid profile")
+            if profile not in profiles:
+                profiles.append(profile)
+        if not profiles:
+            raise ValueError("openai_oauth_protocol_impersonates must not be empty")
+        return profiles
 
     @model_validator(mode="after")
     def validate_change_log_pagination(self) -> "Settings":

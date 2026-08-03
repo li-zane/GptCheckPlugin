@@ -1824,6 +1824,13 @@ test("sub2api credential changes invalidate the API key display cache", () => {
   );
 });
 
+test("login screen loads the public custom logo before authentication", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+
+  assert.match(appSource, /<LoginScreen[\s\S]*?logoUrl="\/api\/settings\/logo"/);
+  assert.match(appSource, /<img alt="" onError=\{fallbackSiteLogo\} src=\{logoUrl\} \/>/);
+});
+
 test("priority interval API requests use stable paths and identity-checked assignment", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;
@@ -3321,6 +3328,9 @@ test("mailbox and phone tables expose filtered select-all controls and URL mailb
   assert.match(styles, /\.resource-select-cell\s*\{[^}]*width:\s*42px;/s);
   assert.match(styles, /\.table-wrap tbody tr\.is-selected > td\s*\{[^}]*background:\s*var\(--green-tint\);/s);
   assert.match(appSource, /api\.exportMailboxes\(mailboxIds\)/);
+  assert.match(appSource, /copyTextToClipboard\(result\.content\)/);
+  assert.match(appSource, /title="按导入格式复制"/);
+  assert.match(appSource, />复制已选<\/span>/);
   assert.match(appSource, /api\.mailboxCredentials\(mailbox\.id\)/);
   assert.match(appSource, /function MailboxCredentialDialog/);
   assert.match(appSource, /className="mailbox-field-copy mono" middleEllipsis/);

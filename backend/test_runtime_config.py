@@ -58,6 +58,21 @@ def _logo_bytes(
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_oauth_protocol_impersonates_are_trimmed_and_deduplicated(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            openai_oauth_protocol_impersonates=[" chrome142 ", "safari184", "chrome142"],
+        )
+
+        self.assertEqual(
+            settings.openai_oauth_protocol_impersonates,
+            ["chrome142", "safari184"],
+        )
+
+    def test_oauth_protocol_impersonates_reject_empty_profiles(self) -> None:
+        with self.assertRaises(ValidationError):
+            Settings(_env_file=None, openai_oauth_protocol_impersonates=[" "])
+
     def test_fallback_model_chain_accepts_json_arrows_and_deduplicates(self) -> None:
         self.assertEqual(
             runtime_config._normalize_model_chain('["gpt-5.4-mini", "grok-4.5"]'),
@@ -124,7 +139,7 @@ class RuntimeConfigTests(unittest.TestCase):
         finally:
             await engine.dispose()
 
-    def test_logo_route_is_nosniff_and_immutable(self) -> None:
+    def test_logo_route_is_public_nosniff_and_uses_version_aware_cache(self) -> None:
         app = FastAPI()
         app.include_router(settings_router, prefix="/api/settings")
         logo = _logo_bytes("PNG", size=(8, 8))
@@ -134,10 +149,13 @@ class RuntimeConfigTests(unittest.TestCase):
             TestClient(app) as client,
         ):
             response = client.get("/api/settings/logo")
+            versioned_response = client.get("/api/settings/logo?v=content-hash")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["x-content-type-options"], "nosniff")
-        self.assertIn("immutable", response.headers["cache-control"])
+        self.assertEqual(response.headers["cache-control"], "public, no-cache")
+        self.assertEqual(versioned_response.status_code, 200)
+        self.assertIn("immutable", versioned_response.headers["cache-control"])
 
     def test_logo_validation_decodes_bounds_and_normalizes(self) -> None:
         raw = _logo_bytes("PNG", size=(16, 16), metadata=True)

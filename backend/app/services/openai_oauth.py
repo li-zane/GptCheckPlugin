@@ -8,6 +8,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -28,8 +29,10 @@ AUTH_ACCOUNTS_BASE = "https://auth.openai.com/api/accounts"
 ADD_PHONE_ERROR = "当前账号触发 OpenAI 手机号验证；无接码流程下自动 OAuth 终止。"
 OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE = "oauth_protocol_edge_verification_blocked"
 OAUTH_PROTOCOL_EDGE_BLOCK_GUIDANCE = (
-    "Switch OAuth login mode to headless browser in Settings and retry."
+    "Review OPENAI_OAUTH_PROTOCOL_IMPERSONATES and retry protocol OAuth."
 )
+DEFAULT_OAUTH_PROTOCOL_IMPERSONATES = ("chrome142", "safari184", "firefox135")
+OAUTH_CODEX_CONSENT_PATH = "/sign-in-with-chatgpt/codex/consent"
 
 
 class PhoneVerificationError(RuntimeError):
@@ -70,27 +73,70 @@ class OpenAiOAuthRefresher:
     async def refresh_with_protocol(self, email: str, fetch_code: FetchCode) -> OpenAiOAuthOutcome:
         try:
             from curl_cffi import requests
+            from curl_cffi.requests.exceptions import ImpersonateError
         except ImportError:
             return OpenAiOAuthOutcome(status="failed", error="curl_cffi is not installed.")
 
-        context = self._new_context()
-        try:
-            async with requests.AsyncSession(impersonate="chrome136", timeout=60) as session:
-                code_result = await self._run_protocol_oauth(session, context, email, fetch_code)
-                if code_result.status != "ok" or not code_result.access_token:
-                    return code_result
-                return await self._exchange_code(context, code_result.access_token, email)
-        except Exception as exc:
-            if looks_deactive_text(str(exc)):
-                return OpenAiOAuthOutcome(status="deactive", error=f"OpenAI OAuth reported account_deactivated: {exc}")
-            if _is_add_phone_text(str(exc)):
-                return OpenAiOAuthOutcome(status="add_phone", error=ADD_PHONE_ERROR)
-            if _is_protocol_edge_verification_text(str(exc)):
-                return self._protocol_edge_blocked_outcome(
-                    "OpenAI OAuth protocol flow",
-                    _edge_status_from_text(str(exc)),
+        profiles = self._protocol_impersonates()
+        last_outcome: OpenAiOAuthOutcome | None = None
+        attempted_profiles: list[str] = []
+        for profile in profiles:
+            context = self._new_context()
+            attempted_profiles.append(profile)
+            try:
+                async with requests.AsyncSession(impersonate=profile, timeout=60) as session:
+                    code_result = await self._run_protocol_oauth(session, context, email, fetch_code)
+                    if self._authorization_start_edge_blocked(code_result):
+                        last_outcome = code_result
+                        continue
+                    if code_result.status != "ok" or not code_result.access_token:
+                        return code_result
+                    return await self._exchange_code(context, code_result.access_token, email)
+            except ImpersonateError:
+                last_outcome = OpenAiOAuthOutcome(
+                    status="failed",
+                    error=f"curl_cffi does not support the configured OAuth protocol fingerprint: {profile}.",
                 )
-            return OpenAiOAuthOutcome(status="failed", error=f"OpenAI OAuth protocol flow failed: {exc}")
+                continue
+            except Exception as exc:
+                if looks_deactive_text(str(exc)):
+                    return OpenAiOAuthOutcome(status="deactive", error=f"OpenAI OAuth reported account_deactivated: {exc}")
+                if _is_add_phone_text(str(exc)):
+                    return OpenAiOAuthOutcome(status="add_phone", error=ADD_PHONE_ERROR)
+                if _is_protocol_edge_verification_text(str(exc)):
+                    return self._protocol_edge_blocked_outcome(
+                        "OpenAI OAuth protocol flow",
+                        _edge_status_from_text(str(exc)),
+                    )
+                return OpenAiOAuthOutcome(status="failed", error=f"OpenAI OAuth protocol flow failed: {exc}")
+
+        if last_outcome is not None and last_outcome.reason_code == OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE:
+            tried = ", ".join(attempted_profiles)
+            last_outcome.error = f"{last_outcome.error} Tried protocol fingerprints: {tried}."
+        return last_outcome or OpenAiOAuthOutcome(
+            status="failed",
+            error="No OpenAI OAuth protocol fingerprint is configured.",
+        )
+
+    def _protocol_impersonates(self) -> tuple[str, ...]:
+        configured = getattr(self.settings, "openai_oauth_protocol_impersonates", None)
+        if isinstance(configured, str):
+            configured = [configured]
+        profiles = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in (configured or DEFAULT_OAUTH_PROTOCOL_IMPERSONATES)
+                if str(item).strip()
+            )
+        )
+        return profiles or DEFAULT_OAUTH_PROTOCOL_IMPERSONATES
+
+    @staticmethod
+    def _authorization_start_edge_blocked(outcome: OpenAiOAuthOutcome) -> bool:
+        return (
+            outcome.reason_code == OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE
+            and "authorization start" in str(outcome.error or "").casefold()
+        )
 
     async def refresh_with_browser(
         self,
@@ -418,6 +464,24 @@ class OpenAiOAuthRefresher:
             )
             if callback_code:
                 return OpenAiOAuthOutcome(status="ok", access_token=callback_code)
+            workspace_id = _protocol_consent_workspace_id(response, context)
+            if workspace_id is not None:
+                response = await session.post(
+                    f"{AUTH_ACCOUNTS_BASE}/workspace/select",
+                    json={"workspace_id": workspace_id},
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Origin": "https://auth.openai.com",
+                        "Referer": str(getattr(response, "url", current_url)),
+                    },
+                    allow_redirects=False,
+                )
+                callback_code = self._code_from_response(
+                    response, context.state, context.redirect_uri
+                )
+                if callback_code:
+                    return OpenAiOAuthOutcome(status="ok", access_token=callback_code)
             text = str(getattr(response, "text", ""))[:4000]
             if _is_add_phone_text(text) or _is_add_phone_text(self._location(response)):
                 return OpenAiOAuthOutcome(status="add_phone", error=ADD_PHONE_ERROR)
@@ -1100,6 +1164,64 @@ def _same_oauth_redirect_target(actual: Any, expected: Any) -> bool:
         and not actual.fragment
         and not expected.fragment
     )
+
+
+class _ProtocolConsentFormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.action: str | None = None
+        self.method: str | None = None
+        self.fields: dict[str, str] = {}
+        self._in_form = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key.casefold(): value for key, value in attrs}
+        if tag.casefold() == "form" and self.action is None:
+            self.action = str(values.get("action") or "")
+            self.method = str(values.get("method") or "get").casefold()
+            self._in_form = True
+            return
+        if tag.casefold() != "input" or not self._in_form or "disabled" in values:
+            return
+        field_type = str(values.get("type") or "text").casefold()
+        name = str(values.get("name") or "").strip()
+        value = str(values.get("value") or "")
+        if (
+            field_type == "hidden"
+            and name
+            and len(name) <= 100
+            and len(value) <= 2000
+            and len(self.fields) < 20
+        ):
+            self.fields[name] = value
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "form" and self._in_form:
+            self._in_form = False
+
+
+def _protocol_consent_workspace_id(
+    response: Any,
+    context: OAuthContext,
+) -> str | None:
+    response_url = str(getattr(response, "url", ""))
+    if urlparse(response_url).path != OAUTH_CODEX_CONSENT_PATH:
+        return None
+    parser = _ProtocolConsentFormParser()
+    try:
+        parser.feed(str(getattr(response, "text", ""))[:256_000])
+        parser.close()
+    except (ValueError, TypeError):
+        return None
+    if parser.method != "post" or "workspace_id" not in parser.fields:
+        return None
+    action_url = urljoin(response_url, parser.action or OAUTH_CODEX_CONSENT_PATH)
+    if (
+        urlparse(action_url).path != OAUTH_CODEX_CONSENT_PATH
+        or not _is_allowed_protocol_continuation(action_url, context)
+    ):
+        return None
+    return parser.fields["workspace_id"]
 
 
 def _is_allowed_protocol_continuation(url: str, context: OAuthContext) -> bool:

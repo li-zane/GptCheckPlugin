@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from app.services.openai_oauth import (
     OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE,
     OAuthContext,
+    OpenAiOAuthOutcome,
     OpenAiOAuthRefresher,
     _is_protocol_edge_verification_response,
 )
@@ -58,7 +59,7 @@ class OAuthEdgeVerificationClassificationTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(outcome.reason_code, OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE)
         self.assertIn(OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE, outcome.error or "")
         self.assertIn("HTTP 403", outcome.error or "")
-        self.assertIn("headless browser", outcome.error or "")
+        self.assertIn("OPENAI_OAUTH_PROTOCOL_IMPERSONATES", outcome.error or "")
         self.assertNotIn("sensitive-response-token", outcome.error or "")
         self.assertNotIn("sensitive-header-token", outcome.error or "")
 
@@ -177,6 +178,75 @@ class OAuthEdgeVerificationClassificationTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(outcome.reason_code, OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE)
         self.assertIn("Cloudflare/Sentinel", outcome.error or "")
 
+    async def test_codex_consent_selects_workspace_and_extracts_callback_code(self) -> None:
+        consent_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        session = SimpleNamespace(
+            get=AsyncMock(
+                return_value=FakeResponse(
+                    200,
+                    text=(
+                        '<form method="post" action="/sign-in-with-chatgpt/codex/consent">'
+                        '<input type="hidden" name="workspace_id" value="workspace-id">'
+                        '<button type="submit">Continue</button></form>'
+                    ),
+                    url=consent_url,
+                )
+            ),
+            post=AsyncMock(
+                return_value=FakeResponse(
+                    302,
+                    headers={
+                        "location": (
+                            "http://localhost:1455/auth/callback?"
+                            "code=authorization-code&state=expected-state"
+                        )
+                    },
+                    url=consent_url,
+                )
+            ),
+        )
+
+        outcome = await OpenAiOAuthRefresher(SimpleNamespace())._follow_protocol_url(
+            session,
+            consent_url,
+            _context(),
+        )
+
+        self.assertEqual(outcome.status, "ok")
+        self.assertEqual(outcome.access_token, "authorization-code")
+        session.post.assert_awaited_once()
+        self.assertEqual(
+            session.post.await_args.args[0],
+            "https://auth.openai.com/api/accounts/workspace/select",
+        )
+        self.assertEqual(session.post.await_args.kwargs["json"], {"workspace_id": "workspace-id"})
+
+    async def test_codex_consent_form_rejects_untrusted_action(self) -> None:
+        consent_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        session = SimpleNamespace(
+            get=AsyncMock(
+                return_value=FakeResponse(
+                    200,
+                    text=(
+                        '<form method="post" action="https://example.com/sign-in-with-chatgpt/codex/consent">'
+                        '<input type="hidden" name="workspace_id" value="workspace-id">'
+                        "</form>"
+                    ),
+                    url=consent_url,
+                )
+            ),
+            post=AsyncMock(),
+        )
+
+        outcome = await OpenAiOAuthRefresher(SimpleNamespace())._follow_protocol_url(
+            session,
+            consent_url,
+            _context(),
+        )
+
+        self.assertEqual(outcome.status, "failed")
+        session.post.assert_not_awaited()
+
     async def test_token_exchange_edge_block_does_not_echo_authorization_code(self) -> None:
         settings = SimpleNamespace(
             openai_oauth_token_url="https://auth.openai.com/oauth/token",
@@ -202,7 +272,7 @@ class OAuthEdgeVerificationClassificationTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(outcome.reason_code, OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE)
         self.assertNotIn("authorization-code-secret", outcome.error or "")
 
-    async def test_refresh_event_logs_reason_code_and_headless_browser_guidance(self) -> None:
+    async def test_refresh_event_logs_reason_code_and_protocol_fingerprint_guidance(self) -> None:
         service = object.__new__(RefreshService)
         service._record_event_safely = AsyncMock()
         edge_error = OpenAiOAuthRefresher(SimpleNamespace())._http_error(
@@ -219,9 +289,107 @@ class OAuthEdgeVerificationClassificationTests(unittest.IsolatedAsyncioTestCase)
 
         service._record_event_safely.assert_awaited_once()
         event_args = service._record_event_safely.await_args.args
-        self.assertIn("headless browser", event_args[1])
+        self.assertIn("OPENAI_OAUTH_PROTOCOL_IMPERSONATES", event_args[1])
         self.assertEqual(event_args[3]["reason_code"], OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE)
         self.assertNotIn("secret-value", event_args[3]["error"])
+
+
+class OAuthProtocolFingerprintSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authorization_start_edge_block_tries_next_protocol_fingerprint(self) -> None:
+        profiles: list[str] = []
+
+        class RecordingSession:
+            def __init__(self, *, impersonate: str, timeout: int) -> None:
+                profiles.append(impersonate)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+        refresher = OpenAiOAuthRefresher(
+            SimpleNamespace(openai_oauth_protocol_impersonates=["chrome136", "chrome142"])
+        )
+        start_edge = refresher._protocol_edge_blocked_outcome(
+            "OpenAI OAuth authorization start",
+            403,
+        )
+        next_outcome = OpenAiOAuthOutcome(status="failed", error="verification code pending")
+
+        with (
+            patch("curl_cffi.requests.AsyncSession", RecordingSession),
+            patch.object(refresher, "_new_context", return_value=_context()),
+            patch.object(
+                refresher,
+                "_run_protocol_oauth",
+                new=AsyncMock(side_effect=[start_edge, next_outcome]),
+            ),
+        ):
+            outcome = await refresher.refresh_with_protocol("person@example.com", AsyncMock())
+
+        self.assertIs(outcome, next_outcome)
+        self.assertEqual(profiles, ["chrome136", "chrome142"])
+
+    async def test_later_edge_block_does_not_restart_oauth_with_another_fingerprint(self) -> None:
+        profiles: list[str] = []
+
+        class RecordingSession:
+            def __init__(self, *, impersonate: str, timeout: int) -> None:
+                profiles.append(impersonate)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+        refresher = OpenAiOAuthRefresher(
+            SimpleNamespace(openai_oauth_protocol_impersonates=["chrome142", "safari184"])
+        )
+        email_edge = refresher._protocol_edge_blocked_outcome(
+            "OpenAI OAuth email submission",
+            403,
+        )
+
+        with (
+            patch("curl_cffi.requests.AsyncSession", RecordingSession),
+            patch.object(refresher, "_new_context", return_value=_context()),
+            patch.object(refresher, "_run_protocol_oauth", new=AsyncMock(return_value=email_edge)),
+        ):
+            outcome = await refresher.refresh_with_protocol("person@example.com", AsyncMock())
+
+        self.assertIs(outcome, email_edge)
+        self.assertEqual(profiles, ["chrome142"])
+
+    async def test_exhausted_start_profiles_report_every_attempt(self) -> None:
+        class RecordingSession:
+            def __init__(self, *, impersonate: str, timeout: int) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+        refresher = OpenAiOAuthRefresher(
+            SimpleNamespace(openai_oauth_protocol_impersonates=["chrome136", "chrome145"])
+        )
+        outcomes = [
+            refresher._protocol_edge_blocked_outcome("OpenAI OAuth authorization start", 403),
+            refresher._protocol_edge_blocked_outcome("OpenAI OAuth authorization start", 403),
+        ]
+
+        with (
+            patch("curl_cffi.requests.AsyncSession", RecordingSession),
+            patch.object(refresher, "_new_context", return_value=_context()),
+            patch.object(refresher, "_run_protocol_oauth", new=AsyncMock(side_effect=outcomes)),
+        ):
+            outcome = await refresher.refresh_with_protocol("person@example.com", AsyncMock())
+
+        self.assertEqual(outcome.reason_code, OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE)
+        self.assertIn("Tried protocol fingerprints: chrome136, chrome145", outcome.error or "")
 
 
 if __name__ == "__main__":

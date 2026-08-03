@@ -1054,7 +1054,7 @@ function App() {
   if (authState === "out") {
     return (
       <LoginScreen
-        logoUrl={siteLogoUrl}
+        logoUrl="/api/settings/logo"
         siteName={siteName}
         theme={theme}
         onToggleTheme={toggleTheme}
@@ -4033,6 +4033,7 @@ function MailboxView({
   const [credentialLoading, setCredentialLoading] = useState(false);
   const [credentialError, setCredentialError] = useState("");
   const [credentialActionError, setCredentialActionError] = useState("");
+  const [credentialActionMessage, setCredentialActionMessage] = useState("");
   const [credentialExporting, setCredentialExporting] = useState(false);
   const [folder, setFolder] = useState<"inbox" | "junk">("inbox");
   const [messages, setMessages] = useState<MailMessage[]>([]);
@@ -4076,6 +4077,7 @@ function MailboxView({
     setCredentialDetail(null);
     setCredentialError("");
     setCredentialActionError("");
+    setCredentialActionMessage("");
     setCredentialLoading(true);
     api.mailboxCredentials(mailbox.id)
       .then((detail) => {
@@ -4100,12 +4102,29 @@ function MailboxView({
   const exportMailboxIds = async (mailboxIds: number[], fileName: string) => {
     if (!mailboxIds.length) return;
     setCredentialActionError("");
+    setCredentialActionMessage("");
     setCredentialExporting(true);
     try {
       const result = await api.exportMailboxes(mailboxIds);
       downloadTextFile(fileName, result.content);
+      setCredentialActionMessage(`已导出 ${result.exported} 个邮箱凭据`);
     } catch (error) {
       setCredentialActionError(error instanceof Error ? error.message : "导出邮箱凭据失败");
+    } finally {
+      setCredentialExporting(false);
+    }
+  };
+  const copyMailboxIds = async (mailboxIds: number[]) => {
+    if (!mailboxIds.length) return;
+    setCredentialActionError("");
+    setCredentialActionMessage("");
+    setCredentialExporting(true);
+    try {
+      const result = await api.exportMailboxes(mailboxIds);
+      await copyTextToClipboard(result.content);
+      setCredentialActionMessage(`已按导入格式复制 ${result.exported} 个邮箱凭据`);
+    } catch (error) {
+      setCredentialActionError(error instanceof Error ? error.message : "复制邮箱凭据失败");
     } finally {
       setCredentialExporting(false);
     }
@@ -4231,6 +4250,15 @@ function MailboxView({
             />
             <span className="resource-selection-count" aria-live="polite">已选 {selectedMailboxIds.size}</span>
             <button
+              className="secondary-button resource-bulk-copy"
+              disabled={busy || credentialExporting || selectedMailboxIds.size === 0}
+              onClick={() => void copyMailboxIds([...selectedMailboxIds])}
+              type="button"
+            >
+              <Copy size={16} />
+              <span>复制已选</span>
+            </button>
+            <button
               className="secondary-button resource-bulk-export"
               disabled={busy || credentialExporting || selectedMailboxIds.size === 0}
               onClick={() => void exportMailboxIds([...selectedMailboxIds], "mailboxes.txt")}
@@ -4250,6 +4278,7 @@ function MailboxView({
             </button>
           </div>
         </div>
+        {credentialActionMessage ? <p className="resource-action-message" role="status">{credentialActionMessage}</p> : null}
         {credentialActionError ? <p className="mail-error">{credentialActionError}</p> : null}
         <div className="table-wrap">
           <table className="mailbox-table">
@@ -4322,6 +4351,15 @@ function MailboxView({
                       </button>
                       <button className="icon-button" disabled={busy} onClick={() => openCredentialDetail(mailbox)} title="查看凭据详情" type="button">
                         <KeyRound size={16} />
+                      </button>
+                      <button
+                        className="icon-button"
+                        disabled={busy || credentialExporting}
+                        onClick={() => void copyMailboxIds([mailbox.id])}
+                        title="按导入格式复制"
+                        type="button"
+                      >
+                        <Copy size={16} />
                       </button>
                       <button
                         className="icon-button"

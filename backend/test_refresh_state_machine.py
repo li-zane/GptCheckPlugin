@@ -112,7 +112,7 @@ class RefreshStateMachineTests(unittest.IsolatedAsyncioTestCase):
             "phone verification required",
         )
 
-    async def test_protocol_edge_verification_automatically_falls_back_to_browser(self) -> None:
+    async def test_protocol_edge_verification_does_not_fall_back_to_browser(self) -> None:
         service = self._service(oauth_login_mode="protocol", stop_on_phone=False)
         service._load_local_openai_tokens = AsyncMock(return_value={})
         service._try_protocol_slot_refresh = AsyncMock()
@@ -122,27 +122,26 @@ class RefreshStateMachineTests(unittest.IsolatedAsyncioTestCase):
                 error="oauth_protocol_edge_verification_blocked: authorization start returned HTTP 403",
             )
         )
-        service._oauth_with_browser_slot = AsyncMock(
-            return_value=OpenAiOAuthOutcome(
-                status="ok",
-                access_token="new-at",
-                refresh_token="new-rt",
-            )
-        )
+        service._oauth_with_browser_slot = AsyncMock()
 
         account = {"id": 9, "email": "oauth@example.com", "type": "oauth"}
         await service._run_inner(5, "oauth@example.com", account)
 
         service._oauth_with_protocol_slot.assert_awaited_once()
-        service._oauth_with_browser_slot.assert_awaited_once()
+        service._oauth_with_browser_slot.assert_not_awaited()
         service._record_openai_oauth_warning.assert_awaited_once_with(
             5,
             "oauth@example.com",
             "oauth_protocol_edge_verification_blocked: authorization start returned HTTP 403",
-            will_fallback=True,
-            fallback_target="headless browser",
+            will_fallback=False,
         )
-        self.assertEqual(service._handle_oauth_outcome.await_args.kwargs["source"], "browser")
+        service._handle_oauth_outcome.assert_not_awaited()
+        service._finish.assert_awaited_once_with(
+            5,
+            "oauth@example.com",
+            "failed",
+            "oauth_protocol_edge_verification_blocked: authorization start returned HTTP 403",
+        )
 
     async def test_phone_verification_stop_records_stable_event_and_snapshot_reason(self) -> None:
         service = object.__new__(RefreshService)

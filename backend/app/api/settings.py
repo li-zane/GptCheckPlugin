@@ -51,7 +51,7 @@ async def _available_test_models(db: AsyncSession) -> list[dict[str, str]]:
 
 
 @router.get("/logo", include_in_schema=False)
-async def get_site_logo() -> Response:
+async def get_site_logo(request: Request) -> Response:
     logo = await get_runtime_config_service().get_site_logo()
     if logo is None:
         raise HTTPException(status_code=404, detail="A custom site logo is not configured.")
@@ -60,7 +60,11 @@ async def get_site_logo() -> Response:
         content=content,
         media_type=media_type,
         headers={
-            "Cache-Control": "public, max-age=31536000, immutable",
+            "Cache-Control": (
+                "public, max-age=31536000, immutable"
+                if request.query_params.get("v")
+                else "public, no-cache"
+            ),
             "X-Content-Type-Options": "nosniff",
         },
     )
