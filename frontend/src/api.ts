@@ -18,6 +18,8 @@ import type {
   ChangeLogUnreadCounts,
   DeactivatedCleanupResult,
   Mailbox,
+  MailboxCredentialDetail,
+  MailboxExportResult,
   MailboxImportResult,
   MailMessage,
   PhoneImportResult,
@@ -327,6 +329,13 @@ export const api = {
   scanSub2Api: () => request<Sub2ApiPortScanResult>("/api/settings/scan-sub2api", { method: "POST" }),
   testNotification: () => request<{ message: string }>("/api/settings/notifications/test", { method: "POST" }),
   mailboxes: () => request<Mailbox[]>("/api/mailboxes"),
+  mailboxCredentials: (id: number) =>
+    request<MailboxCredentialDetail>(`/api/mailboxes/${id}/credentials`),
+  exportMailboxes: (ids: number[]) =>
+    request<MailboxExportResult>("/api/mailboxes/export", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
   mailboxMessages: (id: number, folder: "inbox" | "junk") =>
     request<MailMessage[]>(`/api/mailboxes/${id}/messages?folder=${folder}&limit=10`, {}, 50_000),
   importMailboxes: (content: string, defaultProvider: string) =>

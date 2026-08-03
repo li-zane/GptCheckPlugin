@@ -786,6 +786,11 @@ h2 {
   padding: 6px 10px;
 }
 
+.resource-bulk-export {
+  min-height: 36px;
+  padding: 6px 10px;
+}
+
 .accounts-panel-toolbar {
   align-items: flex-start;
 }
@@ -1864,6 +1869,44 @@ table {
 
 .accounts-col-actions {
   width: 224px;
+}
+
+.mailbox-table {
+  min-width: 1160px;
+  table-layout: fixed;
+}
+
+.mailbox-col-select {
+  width: 42px;
+}
+
+.mailbox-col-gpt,
+.mailbox-col-address {
+  width: 220px;
+}
+
+.mailbox-col-provider {
+  width: 96px;
+}
+
+.mailbox-col-success {
+  width: 168px;
+}
+
+.mailbox-col-error {
+  width: 250px;
+}
+
+.mailbox-col-actions {
+  width: 164px;
+}
+
+.mailbox-field-copy {
+  width: 100%;
+}
+
+.mailbox-field-copy .middle-ellipsis-text {
+  flex: 1 1 auto;
 }
 
 .accounts-select-header {
@@ -3213,6 +3256,71 @@ select:focus {
 
 .mail-dialog-head h2 {
   overflow-wrap: anywhere;
+}
+
+.mailbox-credential-dialog {
+  max-width: 980px;
+  min-width: min(980px, calc(100vw - 44px));
+}
+
+.mailbox-credential-loading {
+  color: var(--muted);
+  padding: 18px 0;
+  text-align: center;
+}
+
+.mailbox-credential-grid {
+  display: grid;
+  max-height: min(620px, calc(100vh - 190px));
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.mailbox-credential-field {
+  align-items: start;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 128px minmax(0, 1fr);
+  min-width: 0;
+  padding: 11px 2px;
+}
+
+.mailbox-credential-field > span:first-child {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  padding-top: 4px;
+}
+
+.mailbox-credential-copy {
+  align-items: flex-start;
+  width: 100%;
+}
+
+.mailbox-credential-copy > span:first-child {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.mailbox-credential-import-line {
+  border-bottom: 0;
+}
+
+.mailbox-credential-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+@media (max-width: 700px) {
+  .mailbox-credential-field {
+    gap: 5px;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .mailbox-credential-field > span:first-child {
+    padding-top: 0;
+  }
 }
 
 .mail-tabs {

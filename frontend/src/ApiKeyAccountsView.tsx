@@ -58,6 +58,7 @@ import {
   CHANGE_LOG_READ_RETRY_DELAYS_MS,
   departedChangeLogSubview,
   pendingReadThroughId,
+  urlConfirmsChangeLogSubview,
   visibleChangeLogUnreadCounts,
 } from "./changeLogReadState";
 import {
@@ -764,11 +765,6 @@ export function ApiKeyAccountsView({
       ? pendingAccountRateLogReadThroughIdRef
       : pendingRateLogReadThroughIdRef;
     for (let retryAttempt = 0; ; retryAttempt += 1) {
-      if (
-        retryAttempt > 0
-        && componentMountedRef.current
-        && previousSubviewRef.current === logSubview
-      ) return;
       const throughId = pendingRef.current;
       if (throughId === null) return;
       const cacheKey = rateLogCacheKeysRef.current[category];
@@ -811,11 +807,6 @@ export function ApiKeyAccountsView({
 
   const markScheduleLogsReadOnLeave = useCallback(async (updateLocalState = true) => {
     for (let retryAttempt = 0; ; retryAttempt += 1) {
-      if (
-        retryAttempt > 0
-        && componentMountedRef.current
-        && previousSubviewRef.current === "schedule-log"
-      ) return;
       const throughId = pendingScheduleLogReadThroughIdRef.current;
       if (throughId === null) return;
       const cacheKey = scheduleLogCacheKeyRef.current;
@@ -870,6 +861,30 @@ export function ApiKeyAccountsView({
       void markScheduleLogsReadOnLeave();
     }
   }, [markRateLogsReadOnLeave, markScheduleLogsReadOnLeave, subview]);
+
+  useEffect(() => {
+    if (!urlConfirmsChangeLogSubview(window.location.pathname, subview)) return;
+    if (
+      (subview === "rate-log" || subview === "account-rate-log")
+      && rateLogsLoaded
+      && !rateLogsLoading
+    ) {
+      void markRateLogsReadOnLeave(
+        subview === "account-rate-log" ? "account_rate" : "upstream",
+      );
+    }
+    if (subview === "schedule-log" && scheduleLogsLoaded && !scheduleLogsLoading) {
+      void markScheduleLogsReadOnLeave();
+    }
+  }, [
+    markRateLogsReadOnLeave,
+    markScheduleLogsReadOnLeave,
+    rateLogsLoaded,
+    rateLogsLoading,
+    scheduleLogsLoaded,
+    scheduleLogsLoading,
+    subview,
+  ]);
 
   useLayoutEffect(() => {
     if (subview !== "rate-log" && subview !== "account-rate-log") return;

@@ -36,6 +36,19 @@ export function departedChangeLogSubview(
   return null;
 }
 
+export function urlConfirmsChangeLogSubview(
+  pathname: string,
+  currentSubview: ApiKeySubview,
+): boolean {
+  const normalizedPath = pathname.trim().replace(/\/+$/, "") || "/";
+  const expectedPath: Partial<Record<ApiKeySubview, string>> = {
+    "rate-log": "/api-keys/upstream-changes",
+    "account-rate-log": "/api-keys/account-rate-changes",
+    "schedule-log": "/api-keys/scheduling-changes",
+  };
+  return expectedPath[currentSubview] === normalizedPath;
+}
+
 export function visibleChangeLogUnreadCounts(
   counts: ChangeLogUnreadCounts,
   currentSubview: ApiKeySubview,

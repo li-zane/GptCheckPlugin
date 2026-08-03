@@ -11,6 +11,7 @@ import {
   Clock3,
   Copy,
   Database,
+  Download,
   ExternalLink,
   Globe2,
   Inbox,
@@ -156,6 +157,7 @@ import type {
   AppSettings,
   AppSettingsUpdate,
   Mailbox,
+  MailboxCredentialDetail,
   MailMessage,
   PhoneNumber,
   RefreshJob,
@@ -4026,6 +4028,12 @@ function MailboxView({
   const [content, setContent] = useState("");
   const [provider, setProvider] = useState("auto");
   const [selectedMailbox, setSelectedMailbox] = useState<Mailbox | null>(null);
+  const [credentialMailbox, setCredentialMailbox] = useState<Mailbox | null>(null);
+  const [credentialDetail, setCredentialDetail] = useState<MailboxCredentialDetail | null>(null);
+  const [credentialLoading, setCredentialLoading] = useState(false);
+  const [credentialError, setCredentialError] = useState("");
+  const [credentialActionError, setCredentialActionError] = useState("");
+  const [credentialExporting, setCredentialExporting] = useState(false);
   const [folder, setFolder] = useState<"inbox" | "junk">("inbox");
   const [messages, setMessages] = useState<MailMessage[]>([]);
   const [mailLoading, setMailLoading] = useState(false);
@@ -4033,6 +4041,7 @@ function MailboxView({
   const [mailboxSearch, setMailboxSearch] = useState("");
   const [selectedMailboxIds, setSelectedMailboxIds] = useState<Set<number>>(() => new Set());
   const selectAllMailboxesRef = useRef<HTMLInputElement>(null);
+  const credentialRequestSequenceRef = useRef(0);
   const filteredMailboxes = useMemo(
     () =>
       mailboxes.filter((mailbox) =>
@@ -4060,6 +4069,46 @@ function MailboxView({
     setFolder("inbox");
     setMessages([]);
     setMailError("");
+  };
+  const openCredentialDetail = (mailbox: Mailbox) => {
+    const sequence = ++credentialRequestSequenceRef.current;
+    setCredentialMailbox(mailbox);
+    setCredentialDetail(null);
+    setCredentialError("");
+    setCredentialActionError("");
+    setCredentialLoading(true);
+    api.mailboxCredentials(mailbox.id)
+      .then((detail) => {
+        if (sequence === credentialRequestSequenceRef.current) setCredentialDetail(detail);
+      })
+      .catch((error) => {
+        if (sequence === credentialRequestSequenceRef.current) {
+          setCredentialError(error instanceof Error ? error.message : "读取邮箱凭据失败");
+        }
+      })
+      .finally(() => {
+        if (sequence === credentialRequestSequenceRef.current) setCredentialLoading(false);
+      });
+  };
+  const closeCredentialDetail = () => {
+    credentialRequestSequenceRef.current += 1;
+    setCredentialMailbox(null);
+    setCredentialDetail(null);
+    setCredentialError("");
+    setCredentialLoading(false);
+  };
+  const exportMailboxIds = async (mailboxIds: number[], fileName: string) => {
+    if (!mailboxIds.length) return;
+    setCredentialActionError("");
+    setCredentialExporting(true);
+    try {
+      const result = await api.exportMailboxes(mailboxIds);
+      downloadTextFile(fileName, result.content);
+    } catch (error) {
+      setCredentialActionError(error instanceof Error ? error.message : "导出邮箱凭据失败");
+    } finally {
+      setCredentialExporting(false);
+    }
   };
 
   useEffect(() => {
@@ -4091,7 +4140,14 @@ function MailboxView({
       return next.size === current.size ? current : next;
     });
     if (selectedMailbox && !availableIds.has(selectedMailbox.id)) setSelectedMailbox(null);
-  }, [mailboxes, selectedMailbox]);
+    if (credentialMailbox && !availableIds.has(credentialMailbox.id)) {
+      credentialRequestSequenceRef.current += 1;
+      setCredentialMailbox(null);
+      setCredentialDetail(null);
+      setCredentialError("");
+      setCredentialLoading(false);
+    }
+  }, [credentialMailbox, mailboxes, selectedMailbox]);
 
   useEffect(() => {
     if (selectAllMailboxesRef.current) {
@@ -4175,8 +4231,17 @@ function MailboxView({
             />
             <span className="resource-selection-count" aria-live="polite">已选 {selectedMailboxIds.size}</span>
             <button
+              className="secondary-button resource-bulk-export"
+              disabled={busy || credentialExporting || selectedMailboxIds.size === 0}
+              onClick={() => void exportMailboxIds([...selectedMailboxIds], "mailboxes.txt")}
+              type="button"
+            >
+              <Download size={16} />
+              <span>导出已选</span>
+            </button>
+            <button
               className="danger-button resource-bulk-delete"
-              disabled={busy || selectedMailboxIds.size === 0}
+              disabled={busy || credentialExporting || selectedMailboxIds.size === 0}
               onClick={deleteSelectedMailboxes}
               type="button"
             >
@@ -4185,8 +4250,18 @@ function MailboxView({
             </button>
           </div>
         </div>
+        {credentialActionError ? <p className="mail-error">{credentialActionError}</p> : null}
         <div className="table-wrap">
-          <table>
+          <table className="mailbox-table">
+            <colgroup>
+              <col className="mailbox-col-select" />
+              <col className="mailbox-col-gpt" />
+              <col className="mailbox-col-address" />
+              <col className="mailbox-col-provider" />
+              <col className="mailbox-col-success" />
+              <col className="mailbox-col-error" />
+              <col className="mailbox-col-actions" />
+            </colgroup>
             <thead>
               <tr>
                 <th className="resource-select-cell">
@@ -4219,17 +4294,46 @@ function MailboxView({
                       type="checkbox"
                     />
                   </td>
-                  <td className="mono">{mailbox.gpt_email}</td>
-                  <td className="mono">{mailbox.mailbox_email}</td>
                   <td>
-                    <Badge tone={mailbox.disabled ? "deactive" : "ok"}>{mailbox.provider}</Badge>
+                    <CopyTextButton className="mailbox-field-copy mono" middleEllipsis title="复制 GPT 邮箱" value={mailbox.gpt_email} />
                   </td>
-                  <td>{mailbox.last_success_at ? formatDate(mailbox.last_success_at, timeZone) : "-"}</td>
-                  <td className="truncate">{mailbox.last_error || "-"}</td>
+                  <td>
+                    <CopyTextButton className="mailbox-field-copy mono" middleEllipsis title="复制取件邮箱" value={mailbox.mailbox_email} />
+                  </td>
+                  <td>
+                    <CopyTextButton className="mailbox-field-copy" middleEllipsis title="复制类型" value={mailbox.provider} />
+                  </td>
+                  <td>
+                    <CopyTextButton
+                      className="mailbox-field-copy"
+                      displayValue={mailbox.last_success_at ? formatDate(mailbox.last_success_at, timeZone) : "-"}
+                      middleEllipsis
+                      title="复制最近成功时间"
+                      value={mailbox.last_success_at || ""}
+                    />
+                  </td>
+                  <td>
+                    <CopyTextButton className="mailbox-field-copy" middleEllipsis title="复制错误信息" value={mailbox.last_error || "-"} />
+                  </td>
                   <td className="right">
                     <div className="row-actions">
                       <button className="icon-button" disabled={busy} onClick={() => openMessages(mailbox)} title="查看邮件" type="button">
                         <MailOpen size={16} />
+                      </button>
+                      <button className="icon-button" disabled={busy} onClick={() => openCredentialDetail(mailbox)} title="查看凭据详情" type="button">
+                        <KeyRound size={16} />
+                      </button>
+                      <button
+                        className="icon-button"
+                        disabled={busy || credentialExporting}
+                        onClick={() => void exportMailboxIds(
+                          [mailbox.id],
+                          `mailbox-${mailbox.gpt_email.replace(/[^a-z0-9@._-]/gi, "_")}.txt`,
+                        )}
+                        title="导出邮箱凭据"
+                        type="button"
+                      >
+                        <Download size={16} />
                       </button>
                       <button className="icon-button danger" disabled={busy} onClick={() => onDelete(mailbox.id)} title="删除" type="button">
                         <Trash2 size={16} />
@@ -4256,6 +4360,107 @@ function MailboxView({
           onFolderChange={setFolder}
         />
       ) : null}
+      {credentialMailbox ? (
+        <MailboxCredentialDialog
+          detail={credentialDetail}
+          error={credentialError}
+          exportError={credentialActionError}
+          exporting={credentialExporting}
+          loading={credentialLoading}
+          mailbox={credentialMailbox}
+          onClose={closeCredentialDetail}
+          onExport={() => void exportMailboxIds(
+            [credentialMailbox.id],
+            `mailbox-${credentialMailbox.gpt_email.replace(/[^a-z0-9@._-]/gi, "_")}.txt`,
+          )}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function MailboxCredentialDialog({
+  mailbox,
+  detail,
+  loading,
+  error,
+  exportError,
+  exporting,
+  onClose,
+  onExport,
+}: {
+  mailbox: Mailbox;
+  detail: MailboxCredentialDetail | null;
+  loading: boolean;
+  error: string;
+  exportError: string;
+  exporting: boolean;
+  onClose: () => void;
+  onExport: () => void;
+}) {
+  const fields = detail ? [
+    ["GPT 邮箱", detail.gpt_email],
+    ["取件邮箱", detail.mailbox_email],
+    ["类型", detail.provider],
+    ["邮箱密码", detail.password],
+    ["Client ID", detail.client_id],
+    ["Refresh Token", detail.refresh_token],
+    ["Access Token", detail.access_token],
+    ["取件 URL", detail.custom_fetch_url],
+    ["代理 URL", detail.proxy_url],
+  ] as const : [];
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      role="presentation"
+    >
+      <section aria-modal="true" className="mail-dialog mailbox-credential-dialog" role="dialog">
+        <header className="mail-dialog-head">
+          <div>
+            <p className="eyebrow">邮箱凭据详情</p>
+            <h2>{mailbox.gpt_email}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} title="关闭" type="button">
+            <X size={17} />
+          </button>
+        </header>
+        {loading ? <div className="mailbox-credential-loading">正在读取凭据...</div> : null}
+        {error ? <p className="mail-error">{error}</p> : null}
+        {exportError ? <p className="mail-error">{exportError}</p> : null}
+        {detail ? (
+          <div className="mailbox-credential-grid">
+            {fields.map(([label, value]) => (
+              <div className="mailbox-credential-field" key={label}>
+                <span>{label}</span>
+                {value ? (
+                  <CopyTextButton
+                    className="mailbox-credential-copy mono"
+                    title={`复制${label}`}
+                    value={value}
+                  />
+                ) : <strong>-</strong>}
+              </div>
+            ))}
+            <div className="mailbox-credential-field mailbox-credential-import-line">
+              <span>导入格式</span>
+              <CopyTextButton
+                className="mailbox-credential-copy mono"
+                title="复制导入格式"
+                value={detail.import_line}
+              />
+            </div>
+          </div>
+        ) : null}
+        <footer className="mailbox-credential-actions">
+          <button className="secondary-button" disabled={!detail || loading || exporting} onClick={onExport} type="button">
+            <Download size={16} />
+            <span>{exporting ? "正在导出..." : "导出凭据"}</span>
+          </button>
+        </footer>
+      </section>
     </div>
   );
 }
@@ -7182,16 +7387,20 @@ function Badge({ children, className, tone }: { children: string; className?: st
 
 function CopyTextButton({
   value,
+  displayValue,
   className = "",
   title = "复制",
   copiedLabel = "已复制",
   hideIcon = false,
+  middleEllipsis = false,
 }: {
   value: string;
+  displayValue?: string;
   className?: string;
   title?: string;
   copiedLabel?: string;
   hideIcon?: boolean;
+  middleEllipsis?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<number | null>(null);
@@ -7218,7 +7427,9 @@ function CopyTextButton({
       title={copied ? copiedLabel : title}
       type="button"
     >
-      <span>{value}</span>
+      {middleEllipsis
+        ? <MiddleEllipsisText text={displayValue ?? value} />
+        : <span>{displayValue ?? value}</span>}
       {copied ? <span className="copy-feedback">{copiedLabel}</span> : hideIcon ? null : <Copy size={13} />}
     </button>
   );

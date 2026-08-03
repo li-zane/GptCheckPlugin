@@ -41,6 +41,7 @@ import {
   CHANGE_LOG_READ_RETRY_DELAYS_MS,
   departedChangeLogSubview,
   pendingReadThroughId,
+  urlConfirmsChangeLogSubview,
   visibleChangeLogUnreadCounts,
 } from "../src/changeLogReadState.ts";
 import {
@@ -732,7 +733,7 @@ test("API key change pages expose separate ledgers and unread highlighting", () 
   assert.match(styles, /\.api-key-scheduling-evidence/);
 });
 
-test("change ledger badges remain visible until the user leaves the subview", () => {
+test("change ledger read state follows the active subview URL and retains leave fallback", () => {
   assert.deepEqual(CHANGE_LOG_READ_RETRY_DELAYS_MS, [1_000, 2_000, 4_000]);
   assert.equal(pendingReadThroughId(null, [
     { id: 11, unread: false },
@@ -749,6 +750,11 @@ test("change ledger badges remain visible until the user leaves the subview", ()
   assert.equal(departedChangeLogSubview("rate-log", "rate-log"), null);
   assert.equal(departedChangeLogSubview("rate-log", "schedule-log"), "rate-log");
   assert.equal(departedChangeLogSubview("schedule-log", "accounts"), "schedule-log");
+  assert.equal(urlConfirmsChangeLogSubview("/api-keys/upstream-changes", "rate-log"), true);
+  assert.equal(urlConfirmsChangeLogSubview("/api-keys/account-rate-changes", "account-rate-log"), true);
+  assert.equal(urlConfirmsChangeLogSubview("/api-keys/scheduling-changes", "schedule-log"), true);
+  assert.equal(urlConfirmsChangeLogSubview("/api-keys/accounts", "rate-log"), false);
+  assert.equal(urlConfirmsChangeLogSubview("/api-keys/upstream-changes", "accounts"), false);
 
   const unreadCounts = {
     upstream_changes: 3,
@@ -768,6 +774,11 @@ test("change ledger badges remain visible until the user leaves the subview", ()
   assert.match(source, /CHANGE_LOG_READ_RETRY_DELAYS_MS\[retryAttempt\]/);
   assert.match(source, /const nextRoute = routeFromPath\(window\.location\.pathname\)/);
   assert.match(source, /const stillViewingSameLog = nextRoute\.view === "api-keys"/);
+  assert.match(source, /urlConfirmsChangeLogSubview\(window\.location\.pathname, subview\)/);
+  assert.match(source, /rateLogsLoaded[\s\S]*?!rateLogsLoading[\s\S]*?markRateLogsReadOnLeave/);
+  assert.match(source, /scheduleLogsLoaded && !scheduleLogsLoading[\s\S]*?markScheduleLogsReadOnLeave/);
+  assert.doesNotMatch(source, /retryAttempt > 0[\s\S]*?previousSubviewRef\.current === logSubview/);
+  assert.doesNotMatch(source, /retryAttempt > 0[\s\S]*?previousSubviewRef\.current === "schedule-log"/);
   assert.match(source, /visibleChangeLogUnreadCounts\(changeLogUnreadCounts, subview\)/);
   assert.match(source, /markChangeLogCategoryCachesRead\(storage, cacheBaseUrl, category, throughId\)/);
   assert.match(source, /markChangeLogCategoryCachesRead\(storage, cacheBaseUrl, "scheduling", throughId\)/);
@@ -3259,7 +3270,7 @@ test("phone-verification stop errors recognize backend reasons without overmatch
   assert.equal(isOAuthPhoneVerificationStopped("OAuth 登录需要手机验证"), false);
 });
 
-test("mailbox and phone bulk deletion post selected numeric ids", async () => {
+test("mailbox credential export/detail and resource bulk deletion use scoped endpoints", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;
   const calls: Array<{ path: string; method: string; body: unknown }> = [];
@@ -3280,6 +3291,8 @@ test("mailbox and phone bulk deletion post selected numeric ids", async () => {
     });
   }) as typeof fetch;
   try {
+    await api.exportMailboxes([11, 12]);
+    await api.mailboxCredentials(11);
     await api.deleteMailboxes([11, 12]);
     await api.deletePhones([21, 22]);
   } finally {
@@ -3288,6 +3301,8 @@ test("mailbox and phone bulk deletion post selected numeric ids", async () => {
   }
 
   assert.deepEqual(calls, [
+    { path: "/api/mailboxes/export", method: "POST", body: { ids: [11, 12] } },
+    { path: "/api/mailboxes/11/credentials", method: "GET", body: null },
     { path: "/api/mailboxes/bulk-delete", method: "POST", body: { ids: [11, 12] } },
     { path: "/api/phones/bulk-delete", method: "POST", body: { ids: [21, 22] } },
   ]);
@@ -3305,6 +3320,13 @@ test("mailbox and phone tables expose filtered select-all controls and URL mailb
   assert.match(appSource, /onDeleteMany=\{\(ids\) => runAction\(\(\) => api\.deletePhones\(ids\)/);
   assert.match(styles, /\.resource-select-cell\s*\{[^}]*width:\s*42px;/s);
   assert.match(styles, /\.table-wrap tbody tr\.is-selected > td\s*\{[^}]*background:\s*var\(--green-tint\);/s);
+  assert.match(appSource, /api\.exportMailboxes\(mailboxIds\)/);
+  assert.match(appSource, /api\.mailboxCredentials\(mailbox\.id\)/);
+  assert.match(appSource, /function MailboxCredentialDialog/);
+  assert.match(appSource, /className="mailbox-field-copy mono" middleEllipsis/);
+  assert.match(styles, /\.mailbox-table\s*\{[^}]*table-layout:\s*fixed;/s);
+  assert.match(styles, /\.mailbox-col-error\s*\{[^}]*width:\s*250px;/s);
+  assert.match(styles, /\.mailbox-credential-field\s*\{[^}]*grid-template-columns:\s*128px minmax\(0, 1fr\);/s);
 });
 
 class MemoryStorage {

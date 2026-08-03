@@ -3,19 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib import parse as urllib_parse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import EmailStr, TypeAdapter
 from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.crypto import encrypt_text
+from app.core.crypto import decrypt_text, encrypt_text
 from app.core.database import get_db
 from app.core.security import require_admin
 from app.models import MailboxCredential, utcnow
 from app.schemas import (
     BulkDeleteRequest,
     BulkDeleteResult,
+    MailboxCredentialDetailOut,
     MailboxCredentialOut,
+    MailboxExportResult,
     MailboxImportRequest,
     MailboxImportResult,
     MailMessageOut,
@@ -125,6 +127,53 @@ async def import_mailboxes(
     return MailboxImportResult(message=message, imported=imported, skipped=skipped, invalid_lines=invalid_lines)
 
 
+@router.post("/export", response_model=MailboxExportResult)
+async def export_mailboxes(
+    payload: BulkDeleteRequest,
+    response: Response,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MailboxExportResult:
+    result = await db.execute(select(MailboxCredential).where(MailboxCredential.id.in_(payload.ids)))
+    rows_by_id = {row.id: row for row in result.scalars().all()}
+    rows = [rows_by_id[credential_id] for credential_id in payload.ids if credential_id in rows_by_id]
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox credential not found.")
+    _set_secret_response_headers(response)
+    content = "\n".join(_mailbox_import_line(row) for row in rows)
+    return MailboxExportResult(
+        message=f"Exported {len(rows)} mailbox credential(s).",
+        exported=len(rows),
+        content=content,
+    )
+
+
+@router.get("/{credential_id}/credentials", response_model=MailboxCredentialDetailOut)
+async def get_mailbox_credentials(
+    credential_id: int,
+    response: Response,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MailboxCredentialDetailOut:
+    credential = await db.get(MailboxCredential, credential_id)
+    if credential is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox credential not found.")
+    _set_secret_response_headers(response)
+    return MailboxCredentialDetailOut(
+        id=credential.id,
+        gpt_email=credential.gpt_email,
+        mailbox_email=credential.mailbox_email,
+        provider=credential.provider,
+        password=decrypt_text(credential.encrypted_password),
+        client_id=decrypt_text(credential.encrypted_client_id),
+        refresh_token=decrypt_text(credential.encrypted_refresh_token),
+        access_token=decrypt_text(credential.encrypted_access_token),
+        custom_fetch_url=credential.custom_fetch_url,
+        proxy_url=credential.proxy_url,
+        import_line=_mailbox_import_line(credential),
+    )
+
+
 @router.get("/{credential_id}/messages", response_model=list[MailMessageOut])
 async def list_mailbox_messages(
     credential_id: int,
@@ -204,6 +253,41 @@ async def bulk_delete_mailboxes(
 def _parse_import(content: str, default_provider: str) -> list[ParsedMailbox]:
     parsed, _ = _parse_import_with_report(content, default_provider)
     return parsed
+
+
+def _set_secret_response_headers(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+def _mailbox_import_line(credential: MailboxCredential) -> str:
+    gpt_email = credential.gpt_email
+    mailbox_email = credential.mailbox_email
+    provider = credential.provider.lower()
+    custom_fetch_url = (credential.custom_fetch_url or "").strip()
+    if provider == "url" and custom_fetch_url:
+        values = [gpt_email]
+        if mailbox_email.lower() != gpt_email.lower():
+            values.append(mailbox_email)
+        values.append(custom_fetch_url)
+        return "----".join(values)
+
+    password = decrypt_text(credential.encrypted_password) or ""
+    client_id = decrypt_text(credential.encrypted_client_id) or ""
+    refresh_token = decrypt_text(credential.encrypted_refresh_token) or ""
+    access_token = decrypt_text(credential.encrypted_access_token) or ""
+    if access_token or mailbox_email.lower() != gpt_email.lower():
+        values = [gpt_email, mailbox_email, password, client_id, refresh_token]
+        if access_token:
+            values.append(access_token)
+    else:
+        values = [gpt_email, password, client_id, refresh_token]
+
+    if provider == "custom":
+        values.extend([provider, custom_fetch_url])
+    elif provider in PROVIDERS - {"url"}:
+        values.append(provider)
+    return "----".join(values)
 
 
 def _parse_import_with_report(content: str, default_provider: str) -> tuple[list[ParsedMailbox], list[int]]:

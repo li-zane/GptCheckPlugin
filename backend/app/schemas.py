@@ -295,6 +295,25 @@ class MailboxImportResult(MessageResponse):
     invalid_lines: list[int]
 
 
+class MailboxCredentialDetailOut(BaseModel):
+    id: int
+    gpt_email: str
+    mailbox_email: str
+    provider: str
+    password: str | None
+    client_id: str | None
+    refresh_token: str | None
+    access_token: str | None
+    custom_fetch_url: str | None
+    proxy_url: str | None
+    import_line: str
+
+
+class MailboxExportResult(MessageResponse):
+    exported: int
+    content: str
+
+
 class PhoneImportRequest(BaseModel):
     content: str = Field(min_length=1)
 

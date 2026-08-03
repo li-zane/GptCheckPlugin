@@ -186,6 +186,26 @@ export type MailboxImportResult = {
   invalid_lines: number[];
 };
 
+export type MailboxCredentialDetail = {
+  id: number;
+  gpt_email: string;
+  mailbox_email: string;
+  provider: string;
+  password: string | null;
+  client_id: string | null;
+  refresh_token: string | null;
+  access_token: string | null;
+  custom_fetch_url: string | null;
+  proxy_url: string | null;
+  import_line: string;
+};
+
+export type MailboxExportResult = {
+  message: string;
+  exported: number;
+  content: string;
+};
+
 export type PhoneNumber = {
   id: number;
   phone_number: string;
