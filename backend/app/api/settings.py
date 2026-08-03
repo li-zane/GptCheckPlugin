@@ -174,6 +174,7 @@ async def update_settings(
         "manual_upstream_sync_rate_pause_enabled",
         "api_key_auto_disable_on_upstream_unavailable",
         "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+        "api_key_availability_all_tests_must_succeed",
         "channel_monitor_auto_probe_enabled",
         "channel_monitor_fallback_without_monitor_enabled",
         "channel_monitor_fallback_test_models",

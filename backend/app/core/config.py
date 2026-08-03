@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     automation_paused: bool = False
     oauth_account_sync_enabled: bool = True
     recovery_enabled: bool = False
+    oauth_login_mode: Literal["protocol", "browser"] = "protocol"
+    oauth_stop_on_phone_verification: bool = False
     monitor_interval_seconds: int = 300
     monitor_page_size: int = 100
     usage_refresh_enabled: bool = False
@@ -78,6 +80,7 @@ class Settings(BaseSettings):
     manual_upstream_sync_rate_pause_enabled: bool = True
     api_key_auto_disable_on_upstream_unavailable: bool = False
     api_key_auto_pause_on_channel_monitor_unavailable_enabled: bool = False
+    api_key_availability_all_tests_must_succeed: bool = False
     channel_monitor_auto_probe_enabled: bool = True
     account_model_whitelist_sync_enabled: bool = False
     account_model_whitelist_sync_interval_seconds: int = 3600

@@ -8,7 +8,15 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import require_admin
 from app.models import PhoneAccountBinding, PhoneNumber
-from app.schemas import MessageResponse, PhoneBindingUpdate, PhoneImportRequest, PhoneImportResult, PhoneNumberOut
+from app.schemas import (
+    BulkDeleteRequest,
+    BulkDeleteResult,
+    MessageResponse,
+    PhoneBindingUpdate,
+    PhoneImportRequest,
+    PhoneImportResult,
+    PhoneNumberOut,
+)
 from app.services.phone_numbers import (
     build_phone_export_content,
     find_reconcilable_placeholder,
@@ -200,6 +208,23 @@ async def delete_phone(
     await db.delete(phone)
     await db.commit()
     return MessageResponse(message="Phone number deleted.")
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+async def bulk_delete_phones(
+    payload: BulkDeleteRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> BulkDeleteResult:
+    await db.execute(delete(PhoneAccountBinding).where(PhoneAccountBinding.phone_id.in_(payload.ids)))
+    result = await db.execute(delete(PhoneNumber).where(PhoneNumber.id.in_(payload.ids)))
+    deleted_count = max(int(result.rowcount or 0), 0)
+    await db.commit()
+    return BulkDeleteResult(
+        message=f"Deleted {deleted_count} phone number(s).",
+        requested_count=len(payload.ids),
+        deleted_count=deleted_count,
+    )
 
 
 async def _load_phones(db: AsyncSession) -> list[PhoneNumber]:

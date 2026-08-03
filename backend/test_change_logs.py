@@ -235,7 +235,14 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduling_total, 2)
 
         self.assertEqual(await mark_upstream_changes_read(self.db, 999_999), 3)
-        self.assertEqual(await change_log_unread_counts(self.db), (3, 0, 2))
+        self.assertEqual(await change_log_unread_counts(self.db), (0, 0, 2))
+        upstream_cursor = await self.db.get(
+            AppSetting,
+            "upstream_change_event_last_read_id",
+        )
+        self.assertEqual(upstream_cursor.value, "3")
+        self.assertEqual(await mark_upstream_changes_read(self.db, 1), 3)
+        self.assertEqual(await change_log_unread_counts(self.db), (0, 0, 2))
 
         self.db.add(
             UpstreamChannelChangeEvent(
@@ -246,7 +253,7 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await self.db.commit()
-        self.assertEqual(await change_log_unread_counts(self.db), (4, 0, 2))
+        self.assertEqual(await change_log_unread_counts(self.db), (1, 0, 2))
 
         self.assertEqual(await mark_upstream_changes_read(self.db, 999_999), 4)
         await self.db.execute(delete(UpstreamChannelChangeEvent))
@@ -273,6 +280,38 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
             max(event.id for event in scheduling_page),
         )
         self.assertEqual(await change_log_unread_counts(self.db), (1, 0, 0))
+
+    async def test_account_rate_cursor_never_falls_back_to_upstream_cursor(self) -> None:
+        self.db.add_all(
+            [
+                UpstreamChannelChangeEvent(
+                    channel_id=1,
+                    event_type="group_added",
+                    group_id="group-1",
+                ),
+                UpstreamChannelChangeEvent(
+                    channel_id=1,
+                    event_type="account_rate_changed",
+                    old_value=1.0,
+                    new_value=1.5,
+                ),
+                AppSetting(
+                    key="upstream_change_event_last_read_id",
+                    value="999",
+                ),
+            ]
+        )
+        await self.db.commit()
+
+        rows, cursor, unread, total = await list_upstream_channel_changes(
+            self.db,
+            retention_days=90,
+            category="account_rate",
+        )
+
+        self.assertEqual([row.event_type for row in rows], ["account_rate_changed"])
+        self.assertEqual((cursor, unread, total), (0, 1, 1))
+        self.assertEqual(await change_log_unread_counts(self.db), (1, 1, 0))
 
     async def test_imported_history_is_visible_in_time_order_but_not_unread(self) -> None:
         self.db.add_all(

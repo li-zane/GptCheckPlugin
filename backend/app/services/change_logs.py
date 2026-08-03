@@ -4,7 +4,8 @@ import math
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import Integer, String, cast, delete, func, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -32,13 +33,10 @@ def _cursor_value(raw: str | None) -> int:
 async def _read_cursor(
     db: AsyncSession,
     key: str,
-    *,
-    fallback_key: str | None = None,
 ) -> int:
-    setting = await db.get(AppSetting, key)
-    if setting is None and fallback_key is not None:
-        setting = await db.get(AppSetting, fallback_key)
-    return _cursor_value(setting.value if setting is not None else None)
+    return _cursor_value(
+        await db.scalar(select(AppSetting.value).where(AppSetting.key == key))
+    )
 
 
 async def _effective_cursor(
@@ -46,20 +44,22 @@ async def _effective_cursor(
     model: type[Any],
     key: str,
     *,
-    fallback_key: str | None = None,
     repair: bool = True,
 ) -> int:
-    cursor = await _read_cursor(db, key, fallback_key=fallback_key)
+    cursor = await _read_cursor(db, key)
     maximum = int(await db.scalar(select(func.max(model.id))) or 0)
     if cursor <= maximum:
         return cursor
-    setting = await db.get(AppSetting, key)
-    if repair and setting is not None:
+    if repair:
         # SQLite may reuse low integer primary keys after every row is pruned.
         # Treat existing rows as unread instead of letting a stale high-water
         # mark hide them permanently.
-        setting.value = "0"
-        await db.flush()
+        await db.execute(
+            update(AppSetting)
+            .where(AppSetting.key == key)
+            .values(value="0", updated_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
     return 0
 
 
@@ -68,28 +68,32 @@ async def _mark_read(
     model: type[Any],
     key: str,
     through_id: int,
-    *,
-    fallback_key: str | None = None,
-    preserve_ahead: bool = False,
 ) -> int:
     maximum = int(await db.scalar(select(func.max(model.id))) or 0)
-    raw_requested = max(0, int(through_id))
-    requested = raw_requested if preserve_ahead else min(raw_requested, maximum)
-    setting = await db.get(AppSetting, key)
-    current = await _effective_cursor(db, model, key, fallback_key=fallback_key)
+    requested = min(max(0, int(through_id)), maximum)
+    current = await _effective_cursor(db, model, key)
     next_value = max(current, requested)
-    if setting is None:
-        db.add(AppSetting(key=key, value=str(next_value)))
-    elif next_value != current:
-        setting.value = str(next_value)
+    statement = sqlite_insert(AppSetting).values(
+        key=key,
+        value=str(next_value),
+        updated_at=utcnow(),
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[AppSetting.key],
+        set_={
+            "value": func.max(
+                func.coalesce(cast(AppSetting.value, Integer), 0),
+                next_value,
+            ).cast(String),
+            "updated_at": utcnow(),
+        },
+    )
+    await db.execute(statement.execution_options(synchronize_session=False))
+    persisted = _cursor_value(
+        await db.scalar(select(AppSetting.value).where(AppSetting.key == key))
+    )
     await db.commit()
-    if preserve_ahead:
-        # Return the highest currently known event ID. If the caller supplied
-        # a cursor ahead of the local ledger, retaining that high-water mark
-        # lets _effective_cursor restore unread rows until the corresponding
-        # records actually exist.
-        return min(raw_requested, maximum)
-    return next_value
+    return persisted
 
 
 async def mark_upstream_changes_read(
@@ -108,10 +112,6 @@ async def mark_upstream_changes_read(
         UpstreamChannelChangeEvent,
         cursor_key,
         through_id,
-        fallback_key=(
-            UPSTREAM_CHANGE_READ_CURSOR if category == "account_rate" else None
-        ),
-        preserve_ahead=True,
     )
 
 
@@ -152,7 +152,6 @@ async def delete_expired_change_logs(
         db,
         UpstreamChannelChangeEvent,
         ACCOUNT_RATE_CHANGE_READ_CURSOR,
-        fallback_key=UPSTREAM_CHANGE_READ_CURSOR,
     )
     await _effective_cursor(
         db,
@@ -182,7 +181,6 @@ async def _list_page(
     start_at: datetime | None,
     end_at: datetime | None,
     where_clause: Any | None = None,
-    cursor_fallback_key: str | None = None,
 ) -> tuple[list[Any], int, int, int]:
     if not 1 <= limit <= 200:
         raise ValueError("limit must be between 1 and 200.")
@@ -198,7 +196,6 @@ async def _list_page(
         db,
         model,
         cursor_key,
-        fallback_key=cursor_fallback_key,
         repair=False,
     )
     statement = select(model)
@@ -277,9 +274,6 @@ async def list_upstream_channel_changes(
         start_at=start_at,
         end_at=end_at,
         where_clause=where_clause,
-        cursor_fallback_key=(
-            UPSTREAM_CHANGE_READ_CURSOR if category == "account_rate" else None
-        ),
     )
 
 
@@ -329,7 +323,6 @@ async def change_log_unread_counts(
         db,
         UpstreamChannelChangeEvent,
         ACCOUNT_RATE_CHANGE_READ_CURSOR,
-        fallback_key=UPSTREAM_CHANGE_READ_CURSOR,
         repair=False,
     )
     upstream = int(

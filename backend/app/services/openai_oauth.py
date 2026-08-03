@@ -26,6 +26,10 @@ ResolvePhoneVerification = Callable[[str | None, bool], Awaitable["PhoneVerifica
 
 AUTH_ACCOUNTS_BASE = "https://auth.openai.com/api/accounts"
 ADD_PHONE_ERROR = "当前账号触发 OpenAI 手机号验证；无接码流程下自动 OAuth 终止。"
+OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE = "oauth_protocol_edge_verification_blocked"
+OAUTH_PROTOCOL_EDGE_BLOCK_GUIDANCE = (
+    "Switch OAuth login mode to headless browser in Settings and retry."
+)
 
 
 class PhoneVerificationError(RuntimeError):
@@ -50,6 +54,7 @@ class OpenAiOAuthOutcome:
     session: dict[str, Any] | None = None
     error: str | None = None
     phone_number_hint: str | None = None
+    reason_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,11 @@ class OpenAiOAuthRefresher:
                 return OpenAiOAuthOutcome(status="deactive", error=f"OpenAI OAuth reported account_deactivated: {exc}")
             if _is_add_phone_text(str(exc)):
                 return OpenAiOAuthOutcome(status="add_phone", error=ADD_PHONE_ERROR)
+            if _is_protocol_edge_verification_text(str(exc)):
+                return self._protocol_edge_blocked_outcome(
+                    "OpenAI OAuth protocol flow",
+                    _edge_status_from_text(str(exc)),
+                )
             return OpenAiOAuthOutcome(status="failed", error=f"OpenAI OAuth protocol flow failed: {exc}")
 
     async def refresh_with_browser(
@@ -89,6 +99,8 @@ class OpenAiOAuthRefresher:
         phone: PhoneVerificationContext | None = None,
         fetch_phone_code: FetchPhoneCode | None = None,
         resolve_phone: ResolvePhoneVerification | None = None,
+        *,
+        stop_on_phone_verification: bool = False,
     ) -> OpenAiOAuthOutcome:
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -162,6 +174,13 @@ class OpenAiOAuthRefresher:
                         or (phone is not None and _phone_text_matches_bound_phone(body_text, phone.phone_number))
                     ):
                         page_phone_hint = await self._extract_phone_number_hint(page, body_text)
+                        if stop_on_phone_verification:
+                            snapshot_path = await self._capture_phone_verification_snapshot(page, email)
+                            return OpenAiOAuthOutcome(
+                                status="add_phone",
+                                error=_append_snapshot_path(ADD_PHONE_ERROR, snapshot_path),
+                                phone_number_hint=page_phone_hint,
+                            )
                         if resolve_phone is not None and _is_phone_number_limit_text(body_text):
                             resolved_phone = await resolve_phone(page_phone_hint or (phone.phone_number if phone else None), True)
                             if resolved_phone is not None:
@@ -289,6 +308,13 @@ class OpenAiOAuthRefresher:
         fetch_code: FetchCode,
     ) -> OpenAiOAuthOutcome:
         auth_response = await session.get(context.auth_url, headers={"Accept": "application/json"}, allow_redirects=False)
+        if auth_response.status_code >= 400:
+            return self._http_error("OpenAI OAuth authorization start", auth_response)
+        if _is_protocol_edge_verification_response(auth_response):
+            return self._protocol_edge_blocked_outcome(
+                "OpenAI OAuth authorization start",
+                _response_status_code(auth_response),
+            )
         start_url = self._continue_url(self._json_object(auth_response)) or self._location(auth_response)
         if start_url:
             code = await self._follow_protocol_url(session, start_url, context)
@@ -310,6 +336,11 @@ class OpenAiOAuthRefresher:
         )
         if email_response.status_code >= 400:
             return self._http_error("OpenAI OAuth email submission", email_response)
+        if _is_protocol_edge_verification_response(email_response):
+            return self._protocol_edge_blocked_outcome(
+                "OpenAI OAuth email submission",
+                _response_status_code(email_response),
+            )
         email_location = self._location(email_response)
         if email_location:
             return await self._follow_protocol_url(session, email_location, context)
@@ -345,6 +376,11 @@ class OpenAiOAuthRefresher:
         )
         if otp_response.status_code >= 400:
             return self._http_error("OpenAI OAuth OTP validation", otp_response)
+        if _is_protocol_edge_verification_response(otp_response):
+            return self._protocol_edge_blocked_outcome(
+                "OpenAI OAuth OTP validation",
+                _response_status_code(otp_response),
+            )
 
         otp_payload = self._json_object(otp_response)
         if _is_add_phone_text(json.dumps(otp_payload, ensure_ascii=False)):
@@ -387,6 +423,11 @@ class OpenAiOAuthRefresher:
                 return OpenAiOAuthOutcome(status="add_phone", error=ADD_PHONE_ERROR)
             if looks_deactive_text(text):
                 return OpenAiOAuthOutcome(status="deactive", error="account_deactive was returned during OpenAI OAuth.")
+            if _is_protocol_edge_verification_response(response):
+                return self._protocol_edge_blocked_outcome(
+                    "OpenAI OAuth continuation",
+                    _response_status_code(response),
+                )
             if response.status_code >= 400:
                 return self._http_error("OpenAI OAuth continuation", response)
 
@@ -422,6 +463,11 @@ class OpenAiOAuthRefresher:
         except httpx.HTTPError as exc:
             return OpenAiOAuthOutcome(status="failed", error=f"OpenAI OAuth token request failed: {exc}")
 
+        if _is_protocol_edge_verification_response(response):
+            return self._protocol_edge_blocked_outcome(
+                "OpenAI OAuth token exchange",
+                _response_status_code(response),
+            )
         if response.status_code >= 400:
             return OpenAiOAuthOutcome(
                 status="failed",
@@ -485,7 +531,21 @@ class OpenAiOAuthRefresher:
             return OpenAiOAuthOutcome(status="add_phone", error=ADD_PHONE_ERROR)
         if looks_deactive_text(text):
             return OpenAiOAuthOutcome(status="deactive", error=f"account_deactive was returned by {label}.")
+        if _is_protocol_edge_verification_response(response):
+            return self._protocol_edge_blocked_outcome(label, _response_status_code(response))
         return OpenAiOAuthOutcome(status="failed", error=f"{label} failed with HTTP {response.status_code}.")
+
+    def _protocol_edge_blocked_outcome(self, label: str, status_code: int | None) -> OpenAiOAuthOutcome:
+        status_text = f"HTTP {status_code}, " if status_code is not None else ""
+        return OpenAiOAuthOutcome(
+            status="failed",
+            error=(
+                f"{OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE}: OpenAI OAuth protocol login was blocked by "
+                f"edge verification ({status_text}Cloudflare/Sentinel) during {label}. "
+                f"{OAUTH_PROTOCOL_EDGE_BLOCK_GUIDANCE}"
+            ),
+            reason_code=OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE,
+        )
 
     def _json_object(self, response: Any) -> dict[str, Any]:
         try:
@@ -1240,6 +1300,64 @@ def _looks_phone_hint(value: str) -> bool:
 def _is_masked_phone_value(value: str) -> bool:
     text = str(value or "")
     return any(marker in text for marker in ("*", "•", "x", "X", "#", "?"))
+
+
+_PROTOCOL_EDGE_TEXT_MARKERS = (
+    "cf-chl-",
+    "cf-mitigated",
+    "challenge-platform",
+    "cloudflare",
+    "openai-sentinel",
+    "performing security verification",
+    "sentinel challenge",
+    "turnstile",
+    "verify you are human",
+    "verify you are not a bot",
+)
+
+
+def _response_status_code(response: Any) -> int | None:
+    try:
+        return int(getattr(response, "status_code", None))
+    except (TypeError, ValueError):
+        return None
+
+
+def _edge_status_from_text(value: str) -> int | None:
+    match = re.search(r"\b(?:HTTP(?:\s+status)?\s*)?(403|409)\b", value, re.I)
+    return int(match.group(1)) if match else None
+
+
+def _is_protocol_edge_verification_text(value: str) -> bool:
+    text = str(value or "").casefold()
+    if any(marker in text for marker in _PROTOCOL_EDGE_TEXT_MARKERS):
+        return True
+    return _edge_status_from_text(text) in {403, 409}
+
+
+def _is_protocol_edge_verification_response(response: Any) -> bool:
+    if _response_status_code(response) in {403, 409}:
+        return True
+    if _is_protocol_edge_verification_text(str(getattr(response, "text", ""))[:16_000]):
+        return True
+    headers = getattr(response, "headers", None)
+    if not hasattr(headers, "items"):
+        return False
+    for key, value in headers.items():
+        normalized_key = str(key).casefold()
+        normalized_value = str(value).casefold()
+        if normalized_key == "cf-mitigated" and "challenge" in normalized_value:
+            return True
+        if normalized_key.startswith("x-openai-sentinel") and any(
+            marker in normalized_value
+            for marker in ("blocked", "challenge", "failed", "invalid", "required")
+        ):
+            return True
+    return False
+
+
+def is_protocol_edge_verification_blocked(value: str | None) -> bool:
+    return OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE in str(value or "")
 
 
 def _is_cloudflare_text(value: str) -> bool:

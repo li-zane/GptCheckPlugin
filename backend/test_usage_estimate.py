@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -801,13 +802,16 @@ class UsageEstimateTests(unittest.TestCase):
                 "codex_7d_window_minutes": 10_080,
             },
         }
+        reset_at = (datetime.now(timezone.utc) + timedelta(days=6)).replace(
+            microsecond=0
+        ).isoformat()
         usage = {
             "five_hour": {"window_minutes": 0},
             "seven_day": {
                 "used_percent": 100.0,
                 "window_minutes": 10_080,
                 "remaining_seconds": 529_200,
-                "resets_at": "2026-07-29T17:30:00+08:00",
+                "resets_at": reset_at,
                 "window_stats": {"cost": 120.0},
             },
         }
@@ -843,12 +847,15 @@ class UsageEstimateTests(unittest.TestCase):
             "credentials": {"plan_type": "team"},
             "extra": {"codex_5h_window_minutes": 0},
         }
+        reset_at = (datetime.now(timezone.utc) + timedelta(days=30)).replace(
+            microsecond=0
+        ).isoformat()
         usage = {
             "five_hour": {"window_minutes": 0},
             "seven_day": {
                 "used_percent": 100.0,
                 "remaining_seconds": 529_200,
-                "reset_at": "2026-07-29T17:30:00+08:00",
+                "reset_at": reset_at,
                 "window_stats": {"cost": 120.0},
             },
         }
@@ -875,8 +882,12 @@ class UsageEstimateTests(unittest.TestCase):
                 async with engine.begin() as conn:
                     await conn.run_sync(Base.metadata.create_all)
 
-                reset_at = "2026-07-29T17:30:00+08:00"
-                other_reset_at = "2026-08-29T17:30:00+08:00"
+                reset_at = (datetime.now(timezone.utc) + timedelta(days=6)).replace(
+                    microsecond=0
+                ).isoformat()
+                other_reset_at = (
+                    datetime.now(timezone.utc) + timedelta(days=36)
+                ).replace(microsecond=0).isoformat()
                 async with usage_estimate.AsyncSessionLocal() as db:
                     db.add(
                         UsageLimitSample(
@@ -898,7 +909,7 @@ class UsageEstimateTests(unittest.TestCase):
                             email="pinnate.1.plasmid+bzbquv@icloud.com",
                             sub2api_account_id="x1-weekly",
                             window_key="monthly",
-                            window_reset_key="reset_date:2026-07-29",
+                            window_reset_key=f"reset_date:{reset_at[:10]}",
                             reset_at=reset_at,
                             spent=120.0,
                             tokens=120_000,
@@ -924,7 +935,7 @@ class UsageEstimateTests(unittest.TestCase):
                             email="pinnate.1.plasmid+bzbquv@icloud.com",
                             sub2api_account_id="x1-weekly",
                             window_key="monthly",
-                            window_reset_key="reset_date:2026-08-29",
+                            window_reset_key=f"reset_date:{other_reset_at[:10]}",
                             reset_at=other_reset_at,
                             spent=140.0,
                             tokens=140_000,

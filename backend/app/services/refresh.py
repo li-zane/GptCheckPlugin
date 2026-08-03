@@ -17,8 +17,14 @@ from app.services.account_exceptions import clear_account_exception
 from app.services.events import record_event
 from app.services.mail import MailAdapterRegistry
 from app.services.memory import ProcessMemorySampler, available_system_memory_bytes
-from app.services.openai_oauth import OpenAiOAuthOutcome, OpenAiOAuthRefresher, PhoneVerificationContext
-from app.services.openai_token_service import OpenAiAccessTokenInvalid, OpenAiRefreshTokenInvalid, OpenAiTokenService
+from app.services.openai_oauth import (
+    OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE,
+    OpenAiOAuthOutcome,
+    OpenAiOAuthRefresher,
+    PhoneVerificationContext,
+    is_protocol_edge_verification_blocked,
+)
+from app.services.openai_token_service import OpenAiAccessTokenInvalid, OpenAiTokenService
 from app.services.phone_numbers import (
     BoundPhone,
     describe_phone_source,
@@ -44,6 +50,9 @@ SENSITIVE_ERROR_RE = re.compile(
 )
 BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 RECOVERY_DISABLED_REASON = "Automatic credential refresh is disabled in settings; refresh was not started."
+OAUTH_PHONE_VERIFICATION_STOPPED_REASON = (
+    "已尝试重新 OAuth，但遇到手机验证码，因设置中“遇到手机验证码时停止”已开启而终止。"
+)
 logger = logging.getLogger(__name__)
 _UNSET = object()
 
@@ -70,6 +79,23 @@ def _redact_error_text(value: str) -> str:
     text = BEARER_RE.sub("Bearer ***redacted***", value)
     text = SENSITIVE_ERROR_RE.sub(r"\1\2***redacted***", text)
     return text[:500]
+
+
+def _oauth_outcome_requires_phone(outcome: OpenAiOAuthOutcome) -> bool:
+    if outcome.status == "add_phone":
+        return True
+    text = str(outcome.error or "").casefold()
+    return any(
+        marker in text
+        for marker in (
+            "/add-phone",
+            "phone verification",
+            "verify your phone",
+            "phone number required",
+            "手机号验证",
+            "手机验证码",
+        )
+    )
 
 
 class RefreshService:
@@ -133,7 +159,7 @@ class RefreshService:
         return job_id
 
     def can_try_protocol_refresh(self, account: dict) -> bool:
-        if self.sub2api.account_has_refresh_token(account) or bool(self.sub2api.account_access_token(account)):
+        if self.sub2api.account_has_refresh_token(account):
             return True
         email = self.sub2api.account_email(account)
         if not email:
@@ -219,18 +245,17 @@ class RefreshService:
         if await self._finish_if_recovery_disabled(job_id, email):
             return
 
-        has_refresh_token = self.sub2api.account_has_refresh_token(account)
+        token_state = await self._load_local_openai_tokens(email)
+        has_refresh_token = bool(str(token_state.get("refresh_token") or "").strip())
         if has_refresh_token and await self._try_protocol_slot_refresh(job_id, email, account):
             return
 
         credential = await self._load_credential(email)
         if credential is None:
-            if not has_refresh_token and await self._try_protocol_slot_refresh(job_id, email, account):
-                return
             protocol_failure = await self._latest_protocol_failure_summary(job_id, email)
-            reason = "No enabled mailbox credential exists for this GPT account; checked only and skipped browser refresh."
+            reason = "No enabled mailbox credential exists for this GPT account; OAuth re-login was not started."
             if protocol_failure:
-                reason = f"{protocol_failure}；且无绑定邮箱，无法继续浏览器刷新。"
+                reason = f"{protocol_failure}；且无绑定邮箱，未继续 OAuth 重新登录。"
             await self._finish(
                 job_id,
                 email,
@@ -239,12 +264,10 @@ class RefreshService:
             )
             return
         if credential.disabled:
-            if not has_refresh_token and await self._try_protocol_slot_refresh(job_id, email, account):
-                return
             protocol_failure = await self._latest_protocol_failure_summary(job_id, email)
-            reason = "Mailbox credential is disabled; checked only and skipped browser refresh."
+            reason = "Mailbox credential is disabled; OAuth re-login was not started."
             if protocol_failure:
-                reason = f"{protocol_failure}；邮箱凭据已禁用，无法继续浏览器刷新。"
+                reason = f"{protocol_failure}；邮箱凭据已禁用，未继续 OAuth 重新登录。"
             await self._finish(
                 job_id,
                 email,
@@ -282,38 +305,44 @@ class RefreshService:
             await self._mail_error(credential.id, last_error)
             return None
 
-        oauth_protocol_outcome = await self._oauth_with_protocol_slot(job_id, email, fetch_code)
-        if oauth_protocol_outcome is None:
+        oauth_login_mode = await self.runtime_config.get_oauth_login_mode()
+        stop_on_phone_verification = await self.runtime_config.get_oauth_stop_on_phone_verification()
+        if oauth_login_mode == "browser":
+            oauth_outcome = await self._oauth_with_browser_slot(
+                job_id,
+                email,
+                fetch_code,
+                stop_on_phone_verification=stop_on_phone_verification,
+            )
+        else:
+            oauth_outcome = await self._oauth_with_protocol_slot(job_id, email, fetch_code)
+        if oauth_outcome is None:
             return
-        if oauth_protocol_outcome.status in {"ok", "deactive"}:
-            await self._handle_oauth_outcome(job_id, email, account, oauth_protocol_outcome, source="protocol")
+        if stop_on_phone_verification and _oauth_outcome_requires_phone(oauth_outcome):
+            await self._finish_oauth_phone_verification_stopped(
+                job_id,
+                email,
+                oauth_login_mode,
+                oauth_outcome.error,
+            )
             return
+        if oauth_outcome.status in {"ok", "deactive", "add_phone"}:
+            await self._handle_oauth_outcome(job_id, email, account, oauth_outcome, source=oauth_login_mode)
+            return
+        preferred_failure_reason = self._preferred_openai_failure_reason(oauth_outcome.error)
         await self._record_openai_oauth_warning(
             job_id,
             email,
-            oauth_protocol_outcome.error or "OpenAI OAuth protocol refresh_token acquisition failed.",
-            will_fallback=True,
-            fallback_target="browser OAuth refresh_token acquisition",
-        )
-
-        oauth_browser_outcome = await self._oauth_with_browser_slot(job_id, email, fetch_code)
-        if oauth_browser_outcome is None:
-            return
-        if oauth_browser_outcome.status in {"ok", "deactive", "add_phone"}:
-            await self._handle_oauth_outcome(job_id, email, account, oauth_browser_outcome, source="browser")
-            return
-        preferred_failure_reason = self._preferred_openai_failure_reason(oauth_browser_outcome.error)
-        await self._record_openai_oauth_warning(
-            job_id,
-            email,
-            oauth_browser_outcome.error or "OpenAI OAuth browser refresh_token acquisition failed.",
+            oauth_outcome.error or f"OpenAI OAuth {oauth_login_mode} refresh_token acquisition failed.",
             will_fallback=False,
         )
         await self._finish(
             job_id,
             email,
             "failed",
-            preferred_failure_reason or oauth_browser_outcome.error or "OpenAI OAuth browser refresh_token acquisition failed.",
+            preferred_failure_reason
+            or oauth_outcome.error
+            or f"OpenAI OAuth {oauth_login_mode} refresh_token acquisition failed.",
         )
 
     async def _try_protocol_slot_refresh(self, job_id: int, email: str, account: dict) -> bool:
@@ -322,7 +351,7 @@ class RefreshService:
             if await self._finish_if_recovery_disabled(job_id, email):
                 return True
             await self._mark_started(job_id, email)
-            return await self._try_access_token_status_refresh(job_id, email, account)
+            return await self._try_local_openai_refresh_token(job_id, email, account)
         finally:
             await self._release_protocol_slot()
 
@@ -368,8 +397,15 @@ class RefreshService:
         finally:
             await self._release_protocol_slot()
 
-    async def _oauth_with_browser_slot(self, job_id: int, email: str, fetch_code) -> OpenAiOAuthOutcome | None:
-        active_phone = await self._load_bound_phone(email)
+    async def _oauth_with_browser_slot(
+        self,
+        job_id: int,
+        email: str,
+        fetch_code,
+        *,
+        stop_on_phone_verification: bool = False,
+    ) -> OpenAiOAuthOutcome | None:
+        active_phone = None if stop_on_phone_verification else await self._load_bound_phone(email)
         baseline_markers: dict[tuple[str, str], str] = {}
 
         async def load_baseline(phone: BoundPhone | None) -> None:
@@ -478,6 +514,7 @@ class RefreshService:
                 phone_context,
                 fetch_phone_code,
                 resolve_phone,
+                stop_on_phone_verification=stop_on_phone_verification,
             )
         finally:
             await self._release_browser_slot()
@@ -685,15 +722,9 @@ class RefreshService:
             token_data = await self.openai_tokens.refresh_token(refresh_token=refresh_token, client_id=client_id)
             access_token = str(token_data.get("access_token") or "").strip()
             profile = await self.openai_tokens.fetch_profile(access_token)
-        except OpenAiRefreshTokenInvalid as exc:
+        except Exception as exc:
             await self._store_local_openai_tokens(email, refresh_token=None)
             await self._record_local_openai_refresh_token_warning(job_id, email, str(exc), invalid=True)
-            return False
-        except OpenAiAccessTokenInvalid as exc:
-            await self._record_local_openai_refresh_token_warning(job_id, email, str(exc), invalid=False)
-            return False
-        except Exception as exc:
-            await self._record_local_openai_refresh_token_warning(job_id, email, str(exc), invalid=False)
             return False
 
         if profile.deactive:
@@ -892,7 +923,7 @@ class RefreshService:
             await self._finish(job_id, email, "failed", outcome.error or "OpenAI OAuth did not return a refresh_token.")
             return
 
-        source_text = "protocol" if source == "protocol" else "browser fallback"
+        source_text = "protocol" if source == "protocol" else "headless browser"
         await self._store_local_openai_tokens(
             email,
             access_token=outcome.access_token,
@@ -908,6 +939,31 @@ class RefreshService:
             session=outcome.session,
             access_token=outcome.access_token,
             success_prefix=f"OpenAI OAuth refresh_token acquired via {source_text}",
+        )
+
+    async def _finish_oauth_phone_verification_stopped(
+        self,
+        job_id: int,
+        email: str,
+        oauth_login_mode: str,
+        provider_detail: str | None,
+    ) -> None:
+        await self._record_event_safely(
+            "oauth_phone_verification_stopped",
+            OAUTH_PHONE_VERIFICATION_STOPPED_REASON,
+            email,
+            {
+                "job_id": job_id,
+                "reason_code": "oauth_phone_verification_stopped",
+                "oauth_login_mode": oauth_login_mode,
+                "provider_detail": _redact_error_text(provider_detail or ""),
+            },
+        )
+        await self._finish(
+            job_id,
+            email,
+            "failed",
+            OAUTH_PHONE_VERIFICATION_STOPPED_REASON,
         )
 
     async def _finalize_session_refresh(
@@ -1182,14 +1238,14 @@ class RefreshService:
             with sqlite3.connect(path) as conn:
                 row = conn.execute(
                     (
-                        "SELECT encrypted_openai_refresh_token, encrypted_openai_access_token "
+                        "SELECT encrypted_openai_refresh_token "
                         "FROM account_snapshots WHERE lower(email)=lower(?) LIMIT 1"
                     ),
                     (email,),
                 ).fetchone()
             if not row:
                 return False
-            return bool(row[0] or row[1])
+            return bool(row[0])
         except Exception:
             return False
 
@@ -1440,9 +1496,7 @@ class RefreshService:
     ) -> None:
         await self._record_event_safely(
             "local_openai_refresh_token_failed",
-            "Local cached OpenAI refresh_token refresh failed; falling back to other paths."
-            if not invalid
-            else "Local cached OpenAI refresh_token is invalid; falling back to other paths.",
+            "Persisted OpenAI refresh_token refresh failed and the token was invalidated; proceeding to mailbox OAuth re-login.",
             email,
             {"job_id": job_id, "error": _redact_error_text(error), "invalid": invalid},
         )
@@ -1542,13 +1596,29 @@ class RefreshService:
         will_fallback: bool,
         fallback_target: str = "ChatGPT session refresh",
     ) -> None:
+        edge_blocked = is_protocol_edge_verification_blocked(error)
+        message = (
+            "OpenAI OAuth protocol login was blocked by edge verification; switch OAuth login mode to "
+            "headless browser in Settings and retry."
+            if edge_blocked
+            else (
+                f"OpenAI OAuth refresh_token acquisition failed; falling back to {fallback_target}."
+                if will_fallback
+                else "OpenAI OAuth refresh_token acquisition failed."
+            )
+        )
+        details: dict[str, Any] = {
+            "job_id": job_id,
+            "error": _redact_error_text(error),
+            "will_fallback": will_fallback,
+        }
+        if edge_blocked:
+            details["reason_code"] = OAUTH_PROTOCOL_EDGE_BLOCK_REASON_CODE
         await self._record_event_safely(
             "openai_oauth_refresh_token_failed",
-            f"OpenAI OAuth refresh_token acquisition failed; falling back to {fallback_target}."
-            if will_fallback
-            else "OpenAI OAuth refresh_token acquisition failed.",
+            message,
             email,
-            {"job_id": job_id, "error": _redact_error_text(error), "will_fallback": will_fallback},
+            details,
         )
 
     async def _mail_error(self, credential_id: int, error: str) -> None:

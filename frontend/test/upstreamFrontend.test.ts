@@ -25,6 +25,7 @@ import {
   accountEstimateHasEffectiveError,
   accountRateLimitShouldBeVisible,
 } from "../src/accountRateLimitPresentation.ts";
+import { isOAuthPhoneVerificationStopped } from "../src/accountErrorPresentation.ts";
 import { sortAccountsForTable } from "../src/accountTableSort.ts";
 import {
   buildUpstreamAccountUpdatePayload,
@@ -450,6 +451,44 @@ test("App navigation uses history state, a page refresh control, and a top setti
   assert.match(styleSource, /\.discord-bot-install-mode-grid[\s\S]*grid-template-columns:\s*repeat\(2/);
 });
 
+test("account editor exposes live sub2api settings and revalidates reusable presets", () => {
+  const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const editorSource = readFileSync(new URL("../src/AccountEditorDialog.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+  assert.match(apiSource, /`\/api\/accounts\/editor\/\$\{encodeURIComponent\(accountId\)\}`/);
+  assert.match(apiSource, /"\/api\/accounts\/edit-presets"/);
+  assert.match(apiSource, /`\/api\/accounts\/edit-presets\/\$\{presetId\}\/apply\/\$\{encodeURIComponent\(accountId\)\}`/);
+  assert.match(appSource, /const loadAccountEditorDialog = \(\) => import\("\.\/AccountEditorDialog"\)/);
+  assert.match(appSource, /<Pencil size=\{16\} \/>/);
+  assert.match(appSource, /onClick=\{\(\) => onEdit\?\.\(account\)\}/);
+  assert.match(editorSource, /api\.updateAccountEditor\(accountId/);
+  assert.match(editorSource, /api\.createAccountEditPreset\(/);
+  assert.match(editorSource, /api\.deleteAccountEditPreset\(selectedPreset\.id\)/);
+  assert.match(editorSource, /api\.applyAccountEditPreset\([\s\S]*?form\.identity_fingerprint/);
+  assert.match(editorSource, /busyAction === "apply-preset"/);
+  assert.match(editorSource, /resources_checked_at/);
+  assert.match(editorSource, /invalidGroupIds/);
+  assert.match(editorSource, /invalidModelIds/);
+  assert.match(editorSource, /invalidProxy/);
+  assert.match(editorSource, /model_candidates_complete/);
+  assert.match(editorSource, /expected_identity_fingerprint: form\.identity_fingerprint/);
+  assert.match(editorSource, /account_type_scope: form\.account_type/);
+  assert.match(editorSource, /OpenAI \/ Codex 高级设置/);
+  assert.match(editorSource, /WS Mode/);
+  assert.match(editorSource, /Codex 图片桥接/);
+  assert.match(editorSource, /http_bridge/);
+  assert.match(editorSource, /codex_cli_only_allow_app_server/);
+  assert.match(editorSource, /auto_pause_5h_threshold_percent/);
+  assert.match(styles, /@media \(max-width: 560px\)[\s\S]*?\.account-editor-dialog/);
+  assert.match(styles, /\.account-editor-body\s*\{[^}]*overflow:\s*auto;/s);
+  assert.match(styles, /\.account-editor-choice-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,/s);
+  assert.match(styles, /\.account-editor-model-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
+  assert.match(styles, /\.account-editor-advanced-fields[\s\S]*?grid-template-columns:\s*repeat\(3,/);
+  assert.match(styles, /@media \(max-width: 560px\)[\s\S]*?\.account-editor-advanced-fields[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
+});
+
 test("automatic pause settings keep balance controls while multiplier policy belongs to intervals and accounts", () => {
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const accountSource = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
@@ -487,6 +526,7 @@ test("API key availability settings preserve unbound monitor mode and support ex
   const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
   const helpSource = readFileSync(new URL("../src/HelpPopover.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const typesSource = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
 
   assert.match(accountSource, /<option value="channel_monitor">绑定监控面板（默认）<\/option>/);
   assert.match(accountSource, /<option value="disabled">关闭<\/option>/);
@@ -514,6 +554,7 @@ test("API key availability settings preserve unbound monitor mode and support ex
   assert.match(accountSource, /api\.testUpstreamAccountAvailability\(/);
   assert.match(accountSource, /api\.testUpstreamAccountConnection\(/);
   assert.match(accountSource, /强制连接测试完成/);
+  assert.match(accountSource, /已使用回退模型 \$2 完成 \$1 次连接测试，且全部成功/);
   assert.match(accountSource, /<AccountCardConfigurationTags/);
   assert.match(accountSource, /middleEllipsis\(monitorName \|\| "监控面板", 12\)/);
   assert.match(accountSource, /api-key-account-config-tag-wrap--availability/);
@@ -524,6 +565,10 @@ test("API key availability settings preserve unbound monitor mode and support ex
   assert.match(appSource, /暂停判定测试次数/);
   assert.match(appSource, /恢复判定测试次数/);
   assert.match(appSource, /未绑定监控面板时使用回退模型链/);
+  assert.match(appSource, /全部连接测试成功才判定可用/);
+  assert.match(appSource, /api_key_availability_all_tests_must_succeed: apiKeyAvailabilityAllTestsMustSucceed/);
+  assert.match(appSource, /settings\.api_key_availability_all_tests_must_succeed \?\? false/);
+  assert.equal((typesSource.match(/api_key_availability_all_tests_must_succeed/g) || []).length, 2);
   assert.match(appSource, /channel_monitor_fallback_test_models: fallbackTestModels/);
   assert.match(appSource, /按从上到下的顺序选择账号白名单中第一个存在的模型/);
   assert.match(appSource, /aria-label=\{`回退测试模型 \$\{index \+ 1\}`\}/);
@@ -538,6 +583,7 @@ test("API key availability settings preserve unbound monitor mode and support ex
   assert.match(styles, /\.settings-model-chain-dialog-list\s*\{[^}]*max-height:[^;]+;[^}]*overflow-y:\s*auto;/s);
   assert.doesNotMatch(appSource, /channel-monitor-fallback-model-options/);
   assert.match(appSource, /任意一次连接成功即判定可用，全部失败才暂停或保持暂停/);
+  assert.match(appSource, /全部连接测试均成功才判定可用，任意一次失败都会暂停或保持暂停/);
   assert.match(appSource, /label="API Key 账号可用性监测与自动暂停"/);
   assert.doesNotMatch(appSource, /跟随 API Key 上游同步/);
   assert.match(appSource, /label="API Key 账号可用性监测与自动暂停"[\s\S]*?<AutomationSettingInherited>跟随上游同步<\/AutomationSettingInherited>/);
@@ -821,6 +867,7 @@ test("new account and upstream controls are present without exposing Sub2API-onl
 
   assert.match(appSource, /api_key_auto_pause_on_negative_balance_enabled: apiKeyNegativeBalancePauseEnabled/);
   assert.match(appSource, /api_key_auto_pause_on_channel_monitor_unavailable_enabled: apiKeyChannelMonitorPauseEnabled/);
+  assert.match(appSource, /api_key_availability_all_tests_must_succeed: apiKeyAvailabilityAllTestsMustSucceed/);
   assert.match(appSource, /channel_monitor_auto_probe_enabled: channelMonitorAutoProbeEnabled/);
   assert.match(appSource, /account_model_whitelist_sync_enabled: accountModelWhitelistSyncEnabled/);
   assert.match(appSource, /channel_monitor_fallback_test_attempts: Math\.max/);
@@ -1075,6 +1122,19 @@ test("change log cache restores, merges, and marks records read without crossing
   assert.equal(marked?.unreadCount, 0);
   assert.equal(marked?.lastReadId, 11);
   assert.equal(marked?.items.every((item) => !item.unread), true);
+
+  markChangeLogCategoryCachesRead(storage, "https://sub2api.example.com/", "upstream", 11);
+  writeChangeLogCache(storage, key, {
+    items: [newer, older],
+    hasMore: false,
+    unreadCount: 2,
+    lastReadId: 0,
+  });
+  clearChangeLogMemoryCache();
+  const afterStaleResponse = readChangeLogCache(storage, key);
+  assert.equal(afterStaleResponse?.lastReadId, 11);
+  assert.equal(afterStaleResponse?.unreadCount, 0);
+  assert.equal(afterStaleResponse?.items.every((item) => !item.unread), true);
 });
 
 test("change log cache clearing removes persisted and in-memory entries only", () => {
@@ -3094,6 +3154,157 @@ test("change log page sizes accept configurable persisted options", () => {
   assert.equal(normalizeChangeLogPageSize(50, [10, 25, 50]), 50);
   assert.equal(normalizeChangeLogPageSize(20, [10, 25, 50]), 50);
   assert.equal(normalizeChangeLogPageSize(20, [10, 25]), 10);
+});
+
+test("settings are grouped by functional domain with responsive local navigation", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const settingsSource = appSource.slice(
+    appSource.indexOf("function SettingsView"),
+    appSource.indexOf("function PanelTitle", appSource.indexOf("function SettingsView")),
+  );
+  const connectionSection = settingsSource.slice(
+    settingsSource.indexOf('id="settings-connection"'),
+    settingsSource.indexOf('id="settings-oauth"'),
+  );
+  const oauthSection = settingsSource.slice(
+    settingsSource.indexOf('id="settings-oauth"'),
+    settingsSource.indexOf('id="settings-api-key-sync"'),
+  );
+  const upstreamSection = settingsSource.slice(
+    settingsSource.indexOf('id="settings-api-key-sync"'),
+    settingsSource.indexOf('id="settings-api-key-policies"'),
+  );
+  const policySection = settingsSource.slice(
+    settingsSource.indexOf('id="settings-api-key-policies"'),
+    settingsSource.indexOf('id="settings-usage"'),
+  );
+  const displaySection = settingsSource.slice(
+    settingsSource.indexOf('id="settings-display-security"'),
+    settingsSource.indexOf("</form>"),
+  );
+
+  assert.match(settingsSource, /const automationSwitches = \[/);
+  assert.match(settingsSource, /已开启 \{enabledAutomationCount\}\/\{automationSwitches\.length\} 项自动任务/);
+  assert.match(settingsSource, /settingsNavigation\.map/);
+  assert.match(settingsSource, /aria-current=\{activeSettingsSection === id \? "location" : undefined\}/);
+  assert.match(settingsSource, /closest<HTMLElement>\("\.workspace--settings"\)/);
+  assert.match(settingsSource, /document\.scrollingElement as HTMLElement \| null/);
+  assert.match(settingsSource, /workspace\.scrollHeight > workspace\.clientHeight/);
+  assert.match(settingsSource, /target\.addEventListener\("scroll", updateActiveSettingsSection, \{ passive: true \}\)/);
+  assert.match(settingsSource, /window\.addEventListener\("scroll", updateActiveSettingsSection, \{ passive: true \}\)/);
+  assert.match(settingsSource, /scrollRoot === documentScrollRoot \? 0 : scrollRoot\.getBoundingClientRect\(\)\.top/);
+  assert.match(settingsSource, /section\.getBoundingClientRect\(\)\.top > activationLine/);
+  assert.match(settingsSource, /maxScrollTop > 0 && scrollRoot\.scrollTop >= maxScrollTop - 2/);
+  assert.match(settingsSource, /button\[aria-current="location"\]/);
+  assert.match(settingsSource, /nav\.scrollTo\(\{\s*behavior: "smooth"/s);
+  assert.match(settingsSource, /onClick=\{\(\) => scrollToSettingsSection\(id\)\}/);
+  assert.doesNotMatch(settingsSource, /setActiveSettingsSection\(id\);\s*scrollToSettingsSection\(id\)/);
+  assert.doesNotMatch(settingsSource, /settings-save-header/);
+  assert.doesNotMatch(settingsSource, /id="settings-resources"/);
+  assert.equal(settingsSource.match(/<AutomationSettingRow/g)?.length, 12);
+
+  assert.match(connectionSection, /x-api 密钥/);
+  assert.match(connectionSection, /id="settings-scan"/);
+  assert.match(oauthSection, /同步 sub2api OAuth 账号/);
+  assert.match(oauthSection, /刷新 OAuth 账号凭证/);
+  assert.match(oauthSection, /同步 OAuth 账号用量窗口/);
+  assert.match(oauthSection, /浏览器最低可用内存/);
+  assert.doesNotMatch(oauthSection, /同步 sub2api API Key 账号/);
+  assert.match(upstreamSection, /同步 sub2api API Key 账号/);
+  assert.match(upstreamSection, /同步 API Key 账号上游/);
+  assert.doesNotMatch(upstreamSection, /刷新 OAuth 账号凭证/);
+  assert.match(policySection, /API Key 账号可用性监测与自动暂停/);
+  assert.match(policySection, /账号测活最大线程数/);
+  assert.doesNotMatch(displaySection, /x-api 密钥/);
+
+  assert.match(styles, /\.settings-page\s*\{[^}]*grid-template-columns:\s*184px minmax\(0, 1fr\)/s);
+  assert.match(styles, /\.settings-local-nav\s*\{[^}]*position:\s*sticky/s);
+  assert.match(styles, /\.settings-page \.settings-grid\s*\{[^}]*gap:\s*16px/s);
+  assert.match(styles, /\.settings-form > \.settings-section \+ \.settings-section\s*\{[^}]*border-top:\s*6px solid/s);
+  assert.match(styles, /\.settings-form > \.settings-section \+ \.settings-section\s*\{[^}]*padding-top:\s*32px/s);
+  assert.match(styles, /@media \(max-width: 900px\)\s*\{[^}]*\.settings-page\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s);
+});
+
+test("OAuth relogin settings expose one selected flow and a phone-verification stop policy", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const typeSource = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
+
+  assert.match(typeSource, /oauth_login_mode: "protocol" \| "browser";/);
+  assert.match(typeSource, /oauth_stop_on_phone_verification: boolean;/);
+  assert.match(appSource, /settings\.oauth_login_mode \?\? "protocol"/);
+  assert.match(appSource, /settings\.oauth_stop_on_phone_verification \?\? false/);
+  assert.match(appSource, /oauth_login_mode: oauthLoginMode/);
+  assert.match(appSource, /oauth_stop_on_phone_verification: oauthStopOnPhoneVerification/);
+  assert.match(appSource, /aria-label="OAuth 重新登录方式"/);
+  assert.match(appSource, />协议<\/button>/);
+  assert.match(appSource, />无头浏览器<\/button>/);
+  assert.match(appSource, /遇到手机验证码时停止/);
+  assert.match(appSource, /isOAuthPhoneVerificationStopped/);
+  assert.match(appSource, /尝试重新 OAuth，但遇到手机验证码而终止/);
+});
+
+test("phone-verification stop errors recognize backend reasons without overmatching", () => {
+  assert.equal(isOAuthPhoneVerificationStopped("oauth_phone_verification_stopped"), true);
+  assert.equal(
+    isOAuthPhoneVerificationStopped(
+      "已尝试重新 OAuth，但遇到手机验证码，因设置中“遇到手机验证码时停止”已开启而终止。",
+    ),
+    true,
+  );
+  assert.equal(
+    isOAuthPhoneVerificationStopped("尝试重新OAuth登录时遇到手机验证，流程已经停止"),
+    true,
+  );
+  assert.equal(isOAuthPhoneVerificationStopped("OAuth 登录需要手机验证"), false);
+});
+
+test("mailbox and phone bulk deletion post selected numeric ids", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ path: string; method: string; body: unknown }> = [];
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({
+      path: String(input),
+      method: String(init?.method || "GET"),
+      body: JSON.parse(String(init?.body || "null")),
+    });
+    return new Response(JSON.stringify({ message: "deleted", requested_count: 2, deleted_count: 2 }), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  try {
+    await api.deleteMailboxes([11, 12]);
+    await api.deletePhones([21, 22]);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(calls, [
+    { path: "/api/mailboxes/bulk-delete", method: "POST", body: { ids: [11, 12] } },
+    { path: "/api/phones/bulk-delete", method: "POST", body: { ids: [21, 22] } },
+  ]);
+});
+
+test("mailbox and phone tables expose filtered select-all controls and URL mailbox import", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+  assert.match(appSource, /option value="url">URL 取件<\/option>/);
+  assert.match(appSource, /GPT 邮箱----取件 URL/);
+  assert.match(appSource, /aria-label="全选当前筛选邮箱"/);
+  assert.match(appSource, /aria-label="全选当前筛选手机号"/);
+  assert.match(appSource, /onDeleteMany=\{\(ids\) => runAction\(\(\) => api\.deleteMailboxes\(ids\)/);
+  assert.match(appSource, /onDeleteMany=\{\(ids\) => runAction\(\(\) => api\.deletePhones\(ids\)/);
+  assert.match(styles, /\.resource-select-cell\s*\{[^}]*width:\s*42px;/s);
+  assert.match(styles, /\.table-wrap tbody tr\.is-selected > td\s*\{[^}]*background:\s*var\(--green-tint\);/s);
 });
 
 class MemoryStorage {

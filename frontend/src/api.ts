@@ -1,5 +1,11 @@
 import type {
   Account,
+  AccountEditConfiguration,
+  AccountEditPreset,
+  AccountEditPresetConfiguration,
+  AccountEditResult,
+  AccountEditor,
+  AccountEditUpdate,
   AccountSchedulingChangeEvent,
   AccountExceptionRecord,
   AccountLivenessModels,
@@ -7,6 +13,7 @@ import type {
   AppEvent,
   AppSettings,
   AppSettingsUpdate,
+  BulkDeleteResult,
   ChangeLogPage,
   ChangeLogUnreadCounts,
   DeactivatedCleanupResult,
@@ -200,6 +207,37 @@ export const api = {
   logout: () => request<{ message: string }>("/api/auth/logout", { method: "POST" }),
   summary: () => request<Summary>("/api/dashboard/summary"),
   accounts: () => request<Account[]>("/api/accounts"),
+  accountEditor: (accountId: string, signal?: AbortSignal) =>
+    request<AccountEditor>(`/api/accounts/editor/${encodeURIComponent(accountId)}`, { signal }),
+  updateAccountEditor: (accountId: string, payload: AccountEditUpdate) =>
+    request<AccountEditResult>(`/api/accounts/editor/${encodeURIComponent(accountId)}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  accountEditPresets: (platform?: string) =>
+    request<AccountEditPreset[]>(
+      `/api/accounts/edit-presets${platform ? `?platform=${encodeURIComponent(platform)}` : ""}`,
+    ),
+  createAccountEditPreset: (payload: { name: string; platform: string; configuration: AccountEditPresetConfiguration }) =>
+    request<AccountEditPreset>("/api/accounts/edit-presets", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateAccountEditPreset: (presetId: number, payload: { name: string; configuration: AccountEditPresetConfiguration }) =>
+    request<AccountEditPreset>(`/api/accounts/edit-presets/${presetId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  deleteAccountEditPreset: (presetId: number) =>
+    request<{ message: string }>(`/api/accounts/edit-presets/${presetId}`, { method: "DELETE" }),
+  applyAccountEditPreset: (presetId: number, accountId: string, expectedIdentityFingerprint: string) =>
+    request<AccountEditResult>(
+      `/api/accounts/edit-presets/${presetId}/apply/${encodeURIComponent(accountId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ expected_identity_fingerprint: expectedIdentityFingerprint }),
+      },
+    ),
   accountLivenessModels: (accountIds: string[], signal?: AbortSignal) =>
     request<AccountLivenessModels>(
       "/api/accounts/liveness-models",
@@ -297,6 +335,11 @@ export const api = {
       body: JSON.stringify({ content, default_provider: defaultProvider }),
     }),
   deleteMailbox: (id: number) => request<{ message: string }>(`/api/mailboxes/${id}`, { method: "DELETE" }),
+  deleteMailboxes: (ids: number[]) =>
+    request<BulkDeleteResult>("/api/mailboxes/bulk-delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
   phones: () => request<PhoneNumber[]>("/api/phones"),
   exportPhones: () => request<{ message: string }>("/api/phones/export"),
   importPhones: (content: string) =>
@@ -311,6 +354,11 @@ export const api = {
       body: JSON.stringify({ account_emails: accountEmails }),
     }),
   deletePhone: (id: number) => request<{ message: string }>(`/api/phones/${id}`, { method: "DELETE" }),
+  deletePhones: (ids: number[]) =>
+    request<BulkDeleteResult>("/api/phones/bulk-delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
   upstreamAccounts: () => request<UpstreamAccount[]>("/api/upstream-accounts"),
   priorityIntervals: () => request<PriorityInterval[]>("/api/upstream-accounts/priority-intervals"),
   createPriorityInterval: (payload: PriorityIntervalInput) =>

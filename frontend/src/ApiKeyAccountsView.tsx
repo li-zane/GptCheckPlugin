@@ -892,12 +892,6 @@ export function ApiKeyAccountsView({
       ? pendingAccountRateLogReadThroughIdRef
       : pendingRateLogReadThroughIdRef;
     pendingRef.current = pendingReadThroughId(pendingRef.current, items);
-    if (cached) {
-      setChangeLogUnreadCounts((current) => ({
-        ...current,
-        [category === "account_rate" ? "account_rate_changes" : "upstream_changes"]: cached.unreadCount,
-      }));
-    }
   }, [rateLogCacheKey, subview]);
 
   useLayoutEffect(() => {
@@ -920,12 +914,6 @@ export function ApiKeyAccountsView({
       pendingScheduleLogReadThroughIdRef.current,
       items,
     );
-    if (cached) {
-      setChangeLogUnreadCounts((current) => ({
-        ...current,
-        account_scheduling_changes: cached.unreadCount,
-      }));
-    }
   }, [schedulingLogCacheKey, subview]);
 
   useLayoutEffect(() => {
@@ -4582,6 +4570,7 @@ function availabilityMessageText(message?: string | null) {
     .replace("Fallback testing for unbound accounts is disabled.", "设置已禁止未绑定面板的账号使用回退测试。")
     .replace("No fallback test model chain is configured.", "未配置回退测试模型链。")
     .replace("None of the fallback test models are in this API Key account's available model whitelist.", "回退模型链中没有模型位于该账号白名单。")
+    .replace(/All (\d+) fallback connection tests succeeded with model ([^ ]+)\./, "已使用回退模型 $2 完成 $1 次连接测试，且全部成功。")
     .replace(/Fallback connection test succeeded with model ([^ ]+) after (\d+) attempt\(s\)\./, "已使用回退模型 $1 完成连接测试，并在第 $2 次测试成功。");
 }
 

@@ -699,6 +699,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 "CHANGE_LOG_PAGE_SIZE_OPTIONS=[25,100,200]\n"
                 "SHOW_STALE_NEGATIVE_BALANCE_ALERT=false\n"
                 "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED=true\n"
+                "API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED=true\n"
                 "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD=3\n"
                 "CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD=4\n"
                 "CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS=17\n"
@@ -725,6 +726,9 @@ class RuntimeConfigTests(unittest.TestCase):
                 auto_pause_on_monitor = asyncio.run(
                     service.get_api_key_auto_pause_on_channel_monitor_unavailable_enabled()
                 )
+                all_availability_tests_must_succeed = asyncio.run(
+                    service.get_api_key_availability_all_tests_must_succeed()
+                )
                 monitor_unavailable_threshold = asyncio.run(
                     service.get_channel_monitor_unavailable_consecutive_threshold()
                 )
@@ -747,6 +751,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(change_log_page_size_options, [25, 100, 200])
         self.assertFalse(show_stale_alert)
         self.assertTrue(auto_pause_on_monitor)
+        self.assertTrue(all_availability_tests_must_succeed)
         self.assertEqual(monitor_unavailable_threshold, 3)
         self.assertEqual(monitor_recovery_threshold, 4)
         self.assertEqual(monitor_test_attempt_interval, 17)
@@ -759,6 +764,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(public["change_log_page_size_options"], [25, 100, 200])
         self.assertFalse(public["show_stale_negative_balance_alert"])
         self.assertTrue(public["api_key_auto_pause_on_channel_monitor_unavailable_enabled"])
+        self.assertTrue(public["api_key_availability_all_tests_must_succeed"])
         self.assertEqual(public["channel_monitor_unavailable_consecutive_threshold"], 3)
         self.assertEqual(public["channel_monitor_recovery_consecutive_threshold"], 4)
         self.assertEqual(public["channel_monitor_test_attempt_interval_seconds"], 17)
@@ -796,6 +802,9 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertFalse(
                     defaults["api_key_auto_pause_on_channel_monitor_unavailable_enabled"]
                 )
+                self.assertFalse(
+                    defaults["api_key_availability_all_tests_must_succeed"]
+                )
                 self.assertTrue(defaults["channel_monitor_auto_probe_enabled"])
                 self.assertFalse(defaults["account_model_whitelist_sync_enabled"])
                 self.assertEqual(defaults["account_model_whitelist_sync_interval_seconds"], 3600)
@@ -820,6 +829,7 @@ class RuntimeConfigTests(unittest.TestCase):
                         "upstream_priority_sync_enabled": False,
                         "api_key_auto_disable_on_upstream_unavailable": True,
                         "api_key_auto_pause_on_channel_monitor_unavailable_enabled": True,
+                        "api_key_availability_all_tests_must_succeed": True,
                         "channel_monitor_auto_probe_enabled": False,
                         "account_model_whitelist_sync_enabled": True,
                         "account_model_whitelist_sync_interval_seconds": 1800,
@@ -850,6 +860,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertTrue(
                     settings["api_key_auto_pause_on_channel_monitor_unavailable_enabled"]
                 )
+                self.assertTrue(settings["api_key_availability_all_tests_must_succeed"])
                 self.assertFalse(settings["channel_monitor_auto_probe_enabled"])
                 self.assertTrue(settings["account_model_whitelist_sync_enabled"])
                 self.assertEqual(settings["account_model_whitelist_sync_interval_seconds"], 1800)
@@ -878,6 +889,9 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertTrue(await service.get_api_key_auto_disable_on_upstream_unavailable())
                 self.assertTrue(
                     await service.get_api_key_auto_pause_on_channel_monitor_unavailable_enabled()
+                )
+                self.assertTrue(
+                    await service.get_api_key_availability_all_tests_must_succeed()
                 )
                 self.assertFalse(await service.get_channel_monitor_auto_probe_enabled())
                 self.assertTrue(await service.get_account_model_whitelist_sync_enabled())
@@ -920,6 +934,7 @@ class RuntimeConfigTests(unittest.TestCase):
                                     "upstream_priority_sync_enabled",
                                     "api_key_auto_disable_on_upstream_unavailable",
                                     "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                                    "api_key_availability_all_tests_must_succeed",
                                     "channel_monitor_auto_probe_enabled",
                                     "account_model_whitelist_sync_enabled",
                                     "account_model_whitelist_sync_interval_seconds",
@@ -950,6 +965,10 @@ class RuntimeConfigTests(unittest.TestCase):
                     values["api_key_auto_pause_on_channel_monitor_unavailable_enabled"],
                     "true",
                 )
+                self.assertEqual(
+                    values["api_key_availability_all_tests_must_succeed"],
+                    "true",
+                )
                 self.assertEqual(values["channel_monitor_auto_probe_enabled"], "false")
                 self.assertEqual(values["account_model_whitelist_sync_enabled"], "true")
                 self.assertEqual(values["account_model_whitelist_sync_interval_seconds"], "1800")
@@ -975,6 +994,10 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertIn("API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE=true", env_text)
                 self.assertIn(
                     "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED=true",
+                    env_text,
+                )
+                self.assertIn(
+                    "API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED=true",
                     env_text,
                 )
                 self.assertIn("CHANNEL_MONITOR_AUTO_PROBE_ENABLED=false", env_text)

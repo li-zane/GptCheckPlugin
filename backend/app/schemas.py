@@ -286,7 +286,7 @@ class UsageLimitPlanRanges(BaseModel):
 
 class MailboxImportRequest(BaseModel):
     content: str = Field(min_length=1)
-    default_provider: Literal["auto", "outlook", "hotmail", "gmail", "custom", "manual"] = "auto"
+    default_provider: Literal["auto", "outlook", "hotmail", "gmail", "custom", "url", "manual"] = "auto"
 
 
 class MailboxImportResult(MessageResponse):
@@ -304,6 +304,28 @@ class PhoneImportResult(MessageResponse):
     updated: int
     skipped: int
     invalid_lines: list[int]
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=500)
+
+    @field_validator("ids")
+    @classmethod
+    def validate_ids(cls, values: list[int]) -> list[int]:
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for value in values:
+            if value < 1:
+                raise ValueError("ids must be positive integers")
+            if value not in seen:
+                normalized.append(value)
+                seen.add(value)
+        return normalized
+
+
+class BulkDeleteResult(MessageResponse):
+    requested_count: int
+    deleted_count: int
 
 
 class PhoneBindingUpdate(BaseModel):
@@ -491,6 +513,145 @@ class AccountLivenessTestResult(MessageResponse):
     results: list[AccountLivenessTestItemOut]
 
 
+class AccountEditConfiguration(BaseModel):
+    concurrency: int = Field(ge=1, le=1000)
+    priority: int = Field(ge=0, le=JS_SAFE_INTEGER_MAX)
+    rate_multiplier: float = Field(ge=0, le=1000)
+    status: Literal["active", "inactive", "error"] | None = None
+    schedulable: bool
+    proxy_id: int | None = Field(default=None, ge=1, le=JS_SAFE_INTEGER_MAX)
+    group_ids: list[int] = Field(default_factory=list, max_length=100)
+    model_whitelist: list[str] = Field(default_factory=list, max_length=200)
+    openai_ws_mode: Literal["off", "ctx_pool", "passthrough", "http_bridge"] | None = None
+    codex_image_tool_mode: Literal["inherit", "enabled", "disabled", "block"] | None = None
+    openai_passthrough: bool | None = None
+    openai_long_context_billing: bool | None = None
+    openai_compact_mode: Literal["auto", "force_on", "force_off"] | None = None
+    codex_cli_only: bool | None = None
+    codex_cli_only_allow_app_server: bool | None = None
+    auto_pause_5h_disabled: bool | None = None
+    auto_pause_7d_disabled: bool | None = None
+    auto_pause_5h_threshold_percent: float | None = Field(default=None, ge=0, le=100)
+    auto_pause_7d_threshold_percent: float | None = Field(default=None, ge=0, le=100)
+
+    @field_validator("group_ids")
+    @classmethod
+    def validate_account_edit_group_ids(cls, values: list[int]) -> list[int]:
+        result: list[int] = []
+        for value in values:
+            if value < 1 or value > JS_SAFE_INTEGER_MAX:
+                raise ValueError("group ids must be positive safe integers")
+            if value not in result:
+                result.append(value)
+        return result
+
+    @field_validator("model_whitelist")
+    @classmethod
+    def validate_account_edit_model_whitelist(cls, values: list[str]) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            model = str(value or "").strip()
+            if not model:
+                continue
+            if len(model) > 160:
+                raise ValueError("model ids must not exceed 160 characters")
+            if "*" in model:
+                raise ValueError("model whitelist entries must be exact model ids")
+            if model not in result:
+                result.append(model)
+        return result
+
+
+class AccountEditUpdate(AccountEditConfiguration):
+    name: str = Field(min_length=1, max_length=100)
+    expected_identity_fingerprint: str = Field(min_length=64, max_length=64)
+
+    @field_validator("name", "expected_identity_fingerprint")
+    @classmethod
+    def strip_account_edit_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class AccountEditPresetConfiguration(AccountEditConfiguration):
+    account_type_scope: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("account_type_scope")
+    @classmethod
+    def strip_account_edit_preset_scope(cls, value: str | None) -> str | None:
+        return value.strip().lower() if value else None
+
+
+class AccountEditPresetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    platform: str = Field(min_length=1, max_length=64)
+    configuration: AccountEditPresetConfiguration
+
+    @field_validator("name", "platform")
+    @classmethod
+    def strip_account_edit_preset_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class AccountEditPresetUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    configuration: AccountEditPresetConfiguration
+
+    @field_validator("name")
+    @classmethod
+    def strip_account_edit_preset_name(cls, value: str) -> str:
+        return value.strip()
+
+
+class AccountEditPresetApply(BaseModel):
+    expected_identity_fingerprint: str = Field(min_length=64, max_length=64)
+
+    @field_validator("expected_identity_fingerprint")
+    @classmethod
+    def strip_account_edit_preset_fingerprint(cls, value: str) -> str:
+        return value.strip()
+
+
+class AccountEditResourceOption(BaseModel):
+    id: int
+    name: str
+    status: str | None = None
+    detail: str | None = None
+
+
+class AccountEditCurrent(AccountEditConfiguration):
+    account_id: str
+    name: str
+    platform: str
+    account_type: str
+    identity_fingerprint: str
+
+
+class AccountEditPresetOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    platform: str
+    configuration: AccountEditPresetConfiguration
+    created_at: datetime
+    updated_at: datetime
+
+
+class AccountEditorOut(BaseModel):
+    account: AccountEditCurrent
+    groups: list[AccountEditResourceOption]
+    proxies: list[AccountEditResourceOption]
+    model_candidates: list[AccountLivenessModelOut]
+    model_candidates_complete: bool = True
+    presets: list[AccountEditPresetOut]
+    resources_checked_at: datetime
+
+
+class AccountEditResult(BaseModel):
+    message: str
+    editor: AccountEditorOut
+
+
 class Sub2ApiSyncResult(MessageResponse):
     total_seen: int
     error_seen: int
@@ -553,6 +714,8 @@ class AppSettingsOut(BaseModel):
     automation_paused: bool
     oauth_account_sync_enabled: bool
     recovery_enabled: bool
+    oauth_login_mode: Literal["protocol", "browser"] = "protocol"
+    oauth_stop_on_phone_verification: bool = False
     monitor_interval_seconds: int
     usage_refresh_enabled: bool
     usage_refresh_interval_seconds: int
@@ -573,6 +736,7 @@ class AppSettingsOut(BaseModel):
     manual_upstream_sync_rate_pause_enabled: bool = True
     api_key_auto_disable_on_upstream_unavailable: bool
     api_key_auto_pause_on_channel_monitor_unavailable_enabled: bool = False
+    api_key_availability_all_tests_must_succeed: bool = False
     channel_monitor_auto_probe_enabled: bool = True
     account_model_whitelist_sync_enabled: bool = False
     account_model_whitelist_sync_interval_seconds: int = 3600
@@ -638,6 +802,8 @@ class AppSettingsUpdate(BaseModel):
     automation_paused: bool | None = None
     oauth_account_sync_enabled: bool | None = None
     recovery_enabled: bool | None = None
+    oauth_login_mode: Literal["protocol", "browser"] | None = None
+    oauth_stop_on_phone_verification: bool | None = None
     monitor_interval_seconds: int | None = Field(default=None, ge=30, le=86_400)
     usage_refresh_enabled: bool | None = None
     usage_refresh_interval_seconds: int | None = Field(default=None, ge=60, le=86_400)
@@ -658,6 +824,7 @@ class AppSettingsUpdate(BaseModel):
     manual_upstream_sync_rate_pause_enabled: bool | None = None
     api_key_auto_disable_on_upstream_unavailable: bool | None = None
     api_key_auto_pause_on_channel_monitor_unavailable_enabled: bool | None = None
+    api_key_availability_all_tests_must_succeed: bool | None = None
     channel_monitor_auto_probe_enabled: bool | None = None
     account_model_whitelist_sync_enabled: bool | None = None
     account_model_whitelist_sync_interval_seconds: int | None = Field(

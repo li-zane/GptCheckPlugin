@@ -350,6 +350,24 @@ def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int
     return parsed
 
 
+def _mapping_patch_matches(source: dict[str, Any], patch: dict[str, Any]) -> bool:
+    for key, expected in patch.items():
+        actual = source.get(key)
+        if isinstance(expected, bool):
+            if actual is not expected:
+                return False
+        elif isinstance(expected, (int, float)):
+            confirmed = _bounded_number(actual, minimum=-1_000_000, maximum=1_000_000)
+            if confirmed is None or not math.isclose(confirmed, float(expected), rel_tol=1e-9, abs_tol=1e-9):
+                return False
+        elif expected is None:
+            if actual is not None:
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
 def _parse_account_daily_costs(payload: Any) -> dict[date, float]:
     """Extract per-calendar-day actual costs from one account's stats payload."""
 
@@ -1502,16 +1520,219 @@ class Sub2ApiClient:
 
     async def list_groups(self) -> list[dict[str, Any]]:
         config = await get_runtime_config_service().get_sub2api_config()
+        return await self.list_groups_for_platform(None, config=config)
+
+    async def list_groups_for_platform(
+        self,
+        platform: str | None,
+        *,
+        config: EffectiveSub2ApiConfig | None = None,
+    ) -> list[dict[str, Any]]:
+        config = config or await get_runtime_config_service().get_sub2api_config()
+        params = {"platform": platform} if platform else None
         try:
-            payload = await self._request("GET", "/admin/groups/all", config=config)
+            payload = await self._request("GET", "/admin/groups/all", config=config, params=params)
         except Sub2ApiRequestError as exc:
             if exc.status_code not in {404, 405}:
                 raise
-            payload = await self._request("GET", "/admin/groups", config=config)
+            payload = await self._request("GET", "/admin/groups", config=config, params=params)
         groups = self._unwrap(payload)
         if isinstance(groups, list):
             return [item for item in groups if isinstance(item, dict)]
         return []
+
+    async def list_proxies(self) -> list[dict[str, Any]]:
+        config = await get_runtime_config_service().get_sub2api_config()
+        payload = await self._request("GET", "/admin/proxies/all", config=config)
+        proxies = self._unwrap(payload)
+        if isinstance(proxies, list):
+            return [item for item in proxies if isinstance(item, dict)]
+        return []
+
+    async def list_account_model_candidates(self, platform: str) -> list[dict[str, str]]:
+        normalized_platform = str(platform or "").strip().lower()
+        if not normalized_platform:
+            raise ValueError("Cannot list sub2api model candidates without platform.")
+        config = await get_runtime_config_service().get_sub2api_config()
+        payload = await self._request(
+            "GET",
+            "/admin/groups/0/models-list-candidates",
+            config=config,
+            params={"platform": normalized_platform},
+        )
+        data = self._unwrap(payload)
+        raw_models = data.get("models") if isinstance(data, dict) else data
+        if not isinstance(raw_models, list):
+            return []
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in raw_models:
+            if isinstance(item, dict):
+                model_id = str(item.get("id") or item.get("model_id") or "").strip()
+                display_name = str(item.get("display_name") or item.get("name") or model_id).strip()
+            else:
+                model_id = str(item or "").strip()
+                display_name = model_id
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            result.append({"id": model_id, "display_name": display_name or model_id})
+        return result
+
+    async def update_account_configuration(
+        self,
+        account_id: str | int,
+        *,
+        name: str,
+        concurrency: int,
+        priority: int,
+        rate_multiplier: float,
+        status: str | None,
+        schedulable: bool,
+        proxy_id: int | None,
+        group_ids: list[int],
+        model_whitelist: list[str],
+        extra_patch: dict[str, Any] | None = None,
+        validate_current: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        normalized_name = str(name or "").strip()
+        if not normalized_name or len(normalized_name) > 100:
+            raise ValueError("name must contain between 1 and 100 characters.")
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        current = await self.get_account_by_id(numeric_id, config=config)
+        if current is None:
+            raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
+        if validate_current is not None:
+            validate_current(current)
+
+        model_mapping = {model_id: model_id for model_id in model_whitelist}
+        payload = {
+            "account_ids": [numeric_id],
+            "name": normalized_name,
+            "concurrency": concurrency,
+            "priority": priority,
+            "rate_multiplier": rate_multiplier,
+            "schedulable": schedulable,
+            "proxy_id": proxy_id or 0,
+            "group_ids": group_ids,
+            "credentials": {"model_mapping": model_mapping or None},
+        }
+        if status is not None:
+            payload["status"] = status
+        if extra_patch:
+            payload["extra"] = extra_patch
+        mutation_error: Exception | None = None
+        try:
+            result = self._unwrap(
+                await self._request(
+                    "POST",
+                    f"{config.accounts_path}/bulk-update",
+                    config=config,
+                    json=payload,
+                )
+            )
+            if isinstance(result, dict):
+                failed_ids = {_positive_int(value) for value in result.get("failed_ids", [])}
+                if numeric_id in failed_ids:
+                    raise Sub2ApiRequestError("sub2api rejected the account configuration update.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            mutation_error = exc
+
+        account_was_seen = False
+        readback_completed = False
+        try:
+            async with asyncio.timeout(SUB2API_MUTATION_READBACK_TIMEOUT_SECONDS):
+                for attempt in range(SUB2API_MUTATION_READBACK_ATTEMPTS):
+                    try:
+                        updated = await self.get_account_by_id(numeric_id, config=config)
+                        readback_completed = True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        updated = None
+                    if updated is not None:
+                        account_was_seen = True
+                        if self._account_configuration_matches(
+                            updated,
+                            name=normalized_name,
+                            concurrency=concurrency,
+                            priority=priority,
+                            rate_multiplier=rate_multiplier,
+                            status=status,
+                            schedulable=schedulable,
+                            proxy_id=proxy_id,
+                            group_ids=group_ids,
+                            model_whitelist=model_whitelist,
+                            extra_patch=extra_patch,
+                        ):
+                            return updated
+                    if attempt + 1 < SUB2API_MUTATION_READBACK_ATTEMPTS:
+                        await asyncio.sleep(SUB2API_MUTATION_READBACK_DELAY_SECONDS)
+        except TimeoutError:
+            pass
+
+        if mutation_error is not None:
+            raise mutation_error
+        if readback_completed and not account_was_seen:
+            raise Sub2ApiRequestError(
+                "sub2api account was not found after updating its configuration.",
+                status_code=404,
+            )
+        if not readback_completed:
+            raise Sub2ApiRequestError(
+                "sub2api account readback did not complete after updating its configuration."
+            )
+        raise Sub2ApiRequestError("sub2api did not confirm the updated account configuration.")
+
+    def _account_configuration_matches(
+        self,
+        account: dict[str, Any],
+        *,
+        name: str,
+        concurrency: int,
+        priority: int,
+        rate_multiplier: float,
+        status: str | None,
+        schedulable: bool,
+        proxy_id: int | None,
+        group_ids: list[int],
+        model_whitelist: list[str],
+        extra_patch: dict[str, Any] | None,
+    ) -> bool:
+        credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
+        extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+        mapping = credentials.get("model_mapping") if isinstance(credentials, dict) else None
+        confirmed_models = sorted(
+            str(key)
+            for key, value in (mapping.items() if isinstance(mapping, dict) else ())
+            if isinstance(value, str) and str(key) == value
+        )
+        confirmed_groups = sorted(
+            value
+            for raw in account.get("group_ids", [])
+            if (value := _positive_int(raw)) is not None
+        )
+        confirmed_proxy = _positive_int(account.get("proxy_id"))
+        confirmed_rate = _bounded_number(account.get("rate_multiplier"), minimum=0, maximum=1000)
+        return (
+            self.account_name(account) == name
+            and _nonnegative_int(account.get("concurrency")) == concurrency
+            and _nonnegative_int(account.get("priority")) == priority
+            and confirmed_rate is not None
+            and math.isclose(confirmed_rate, rate_multiplier, rel_tol=1e-9, abs_tol=1e-9)
+            and (status is None or str(account.get("status") or "").strip().lower() == status)
+            and account.get("schedulable") is schedulable
+            and confirmed_proxy == proxy_id
+            and confirmed_groups == sorted(group_ids)
+            and confirmed_models == sorted(model_whitelist)
+            and _mapping_patch_matches(extra, extra_patch or {})
+        )
 
     async def get_account_usage(self, account: dict[str, Any] | str, force: bool = True) -> dict[str, Any]:
         account_id = account if isinstance(account, str) else self.account_id(account)

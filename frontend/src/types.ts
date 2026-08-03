@@ -68,6 +68,76 @@ export type AccountLivenessModels = {
   models: AccountLivenessModel[];
 };
 
+export type AccountEditConfiguration = {
+  concurrency: number;
+  priority: number;
+  rate_multiplier: number;
+  status: "active" | "inactive" | "error" | null;
+  schedulable: boolean;
+  proxy_id: number | null;
+  group_ids: number[];
+  model_whitelist: string[];
+  openai_ws_mode: "off" | "ctx_pool" | "passthrough" | "http_bridge" | null;
+  codex_image_tool_mode: "inherit" | "enabled" | "disabled" | "block" | null;
+  openai_passthrough: boolean | null;
+  openai_long_context_billing: boolean | null;
+  openai_compact_mode: "auto" | "force_on" | "force_off" | null;
+  codex_cli_only: boolean | null;
+  codex_cli_only_allow_app_server: boolean | null;
+  auto_pause_5h_disabled: boolean | null;
+  auto_pause_7d_disabled: boolean | null;
+  auto_pause_5h_threshold_percent: number | null;
+  auto_pause_7d_threshold_percent: number | null;
+};
+
+export type AccountEditPresetConfiguration = AccountEditConfiguration & {
+  account_type_scope: string | null;
+};
+
+export type AccountEditCurrent = AccountEditConfiguration & {
+  account_id: string;
+  name: string;
+  platform: string;
+  account_type: string;
+  identity_fingerprint: string;
+};
+
+export type AccountEditResourceOption = {
+  id: number;
+  name: string;
+  status: string | null;
+  detail: string | null;
+};
+
+export type AccountEditPreset = {
+  id: number;
+  name: string;
+  platform: string;
+  configuration: AccountEditPresetConfiguration;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AccountEditor = {
+  account: AccountEditCurrent;
+  groups: AccountEditResourceOption[];
+  proxies: AccountEditResourceOption[];
+  model_candidates: AccountLivenessModel[];
+  model_candidates_complete: boolean;
+  presets: AccountEditPreset[];
+  resources_checked_at: string;
+};
+
+export type AccountEditUpdate = AccountEditConfiguration & {
+  name: string;
+  expected_identity_fingerprint: string;
+};
+
+export type AccountEditResult = {
+  message: string;
+  editor: AccountEditor;
+};
+
 export type AccountLivenessTestItem = {
   account_id: string;
   email: string | null;
@@ -137,6 +207,12 @@ export type PhoneImportResult = {
   updated: number;
   skipped: number;
   invalid_lines: number[];
+};
+
+export type BulkDeleteResult = {
+  message: string;
+  requested_count: number;
+  deleted_count: number;
 };
 
 export type RefreshJob = {
@@ -412,6 +488,8 @@ export type AppSettings = {
   sub2api_auto_recover_state: boolean;
   automation_paused: boolean;
   oauth_account_sync_enabled: boolean;
+  oauth_login_mode: "protocol" | "browser";
+  oauth_stop_on_phone_verification: boolean;
   recovery_enabled: boolean;
   monitor_interval_seconds: number;
   usage_refresh_enabled: boolean;
@@ -434,6 +512,7 @@ export type AppSettings = {
   api_key_auto_disable_on_upstream_unavailable: boolean;
   api_key_auto_pause_on_negative_balance_enabled: boolean;
   api_key_auto_pause_on_channel_monitor_unavailable_enabled: boolean;
+  api_key_availability_all_tests_must_succeed: boolean;
   channel_monitor_auto_probe_enabled: boolean;
   account_model_whitelist_sync_enabled: boolean;
   account_model_whitelist_sync_interval_seconds: number;
@@ -495,6 +574,8 @@ export type AppSettingsUpdate = {
   sub2api_auto_recover_state?: boolean;
   automation_paused?: boolean;
   oauth_account_sync_enabled?: boolean;
+  oauth_login_mode?: "protocol" | "browser";
+  oauth_stop_on_phone_verification?: boolean;
   recovery_enabled?: boolean;
   monitor_interval_seconds?: number;
   usage_refresh_enabled?: boolean;
@@ -517,6 +598,7 @@ export type AppSettingsUpdate = {
   api_key_auto_disable_on_upstream_unavailable?: boolean;
   api_key_auto_pause_on_negative_balance_enabled?: boolean;
   api_key_auto_pause_on_channel_monitor_unavailable_enabled?: boolean;
+  api_key_availability_all_tests_must_succeed?: boolean;
   channel_monitor_auto_probe_enabled?: boolean;
   account_model_whitelist_sync_enabled?: boolean;
   account_model_whitelist_sync_interval_seconds?: number;

@@ -450,7 +450,7 @@ class MonitorService:
             ("encrypted_openai_client_id", "client_id"),
         ):
             value = state.get(key)
-            if not isinstance(value, str) or not value.strip():
+            if not _persistable_oauth_credential(value):
                 continue
             normalized = value.strip()
             current = getattr(snapshot, attribute)
@@ -863,6 +863,18 @@ class MonitorService:
             sub2api_account_id=sub2api_account_id,
             commit=False,
         )
+
+
+def _persistable_oauth_credential(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered in {"redacted", "***redacted***", "[redacted]", "***", "********"}:
+        return False
+    return not (len(text) >= 3 and set(text) <= {"*"})
 
 
 _monitor_service: MonitorService | None = None

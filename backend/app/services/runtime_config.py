@@ -73,6 +73,9 @@ KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE = (
 KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED = (
     "api_key_auto_pause_on_channel_monitor_unavailable_enabled"
 )
+KEY_API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED = (
+    "api_key_availability_all_tests_must_succeed"
+)
 KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED = "channel_monitor_auto_probe_enabled"
 KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED = "account_model_whitelist_sync_enabled"
 KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS = "account_model_whitelist_sync_interval_seconds"
@@ -122,6 +125,8 @@ KEY_USAGE_LIMIT_SAMPLE_FIVE_HOUR_THRESHOLD_PERCENT = "usage_limit_sample_five_ho
 KEY_USAGE_LIMIT_SAMPLE_SEVEN_DAY_THRESHOLD_PERCENT = "usage_limit_sample_seven_day_threshold_percent"
 KEY_USAGE_LIMIT_DEFAULT_RANGES = "usage_limit_default_ranges"
 KEY_RECOVERY_ENABLED = "recovery_enabled"
+KEY_OAUTH_LOGIN_MODE = "oauth_login_mode"
+KEY_OAUTH_STOP_ON_PHONE_VERIFICATION = "oauth_stop_on_phone_verification"
 KEY_REFRESH_MAX_CONCURRENCY = "refresh_max_concurrency"
 KEY_PROTOCOL_REFRESH_MAX_CONCURRENCY = "protocol_refresh_max_concurrency"
 KEY_BROWSER_REFRESH_MAX_CONCURRENCY = "browser_refresh_max_concurrency"
@@ -226,6 +231,20 @@ class RuntimeConfigService:
         values = await self._load_values()
         return _bool_or_default(values.get(KEY_RECOVERY_ENABLED), self.settings.recovery_enabled)
 
+    async def get_oauth_login_mode(self) -> str:
+        values = await self._load_values()
+        return _oauth_login_mode_or_default(
+            values.get(KEY_OAUTH_LOGIN_MODE),
+            getattr(self.settings, "oauth_login_mode", "protocol"),
+        )
+
+    async def get_oauth_stop_on_phone_verification(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_OAUTH_STOP_ON_PHONE_VERIFICATION),
+            bool(getattr(self.settings, "oauth_stop_on_phone_verification", False)),
+        )
+
     async def get_usage_refresh_enabled(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(values.get(KEY_USAGE_REFRESH_ENABLED), self.settings.usage_refresh_enabled)
@@ -319,6 +338,19 @@ class RuntimeConfigService:
                 getattr(
                     self.settings,
                     "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                    False,
+                )
+            ),
+        )
+
+    async def get_api_key_availability_all_tests_must_succeed(self) -> bool:
+        values = await self._load_values()
+        return _bool_or_default(
+            values.get(KEY_API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED),
+            bool(
+                getattr(
+                    self.settings,
+                    "api_key_availability_all_tests_must_succeed",
                     False,
                 )
             ),
@@ -745,6 +777,14 @@ class RuntimeConfigService:
                 values.get(KEY_RECOVERY_ENABLED),
                 self.settings.recovery_enabled,
             ),
+            "oauth_login_mode": _oauth_login_mode_or_default(
+                values.get(KEY_OAUTH_LOGIN_MODE),
+                getattr(self.settings, "oauth_login_mode", "protocol"),
+            ),
+            "oauth_stop_on_phone_verification": _bool_or_default(
+                values.get(KEY_OAUTH_STOP_ON_PHONE_VERIFICATION),
+                bool(getattr(self.settings, "oauth_stop_on_phone_verification", False)),
+            ),
             "monitor_interval_seconds": _int_or_default(
                 values.get(KEY_MONITOR_INTERVAL_SECONDS),
                 self.settings.monitor_interval_seconds,
@@ -870,6 +910,16 @@ class RuntimeConfigService:
                     getattr(
                         self.settings,
                         "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                        False,
+                    )
+                ),
+            ),
+            "api_key_availability_all_tests_must_succeed": _bool_or_default(
+                values.get(KEY_API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED),
+                bool(
+                    getattr(
+                        self.settings,
+                        "api_key_availability_all_tests_must_succeed",
                         False,
                     )
                 ),
@@ -1206,6 +1256,19 @@ class RuntimeConfigService:
             if payload.get("recovery_enabled") is not None:
                 await self._put(db, KEY_RECOVERY_ENABLED, "true" if payload["recovery_enabled"] else "false")
 
+            if payload.get("oauth_login_mode") is not None:
+                requested_mode = str(payload["oauth_login_mode"]).strip().lower()
+                if requested_mode not in {"protocol", "browser"}:
+                    raise RuntimeConfigServiceError("OAuth login mode must be protocol or browser.")
+                await self._put(db, KEY_OAUTH_LOGIN_MODE, requested_mode)
+
+            if payload.get("oauth_stop_on_phone_verification") is not None:
+                await self._put(
+                    db,
+                    KEY_OAUTH_STOP_ON_PHONE_VERIFICATION,
+                    "true" if payload["oauth_stop_on_phone_verification"] else "false",
+                )
+
             if payload.get("usage_refresh_enabled") is not None:
                 await self._put(db, KEY_USAGE_REFRESH_ENABLED, "true" if payload["usage_refresh_enabled"] else "false")
 
@@ -1290,6 +1353,7 @@ class RuntimeConfigService:
                 "manual_upstream_sync_balance_guard_enabled": KEY_MANUAL_UPSTREAM_SYNC_BALANCE_GUARD_ENABLED,
                 "manual_upstream_sync_rate_pause_enabled": KEY_MANUAL_UPSTREAM_SYNC_RATE_PAUSE_ENABLED,
                 "api_key_auto_pause_on_channel_monitor_unavailable_enabled": KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED,
+                "api_key_availability_all_tests_must_succeed": KEY_API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED,
                 "channel_monitor_auto_probe_enabled": KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED,
                 "account_model_whitelist_sync_enabled": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED,
                 "account_model_whitelist_sync_each_time": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME,
@@ -1758,6 +1822,10 @@ class RuntimeConfigService:
             "AUTOMATION_PAUSED": _env_bool(bool(settings["automation_paused"])),
             "OAUTH_ACCOUNT_SYNC_ENABLED": _env_bool(bool(settings["oauth_account_sync_enabled"])),
             "RECOVERY_ENABLED": _env_bool(bool(settings["recovery_enabled"])),
+            "OAUTH_LOGIN_MODE": str(settings.get("oauth_login_mode", "protocol")),
+            "OAUTH_STOP_ON_PHONE_VERIFICATION": _env_bool(
+                bool(settings.get("oauth_stop_on_phone_verification", False))
+            ),
             "MONITOR_INTERVAL_SECONDS": str(int(settings["monitor_interval_seconds"])),
             "USAGE_REFRESH_ENABLED": _env_bool(bool(settings["usage_refresh_enabled"])),
             "USAGE_REFRESH_INTERVAL_SECONDS": str(int(settings["usage_refresh_interval_seconds"])),
@@ -1799,6 +1867,9 @@ class RuntimeConfigService:
             ),
             "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED": _env_bool(
                 bool(settings["api_key_auto_pause_on_channel_monitor_unavailable_enabled"])
+            ),
+            "API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED": _env_bool(
+                bool(settings.get("api_key_availability_all_tests_must_succeed", False))
             ),
             "CHANNEL_MONITOR_AUTO_PROBE_ENABLED": _env_bool(
                 bool(settings.get("channel_monitor_auto_probe_enabled", True))
@@ -2063,6 +2134,14 @@ def _bool_or_default(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _oauth_login_mode_or_default(value: Any, default: Any = "protocol") -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in {"protocol", "browser"}:
+        return candidate
+    fallback = str(default or "protocol").strip().lower()
+    return fallback if fallback in {"protocol", "browser"} else "protocol"
 
 
 def _normalize_model_chain(value: Any) -> list[str]:

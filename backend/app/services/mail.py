@@ -3,14 +3,17 @@ import hashlib
 import html
 import imaplib
 import json
+import logging
 import re
 import socket
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.utils import parseaddr, parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Any, ClassVar, Protocol
 from urllib import parse as urllib_parse
 
@@ -47,6 +50,21 @@ _RECIPIENT_HEADERS = (
     "X-MS-Exchange-Organization-OriginalEnvelopeRecipients",
 )
 _OPENAI_SENDER_DOMAINS = ("openai.com", "chatgpt.com")
+_PICKUP_HTTP_LOG_REDACTION: ContextVar[bool] = ContextVar("pickup_http_log_redaction", default=False)
+
+
+class _PickupHttpLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _PICKUP_HTTP_LOG_REDACTION.get() or not isinstance(record.args, tuple) or len(record.args) < 2:
+            return True
+        if isinstance(record.msg, str) and record.msg.startswith("HTTP Request:"):
+            args = list(record.args)
+            args[1] = "[pickup endpoint redacted]"
+            record.args = tuple(args)
+        return True
+
+
+logging.getLogger("httpx").addFilter(_PickupHttpLogFilter())
 
 
 class _ProxyImap4Ssl(imaplib.IMAP4_SSL):
@@ -1004,6 +1022,76 @@ class CustomHttpMailAdapter:
         return MailMessagesResult(status=str(data.get("status") or "ok"), messages=messages, error=data.get("error"))
 
 
+class UrlPickupMailAdapter:
+    _max_response_bytes = 2_000_000
+
+    async def fetch_code(self, credential: MailboxCredential, after: datetime) -> MailFetchResult:
+        result = await self.fetch_messages(credential, "inbox", 50)
+        if result.status != "ok":
+            return MailFetchResult(
+                status="failed",
+                error=result.error,
+                provider_status=result.provider_status,
+            )
+
+        normalized_after = _normalize_mail_datetime(after)
+        for message in _sort_pickup_messages(result.messages):
+            if message.received_at and _normalize_mail_datetime(message.received_at) < normalized_after:
+                continue
+            code = extract_code(message.code, message.subject, message.body_preview, message.text)
+            if code:
+                return MailFetchResult(status="ok", code=code)
+        return MailFetchResult(status="not_found", error="No fresh verification code was found at the pickup endpoint.")
+
+    async def fetch_messages(self, credential: MailboxCredential, folder: str, limit: int) -> MailMessagesResult:
+        if folder != "inbox":
+            return MailMessagesResult(status="ok", messages=[])
+        endpoint = str(credential.custom_fetch_url or "").strip()
+        if not _valid_pickup_endpoint(endpoint):
+            return MailMessagesResult(status="failed", messages=[], error="The pickup endpoint URL is invalid.")
+
+        log_context = _PICKUP_HTTP_LOG_REDACTION.set(True)
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(
+                    endpoint,
+                    headers={"Accept": "application/json, text/html;q=0.9, text/plain;q=0.8"},
+                )
+        except httpx.HTTPError as exc:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error=f"Pickup endpoint request failed ({type(exc).__name__}).",
+            )
+        finally:
+            _PICKUP_HTTP_LOG_REDACTION.reset(log_context)
+
+        if response.status_code >= 400:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error=f"Pickup endpoint returned HTTP {response.status_code}.",
+                provider_status=f"HTTP {response.status_code}",
+            )
+        if len(response.content) > self._max_response_bytes:
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error="Pickup endpoint response exceeded the 2 MB limit.",
+            )
+
+        try:
+            messages = _pickup_response_messages(response)
+        except (UnicodeError, ValueError):
+            return MailMessagesResult(
+                status="failed",
+                messages=[],
+                error="Pickup endpoint response could not be parsed.",
+            )
+        bounded_limit = max(1, min(limit, 50))
+        return MailMessagesResult(status="ok", messages=_sort_pickup_messages(messages)[:bounded_limit])
+
+
 class GmailImapAdapter:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -1165,6 +1253,7 @@ class MailAdapterRegistry:
             "hotmail": outlook,
             "gmail": gmail,
             "custom": CustomHttpMailAdapter(),
+            "url": UrlPickupMailAdapter(),
             "manual": ManualMailAdapter(),
         }
 
@@ -1426,6 +1515,347 @@ def _normalize_outlook_rest_message(item: dict[str, Any], folder: str) -> MailMe
     )
 
 
+_PICKUP_CONTAINER_KEYS = {"data", "items", "list", "mails", "messages", "records", "results", "inbox"}
+_PICKUP_MESSAGE_KEYS = {
+    "body",
+    "body_html",
+    "body_text",
+    "captcha",
+    "code",
+    "content",
+    "date",
+    "from",
+    "html",
+    "internaldate",
+    "message",
+    "otp",
+    "plain",
+    "preview",
+    "received_at",
+    "receiveddatetime",
+    "sender",
+    "sent_at",
+    "snippet",
+    "subject",
+    "text",
+    "title",
+    "verification_code",
+    "verificationcode",
+}
+_PICKUP_TEXT_KEYS = {
+    "body",
+    "body_html",
+    "body_text",
+    "captcha",
+    "code",
+    "content",
+    "html",
+    "message",
+    "otp",
+    "plain",
+    "preview",
+    "snippet",
+    "subject",
+    "text",
+    "title",
+    "verification_code",
+    "verificationcode",
+}
+_PICKUP_TIME_KEYS = {
+    "created_at",
+    "date",
+    "internaldate",
+    "received_at",
+    "receiveddatetime",
+    "sent_at",
+}
+
+
+def _valid_pickup_endpoint(value: str) -> bool:
+    try:
+        parsed = urllib_parse.urlparse(value)
+        return bool(
+            parsed.scheme.casefold() in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        return False
+
+
+def _normalize_mail_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _pickup_local_timezone() -> tzinfo:
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def _parse_pickup_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return _parse_mail_time(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=_pickup_local_timezone())
+    return parsed
+
+
+def _sort_pickup_messages(messages: list[MailMessage]) -> list[MailMessage]:
+    indexed = list(enumerate(messages))
+
+    def sort_key(item: tuple[int, MailMessage]) -> tuple[bool, datetime, int]:
+        index, message = item
+        received_at = message.received_at
+        return (
+            received_at is not None,
+            _normalize_mail_datetime(received_at) if received_at else datetime.min.replace(tzinfo=timezone.utc),
+            -index,
+        )
+
+    return [message for _, message in sorted(indexed, key=sort_key, reverse=True)]
+
+
+def _pickup_response_messages(response: httpx.Response) -> list[MailMessage]:
+    text = response.text
+    stripped = text.lstrip()
+    content_type = response.headers.get("content-type", "").casefold()
+    payload: Any = None
+    if "json" in content_type or stripped.startswith(("{", "[")):
+        try:
+            payload = response.json()
+        except ValueError:
+            if "json" in content_type:
+                raise ValueError("invalid JSON response") from None
+
+    if payload is not None:
+        return _pickup_json_messages(payload)
+    if "html" in content_type or re.search(r"<(?:!doctype\s+html|html|article|body)\b", stripped, re.I):
+        parser = _PickupHtmlParser()
+        parser.feed(text)
+        parser.close()
+        return parser.as_messages()
+
+    plain_text = text.strip()
+    if not plain_text:
+        return []
+    return [
+        MailMessage(
+            id=f"pickup-{hashlib.sha256(plain_text.encode('utf-8')).hexdigest()[:16]}",
+            folder="inbox",
+            subject=None,
+            sender_name=None,
+            sender_address=None,
+            body_preview=_truncate(plain_text),
+            received_at=None,
+            text=plain_text,
+            code=extract_code(plain_text),
+        )
+    ]
+
+
+def _pickup_json_messages(payload: Any) -> list[MailMessage]:
+    candidates: list[Any] = []
+
+    def collect(value: Any, depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            if isinstance(value, (str, int)) and extract_code(str(value)):
+                candidates.append(value)
+            return
+
+        nested_values = [item for key, item in value.items() if str(key).casefold() in _PICKUP_CONTAINER_KEYS]
+        before = len(candidates)
+        for nested in nested_values:
+            collect(nested, depth + 1)
+        if len(candidates) > before:
+            return
+        if any(str(key).casefold() in _PICKUP_MESSAGE_KEYS for key in value):
+            candidates.append(value)
+
+    collect(payload)
+    if not candidates:
+        semantic_text = "\n".join(_pickup_semantic_texts(payload))
+        if extract_code(semantic_text):
+            candidates.append(semantic_text)
+
+    messages: list[MailMessage] = []
+    for index, candidate in enumerate(candidates):
+        message = _external_message_to_mail_message(candidate, "inbox", index)
+        candidate_time = _pickup_candidate_time(candidate)
+        if candidate_time is not None:
+            message.received_at = candidate_time
+        semantic_texts = _pickup_semantic_texts(candidate)
+        semantic_text = "\n".join(semantic_texts) or None
+        normalized_code = extract_code(message.code, semantic_text, message.subject, message.body_preview, message.text)
+        message.code = normalized_code
+        if message.text is None and semantic_text:
+            message.text = semantic_text
+        if message.body_preview is None and semantic_text:
+            message.body_preview = _truncate(semantic_text)
+        messages.append(message)
+    return messages
+
+
+def _pickup_candidate_time(value: Any) -> datetime | None:
+    if not isinstance(value, dict):
+        return None
+    for key, item in value.items():
+        if str(key).casefold() in _PICKUP_TIME_KEYS and item is not None:
+            parsed = _parse_pickup_time(str(item))
+            if parsed is not None:
+                return parsed
+    raw = value.get("raw")
+    return _pickup_candidate_time(raw) if isinstance(raw, dict) else None
+
+
+def _pickup_semantic_texts(value: Any, depth: int = 0) -> list[str]:
+    if depth > 10:
+        return []
+    if isinstance(value, list):
+        result: list[str] = []
+        for item in value:
+            result.extend(_pickup_semantic_texts(item, depth + 1))
+        return result
+    if not isinstance(value, dict):
+        return [str(value)] if isinstance(value, (str, int)) else []
+
+    result: list[str] = []
+    for key, item in value.items():
+        normalized_key = str(key).casefold()
+        if normalized_key not in _PICKUP_TEXT_KEYS:
+            continue
+        if isinstance(item, (dict, list)):
+            result.extend(_pickup_semantic_texts(item, depth + 1))
+        elif item is not None:
+            result.append(str(item))
+    return result
+
+
+class _PickupHtmlParser(HTMLParser):
+    _field_classes = {"body", "date", "meta", "subject"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_tag: str | None = None
+        self._article_depth = 0
+        self._current: dict[str, list[str]] | None = None
+        self._captures: list[tuple[str, str]] = []
+        self._articles: list[dict[str, str]] = []
+        self._page_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized_tag = tag.casefold()
+        if self._ignored_tag:
+            return
+        if normalized_tag in {"script", "style"}:
+            self._ignored_tag = normalized_tag
+            return
+        if normalized_tag == "article":
+            self._article_depth += 1
+            if self._current is None:
+                self._current = {"all": [], "body": [], "date": [], "meta": [], "subject": []}
+
+        if self._current is not None:
+            classes = {
+                item.casefold()
+                for name, value in attrs
+                if name.casefold() == "class" and value
+                for item in value.split()
+            }
+            field = next((name for name in self._field_classes if name in classes), None)
+            if field:
+                self._captures.append((normalized_tag, field))
+            if normalized_tag == "br":
+                self._append_text("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = tag.casefold()
+        if self._ignored_tag:
+            if normalized_tag == self._ignored_tag:
+                self._ignored_tag = None
+            return
+        for index in range(len(self._captures) - 1, -1, -1):
+            if self._captures[index][0] == normalized_tag:
+                del self._captures[index]
+                break
+        if normalized_tag == "article" and self._article_depth:
+            self._article_depth -= 1
+            if self._article_depth == 0 and self._current is not None:
+                self._articles.append({key: _compact_pickup_text(parts) for key, parts in self._current.items()})
+                self._current = None
+                self._captures.clear()
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_tag or not data:
+            return
+        self._page_text.append(data)
+        self._append_text(data)
+
+    def _append_text(self, value: str) -> None:
+        if self._current is None:
+            return
+        self._current["all"].append(value)
+        if self._captures:
+            self._current[self._captures[-1][1]].append(value)
+
+    def as_messages(self) -> list[MailMessage]:
+        if not self._articles:
+            fallback = _compact_pickup_text(self._page_text)
+            if not fallback:
+                return []
+            self._articles.append({"all": fallback, "body": fallback, "date": "", "meta": "", "subject": ""})
+
+        messages: list[MailMessage] = []
+        for article in self._articles:
+            all_text = article.get("all", "")
+            body = article.get("body", "") or all_text
+            subject = article.get("subject", "") or None
+            date_text = article.get("date", "")
+            date_match = re.search(
+                r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?\b",
+                date_text,
+            )
+            received_at = _parse_pickup_time(date_match.group(0) if date_match else date_text or None)
+            sender_text = re.sub(
+                r"^(?:from|\u53d1\u4ef6\u4eba)\s*[:\uff1a]\s*",
+                "",
+                article.get("meta", ""),
+                flags=re.I,
+            )
+            sender_name, sender_address = parseaddr(sender_text)
+            messages.append(
+                MailMessage(
+                    id=f"pickup-{hashlib.sha256(all_text.encode('utf-8')).hexdigest()[:16]}",
+                    folder="inbox",
+                    subject=subject,
+                    sender_name=sender_name or None,
+                    sender_address=sender_address or None,
+                    body_preview=_truncate(body),
+                    received_at=received_at,
+                    text=body,
+                    code=extract_code(body, subject, all_text),
+                    recipients=tuple(sorted(_extract_email_candidates(all_text))),
+                )
+            )
+        return messages
+
+
+def _compact_pickup_text(parts: list[str]) -> str:
+    return re.sub(r"\s+", " ", "".join(parts)).strip()
+
+
 def _custom_message_to_mail_message(message: Any, folder: str) -> MailMessage:
     if not isinstance(message, dict):
         return MailMessage(
@@ -1494,7 +1924,7 @@ def _external_message_to_mail_message(message: Any, folder: str, index: int) -> 
     text_source = text_content or (_strip_html(html_content) if html_content else None)
     snippet = _pick_mail_value(message, "snippet", "summary", "preview") or _truncate(text_source)
     subject = _pick_mail_value(message, "subject", "title") or "(No subject)"
-    code = _pick_mail_value(message, "code", "verification_code", "otp", "captcha") or extract_code(
+    code = _pick_mail_value(message, "code", "verification_code", "verificationCode", "otp", "captcha") or extract_code(
         subject,
         snippet,
         text_source,
@@ -1508,7 +1938,17 @@ def _external_message_to_mail_message(message: Any, folder: str, index: int) -> 
         sender_name=sender_name,
         sender_address=sender_address,
         body_preview=snippet,
-        received_at=_parse_mail_time(_pick_mail_value(message, "date", "received_at", "sent_at", "created_at", "internalDate")),
+        received_at=_parse_mail_time(
+            _pick_mail_value(
+                message,
+                "date",
+                "received_at",
+                "receivedDateTime",
+                "sent_at",
+                "created_at",
+                "internalDate",
+            )
+        ),
         text=text_source,
         code=code,
         recipients=_message_recipient_candidates(message, raw),

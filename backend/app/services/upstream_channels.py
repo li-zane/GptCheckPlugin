@@ -122,6 +122,23 @@ def _account_group_rate_change_reason(
     return None
 
 
+def _group_removal_matches(
+    change: dict[str, Any],
+    *,
+    group_id: str | None,
+    group_name: str | None,
+) -> bool:
+    if change.get("change_type") != "removed":
+        return False
+    expected_id = str(group_id or "").strip().casefold()
+    changed_id = str(change.get("group_id") or "").strip().casefold()
+    if expected_id:
+        return expected_id == changed_id
+    expected_name = str(group_name or "").strip().casefold()
+    changed_name = str(change.get("group_name") or "").strip().casefold()
+    return bool(expected_name and expected_name == changed_name)
+
+
 @dataclass(frozen=True)
 class UpstreamDiscoveryOptions:
     """Optional task inclusion overrides for one upstream discovery run."""
@@ -2392,6 +2409,7 @@ class UpstreamChannelService:
         attempts: int,
         *,
         attempt_interval_seconds: float = 0,
+        require_all_success: bool = False,
     ) -> tuple[bool | None, str | None, int | None, int]:
         candidates = sorted(
             {
@@ -2438,11 +2456,14 @@ class UpstreamChannelService:
                 success = False
                 redactor = getattr(self.sub2api, "redact_error_text", None)
                 error = redactor(exc) if callable(redactor) else None
-            if success:
+            if success and not require_all_success:
                 return True, None, last_account_id, completed_attempts
-            last_error = _safe_text(error, limit=300) or "Connection test failed."
+            if not success:
+                last_error = _safe_text(error, limit=300) or "Connection test failed."
             if bounded_interval and index + 1 < bounded_attempts:
                 await asyncio.sleep(bounded_interval)
+        if require_all_success and last_error is None:
+            return True, None, last_account_id, completed_attempts
         return False, last_error, last_account_id, completed_attempts
 
     async def _prepare_channel_monitor_guard(
@@ -2585,6 +2606,16 @@ class UpstreamChannelService:
                 attempt_interval_seconds = 0.0
             if not 0 <= attempt_interval_seconds <= 300:
                 attempt_interval_seconds = 0.0
+            get_require_all_success = getattr(
+                runtime_config,
+                "get_api_key_availability_all_tests_must_succeed",
+                None,
+            )
+            require_all_success = (
+                bool(await get_require_all_success())
+                if callable(get_require_all_success)
+                else False
+            )
         except Exception:
             config.availability_status = "unknown"
             config.availability_source = None
@@ -2622,6 +2653,7 @@ class UpstreamChannelService:
             "test_purpose": "recovery" if recovering else "pause",
             "max_test_attempts": attempts,
             "test_attempt_interval_seconds": attempt_interval_seconds,
+            "test_success_policy": "all" if require_all_success else "any",
         }
 
         def paused_by_other_reason() -> tuple[None, dict[str, Any]]:
@@ -2658,6 +2690,7 @@ class UpstreamChannelService:
                 model,
                 attempts,
                 attempt_interval_seconds=attempt_interval_seconds,
+                require_all_success=require_all_success,
             )
             evidence.update(
                 model=model or None,
@@ -2802,6 +2835,7 @@ class UpstreamChannelService:
             model,
             attempts,
             attempt_interval_seconds=attempt_interval_seconds,
+            require_all_success=require_all_success,
         )
         config.availability_checked_at = _utcnow()
         config.availability_source = "channel_monitor_fallback"
@@ -2815,10 +2849,16 @@ class UpstreamChannelService:
         )
         if success is True:
             config.availability_status = "available"
-            config.availability_message = (
-                f"{fallback_reason} Fallback connection test succeeded with model "
-                f"{model} after {completed} attempt(s)."
-            )
+            if require_all_success:
+                config.availability_message = (
+                    f"{fallback_reason} All {completed} fallback connection tests "
+                    f"succeeded with model {model}."
+                )
+            else:
+                config.availability_message = (
+                    f"{fallback_reason} Fallback connection test succeeded with model "
+                    f"{model} after {completed} attempt(s)."
+                )
             evidence["status"] = "available"
             return action_for_result("available"), evidence
         if success is False:
@@ -3443,6 +3483,7 @@ class UpstreamChannelService:
         current_remote: dict[str, Any],
         runtime_config: Any,
         rate_notification_events: list[dict[str, Any]],
+        group_removed_in_discovery: bool = False,
     ) -> None:
         group_changed = not self._same_multiplier(
             previous_group_multiplier,
@@ -3741,6 +3782,15 @@ class UpstreamChannelService:
             ),
         ):
             if old_health == new_health:
+                continue
+            if (
+                event_type == "upstream_group_status_changed"
+                and new_health == "deleted"
+                and group_removed_in_discovery
+            ):
+                # The channel-level group_removed event is the canonical deletion
+                # record for this observation. Emitting the account health view as
+                # well renders the same deletion twice in the shared change ledger.
                 continue
             invalid_statuses = (
                 INVALID_UPSTREAM_KEY_STATUSES
@@ -4746,6 +4796,14 @@ class UpstreamChannelService:
                         current_remote=current_remote,
                         runtime_config=runtime_config,
                         rate_notification_events=rate_notification_events,
+                        group_removed_in_discovery=any(
+                            _group_removal_matches(
+                                change,
+                                group_id=previous_group_id,
+                                group_name=previous_group_name,
+                            )
+                            for change in group_changes
+                        ),
                     )
                     self.accounts.apply_remote_snapshot(
                         config,

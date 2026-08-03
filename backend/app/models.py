@@ -63,6 +63,18 @@ class AccountSnapshot(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class AccountEditPreset(Base):
+    __tablename__ = "account_edit_presets"
+    __table_args__ = (UniqueConstraint("platform", "name", name="uq_account_edit_preset_platform_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    platform: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    configuration: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class MailboxCredential(Base):
     __tablename__ = "mailbox_credentials"
     __table_args__ = (UniqueConstraint("gpt_email", name="uq_mailbox_gpt_email"),)

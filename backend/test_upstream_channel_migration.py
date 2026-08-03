@@ -8,6 +8,7 @@ from app import models  # noqa: F401
 from app.core.crypto import decrypt_text, encrypt_text
 from app.core.database import (
     Base,
+    _migrate_duplicate_group_deletion_events,
     _migrate_legacy_rate_logs_to_change_events,
     _migrate_upstream_channels,
     _migrate_upstream_rate_change_logs,
@@ -442,6 +443,45 @@ class UpstreamChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((rows[0]["old_value"], rows[0]["new_value"]), (1.0, 1.5))
         self.assertEqual(rows[0]["legacy_imported"], 1)
         self.assertIn('"legacy_rate_log_id"', rows[0]["details"])
+
+    async def test_duplicate_group_deletion_events_are_removed_once(self) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_channel_change_events ("
+                    "channel_id, event_type, group_id, group_name, old_status, "
+                    "new_status, created_at"
+                    ") VALUES "
+                    "(3, 'group_removed', 'vip', 'VIP', 'available', 'removed', "
+                    "'2026-07-03 00:00:00'), "
+                    "(3, 'upstream_group_status_changed', 'vip', 'VIP', "
+                    "'available', 'deleted', '2026-07-03 00:00:00'), "
+                    "(3, 'upstream_group_status_changed', 'vip', 'VIP', "
+                    "'unavailable', 'deleted', '2026-07-04 00:00:00'), "
+                    "(3, 'upstream_group_status_changed', 'other', 'Other', "
+                    "'available', 'deleted', '2026-07-03 00:00:00')"
+                )
+            )
+            await _migrate_duplicate_group_deletion_events(conn)
+            await _migrate_duplicate_group_deletion_events(conn)
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT event_type, group_id, old_status, new_status "
+                        "FROM upstream_channel_change_events ORDER BY id"
+                    )
+                )
+            ).mappings().all()
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [(row["event_type"], row["group_id"]) for row in rows],
+            [
+                ("group_removed", "vip"),
+                ("upstream_group_status_changed", "vip"),
+                ("upstream_group_status_changed", "other"),
+            ],
+        )
 
     async def test_unbound_monitor_modes_are_preserved(self) -> None:
         async with self.engine.begin() as conn:

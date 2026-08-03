@@ -22,6 +22,7 @@ import {
   MailOpen,
   Moon,
   PauseCircle,
+  Pencil,
   Play,
   Plus,
   Radar,
@@ -71,6 +72,7 @@ import {
   accountEstimateHasEffectiveError,
   accountRateLimitShouldBeVisible,
 } from "./accountRateLimitPresentation";
+import { isOAuthPhoneVerificationStopped } from "./accountErrorPresentation";
 import { sortAccountsForTable } from "./accountTableSort";
 import {
   firstUnusedFallbackModel,
@@ -180,6 +182,10 @@ const loadHistoryView = () => import("./HistoryView");
 const HistoryView = lazy(async () => ({
   default: (await loadHistoryView()).HistoryView,
 }));
+const loadAccountEditorDialog = () => import("./AccountEditorDialog");
+const AccountEditorDialog = lazy(async () => ({
+  default: (await loadAccountEditorDialog()).AccountEditorDialog,
+}));
 
 type Theme = "light" | "dark";
 type AccountCounts = { actual: number; deduped: number; duplicates: number };
@@ -261,6 +267,8 @@ const emptySettings: AppSettings = {
   sub2api_auto_recover_state: true,
   automation_paused: false,
   oauth_account_sync_enabled: true,
+  oauth_login_mode: "protocol",
+  oauth_stop_on_phone_verification: false,
   recovery_enabled: false,
   monitor_interval_seconds: 300,
   usage_refresh_enabled: false,
@@ -283,6 +291,7 @@ const emptySettings: AppSettings = {
   api_key_auto_disable_on_upstream_unavailable: false,
   api_key_auto_pause_on_negative_balance_enabled: false,
   api_key_auto_pause_on_channel_monitor_unavailable_enabled: false,
+  api_key_availability_all_tests_must_succeed: false,
   channel_monitor_auto_probe_enabled: true,
   account_model_whitelist_sync_enabled: false,
   account_model_whitelist_sync_interval_seconds: 3600,
@@ -1263,6 +1272,10 @@ function App() {
                 unlocked ? "已解锁自动刷新" : "已恢复自动刷新锁定",
               )
             }
+            onAccountEdited={(message) => {
+              setNotice(message);
+              void api.accounts().then(setAccounts);
+            }}
           />
         ) : null}
         {view === "api-keys" ? (
@@ -1337,6 +1350,7 @@ function App() {
             busy={syncBusy}
             onImport={(content, provider) => runAction(() => api.importMailboxes(content, provider), "导入完成")}
             onDelete={(id) => runAction(() => api.deleteMailbox(id), "已删除")}
+            onDeleteMany={(ids) => runAction(() => api.deleteMailboxes(ids), `已删除 ${ids.length} 个邮箱`)}
           />
         ) : null}
         {view === "phones" ? (
@@ -1345,6 +1359,7 @@ function App() {
             busy={syncBusy}
             phones={phones}
             onDelete={(id) => runAction(() => api.deletePhone(id), "已删除手机号")}
+            onDeleteMany={(ids) => runAction(() => api.deletePhones(ids), `已删除 ${ids.length} 个手机号`)}
             onExport={async () => {
               const result = await api.exportPhones();
               downloadTextFile("phones.txt", result.message || "");
@@ -1942,6 +1957,7 @@ function AccountsView({
   onDeleteSelectedAccounts,
   onAccountJumpHandled,
   onDeleteRemote,
+  onAccountEdited,
   onToggleDeleteUnlock,
   onToggleRefreshLock,
   onRefresh,
@@ -1957,6 +1973,7 @@ function AccountsView({
   onDeleteSelectedAccounts: (accounts: Account[]) => void;
   onAccountJumpHandled: () => void;
   onDeleteRemote: (account: Account) => void;
+  onAccountEdited: (message: string) => void;
   onToggleDeleteUnlock: (account: Account, unlocked: boolean) => void;
   onToggleRefreshLock: (account: Account, unlocked: boolean) => void;
   onRefresh: (email: string) => void;
@@ -1982,6 +1999,7 @@ function AccountsView({
   const [mailError, setMailError] = useState("");
   const [selectedPhoneAccount, setSelectedPhoneAccount] = useState<Account | null>(null);
   const [selectedErrorAccount, setSelectedErrorAccount] = useState<Account | null>(null);
+  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [highlightedAccountKey, setHighlightedAccountKey] = useState<string | null>(null);
   const handledJumpRequestRef = useRef<number | null>(null);
   const livenessTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -2424,6 +2442,7 @@ function AccountsView({
                   selected={Boolean(selectedAccountKeys[accountRowKey(account)])}
                   usage={usageForAccount(account, usageByAccountId, usageByEmail)}
                   onDeleteRemote={deleteRemote}
+                  onEdit={setEditingAccount}
                   onToggleSelected={toggleSelectedAccount}
                   sessionDeleteUnlocked={Boolean(sessionDeleteUnlocks[accountRowKey(account)])}
                   onToggleRefreshLock={onToggleRefreshLock}
@@ -2455,6 +2474,15 @@ function AccountsView({
       {currentSelectedPhoneAccount ? <AccountPhoneDialog account={currentSelectedPhoneAccount} onClose={() => setSelectedPhoneAccount(null)} /> : null}
       {selectedErrorAccount ? <AccountErrorDialog account={selectedErrorAccount} onClose={() => setSelectedErrorAccount(null)} /> : null}
       {livenessAccounts ? <AccountLivenessDialog accounts={livenessAccounts} onClose={closeLivenessDialog} /> : null}
+      {editingAccount ? (
+        <Suspense fallback={null}>
+          <AccountEditorDialog
+            account={editingAccount}
+            onClose={() => setEditingAccount(null)}
+            onUpdated={onAccountEdited}
+          />
+        </Suspense>
+      ) : null}
     </>
   );
 }
@@ -2752,6 +2780,7 @@ function AccountRow({
   selected = false,
   usage,
   onDeleteRemote,
+  onEdit,
   onToggleSelected,
   sessionDeleteUnlocked = false,
   onToggleRefreshLock,
@@ -2770,6 +2799,7 @@ function AccountRow({
   selected?: boolean;
   usage?: AccountUsageEstimate;
   onDeleteRemote?: (account: Account) => void;
+  onEdit?: (account: Account) => void;
   onToggleSelected?: (account: Account, selected: boolean) => void;
   sessionDeleteUnlocked?: boolean;
   onToggleRefreshLock?: (account: Account, unlocked: boolean) => void;
@@ -2922,7 +2952,12 @@ function AccountRow({
       </td>
       <td className="error-cell">
         {errorSummary ? (
-          <button className="error-pill-button" onClick={() => onOpenError?.(account)} title="查看完整错误详情" type="button">
+          <button
+            className="error-pill-button"
+            onClick={() => onOpenError?.(account)}
+            title={errorSummary.title || "查看完整错误详情"}
+            type="button"
+          >
             <Badge className="error-pill-badge" tone={errorSummary.tone}>{errorSummary.label}</Badge>
           </button>
         ) : (
@@ -2938,6 +2973,18 @@ function AccountRow({
           ) : null}
           <button className="icon-button" disabled={busy} onClick={() => onOpenPhone?.(account)} title="查看手机号" type="button">
             <Smartphone size={16} />
+          </button>
+          <button
+            aria-label={`编辑 ${account.account_name || account.email}`}
+            className="icon-button"
+            disabled={busy || !account.sub2api_account_id || !onEdit}
+            onClick={() => onEdit?.(account)}
+            onFocus={() => void loadAccountEditorDialog()}
+            onMouseEnter={() => void loadAccountEditorDialog()}
+            title="编辑账号"
+            type="button"
+          >
+            <Pencil size={16} />
           </button>
           <button
             className={refreshLocked ? "icon-button lock-state" : "icon-button"}
@@ -3967,11 +4014,13 @@ function MailboxView({
   busy,
   onImport,
   onDelete,
+  onDeleteMany,
 }: {
   mailboxes: Mailbox[];
   busy: boolean;
   onImport: (content: string, provider: string) => void;
   onDelete: (id: number) => void;
+  onDeleteMany: (ids: number[]) => Promise<void> | void;
 }) {
   const timeZone = useDisplayTimeZone();
   const [content, setContent] = useState("");
@@ -3982,6 +4031,8 @@ function MailboxView({
   const [mailLoading, setMailLoading] = useState(false);
   const [mailError, setMailError] = useState("");
   const [mailboxSearch, setMailboxSearch] = useState("");
+  const [selectedMailboxIds, setSelectedMailboxIds] = useState<Set<number>>(() => new Set());
+  const selectAllMailboxesRef = useRef<HTMLInputElement>(null);
   const filteredMailboxes = useMemo(
     () =>
       mailboxes.filter((mailbox) =>
@@ -3999,6 +4050,9 @@ function MailboxView({
       ),
     [mailboxSearch, mailboxes],
   );
+  const allVisibleMailboxesSelected = filteredMailboxes.length > 0
+    && filteredMailboxes.every((mailbox) => selectedMailboxIds.has(mailbox.id));
+  const someVisibleMailboxesSelected = filteredMailboxes.some((mailbox) => selectedMailboxIds.has(mailbox.id));
 
   const supportsJunk = selectedMailbox ? ["outlook", "hotmail", "gmail"].includes(selectedMailbox.provider) : false;
   const openMessages = (mailbox: Mailbox) => {
@@ -4030,6 +4084,45 @@ function MailboxView({
     };
   }, [folder, selectedMailbox, supportsJunk]);
 
+  useEffect(() => {
+    const availableIds = new Set(mailboxes.map((mailbox) => mailbox.id));
+    setSelectedMailboxIds((current) => {
+      const next = new Set([...current].filter((mailboxId) => availableIds.has(mailboxId)));
+      return next.size === current.size ? current : next;
+    });
+    if (selectedMailbox && !availableIds.has(selectedMailbox.id)) setSelectedMailbox(null);
+  }, [mailboxes, selectedMailbox]);
+
+  useEffect(() => {
+    if (selectAllMailboxesRef.current) {
+      selectAllMailboxesRef.current.indeterminate = someVisibleMailboxesSelected && !allVisibleMailboxesSelected;
+    }
+  }, [allVisibleMailboxesSelected, someVisibleMailboxesSelected]);
+
+  const toggleVisibleMailboxes = () => {
+    setSelectedMailboxIds((current) => {
+      const next = new Set(current);
+      if (allVisibleMailboxesSelected) filteredMailboxes.forEach((mailbox) => next.delete(mailbox.id));
+      else filteredMailboxes.forEach((mailbox) => next.add(mailbox.id));
+      return next;
+    });
+  };
+  const toggleMailboxSelection = (mailboxId: number) => {
+    setSelectedMailboxIds((current) => {
+      const next = new Set(current);
+      if (next.has(mailboxId)) next.delete(mailboxId);
+      else next.add(mailboxId);
+      return next;
+    });
+  };
+  const deleteSelectedMailboxes = () => {
+    const mailboxIds = [...selectedMailboxIds];
+    if (!mailboxIds.length) return;
+    if (window.confirm(`确定删除选中的 ${mailboxIds.length} 个邮箱吗？此操作不可撤销。`)) {
+      void onDeleteMany(mailboxIds);
+    }
+  };
+
   return (
     <div className="stack">
       <section className="panel">
@@ -4049,6 +4142,7 @@ function MailboxView({
                 <option value="outlook">Outlook</option>
                 <option value="hotmail">Hotmail</option>
                 <option value="gmail">Gmail / Google Workspace</option>
+                <option value="url">URL 取件</option>
                 <option value="custom">Custom HTTP</option>
                 <option value="manual">Manual</option>
               </select>
@@ -4060,11 +4154,11 @@ function MailboxView({
           </div>
           <textarea
             onChange={(event) => setContent(event.target.value)}
-            placeholder={"gpt@example.com----mail@hotmail.com----mail_password----client_id----refresh_token\ncustom@edu.rainynight.me----yourname@gmail.com----gmail_app_password\nother@example.com----other@outlook.com----mail_password----client_id----refresh_token"}
+            placeholder={"gpt@example.com----mail@hotmail.com----mail_password----client_id----refresh_token\nurl@example.com----https://mail.example.com/messages/TOKEN/url%40example.com\naccount@example.com----inbox@example.com----https://mail.example.com/messages/TOKEN/inbox%40example.com"}
             rows={6}
             value={content}
           />
-          <p className="form-hint">支持批量导入，一行一个；空行和 # 开头的行会被忽略。Gmail 转发行可用 3 列：GPT 邮箱----转发到的 Gmail ---- Gmail App Password。</p>
+          <p className="form-hint">支持批量导入，一行一个；URL 取件支持“GPT 邮箱----取件 URL”或“GPT 邮箱----取件邮箱----取件 URL”。</p>
         </form>
       </section>
 
@@ -4079,12 +4173,32 @@ function MailboxView({
               total={mailboxes.length}
               value={mailboxSearch}
             />
+            <span className="resource-selection-count" aria-live="polite">已选 {selectedMailboxIds.size}</span>
+            <button
+              className="danger-button resource-bulk-delete"
+              disabled={busy || selectedMailboxIds.size === 0}
+              onClick={deleteSelectedMailboxes}
+              type="button"
+            >
+              <Trash2 size={16} />
+              <span>删除已选</span>
+            </button>
           </div>
         </div>
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
+                <th className="resource-select-cell">
+                  <input
+                    aria-label="全选当前筛选邮箱"
+                    checked={allVisibleMailboxesSelected}
+                    disabled={busy || filteredMailboxes.length === 0}
+                    onChange={toggleVisibleMailboxes}
+                    ref={selectAllMailboxesRef}
+                    type="checkbox"
+                  />
+                </th>
                 <th>GPT 邮箱</th>
                 <th>取件邮箱</th>
                 <th>类型</th>
@@ -4095,7 +4209,16 @@ function MailboxView({
             </thead>
             <tbody>
               {filteredMailboxes.map((mailbox) => (
-                <tr key={mailbox.id}>
+                <tr className={selectedMailboxIds.has(mailbox.id) ? "is-selected" : ""} key={mailbox.id}>
+                  <td className="resource-select-cell">
+                    <input
+                      aria-label={`选择邮箱 ${mailbox.gpt_email}`}
+                      checked={selectedMailboxIds.has(mailbox.id)}
+                      disabled={busy}
+                      onChange={() => toggleMailboxSelection(mailbox.id)}
+                      type="checkbox"
+                    />
+                  </td>
                   <td className="mono">{mailbox.gpt_email}</td>
                   <td className="mono">{mailbox.mailbox_email}</td>
                   <td>
@@ -4344,7 +4467,11 @@ function AccountErrorDialog({ account, onClose }: { account: Account; onClose: (
         <div className="phone-dialog-grid error-dialog-grid">
           <div className="phone-dialog-card">
             <strong>错误标签</strong>
-            {errorSummary ? <Badge tone={errorSummary.tone}>{errorSummary.label}</Badge> : <span className="muted">无</span>}
+            {errorSummary ? (
+              <span title={errorSummary.title}>
+                <Badge tone={errorSummary.tone}>{errorSummary.label}</Badge>
+              </span>
+            ) : <span className="muted">无</span>}
           </div>
           <div className="phone-dialog-card">
             <strong>当前状态</strong>
@@ -4379,6 +4506,7 @@ function PhoneView({
   onRefreshStatuses,
   onUpdateBindings,
   onDelete,
+  onDeleteMany,
 }: {
   phones: PhoneNumber[];
   accounts: Account[];
@@ -4388,11 +4516,14 @@ function PhoneView({
   onRefreshStatuses: () => Promise<void> | void;
   onUpdateBindings: (id: number, accountEmails: string[]) => Promise<void> | void;
   onDelete: (id: number) => Promise<void> | void;
+  onDeleteMany: (ids: number[]) => Promise<void> | void;
 }) {
   const timeZone = useDisplayTimeZone();
   const [content, setContent] = useState("");
   const [phoneSearch, setPhoneSearch] = useState("");
   const [selectedPhone, setSelectedPhone] = useState<PhoneNumber | null>(null);
+  const [selectedPhoneIds, setSelectedPhoneIds] = useState<Set<number>>(() => new Set());
+  const selectAllPhonesRef = useRef<HTMLInputElement>(null);
   const filteredPhones = useMemo(
     () =>
       phones.filter((phone) =>
@@ -4403,6 +4534,48 @@ function PhoneView({
       ),
     [phoneSearch, phones],
   );
+  const allVisiblePhonesSelected = filteredPhones.length > 0
+    && filteredPhones.every((phone) => selectedPhoneIds.has(phone.id));
+  const someVisiblePhonesSelected = filteredPhones.some((phone) => selectedPhoneIds.has(phone.id));
+
+  useEffect(() => {
+    const availableIds = new Set(phones.map((phone) => phone.id));
+    setSelectedPhoneIds((current) => {
+      const next = new Set([...current].filter((phoneId) => availableIds.has(phoneId)));
+      return next.size === current.size ? current : next;
+    });
+    if (selectedPhone && !availableIds.has(selectedPhone.id)) setSelectedPhone(null);
+  }, [phones, selectedPhone]);
+
+  useEffect(() => {
+    if (selectAllPhonesRef.current) {
+      selectAllPhonesRef.current.indeterminate = someVisiblePhonesSelected && !allVisiblePhonesSelected;
+    }
+  }, [allVisiblePhonesSelected, someVisiblePhonesSelected]);
+
+  const toggleVisiblePhones = () => {
+    setSelectedPhoneIds((current) => {
+      const next = new Set(current);
+      if (allVisiblePhonesSelected) filteredPhones.forEach((phone) => next.delete(phone.id));
+      else filteredPhones.forEach((phone) => next.add(phone.id));
+      return next;
+    });
+  };
+  const togglePhoneSelection = (phoneId: number) => {
+    setSelectedPhoneIds((current) => {
+      const next = new Set(current);
+      if (next.has(phoneId)) next.delete(phoneId);
+      else next.add(phoneId);
+      return next;
+    });
+  };
+  const deleteSelectedPhones = () => {
+    const phoneIds = [...selectedPhoneIds];
+    if (!phoneIds.length) return;
+    if (window.confirm(`确定删除选中的 ${phoneIds.length} 个手机号吗？此操作不可撤销。`)) {
+      void onDeleteMany(phoneIds);
+    }
+  };
 
   return (
     <div className="stack">
@@ -4448,6 +4621,16 @@ function PhoneView({
               total={phones.length}
               value={phoneSearch}
             />
+            <span className="resource-selection-count" aria-live="polite">已选 {selectedPhoneIds.size}</span>
+            <button
+              className="danger-button resource-bulk-delete"
+              disabled={busy || selectedPhoneIds.size === 0}
+              onClick={deleteSelectedPhones}
+              type="button"
+            >
+              <Trash2 size={16} />
+              <span>删除已选</span>
+            </button>
             <button className="secondary-button" disabled={busy || !phones.length} onClick={() => Promise.resolve(onRefreshStatuses()).catch(() => undefined)} type="button">
               <RefreshCcw size={17} />
               <span>检查接码</span>
@@ -4458,6 +4641,16 @@ function PhoneView({
           <table>
             <thead>
               <tr>
+                <th className="resource-select-cell">
+                  <input
+                    aria-label="全选当前筛选手机号"
+                    checked={allVisiblePhonesSelected}
+                    disabled={busy || filteredPhones.length === 0}
+                    onChange={toggleVisiblePhones}
+                    ref={selectAllPhonesRef}
+                    type="checkbox"
+                  />
+                </th>
                 <th>手机号</th>
                 <th>状态</th>
                 <th>接码信息</th>
@@ -4471,7 +4664,16 @@ function PhoneView({
               {filteredPhones.map((phone) => {
                 const smsSummary = phoneSmsSummary(phone, timeZone);
                 return (
-                  <tr key={phone.id}>
+                  <tr className={selectedPhoneIds.has(phone.id) ? "is-selected" : ""} key={phone.id}>
+                    <td className="resource-select-cell">
+                      <input
+                        aria-label={`选择手机号 ${phone.phone_number}`}
+                        checked={selectedPhoneIds.has(phone.id)}
+                        disabled={busy}
+                        onChange={() => togglePhoneSelection(phone.id)}
+                        type="checkbox"
+                      />
+                    </td>
                     <td className="mono">{phone.phone_number}</td>
                     <td>
                       <div className="status-stack">
@@ -4724,6 +4926,17 @@ function AutomationSettingInherited({ children }: { children: ReactNode }) {
 function scrollToSettingsSection(sectionId: string) {
   document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
+
+const settingsNavigation: ReadonlyArray<{ icon: LucideIcon; id: string; label: string }> = [
+  { icon: Link2, id: "settings-connection", label: "基础连接" },
+  { icon: RefreshCcw, id: "settings-oauth", label: "OAuth 账号" },
+  { icon: Database, id: "settings-api-key-sync", label: "API Key 与上游" },
+  { icon: ShieldCheck, id: "settings-api-key-policies", label: "可用性与暂停" },
+  { icon: TimerReset, id: "settings-usage", label: "用量与订阅" },
+  { icon: Database, id: "settings-data-management", label: "数据管理" },
+  { icon: Activity, id: "settings-notifications", label: "通知" },
+  { icon: Globe2, id: "settings-display-security", label: "界面偏好" },
+];
 
 function FallbackModelChainDialog({
   availableModels,
@@ -5220,6 +5433,12 @@ function SettingsView({
   const [autoRecoverState, setAutoRecoverState] = useState(settings.sub2api_auto_recover_state);
   const [automationPaused, setAutomationPaused] = useState(settings.automation_paused);
   const [oauthAccountSyncEnabled, setOauthAccountSyncEnabled] = useState(settings.oauth_account_sync_enabled ?? true);
+  const [oauthLoginMode, setOauthLoginMode] = useState<"protocol" | "browser">(
+    settings.oauth_login_mode ?? "protocol",
+  );
+  const [oauthStopOnPhoneVerification, setOauthStopOnPhoneVerification] = useState(
+    settings.oauth_stop_on_phone_verification ?? false,
+  );
   const [interval, setInterval] = useState(String(settings.monitor_interval_seconds));
   const [usageRefreshEnabled, setUsageRefreshEnabled] = useState(settings.usage_refresh_enabled);
   const [usageRefreshInterval, setUsageRefreshInterval] = useState(String(settings.usage_refresh_interval_seconds));
@@ -5270,6 +5489,9 @@ function SettingsView({
   );
   const [apiKeyChannelMonitorPauseEnabled, setApiKeyChannelMonitorPauseEnabled] = useState(
     settings.api_key_auto_pause_on_channel_monitor_unavailable_enabled ?? false,
+  );
+  const [apiKeyAvailabilityAllTestsMustSucceed, setApiKeyAvailabilityAllTestsMustSucceed] = useState(
+    settings.api_key_availability_all_tests_must_succeed ?? false,
   );
   const [channelMonitorAutoProbeEnabled, setChannelMonitorAutoProbeEnabled] = useState(
     settings.channel_monitor_auto_probe_enabled ?? true,
@@ -5386,6 +5608,8 @@ function SettingsView({
   const [logoPreviewUrl, setLogoPreviewUrl] = useState<string | null>(null);
   const [resetLogo, setResetLogo] = useState(false);
   const [logoError, setLogoError] = useState("");
+  const settingsPageRef = useRef<HTMLDivElement | null>(null);
+  const [activeSettingsSection, setActiveSettingsSection] = useState(settingsNavigation[0].id);
 
   useEffect(() => {
     if (!logoFile) {
@@ -5398,12 +5622,96 @@ function SettingsView({
   }, [logoFile]);
 
   useEffect(() => {
+    const settingsPage = settingsPageRef.current;
+    const workspace = settingsPage?.closest<HTMLElement>(".workspace--settings");
+    const documentScrollRoot = document.scrollingElement as HTMLElement | null;
+    if (!settingsPage) return undefined;
+
+    const getScrollRoot = () => {
+      const workspaceStyle = workspace ? window.getComputedStyle(workspace) : null;
+      const workspaceOwnsScroll = Boolean(
+        workspace
+        && workspace.scrollHeight > workspace.clientHeight
+        && ["auto", "overlay", "scroll"].includes(workspaceStyle?.overflowY || ""),
+      );
+      return workspaceOwnsScroll ? workspace : documentScrollRoot;
+    };
+
+    let animationFrame = 0;
+    const updateActiveSettingsSection = () => {
+      window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => {
+        const scrollRoot = getScrollRoot();
+        if (!scrollRoot) return;
+        const rootTop = scrollRoot === documentScrollRoot ? 0 : scrollRoot.getBoundingClientRect().top;
+        const activationLine = rootTop
+          + Math.min(220, scrollRoot.clientHeight * 0.3);
+        const maxScrollTop = scrollRoot.scrollHeight - scrollRoot.clientHeight;
+        const isAtBottom = maxScrollTop > 0 && scrollRoot.scrollTop >= maxScrollTop - 2;
+        let nextSectionId = settingsNavigation[0].id;
+
+        for (const item of settingsNavigation) {
+          const section = settingsPage.querySelector<HTMLElement>(`#${item.id}`);
+          if (!section) continue;
+          if (section.getBoundingClientRect().top > activationLine) break;
+          nextSectionId = item.id;
+        }
+
+        if (isAtBottom) {
+          nextSectionId = settingsNavigation[settingsNavigation.length - 1].id;
+        }
+        setActiveSettingsSection((current) => current === nextSectionId ? current : nextSectionId);
+      });
+    };
+
+    const scrollTargets: HTMLElement[] = [];
+    if (workspace) scrollTargets.push(workspace);
+    if (documentScrollRoot && documentScrollRoot !== workspace) scrollTargets.push(documentScrollRoot);
+    scrollTargets.forEach((target) => target.addEventListener("scroll", updateActiveSettingsSection, { passive: true }));
+    window.addEventListener("scroll", updateActiveSettingsSection, { passive: true });
+    window.addEventListener("resize", updateActiveSettingsSection);
+    updateActiveSettingsSection();
+
+    return () => {
+      scrollTargets.forEach((target) => target.removeEventListener("scroll", updateActiveSettingsSection));
+      window.removeEventListener("scroll", updateActiveSettingsSection);
+      window.removeEventListener("resize", updateActiveSettingsSection);
+      window.cancelAnimationFrame(animationFrame);
+    };
+  }, []);
+
+  useEffect(() => {
+    const settingsPage = settingsPageRef.current;
+    const nav = settingsPage?.querySelector<HTMLElement>(".settings-local-nav");
+    const activeButton = nav?.querySelector<HTMLElement>('button[aria-current="location"]');
+    if (!nav || !activeButton) return undefined;
+
+    const navRect = nav.getBoundingClientRect();
+    const buttonRect = activeButton.getBoundingClientRect();
+    const edgePadding = 8;
+    if (buttonRect.left < navRect.left + edgePadding) {
+      nav.scrollTo({
+        behavior: "smooth",
+        left: nav.scrollLeft - (navRect.left + edgePadding - buttonRect.left),
+      });
+    } else if (buttonRect.right > navRect.right - edgePadding) {
+      nav.scrollTo({
+        behavior: "smooth",
+        left: nav.scrollLeft + (buttonRect.right - (navRect.right - edgePadding)),
+      });
+    }
+    return undefined;
+  }, [activeSettingsSection]);
+
+  useEffect(() => {
     setSiteName(settings.site_name || defaultSiteName);
     setInstanceUrl(toSub2ApiInstanceUrl(settings.sub2api_base_url));
     setRecoveryEnabled(settings.recovery_enabled);
     setAutoRecoverState(settings.sub2api_auto_recover_state);
     setAutomationPaused(settings.automation_paused);
     setOauthAccountSyncEnabled(settings.oauth_account_sync_enabled ?? true);
+    setOauthLoginMode(settings.oauth_login_mode ?? "protocol");
+    setOauthStopOnPhoneVerification(settings.oauth_stop_on_phone_verification ?? false);
     setInterval(String(settings.monitor_interval_seconds));
     setUsageRefreshEnabled(settings.usage_refresh_enabled);
     setUsageRefreshInterval(String(settings.usage_refresh_interval_seconds));
@@ -5428,6 +5736,9 @@ function SettingsView({
     setApiKeyNegativeBalancePauseEnabled(settings.api_key_auto_pause_on_negative_balance_enabled ?? false);
     setApiKeyChannelMonitorPauseEnabled(
       settings.api_key_auto_pause_on_channel_monitor_unavailable_enabled ?? false,
+    );
+    setApiKeyAvailabilityAllTestsMustSucceed(
+      settings.api_key_availability_all_tests_must_succeed ?? false,
     );
     setChannelMonitorAutoProbeEnabled(settings.channel_monitor_auto_probe_enabled ?? true);
     setAccountModelWhitelistSyncEnabled(
@@ -5496,6 +5807,7 @@ function SettingsView({
     settings.api_key_auto_disable_on_upstream_unavailable,
     settings.api_key_auto_pause_on_negative_balance_enabled,
     settings.api_key_auto_pause_on_channel_monitor_unavailable_enabled,
+    settings.api_key_availability_all_tests_must_succeed,
     settings.channel_monitor_auto_probe_enabled,
     settings.manual_upstream_sync_rate_enabled,
     settings.manual_upstream_sync_priority_enabled,
@@ -5533,6 +5845,8 @@ function SettingsView({
     settings.display_timezone,
     settings.monitor_interval_seconds,
     settings.oauth_account_sync_enabled,
+    settings.oauth_login_mode,
+    settings.oauth_stop_on_phone_verification,
     settings.protocol_refresh_max_concurrency,
     settings.recovery_enabled,
     settings.site_name,
@@ -5738,6 +6052,8 @@ function SettingsView({
       sub2api_auto_recover_state: autoRecoverState,
       automation_paused: automationPaused,
       oauth_account_sync_enabled: oauthAccountSyncEnabled,
+      oauth_login_mode: oauthLoginMode,
+      oauth_stop_on_phone_verification: oauthStopOnPhoneVerification,
       monitor_interval_seconds: intervalNumber,
       usage_refresh_enabled: usageRefreshEnabled,
       usage_refresh_interval_seconds: usageRefreshIntervalNumber,
@@ -5759,6 +6075,7 @@ function SettingsView({
       api_key_auto_disable_on_upstream_unavailable: apiKeyAutoDisableEnabled,
       api_key_auto_pause_on_negative_balance_enabled: apiKeyNegativeBalancePauseEnabled,
       api_key_auto_pause_on_channel_monitor_unavailable_enabled: apiKeyChannelMonitorPauseEnabled,
+      api_key_availability_all_tests_must_succeed: apiKeyAvailabilityAllTestsMustSucceed,
       channel_monitor_auto_probe_enabled: channelMonitorAutoProbeEnabled,
       account_model_whitelist_sync_enabled: accountModelWhitelistSyncEnabled,
       account_model_whitelist_sync_interval_seconds: accountModelWhitelistSyncIntervalNumber,
@@ -5809,7 +6126,7 @@ function SettingsView({
     }
     await onSave(payload, { logoFile, resetLogo });
   };
-  const enabledAutomationCount = [
+  const automationSwitches = [
     oauthAccountSyncEnabled,
     apiKeyAccountSyncEnabled,
     recoveryEnabled,
@@ -5822,28 +6139,52 @@ function SettingsView({
     channelMonitorAutoProbeEnabled,
     accountModelWhitelistSyncEnabled,
     usageRefreshEnabled,
-  ].filter(Boolean).length;
+  ];
+  const enabledAutomationCount = automationSwitches.filter(Boolean).length;
 
   return (
-    <div className="stack settings-page">
+    <div className="settings-page" ref={settingsPageRef}>
       <nav aria-label="设置页面导航" className="settings-local-nav">
-        <button onClick={() => scrollToSettingsSection("settings-connection")} type="button"><Link2 size={15} /><span>站点连接</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-automation")} type="button"><RefreshCcw size={15} /><span>自动任务</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-resources")} type="button"><TimerReset size={15} /><span>资源限制</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-usage")} type="button"><Database size={15} /><span>用量额度</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-data-management")} type="button"><Database size={15} /><span>数据管理与备份</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-notifications")} type="button"><Activity size={15} /><span>通知</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-display-security")} type="button"><ShieldCheck size={15} /><span>显示安全</span></button>
-        <button onClick={() => scrollToSettingsSection("settings-scan")} type="button"><Radar size={15} /><span>端口扫描</span></button>
+        <div className="settings-local-nav-heading">
+          <span><Settings2 size={16} />设置分组</span>
+          <small>{settingsNavigation.length} 个功能区</small>
+        </div>
+        <div className="settings-local-nav-items">
+          {settingsNavigation.map(({ icon: Icon, id, label }) => (
+            <button
+              aria-current={activeSettingsSection === id ? "location" : undefined}
+              key={id}
+              onClick={() => scrollToSettingsSection(id)}
+              type="button"
+            >
+              <Icon size={16} />
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
       </nav>
 
-      <section className="settings-form-shell">
-        <div className="settings-save-header">
-          <PanelTitle title="运行设置" icon={Link2} />
-        </div>
+      <div className="settings-content">
+        <section className="settings-runtime-bar" id="settings-runtime">
+          <div className="settings-runtime-copy">
+            <span>运行控制</span>
+            <strong>{automationPaused ? "自动任务已暂停" : "自动任务运行中"}</strong>
+            <small>已开启 {enabledAutomationCount}/{automationSwitches.length} 项自动任务</small>
+          </div>
+          <label className="checkbox-line settings-toggle settings-global-toggle">
+            <input
+              checked={automationPaused}
+              onChange={(event) => setAutomationPaused(event.target.checked)}
+              type="checkbox"
+            />
+            <span>暂停全部自动任务</span>
+          </label>
+        </section>
+
+        <section className="settings-form-shell">
         <form className="settings-form" id="runtime-settings-form" onSubmit={submit}>
           <fieldset className="settings-section settings-section--connection" id="settings-connection">
-            <legend>站点与连接</legend>
+            <legend>基础与连接</legend>
             <div className="settings-grid settings-main-grid settings-connection-grid">
             <label className="site-name-label">
               站点名
@@ -5900,35 +6241,63 @@ function SettingsView({
               </div>
             </div>
             </div>
+
+            <div className="settings-connection-tools">
+              <div className="settings-connection-secret">
+                <div className="settings-grid secret-grid">
+                  <label>
+                    x-api 密钥
+                    <input
+                      autoComplete="new-password"
+                      onChange={(event) => setXApiKey(event.target.value)}
+                      placeholder={settings.sub2api_x_api_key_set ? "留空保持当前密钥" : "输入 sub2api x-api-key"}
+                      type="password"
+                      value={xApiKey}
+                    />
+                  </label>
+                  <label className="checkbox-line settings-toggle">
+                    <input
+                      checked={clearXApiKey}
+                      onChange={(event) => setClearXApiKey(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span>清空已保存密钥</span>
+                  </label>
+                </div>
+                <div className="key-state">
+                  <KeyRound size={16} />
+                  {settings.sub2api_x_api_key_set ? (
+                    <span className="settings-secret-state">
+                      <span>已保存</span>
+                      {settings.sub2api_x_api_key_hint ? (
+                        <MiddleEllipsisText text={settings.sub2api_x_api_key_hint} />
+                      ) : null}
+                    </span>
+                  ) : <span>未设置</span>}
+                </div>
+              </div>
+
+              <div className="settings-scan-inline" id="settings-scan">
+                <div className="settings-subsection-heading">
+                  <span><Radar size={16} /><strong>连接检测</strong></span>
+                  <button className="secondary-button" disabled={busy} onClick={onScan} type="button">
+                    <Radar size={16} />
+                    <span>扫描 sub2api</span>
+                  </button>
+                </div>
+                <div className="settings-status settings-connection-status">
+                  <SignalLine label="配置来源" value={sourceLabel(settings.sub2api_base_url_source)} />
+                  <SignalLine label="当前地址" value={settings.sub2api_base_url} />
+                  <SignalLine label="上次扫描" value={settings.last_scan_at ? formatDate(settings.last_scan_at, displayTimeZone) : "暂无"} />
+                  <SignalLine label="扫描结果" value={settings.last_scan_message || "暂无"} />
+                </div>
+              </div>
+            </div>
           </fieldset>
 
-          <fieldset className="settings-section settings-section--automation" id="settings-automation">
-            <legend>自动任务与策略</legend>
-            <label className="checkbox-line settings-toggle settings-global-toggle">
-              <input
-                checked={automationPaused}
-                onChange={(event) => setAutomationPaused(event.target.checked)}
-                type="checkbox"
-              />
-              <span>暂停全部自动任务</span>
-            </label>
-            <div className="automation-settings-table">
-              <div className="automation-settings-head">
-                <span>功能开关</span>
-                <span className="settings-label-with-help">
-                  线程数
-                  <HelpPopover label="查看线程数说明">
-                    填 0 表示本批任务不限并发，取得账号或渠道清单后会同时发起。
-                  </HelpPopover>
-                </span>
-                <span>自动执行间隔</span>
-                <span className="settings-label-with-help">
-                  手动同步
-                  <HelpPopover label="查看手动同步说明">
-                    勾选后，点击“同步 API Key 账号”或上游卡片的同步按钮时会执行该项；取消勾选可只刷新基础上游数据，减少等待和连接测试消耗。
-                  </HelpPopover>
-                </span>
-              </div>
+          <fieldset className="settings-section settings-section--automation" id="settings-oauth">
+            <legend>OAuth 账号</legend>
+            <AutomationSettingsTable>
               <AutomationSettingRow
                 checked={oauthAccountSyncEnabled}
                 interval={(
@@ -5942,37 +6311,6 @@ function SettingsView({
                 )}
                 label="同步 sub2api OAuth 账号"
                 onChange={setOauthAccountSyncEnabled}
-                threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
-              />
-              <AutomationSettingRow
-                checked={apiKeyAccountSyncEnabled}
-                interval={(
-                  <AutomationSettingDuration
-                    ariaLabel="API Key 账号同步间隔"
-                    maxSeconds={86_400}
-                    minSeconds={30}
-                    onChange={setApiKeyAccountSyncInterval}
-                    value={apiKeyAccountSyncInterval}
-                  />
-                )}
-                label="同步 sub2api API Key 账号"
-                onChange={setApiKeyAccountSyncEnabled}
-                threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
-              />
-              <AutomationSettingRow
-                checked={accountModelWhitelistSyncEnabled}
-                description="开启后按独立间隔刷新已导入账号的可用模型白名单；关闭时仍会在首次导入或本地缺失白名单时补齐。"
-                interval={(
-                  <AutomationSettingDuration
-                    ariaLabel="账号可用模型白名单刷新间隔"
-                    maxSeconds={86_400}
-                    minSeconds={60}
-                    onChange={setAccountModelWhitelistSyncInterval}
-                    value={accountModelWhitelistSyncInterval}
-                  />
-                )}
-                label="自动刷新账号可用模型白名单"
-                onChange={setAccountModelWhitelistSyncEnabled}
                 threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
               />
               <AutomationSettingRow
@@ -6006,6 +6344,139 @@ function SettingsView({
                     </label>
                   </div>
                 )}
+              />
+              <AutomationSettingRow
+                checked={usageRefreshEnabled}
+                interval={(
+                  <AutomationSettingDuration
+                    ariaLabel="OAuth 用量窗口同步间隔"
+                    maxSeconds={86_400}
+                    minSeconds={60}
+                    onChange={setUsageRefreshInterval}
+                    value={usageRefreshInterval}
+                  />
+                )}
+                label="同步 OAuth 账号用量窗口"
+                onChange={setUsageRefreshEnabled}
+                threads={(
+                  <AutomationSettingNumber
+                    ariaLabel="OAuth 用量窗口同步线程数"
+                    max={100}
+                    min={0}
+                    onChange={setUsageRefreshMaxConcurrency}
+                    value={usageRefreshMaxConcurrency}
+                  />
+                )}
+              />
+            </AutomationSettingsTable>
+
+            <div
+              className="settings-auto-pause-policy settings-oauth-policy"
+              role="group"
+              aria-label="OAuth 重新登录策略"
+            >
+              <div className="settings-policy-heading">
+                <span className="settings-label-with-help">
+                  <strong>重新登录策略</strong>
+                  <HelpPopover label="查看 OAuth 重新登录策略说明">
+                    Refresh Token 刷新失败后，使用这里选定的方式重新登录 OpenAI OAuth；协议模式与无头浏览器模式不会互相回退。
+                  </HelpPopover>
+                </span>
+                <span className={`api-key-chip api-key-chip--${recoveryEnabled ? "success" : "muted"}`}>
+                  {recoveryEnabled ? "已启用" : "已关闭"}
+                </span>
+              </div>
+              <div className="settings-oauth-policy-controls">
+                <div className="settings-oauth-mode-field">
+                  <span>重新登录方式</span>
+                  <div className="api-key-segmented api-key-segmented--two" role="group" aria-label="OAuth 重新登录方式">
+                    <button
+                      aria-pressed={oauthLoginMode === "protocol"}
+                      className={oauthLoginMode === "protocol" ? "active" : ""}
+                      onClick={() => setOauthLoginMode("protocol")}
+                      type="button"
+                    >协议</button>
+                    <button
+                      aria-pressed={oauthLoginMode === "browser"}
+                      className={oauthLoginMode === "browser" ? "active" : ""}
+                      onClick={() => setOauthLoginMode("browser")}
+                      type="button"
+                    >无头浏览器</button>
+                  </div>
+                </div>
+                <label className="checkbox-line settings-toggle settings-oauth-phone-stop">
+                  <input
+                    checked={oauthStopOnPhoneVerification}
+                    onChange={(event) => setOauthStopOnPhoneVerification(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span className="settings-toggle-copy">
+                    <span className="settings-label-with-help">
+                      <strong>遇到手机验证码时停止</strong>
+                      <HelpPopover label="查看手机验证码停止策略说明">
+                        开启后，重新 OAuth 遇到手机验证会立即终止；任务日志和账号错误标签会记录该原因。
+                      </HelpPopover>
+                    </span>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div className="settings-grid settings-section-grid settings-oauth-resource-grid">
+              <label>
+                浏览器最低可用内存（MB）
+                <input
+                  max={1048576}
+                  min={0}
+                  onChange={(event) => setBrowserMinAvailableMemoryMb(event.target.value)}
+                  type="number"
+                  value={browserMinAvailableMemoryMb}
+                />
+              </label>
+              <label className="checkbox-line settings-toggle settings-automation-policy">
+                <input
+                  checked={autoRecoverState}
+                  onChange={(event) => setAutoRecoverState(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>凭证刷新成功后恢复 sub2api 调度状态</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset className="settings-section settings-section--automation" id="settings-api-key-sync">
+            <legend>API Key 与上游同步</legend>
+            <AutomationSettingsTable>
+              <AutomationSettingRow
+                checked={apiKeyAccountSyncEnabled}
+                interval={(
+                  <AutomationSettingDuration
+                    ariaLabel="API Key 账号同步间隔"
+                    maxSeconds={86_400}
+                    minSeconds={30}
+                    onChange={setApiKeyAccountSyncInterval}
+                    value={apiKeyAccountSyncInterval}
+                  />
+                )}
+                label="同步 sub2api API Key 账号"
+                onChange={setApiKeyAccountSyncEnabled}
+                threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
+              />
+              <AutomationSettingRow
+                checked={accountModelWhitelistSyncEnabled}
+                description="开启后按独立间隔刷新已导入账号的可用模型白名单；关闭时仍会在首次导入或本地缺失白名单时补齐。"
+                interval={(
+                  <AutomationSettingDuration
+                    ariaLabel="账号可用模型白名单刷新间隔"
+                    maxSeconds={86_400}
+                    minSeconds={60}
+                    onChange={setAccountModelWhitelistSyncInterval}
+                    value={accountModelWhitelistSyncInterval}
+                  />
+                )}
+                label="自动刷新账号可用模型白名单"
+                onChange={setAccountModelWhitelistSyncEnabled}
+                threads={<AutomationSettingInherited>无需设置</AutomationSettingInherited>}
               />
               <AutomationSettingRow
                 checked={upstreamSyncEnabled}
@@ -6062,6 +6533,27 @@ function SettingsView({
                 threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
               />
               <AutomationSettingRow
+                checked={upstreamPrioritySyncEnabled}
+                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+                label="修改 API Key 账号优先级"
+                manual={(
+                  <AutomationSettingManualCheckbox
+                    checked={manualUpstreamPriorityEnabled}
+                    disabled={!upstreamPrioritySyncEnabled}
+                    label="手动同步时修改 API Key 账号优先级"
+                    onChange={setManualUpstreamPriorityEnabled}
+                  />
+                )}
+                onChange={setUpstreamPrioritySyncEnabled}
+                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
+              />
+            </AutomationSettingsTable>
+          </fieldset>
+
+          <fieldset className="settings-section settings-section--automation" id="settings-api-key-policies">
+            <legend>可用性与暂停</legend>
+            <AutomationSettingsTable>
+              <AutomationSettingRow
                 checked={apiKeyChannelMonitorPauseEnabled}
                 description="自动检测与策略判定跟随上游同步任务执行；手动检测不受自动任务暂停或其他暂停原因限制。"
                 interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
@@ -6075,21 +6567,6 @@ function SettingsView({
                   />
                 )}
                 onChange={setApiKeyChannelMonitorPauseEnabled}
-                threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
-              />
-              <AutomationSettingRow
-                checked={upstreamPrioritySyncEnabled}
-                interval={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
-                label="修改 API Key 账号优先级"
-                manual={(
-                  <AutomationSettingManualCheckbox
-                    checked={manualUpstreamPriorityEnabled}
-                    disabled={!upstreamPrioritySyncEnabled}
-                    label="手动同步时修改 API Key 账号优先级"
-                    onChange={setManualUpstreamPriorityEnabled}
-                  />
-                )}
-                onChange={setUpstreamPrioritySyncEnabled}
                 threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
               />
               <AutomationSettingRow
@@ -6124,30 +6601,7 @@ function SettingsView({
                 onChange={setApiKeyNegativeBalancePauseEnabled}
                 threads={<AutomationSettingInherited>跟随上游同步</AutomationSettingInherited>}
               />
-              <AutomationSettingRow
-                checked={usageRefreshEnabled}
-                interval={(
-                  <AutomationSettingDuration
-                    ariaLabel="OAuth 用量窗口同步间隔"
-                    maxSeconds={86_400}
-                    minSeconds={60}
-                    onChange={setUsageRefreshInterval}
-                    value={usageRefreshInterval}
-                  />
-                )}
-                label="同步 OAuth 账号用量窗口"
-                onChange={setUsageRefreshEnabled}
-                threads={(
-                  <AutomationSettingNumber
-                    ariaLabel="OAuth 用量窗口同步线程数"
-                    max={100}
-                    min={0}
-                    onChange={setUsageRefreshMaxConcurrency}
-                    value={usageRefreshMaxConcurrency}
-                  />
-                )}
-              />
-            </div>
+            </AutomationSettingsTable>
             <div className="settings-automation-policies">
               <div
                 className="settings-auto-pause-policy"
@@ -6158,7 +6612,7 @@ function SettingsView({
                   <span className="settings-label-with-help">
                     <strong>API Key 账号可用性监测策略</strong>
                     <HelpPopover label="查看 API Key 可用性监测策略说明">
-                      仅处理已绑定具体监控面板或已启用独立模型测试的账号。监控面板代表上游的单个分组或模型路由，不代表上游站点整体状态；面板状态为可用或降级时都直接判定账号可用，不进行回退模型测试，降级仅以黄色状态提示。面板缺失、读取失败、状态未知或不可用时才按账号白名单模型回退测试。自动检测跟随上游同步；存在余额、上游 Key、分组或倍率等其他暂停原因时保留上次结果并暂停自动连接测试，手动检测仍会先刷新监控面板及其状态详情并执行。启用账号的暂停判定使用“暂停判定测试次数”，因可用性监测而暂停的账号使用独立的“恢复判定测试次数”；任意一次连接成功即判定可用，全部失败才暂停或保持暂停。没有可用回退模型时不会据此暂停账号。
+                      仅处理已绑定具体监控面板或已启用独立模型测试的账号。监控面板代表上游的单个分组或模型路由，不代表上游站点整体状态；面板状态为可用或降级时都直接判定账号可用，不进行回退模型测试，降级仅以黄色状态提示。面板缺失、读取失败、状态未知或不可用时才按账号白名单模型回退测试。自动检测跟随上游同步；存在余额、上游 Key、分组或倍率等其他暂停原因时保留上次结果并暂停自动连接测试，手动检测仍会先刷新监控面板及其状态详情并执行。启用账号的暂停判定使用“暂停判定测试次数”，因可用性监测而暂停的账号使用独立的“恢复判定测试次数”；{apiKeyAvailabilityAllTestsMustSucceed ? "全部连接测试均成功才判定可用，任意一次失败都会暂停或保持暂停。" : "任意一次连接成功即判定可用，全部失败才暂停或保持暂停。"}没有可用回退模型时不会据此暂停账号。
                     </HelpPopover>
                   </span>
                   <span className={`api-key-chip api-key-chip--${apiKeyChannelMonitorPauseEnabled ? "success" : "muted"}`}>
@@ -6204,11 +6658,26 @@ function SettingsView({
                       </span>
                     </span>
                   </label>
+                  <label className="checkbox-line settings-toggle settings-availability-success-policy">
+                    <input
+                      checked={apiKeyAvailabilityAllTestsMustSucceed}
+                      onChange={(event) => setApiKeyAvailabilityAllTestsMustSucceed(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span className="settings-toggle-copy">
+                      <span className="settings-label-with-help">
+                        <strong>全部连接测试成功才判定可用</strong>
+                        <HelpPopover label="查看连续连接测试成功判定说明">
+                          关闭时，连续测试中任意一次成功即可判定可用；开启时，会执行配置的全部测试次数，只有全部成功才判定可用，任意一次失败都会判定不可用。此策略同时用于暂停与恢复判定。
+                        </HelpPopover>
+                      </span>
+                    </span>
+                  </label>
                   <label>
                     <span className="settings-label-with-help">
                       暂停判定测试次数
                       <HelpPopover label="查看暂停判定测试次数说明">
-                        对当前未被可用性监测暂停的账号，最多发起 1 至 5 次连接测试；任意一次成功即判定可用，全部失败则立即暂停账号。
+                        对当前未被可用性监测暂停的账号发起 1 至 5 次连接测试，并按当前成功判定策略决定是否暂停账号。
                       </HelpPopover>
                     </span>
                     <AutomationSettingNumber
@@ -6223,7 +6692,7 @@ function SettingsView({
                     <span className="settings-label-with-help">
                       恢复判定测试次数
                       <HelpPopover label="查看恢复判定测试次数说明">
-                        对因可用性监测而自动暂停的账号，最多发起 1 至 5 次连接测试；任意一次成功即恢复账号，全部失败则保持暂停。
+                        对因可用性监测而自动暂停的账号发起 1 至 5 次连接测试，并按当前成功判定策略决定是否恢复账号。
                       </HelpPopover>
                     </span>
                     <AutomationSettingNumber
@@ -6238,7 +6707,7 @@ function SettingsView({
                     <span className="settings-label-with-help">
                       多次测试间隔
                       <HelpPopover label="查看多次测试间隔说明">
-                        当暂停或恢复判定需要测试多次时，每次失败后等待此时间再开始下一次；设为 0 秒时连续测试。
+                        当暂停或恢复判定需要测试多次时，每次测试后等待此时间再开始下一次；设为 0 秒时连续测试。
                       </HelpPopover>
                     </span>
                     <AutomationSettingDuration
@@ -6345,19 +6814,7 @@ function SettingsView({
                 </span>
               </label>
             </div>
-            <label className="checkbox-line settings-toggle settings-automation-policy">
-              <input
-                checked={autoRecoverState}
-                onChange={(event) => setAutoRecoverState(event.target.checked)}
-                type="checkbox"
-              />
-              <span>凭证刷新成功后恢复 sub2api 调度状态</span>
-            </label>
-          </fieldset>
-
-          <fieldset className="settings-section" id="settings-resources">
-            <legend>手动任务资源限制</legend>
-            <div className="settings-grid settings-section-grid settings-resource-grid">
+            <div className="settings-grid settings-section-grid settings-policy-resource-grid">
               <label>
                 账号测活最大线程数
                 <input
@@ -6369,21 +6826,11 @@ function SettingsView({
                   value={accountLivenessMaxConcurrency}
                 />
               </label>
-              <label>
-                浏览器最低可用内存（MB）
-                <input
-                  max={1048576}
-                  min={0}
-                  onChange={(event) => setBrowserMinAvailableMemoryMb(event.target.value)}
-                  type="number"
-                  value={browserMinAvailableMemoryMb}
-                />
-              </label>
             </div>
           </fieldset>
 
           <fieldset className="settings-section" id="settings-usage">
-            <legend>用量与订阅规则</legend>
+            <legend>用量与订阅</legend>
             <div className="settings-grid settings-section-grid">
             <label>
               默认 5h 用量阈值 (%)
@@ -6430,10 +6877,11 @@ function SettingsView({
               />
             </label>
             </div>
-          </fieldset>
-
-          <fieldset className="quota-range-settings settings-section" id="settings-quota-ranges">
-            <legend>订阅默认额度区间</legend>
+            <section className="quota-range-settings settings-subsection" id="settings-quota-ranges">
+              <div className="settings-subsection-heading">
+                <strong>订阅默认额度区间</strong>
+                <span>{Object.keys(usageLimitDefaultRanges).length} 种订阅</span>
+              </div>
             <div className="quota-range-list">
               {Object.entries(usageLimitDefaultRanges)
                 .sort(([left], [right]) => subscriptionTypeSortRank(left) - subscriptionTypeSortRank(right) || left.localeCompare(right))
@@ -6516,10 +6964,11 @@ function SettingsView({
                 <span>新增</span>
               </button>
             </div>
+            </section>
           </fieldset>
 
           <fieldset className="settings-section settings-section--api-key" id="settings-data-management">
-            <legend>数据管理与备份</legend>
+            <legend>数据管理</legend>
             <div className="settings-grid settings-section-grid">
               <label>
                 上游变化保留天数
@@ -6649,7 +7098,7 @@ function SettingsView({
           </fieldset>
 
           <fieldset className="settings-section settings-section--display-security" id="settings-display-security">
-            <legend>显示与安全</legend>
+            <legend>界面偏好</legend>
             <div className="settings-grid time-zone-grid">
               <label>
                 显示时区
@@ -6699,62 +7148,10 @@ function SettingsView({
                 <small>使用逗号或空格分隔，最多 20 项；每项为 1 至 200 的整数。</small>
               </label>
             </div>
-
-            <div className="settings-grid secret-grid">
-              <label>
-                x-api 密钥
-                <input
-                  autoComplete="new-password"
-                  onChange={(event) => setXApiKey(event.target.value)}
-                  placeholder={settings.sub2api_x_api_key_set ? "留空保持当前密钥" : "输入 sub2api x-api-key"}
-                  type="password"
-                  value={xApiKey}
-                />
-              </label>
-              <label className="checkbox-line">
-                <input
-                  checked={clearXApiKey}
-                  onChange={(event) => setClearXApiKey(event.target.checked)}
-                  type="checkbox"
-                />
-                <span>清空已保存密钥</span>
-              </label>
-            </div>
-
-            <div className="settings-actions">
-              <div className="key-state">
-                <KeyRound size={16} />
-                <span>{settings.sub2api_x_api_key_set ? `已保存 ${settings.sub2api_x_api_key_hint || ""}` : "未设置"}</span>
-              </div>
-            </div>
           </fieldset>
         </form>
-      </section>
-
-      <section className="panel settings-scan-panel" id="settings-scan">
-        <PanelTitle title="端口扫描" icon={Radar} />
-        <div className="settings-status">
-          <SignalLine label="配置来源" value={sourceLabel(settings.sub2api_base_url_source)} />
-          <SignalLine label="当前地址" value={settings.sub2api_base_url} />
-          <SignalLine label="上次扫描" value={settings.last_scan_at ? formatDate(settings.last_scan_at, displayTimeZone) : "暂无"} />
-          <SignalLine label="扫描结果" value={settings.last_scan_message || "暂无"} />
-        </div>
-        <div className="settings-actions">
-          <div className="key-state">
-            <TimerReset size={16} />
-            <span>
-              {settings.automation_paused ? "自动任务已暂停" : "自动任务运行中"} · 已开启 {enabledAutomationCount}/13 ·
-              上游线程 {settings.upstream_sync_max_concurrency ?? 2} · 测活线程 {settings.account_liveness_max_concurrency ?? 3} ·
-              上游变化保留 {settings.upstream_rate_log_retention_days} 天 ·
-              上游数据保存 {settings.upstream_usage_data_retention_days ?? settings.upstream_data_retention_days ?? 90} 天
-            </span>
-          </div>
-          <button className="secondary-button" disabled={busy} onClick={onScan} type="button">
-            <Radar size={17} />
-            <span>扫描 sub2api</span>
-          </button>
-        </div>
-      </section>
+        </section>
+      </div>
 
       {fallbackModelDialogOpen ? (
         <FallbackModelChainDialog
@@ -7007,6 +7404,30 @@ function SignalLine({ label, value }: { label: string; value: string }) {
     <div className="signal-row">
       <span>{label}</span>
       <strong>{isPhoneUrlSource(value) ? <MiddleEllipsisText text={value} /> : value}</strong>
+    </div>
+  );
+}
+
+function AutomationSettingsTable({ children }: { children: ReactNode }) {
+  return (
+    <div className="automation-settings-table">
+      <div className="automation-settings-head">
+        <span>功能开关</span>
+        <span className="settings-label-with-help">
+          线程数
+          <HelpPopover label="查看线程数说明">
+            填 0 表示本批任务不限并发，取得账号或渠道清单后会同时发起。
+          </HelpPopover>
+        </span>
+        <span>自动执行间隔</span>
+        <span className="settings-label-with-help">
+          手动同步
+          <HelpPopover label="查看手动同步说明">
+            勾选后，点击“同步 API Key 账号”或上游卡片的同步按钮时会执行该项；取消勾选可只刷新基础上游数据，减少等待和连接测试消耗。
+          </HelpPopover>
+        </span>
+      </div>
+      {children}
     </div>
   );
 }
@@ -7809,10 +8230,19 @@ function accountHasError(account: Pick<Account, "remote_error" | "last_error">) 
   return Boolean(account.remote_error || account.last_error || statusLooksError);
 }
 
-function accountErrorSummary(account: Pick<Account, "remote_error" | "last_error" | "sub2api_error_code" | "sub2api_error_message">) {
+function accountErrorSummary(
+  account: Pick<Account, "remote_error" | "last_error" | "sub2api_error_code" | "sub2api_error_message">,
+): { label: string; tone: string; title?: string } | null {
   const remoteCode = account.sub2api_error_code;
   const detail = String(account.sub2api_error_message || account.last_error || "").trim();
-  const text = detail.toLowerCase();
+  const text = `${account.sub2api_error_message || ""} ${account.last_error || ""}`.toLowerCase();
+  if (isOAuthPhoneVerificationStopped(account.sub2api_error_message, account.last_error)) {
+    return {
+      label: "手机验证已终止",
+      tone: "warn",
+      title: "尝试重新 OAuth，但遇到手机验证码而终止",
+    };
+  }
   if (remoteCode) {
     return { label: `sub2api ${remoteCode}`, tone: "error" };
   }

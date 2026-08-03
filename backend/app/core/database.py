@@ -1401,6 +1401,48 @@ async def _migrate_recharge_multiplier_change_baselines(conn: AsyncConnection) -
     )
 
 
+async def _migrate_duplicate_group_deletion_events(conn: AsyncConnection) -> None:
+    """Remove the account-health copy of a canonical group deletion event."""
+    migration_key = "migration.remove_duplicate_group_deletions.v1"
+    completed = await conn.execute(
+        text("SELECT value FROM app_settings WHERE key = :key"),
+        {"key": migration_key},
+    )
+    if completed.scalar_one_or_none() is not None:
+        return
+
+    await conn.execute(
+        text(
+            "DELETE FROM upstream_channel_change_events AS status_event "
+            "WHERE status_event.event_type = 'upstream_group_status_changed' "
+            "AND LOWER(COALESCE(status_event.new_status, '')) IN "
+            "('deleted', 'removed', 'absent') "
+            "AND EXISTS ("
+            "SELECT 1 FROM upstream_channel_change_events AS removed_event "
+            "WHERE removed_event.event_type = 'group_removed' "
+            "AND removed_event.channel_id IS status_event.channel_id "
+            "AND removed_event.created_at = status_event.created_at "
+            "AND COALESCE(removed_event.legacy_imported, 0) = "
+            "COALESCE(status_event.legacy_imported, 0) "
+            "AND ("
+            "(COALESCE(status_event.group_id, '') <> '' "
+            "AND LOWER(removed_event.group_id) = LOWER(status_event.group_id)) "
+            "OR (COALESCE(status_event.group_id, '') = '' "
+            "AND COALESCE(status_event.group_name, '') <> '' "
+            "AND LOWER(removed_event.group_name) = LOWER(status_event.group_name))"
+            ")"
+            ")"
+        )
+    )
+    await conn.execute(
+        text(
+            "INSERT INTO app_settings (key, value, updated_at) "
+            "VALUES (:key, :value, CURRENT_TIMESTAMP)"
+        ),
+        {"key": migration_key, "value": "1"},
+    )
+
+
 async def init_db() -> None:
     from app import models  # noqa: F401
 
@@ -1414,6 +1456,7 @@ async def init_db() -> None:
             await _migrate_upstream_rate_change_logs(conn)
             await _migrate_legacy_rate_logs_to_change_events(conn)
             await _migrate_recharge_multiplier_change_baselines(conn)
+            await _migrate_duplicate_group_deletion_events(conn)
             await _migrate_notification_outbox(conn)
             await _migrate_upstream_priority_intervals(conn)
             await _scrub_upstream_plaintext_secret_copies(conn)

@@ -3,9 +3,10 @@ import type {
   UpstreamChannelChangeEvent,
 } from "./types";
 
-export const changeLogCacheVersion = 2;
+export const changeLogCacheVersion = 3;
 const cacheKeyPrefix = "sub2api-at-change-log:";
 const maxCachedItems = 200;
+const categoryReadCursorMaxAgeMs = 60_000;
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 type EnumerableStorageLike = Pick<Storage, "key" | "length" | "removeItem">;
@@ -25,6 +26,7 @@ export type ChangeLogCacheEntry<T extends ChangeLogItem> = {
 };
 
 const memoryCache = new Map<string, ChangeLogCacheEntry<ChangeLogItem>>();
+const categoryReadCursors = new Map<string, { cursor: number; recordedAt: number }>();
 
 export function getChangeLogSessionStorage(): Storage | null {
   try {
@@ -53,14 +55,22 @@ export function readChangeLogCache<T extends ChangeLogItem>(
   key: string,
 ): ChangeLogCacheEntry<T> | null {
   const inMemory = memoryCache.get(key);
-  if (inMemory) return cloneEntry(inMemory) as ChangeLogCacheEntry<T>;
+  if (inMemory) {
+    return applyReadCursor(
+      cloneEntry(inMemory),
+      readCategoryCursor(key),
+    ) as ChangeLogCacheEntry<T>;
+  }
   if (!storage) return null;
   try {
     const raw = storage.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (parsed.version !== changeLogCacheVersion || !isCacheEntry(parsed.data)) return null;
-    const entry = parsed.data as ChangeLogCacheEntry<ChangeLogItem>;
+    const entry = applyReadCursor(
+      parsed.data as ChangeLogCacheEntry<ChangeLogItem>,
+      readCategoryCursor(key),
+    );
     memoryCache.set(key, cloneEntry(entry));
     return cloneEntry(entry) as ChangeLogCacheEntry<T>;
   } catch {
@@ -78,11 +88,25 @@ export function writeChangeLogCache<T extends ChangeLogItem>(
     storedAt?: number;
   },
 ) {
+  const categoryCursor = readCategoryCursor(key);
+  const lastReadId = Math.max(
+    nonNegativeInteger(entry.lastReadId),
+    categoryCursor,
+  );
+  const incomingItems = mergeChangeLogItems([], entry.items);
+  const acknowledgedUnreadCount = incomingItems.filter(
+    (item) => item.unread && item.id <= lastReadId,
+  ).length;
   const safeEntry: ChangeLogCacheEntry<T> = {
-    items: mergeChangeLogItems([], entry.items),
+    items: incomingItems.map((item) => (
+      item.unread && item.id <= lastReadId ? { ...item, unread: false } : item
+    )),
     hasMore: Boolean(entry.hasMore),
-    unreadCount: nonNegativeInteger(entry.unreadCount),
-    lastReadId: nonNegativeInteger(entry.lastReadId),
+    unreadCount: Math.max(
+      0,
+      nonNegativeInteger(entry.unreadCount) - acknowledgedUnreadCount,
+    ),
+    lastReadId,
     totalCount: nonNegativeInteger(entry.totalCount ?? entry.items.length),
     page: positiveInteger(entry.page, 1),
     pageSize: positiveInteger(entry.pageSize, 50),
@@ -126,6 +150,7 @@ export function markChangeLogCategoryCachesRead(
   category: ChangeLogCacheCategory,
   throughId: number,
 ) {
+  recordCategoryReadCursor(baseUrl, category, throughId);
   const prefix = categoryCacheKeyPrefix(baseUrl, category);
   const markedKeys = new Set<string>();
   for (const key of memoryCache.keys()) {
@@ -170,6 +195,7 @@ export function mergeChangeLogItems<T extends ChangeLogItem>(
 
 export function clearChangeLogMemoryCache() {
   memoryCache.clear();
+  categoryReadCursors.clear();
 }
 
 export function clearChangeLogCache(storage: EnumerableStorageLike | null) {
@@ -232,6 +258,65 @@ function isChangeLogItem(value: unknown): value is ChangeLogItem {
 
 function categoryCacheKeyPrefix(baseUrl: string, category: ChangeLogCacheCategory) {
   return `${cacheKeyPrefix}v${changeLogCacheVersion}:${encodeURIComponent(normalizeBaseUrl(baseUrl))}:${category}:`;
+}
+
+function categoryReadCursorKey(baseUrl: string, category: ChangeLogCacheCategory) {
+  return `${cacheKeyPrefix}v${changeLogCacheVersion}:read:${encodeURIComponent(normalizeBaseUrl(baseUrl))}:${category}`;
+}
+
+function categoryReadCursorKeyFromCacheKey(key: string) {
+  const prefix = `${cacheKeyPrefix}v${changeLogCacheVersion}:`;
+  if (!key.startsWith(prefix)) return null;
+  const [encodedBaseUrl, category] = key.slice(prefix.length).split(":", 2);
+  if (
+    !encodedBaseUrl
+    || !category
+    || !(["upstream", "account_rate", "scheduling"] as string[]).includes(category)
+  ) return null;
+  return `${prefix}read:${encodedBaseUrl}:${category}`;
+}
+
+function readCategoryCursor(cacheKey: string) {
+  const cursorKey = categoryReadCursorKeyFromCacheKey(cacheKey);
+  if (!cursorKey) return 0;
+  const marker = categoryReadCursors.get(cursorKey);
+  if (!marker) return 0;
+  if (Date.now() - marker.recordedAt <= categoryReadCursorMaxAgeMs) {
+    return marker.cursor;
+  }
+  categoryReadCursors.delete(cursorKey);
+  return 0;
+}
+
+function recordCategoryReadCursor(
+  baseUrl: string,
+  category: ChangeLogCacheCategory,
+  throughId: number,
+) {
+  const cursorKey = categoryReadCursorKey(baseUrl, category);
+  const current = categoryReadCursors.get(cursorKey)?.cursor ?? 0;
+  categoryReadCursors.set(cursorKey, {
+    cursor: Math.max(current, nonNegativeInteger(throughId)),
+    recordedAt: Date.now(),
+  });
+}
+
+function applyReadCursor<T extends ChangeLogItem>(
+  entry: ChangeLogCacheEntry<T>,
+  cursor: number,
+): ChangeLogCacheEntry<T> {
+  if (cursor <= entry.lastReadId) return cloneEntry(entry);
+  const acknowledgedUnreadCount = entry.items.filter(
+    (item) => item.unread && item.id <= cursor,
+  ).length;
+  return {
+    ...cloneEntry(entry),
+    items: entry.items.map((item) => (
+      item.unread && item.id <= cursor ? { ...item, unread: false } : { ...item }
+    )),
+    unreadCount: Math.max(0, entry.unreadCount - acknowledgedUnreadCount),
+    lastReadId: cursor,
+  };
 }
 
 function positiveInteger(value: unknown, fallback: number) {

@@ -256,6 +256,9 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             get_api_key_auto_pause_on_channel_monitor_unavailable_enabled=AsyncMock(
                 return_value=False
             ),
+            get_api_key_availability_all_tests_must_succeed=AsyncMock(
+                return_value=False
+            ),
             get_channel_monitor_auto_probe_enabled=AsyncMock(return_value=True),
             get_account_model_whitelist_sync_each_time=AsyncMock(return_value=False),
             get_channel_monitor_unavailable_consecutive_threshold=AsyncMock(
@@ -4781,9 +4784,16 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             if event.event_type == "upstream_group_status_changed"
             and (event.details or {}).get("account_id") == 7
         ]
+        self.assertEqual(group_status_events, [])
+        deletion_events = [
+            event
+            for event in events
+            if event.group_id == "47"
+            and event.new_status in {"deleted", "removed"}
+        ]
         self.assertEqual(
-            [(event.old_status, event.new_status) for event in group_status_events],
-            [("available", "deleted")],
+            [(event.event_type, event.old_status, event.new_status) for event in deletion_events],
+            [("group_removed", "available", "removed")],
         )
 
     async def test_two_empty_group_snapshots_can_confirm_complete_removal(self) -> None:
@@ -6085,6 +6095,83 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         sleep.assert_awaited_once_with(2.0)
 
+    async def test_strict_channel_fallback_reports_all_successful_attempts(self) -> None:
+        self.runtime_config.get_api_key_auto_pause_on_channel_monitor_unavailable_enabled.return_value = True
+        self.runtime_config.get_api_key_availability_all_tests_must_succeed.return_value = True
+        self.runtime_config.get_channel_monitor_fallback_test_attempts.return_value = 2
+        config = UpstreamAccountConfig(
+            sub2api_account_id=7,
+            availability_check_mode="channel_monitor",
+            availability_monitor_id=91,
+            availability_test_model="account-test-model",
+            available_models=[
+                {"id": "account-test-model", "display_name": "Account test"}
+            ],
+        )
+        channel = UpstreamChannel(
+            display_name="Strict missing monitor",
+            canonical_base_url="https://strict-missing-monitor.example",
+            channel_monitor_status="ok",
+            channel_monitors=[],
+            channel_monitor_checked_at=datetime.now(timezone.utc),
+        )
+        self.sub2api.connection_test_results = [(True, None), (True, None)]
+
+        action, evidence = await self.service._prepare_account_monitor_guard(
+            config,
+            channel,
+            self.runtime_config,
+            automation_paused=False,
+        )
+
+        self.assertEqual(action, "clear")
+        self.assertEqual(evidence["test_success_policy"], "all")
+        self.assertEqual(evidence["test_attempts"], 2)
+        self.assertIn(
+            "All 2 fallback connection tests succeeded",
+            config.availability_message,
+        )
+
+    async def test_connection_attempts_require_every_success_in_strict_mode(self) -> None:
+        config = UpstreamAccountConfig(sub2api_account_id=7, remote_schedulable=True)
+        self.sub2api.connection_test_results = [
+            (True, None),
+            (False, "middle failed"),
+            (True, None),
+        ]
+
+        success, error, account_id, completed = (
+            await self.service._test_account_connection_candidates(
+                [config],
+                "account-test-model",
+                3,
+                require_all_success=True,
+            )
+        )
+
+        self.assertFalse(success)
+        self.assertEqual(error, "middle failed")
+        self.assertEqual(account_id, 7)
+        self.assertEqual(completed, 3)
+        self.assertEqual(len(self.sub2api.connection_test_calls), 3)
+
+        self.sub2api.connection_test_calls.clear()
+        self.sub2api.connection_test_results = [(True, None)] * 3
+        success, error, account_id, completed = (
+            await self.service._test_account_connection_candidates(
+                [config],
+                "account-test-model",
+                3,
+                require_all_success=True,
+            )
+        )
+
+        self.assertTrue(success)
+        self.assertIsNone(error)
+        self.assertEqual(account_id, 7)
+        self.assertEqual(completed, 3)
+        self.assertEqual(len(self.sub2api.connection_test_calls), 3)
+
     async def test_connection_attempt_interval_skips_sleep_after_last_failure(self) -> None:
         config = UpstreamAccountConfig(sub2api_account_id=7, remote_schedulable=True)
         self.sub2api.connection_test_results = [
@@ -6338,6 +6425,42 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["test_attempts"], 2)
         self.assertEqual(len(self.sub2api.connection_test_calls), 2)
         self.assertEqual(config.availability_status, "available")
+
+    async def test_pause_attempts_require_all_success_when_strict_policy_enabled(self) -> None:
+        config = UpstreamAccountConfig(
+            sub2api_account_id=7,
+            availability_check_mode="independent_model",
+            availability_test_model="account-test-model",
+            available_models=[
+                {"id": "account-test-model", "display_name": "Account test"}
+            ],
+        )
+        channel = UpstreamChannel(
+            display_name="Strict pause attempts",
+            canonical_base_url="https://strict-pause-attempts.example",
+        )
+        self.runtime_config.get_api_key_auto_pause_on_channel_monitor_unavailable_enabled.return_value = True
+        self.runtime_config.get_api_key_availability_all_tests_must_succeed.return_value = True
+        self.runtime_config.get_channel_monitor_fallback_test_attempts.return_value = 3
+        self.sub2api.connection_test_results = [
+            (True, None),
+            (False, "second failure"),
+            (True, None),
+        ]
+
+        action, evidence = await self.service._prepare_account_monitor_guard(
+            config,
+            channel,
+            self.runtime_config,
+            automation_paused=False,
+        )
+
+        self.assertEqual(action, "hold")
+        self.assertEqual(evidence["test_success_policy"], "all")
+        self.assertEqual(evidence["test_attempts"], 3)
+        self.assertEqual(evidence["test_status"], "unavailable")
+        self.assertEqual(len(self.sub2api.connection_test_calls), 3)
+        self.assertEqual(config.availability_status, "unavailable")
 
     async def test_manual_availability_tests_manually_disabled_account_without_enabling_it(self) -> None:
         await self.service.overview(self.db)

@@ -1,23 +1,32 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib import parse as urllib_parse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import EmailStr, TypeAdapter
-from sqlalchemy import desc, or_, select
+from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_text
 from app.core.database import get_db
 from app.core.security import require_admin
 from app.models import MailboxCredential, utcnow
-from app.schemas import MailboxCredentialOut, MailboxImportRequest, MailboxImportResult, MailMessageOut, MessageResponse
+from app.schemas import (
+    BulkDeleteRequest,
+    BulkDeleteResult,
+    MailboxCredentialOut,
+    MailboxImportRequest,
+    MailboxImportResult,
+    MailMessageOut,
+    MessageResponse,
+)
 from app.services.mail import MailAdapterRegistry
 
 router = APIRouter()
 
 email_adapter = TypeAdapter(EmailStr)
-PROVIDERS = {"outlook", "hotmail", "gmail", "custom", "manual"}
+PROVIDERS = {"outlook", "hotmail", "gmail", "custom", "url", "manual"}
 OUTLOOK_DOMAINS = {
     "outlook.com",
     "outlook.com.cn",
@@ -176,6 +185,22 @@ async def delete_mailbox(
     return MessageResponse(message="Mailbox credential deleted.")
 
 
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+async def bulk_delete_mailboxes(
+    payload: BulkDeleteRequest,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> BulkDeleteResult:
+    result = await db.execute(delete(MailboxCredential).where(MailboxCredential.id.in_(payload.ids)))
+    deleted_count = max(int(result.rowcount or 0), 0)
+    await db.commit()
+    return BulkDeleteResult(
+        message=f"Deleted {deleted_count} mailbox credential(s).",
+        requested_count=len(payload.ids),
+        deleted_count=deleted_count,
+    )
+
+
 def _parse_import(content: str, default_provider: str) -> list[ParsedMailbox]:
     parsed, _ = _parse_import_with_report(content, default_provider)
     return parsed
@@ -207,6 +232,21 @@ def _split_line(line: str) -> list[str]:
 
 def _parse_parts(parts: list[str], default_provider: str) -> ParsedMailbox | None:
     try:
+        if len(parts) == 2 and _is_pickup_url(parts[1]):
+            mailbox = _email(parts[0])
+            return ParsedMailbox(mailbox, mailbox, None, None, None, "url", _pickup_url(parts[1]))
+        if len(parts) == 3 and _is_pickup_url(parts[2]):
+            gpt_email = _email(parts[0])
+            mailbox_email = _email(parts[1])
+            return ParsedMailbox(
+                gpt_email,
+                mailbox_email,
+                None,
+                None,
+                None,
+                "url",
+                _pickup_url(parts[2]),
+            )
         core, explicit_provider, custom_url = _split_provider_tail(parts)
         if len(core) == 3:
             gpt_email = _email(core[0])
@@ -294,3 +334,24 @@ def _maybe_email(value: str) -> str | None:
         return _email(value)
     except ValueError:
         return None
+
+
+def _is_pickup_url(value: str) -> bool:
+    try:
+        _pickup_url(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _pickup_url(value: str) -> str:
+    normalized = value.strip()
+    parsed = urllib_parse.urlparse(normalized)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("invalid pickup URL")
+    return normalized
