@@ -4,7 +4,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.database import Base, _migrate_upstream_usage_history
@@ -227,6 +227,43 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         total = await self.db.get(UpstreamChannelUsageTotal, channel_identity(self.channel))
         self.assertEqual(total.total_balance_used, 6.0)
         self.assertEqual(total.total_balance_used_adjusted, 12.0)
+
+    async def test_hydrate_yesterday_does_not_autoflush_dirty_channel(self) -> None:
+        self.channel.yesterday_balance_used = 6.0
+        self.channel.yesterday_balance_unit = "USD"
+        self.channel.yesterday_balance_status = "ok"
+        self.channel.yesterday_balance_checked_at = self.now
+        self.assertTrue(
+            await finalize_yesterday_usage(
+                self.db,
+                channel=self.channel,
+                now=self.now,
+                time_zone="Asia/Shanghai",
+            )
+        )
+        await self.db.commit()
+
+        self.channel.display_name = "Dirty usage channel"
+        flush_count = 0
+
+        def count_flush(*_args) -> None:
+            nonlocal flush_count
+            flush_count += 1
+
+        event.listen(self.db.sync_session, "before_flush", count_flush)
+        try:
+            hydrated = await hydrate_yesterday_usage(
+                self.db,
+                channel=self.channel,
+                now=self.now,
+                time_zone="Asia/Shanghai",
+            )
+        finally:
+            event.remove(self.db.sync_session, "before_flush", count_flush)
+
+        self.assertTrue(hydrated)
+        self.assertEqual(flush_count, 0)
+        self.assertIn(self.channel, self.db.dirty)
 
     async def test_yesterday_snapshot_is_finalized_without_an_upstream_refetch(self) -> None:
         yesterday_now = self.now - timedelta(days=1)

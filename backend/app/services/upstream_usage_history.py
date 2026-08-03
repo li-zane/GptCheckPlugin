@@ -332,7 +332,11 @@ async def hydrate_yesterday_usage(
     """Expose a finalized local day in the existing channel-card compatibility fields."""
 
     yesterday = usage_day(now, time_zone) - timedelta(days=1)
-    row = await _daily_row(db, identity=channel_identity(channel), day=yesterday)
+    # Discovery updates the channel before hydrating this compatibility view.
+    # Keep the cache lookup read-only so it cannot acquire SQLite's single
+    # writer lock while the rest of the discovery writeback is still running.
+    with db.no_autoflush:
+        row = await _daily_row(db, identity=channel_identity(channel), day=yesterday)
     if row is None or not row.finalized or _finite_amount(row.balance_used) is None:
         return False
     channel.yesterday_balance_used = row.balance_used

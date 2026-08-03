@@ -115,10 +115,11 @@ class UpstreamRateSyncService:
                 interval = await self.runtime_config.get_api_key_account_sync_interval_seconds()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 await self._record_failure(
                     "api_key_inventory_sync_failed",
                     "Scheduled API key account inventory synchronization failed.",
+                    error_type=type(exc).__name__,
                 )
                 interval = 60
             await self._wait_for_next_run(interval, self._inventory_wake)
@@ -129,11 +130,12 @@ class UpstreamRateSyncService:
                 await self._run_inventory_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 await self._record_failure(
                     "api_key_inventory_sync_failed",
                     "Scheduled API key account inventory synchronization failed.",
                     duration_ms=elapsed_ms(started_at),
+                    error_type=type(exc).__name__,
                 )
 
     async def _upstream_loop(self) -> None:
@@ -142,8 +144,8 @@ class UpstreamRateSyncService:
                 interval = await self.runtime_config.get_upstream_sync_interval_seconds()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                await self._record_failure()
+            except Exception as exc:
+                await self._record_failure(error_type=type(exc).__name__)
                 interval = 60
             await self._wait_for_next_run(interval, self._upstream_wake)
             if self._stop.is_set():
@@ -153,8 +155,11 @@ class UpstreamRateSyncService:
                 await self._run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                await self._record_failure(duration_ms=elapsed_ms(started_at))
+            except Exception as exc:
+                await self._record_failure(
+                    duration_ms=elapsed_ms(started_at),
+                    error_type=type(exc).__name__,
+                )
 
     async def _model_whitelist_loop(self) -> None:
         while not self._stop.is_set():
@@ -162,10 +167,11 @@ class UpstreamRateSyncService:
                 interval = await self.runtime_config.get_account_model_whitelist_sync_interval_seconds()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 await self._record_failure(
                     "account_model_whitelist_sync_failed",
                     "Scheduled account model whitelist synchronization failed.",
+                    error_type=type(exc).__name__,
                 )
                 interval = 60
             await self._wait_for_next_run(interval, self._model_whitelist_wake)
@@ -176,11 +182,12 @@ class UpstreamRateSyncService:
                 await self._run_model_whitelist_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 await self._record_failure(
                     "account_model_whitelist_sync_failed",
                     "Scheduled account model whitelist synchronization failed.",
                     duration_ms=elapsed_ms(started_at),
+                    error_type=type(exc).__name__,
                 )
 
     async def _priority_loop(self) -> None:
@@ -194,11 +201,12 @@ class UpstreamRateSyncService:
                 await self._run_priority_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 await self._record_failure(
                     "upstream_priority_sync_failed",
                     "Scheduled API key account priority synchronization failed.",
                     duration_ms=elapsed_ms(started_at),
+                    error_type=type(exc).__name__,
                 )
 
     async def _run_inventory_once(self) -> None:
@@ -466,10 +474,13 @@ class UpstreamRateSyncService:
         kind: str = "upstream_rate_sync_failed",
         message: str = "Scheduled upstream synchronization failed.",
         duration_ms: int | None = None,
+        error_type: str | None = None,
     ) -> None:
         details = {"reason": "scheduled"}
         if duration_ms is not None:
             details["duration_ms"] = duration_ms
+        if error_type:
+            details["error_type"] = error_type
         await self._record_event(kind, message, details=details)
 
     async def _record_event(

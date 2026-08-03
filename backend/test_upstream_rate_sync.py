@@ -330,6 +330,7 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(failure_events), 1)
         self.assertIsInstance(failure_events[0].kwargs["details"]["duration_ms"], int)
+        self.assertEqual(failure_events[0].kwargs["details"]["error_type"], "RuntimeError")
         self.assertNotIn("credential-must-not-be-recorded", str(failure_events[0]))
 
     async def test_stop_cancels_an_inflight_synchronization(self) -> None:

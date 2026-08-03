@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.upstream_channels import router
@@ -4636,6 +4636,43 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         for invalid in (-1, 51, True):
             with self.assertRaises(ValueError):
                 await self.service.discover_all(self.db, max_concurrency=invalid)
+
+    async def test_discover_all_isolates_sqlite_lock_to_failed_channel(self) -> None:
+        base = await self.service.overview(self.db)
+        first = base.channels[0].model_copy(update={"recharge_multiplier_status": "ok"})
+        second = first.model_copy(update={"id": first.id + 1000})
+        synthetic = base.model_copy(update={"channels": [first, second]})
+
+        async def discover(_db, channel_id: int, **_kwargs):
+            if channel_id == second.id:
+                raise OperationalError(
+                    "UPDATE upstream_channels SET last_discovered_at=?",
+                    {},
+                    RuntimeError("database is locked"),
+                )
+            return first
+
+        for max_concurrency in (1, 2):
+            with (
+                patch.object(self.service, "overview", new=AsyncMock(return_value=synthetic)),
+                patch.object(
+                    self.service,
+                    "_discover_channel",
+                    new=AsyncMock(side_effect=discover),
+                ),
+                patch.object(
+                    self.service,
+                    "_rebalance_priorities_best_effort",
+                    new=AsyncMock(),
+                ),
+            ):
+                result = await self.service.discover_all(
+                    self.db,
+                    sync_inventory=False,
+                    max_concurrency=max_concurrency,
+                )
+
+            self.assertEqual((result.total, result.succeeded, result.failed), (2, 1, 1))
 
     async def test_transient_partial_group_snapshot_does_not_remove_or_readd_groups(self) -> None:
         channel_id = await self._configure_sub2api_credentials()

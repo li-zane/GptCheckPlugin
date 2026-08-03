@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
@@ -103,6 +103,10 @@ UPSTREAM_HISTORY_BACKFILL_TIMEOUT_SECONDS = 75.0
 
 API_KEY_EXPORT_BATCH_SIZE = 200
 logger = logging.getLogger(__name__)
+
+
+def _is_sqlite_locked_error(error: BaseException) -> bool:
+    return isinstance(error, OperationalError) and "database is locked" in str(error).lower()
 
 
 def _account_group_rate_change_reason(
@@ -5163,6 +5167,12 @@ class UpstreamChannelService:
                     results.append(await self._discover_channel(db, channel.id, **discover_kwargs))
                 except UpstreamAccountServiceError as exc:
                     results.append(exc)
+                except OperationalError as exc:
+                    if not _is_sqlite_locked_error(exc):
+                        raise
+                    await db.rollback()
+                    db.expire_all()
+                    results.append(exc)
         else:
             # The caller's session may have an active read transaction from the
             # overview. Release it before worker sessions commit channel-local
@@ -5199,9 +5209,16 @@ class UpstreamChannelService:
             )
         probe_duration_ms = elapsed_ms(probe_started_at)
 
-        for result in results:
+        for channel, result in zip(channels_to_probe, results):
             if isinstance(result, UpstreamAccountServiceError):
                 failed += 1
+                continue
+            if _is_sqlite_locked_error(result):
+                failed += 1
+                logger.warning(
+                    "Upstream channel %s writeback failed because SQLite remained locked.",
+                    channel.id,
+                )
                 continue
             if isinstance(result, BaseException):
                 raise result
