@@ -6,6 +6,8 @@ import {
   ArrowUp,
   ArrowUpDown,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
   CircleHelp,
   Clock3,
@@ -227,6 +229,8 @@ const themeStorageKey = "sub2api-at-theme";
 const TimeZoneContext = createContext(defaultTimeZone);
 const NowContext = createContext(Date.now());
 const refreshClockIntervalMs = 30_000;
+const activeViewRefreshIntervalMs = 30_000;
+const usageDetailPageSizeOptions = [25, 50, 100] as const;
 const timeZoneOptions = [
   { value: "Asia/Shanghai", label: "中国标准时间 · Asia/Shanghai" },
   { value: "UTC", label: "UTC" },
@@ -380,6 +384,7 @@ function App() {
   const oauthUsageRefreshGenerationRef = useRef(0);
   const oauthUsageRefreshTimersRef = useRef(new Set<number>());
   const usageEstimateRequestsRef = useRef(new LatestRequestCoordinator());
+  const usageEstimateReadRequestRef = useRef<Promise<UsageEstimate> | null>(null);
   const usageEstimateRefreshRequestRef = useRef<Promise<UsageEstimate> | null>(null);
   const [usageEstimate, setUsageEstimate] = useState<UsageEstimate | null>(null);
   const [usageLimitSamples, setUsageLimitSamples] = useState<UsageLimitSamples | null>(null);
@@ -387,7 +392,6 @@ function App() {
   const [usageLimitSamplesError, setUsageLimitSamplesError] = useState("");
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageError, setUsageError] = useState("");
-  const [usageEstimateRefreshed, setUsageEstimateRefreshed] = useState(false);
   const [notice, setNotice] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [pageRefreshing, setPageRefreshing] = useState(false);
@@ -473,6 +477,7 @@ function App() {
 
   const resetUsageEstimateRequests = useCallback(() => {
     usageEstimateRequestsRef.current.invalidate();
+    usageEstimateReadRequestRef.current = null;
     usageEstimateRefreshRequestRef.current = null;
     setUsageLoading(false);
   }, []);
@@ -481,56 +486,66 @@ function App() {
     if (settingsMutationPendingRef.current) return;
     const requestSequence = ++loadAllRequestSequenceRef.current;
     const settingsGeneration = settingsMutationGenerationRef.current;
+    const requestIsCurrent = () => (
+      requestSequence === loadAllRequestSequenceRef.current
+      && settingsGeneration === settingsMutationGenerationRef.current
+    );
+    const commitResponse = async <T,>(request: Promise<T>, commit: (value: T) => void) => {
+      const value = await request;
+      if (requestIsCurrent()) commit(value);
+      return value;
+    };
+
+    const summaryPromise = api.summary();
+    const accountsPromise = api.accounts();
+    const mailboxesPromise = api.mailboxes();
     const phonePromise = includePhones ? api.phones().catch(() => null) : Promise.resolve<PhoneNumber[] | null>(null);
+    const jobsPromise = api.jobs();
+    const eventsPromise = api.events();
     const exceptionRecordsPromise = api.exceptionRecords().catch(() => null);
-    const [nextSummary, nextAccounts, nextMailboxes, nextPhones, nextJobs, nextEvents, nextExceptionRecords, nextSettings, nextUpstreamOverview] = await Promise.all([
-      api.summary(),
-      api.accounts(),
-      api.mailboxes(),
-      phonePromise,
-      api.jobs(),
-      api.events(),
-      exceptionRecordsPromise,
-      api.settings(),
-      api.upstreamChannels(false).catch(() => null),
+    const settingsPromise = api.settings();
+    const upstreamOverviewPromise = api.upstreamChannels(false).catch(() => null);
+    const commitSettingsAndOverview = (async () => {
+      const [nextSettings, nextUpstreamOverview] = await Promise.all([settingsPromise, upstreamOverviewPromise]);
+      if (!requestIsCurrent()) return;
+      const previousBaseUrl = apiKeyAccountsCacheBaseUrlRef.current;
+      if (!previousBaseUrl) {
+        apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+        const cachedOverview = nextUpstreamOverview
+          ? writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url, nextUpstreamOverview)
+          : readUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url);
+        setApiKeyAccountsCache(nextUpstreamOverview || cachedOverview);
+      } else if (upstreamOverviewCacheScope(previousBaseUrl) !== upstreamOverviewCacheScope(nextSettings.sub2api_base_url)) {
+        clearFrontendSessionCaches();
+        apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+        setUsageEstimate(null);
+        setUsageLimitSamples(null);
+        resetUsageEstimateRequests();
+        const safeOverview = nextUpstreamOverview
+          ? writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url, nextUpstreamOverview)
+          : null;
+        setApiKeyAccountsCache(nextUpstreamOverview || safeOverview);
+      } else {
+        apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
+        if (nextUpstreamOverview) cacheApiKeyAccounts(nextUpstreamOverview, nextSettings.sub2api_base_url);
+      }
+      setSettings((current) => (appSettingsEqual(current, nextSettings) ? current : nextSettings));
+    })();
+
+    await Promise.all([
+      commitResponse(summaryPromise, setSummary),
+      commitResponse(accountsPromise, setAccounts),
+      commitResponse(mailboxesPromise, setMailboxes),
+      commitResponse(phonePromise, (nextPhones) => {
+        if (nextPhones) setPhones(nextPhones);
+      }),
+      commitResponse(jobsPromise, setJobs),
+      commitResponse(eventsPromise, setEvents),
+      commitResponse(exceptionRecordsPromise, (nextExceptionRecords) => {
+        if (nextExceptionRecords) setExceptionRecords(nextExceptionRecords);
+      }),
+      commitSettingsAndOverview,
     ]);
-    if (
-      requestSequence !== loadAllRequestSequenceRef.current
-      || settingsGeneration !== settingsMutationGenerationRef.current
-    ) return;
-    setSummary(nextSummary);
-    setAccounts(nextAccounts);
-    setMailboxes(nextMailboxes);
-    if (nextPhones) {
-      setPhones(nextPhones);
-    }
-    setJobs(nextJobs);
-    setEvents(nextEvents);
-    if (nextExceptionRecords) {
-      setExceptionRecords(nextExceptionRecords);
-    }
-    const previousBaseUrl = apiKeyAccountsCacheBaseUrlRef.current;
-    if (!previousBaseUrl) {
-      apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
-      const cachedOverview = nextUpstreamOverview
-        ? writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url, nextUpstreamOverview)
-        : readUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url);
-      setApiKeyAccountsCache(nextUpstreamOverview || cachedOverview);
-    } else if (upstreamOverviewCacheScope(previousBaseUrl) !== upstreamOverviewCacheScope(nextSettings.sub2api_base_url)) {
-      clearFrontendSessionCaches();
-      apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
-      setUsageEstimate(null);
-      setUsageLimitSamples(null);
-      resetUsageEstimateRequests();
-      const safeOverview = nextUpstreamOverview
-        ? writeUpstreamOverviewCache(getUpstreamOverviewSessionStorage(), nextSettings.sub2api_base_url, nextUpstreamOverview)
-        : null;
-      setApiKeyAccountsCache(nextUpstreamOverview || safeOverview);
-    } else {
-      apiKeyAccountsCacheBaseUrlRef.current = nextSettings.sub2api_base_url;
-      if (nextUpstreamOverview) cacheApiKeyAccounts(nextUpstreamOverview, nextSettings.sub2api_base_url);
-    }
-    setSettings((current) => (appSettingsEqual(current, nextSettings) ? current : nextSettings));
   }, [cacheApiKeyAccounts, resetUsageEstimateRequests]);
 
   const usageByEmail = useMemo(() => {
@@ -566,6 +581,8 @@ function App() {
   const loadUsageEstimate = useCallback((refresh = true): Promise<UsageEstimate> => {
     const activeRefresh = usageEstimateRefreshRequestRef.current;
     if (activeRefresh) return activeRefresh;
+    const activeRead = usageEstimateReadRequestRef.current;
+    if (!refresh && activeRead) return activeRead;
 
     const request = usageEstimateRequestsRef.current.beginForeground();
     setUsageLoading(true);
@@ -575,7 +592,6 @@ function App() {
         const nextEstimate = await api.usageEstimate(refresh);
         if (request.isCurrent()) {
           setUsageEstimate(nextEstimate);
-          setUsageEstimateRefreshed(refresh);
         }
         return nextEstimate;
       } catch (error) {
@@ -589,21 +605,16 @@ function App() {
       }
     })();
 
-    if (refresh) {
-      usageEstimateRefreshRequestRef.current = requestPromise;
-      void requestPromise.then(
-        () => {
-          if (usageEstimateRefreshRequestRef.current === requestPromise) {
-            usageEstimateRefreshRequestRef.current = null;
-          }
-        },
-        () => {
-          if (usageEstimateRefreshRequestRef.current === requestPromise) {
-            usageEstimateRefreshRequestRef.current = null;
-          }
-        },
-      );
-    }
+    const activeRequestRef = refresh ? usageEstimateRefreshRequestRef : usageEstimateReadRequestRef;
+    activeRequestRef.current = requestPromise;
+    void requestPromise.then(
+      () => {
+        if (activeRequestRef.current === requestPromise) activeRequestRef.current = null;
+      },
+      () => {
+        if (activeRequestRef.current === requestPromise) activeRequestRef.current = null;
+      },
+    );
     return requestPromise;
   }, []);
 
@@ -635,7 +646,6 @@ function App() {
             && request.isCurrent()
           ) {
             setUsageEstimate(nextEstimate);
-            setUsageEstimateRefreshed(true);
             setUsageError("");
           }
         } catch {
@@ -668,12 +678,10 @@ function App() {
     }
   }, []);
 
-  const refreshCurrentView = useCallback(async () => {
-    if (pageRefreshing) return;
-    setPageRefreshing(true);
-    setNotice("");
-    loadAllRequestSequenceRef.current += 1;
-    try {
+  const refreshViewData = useCallback(async (
+    view: View,
+    { background, refreshUsage }: { background: boolean; refreshUsage: boolean },
+  ) => {
       if (view === "overview") {
         const [nextSummary, nextAccounts, nextJobs, nextEvents, nextUpstream] = await Promise.all([
           api.summary(),
@@ -699,9 +707,13 @@ function App() {
         cacheApiKeyAccounts(nextUpstream, settings.sub2api_base_url);
         setApiKeyRefreshVersion((current) => current + 1);
       } else if (view === "usage") {
-        await loadUsageEstimate(false);
+        await loadUsageEstimate(refreshUsage);
       } else if (view === "usage-samples") {
-        await loadUsageLimitSamples();
+        if (background) {
+          setUsageLimitSamples(await api.usageLimitSamples());
+        } else {
+          await loadUsageLimitSamples();
+        }
       } else if (view === "mailboxes") {
         setMailboxes(await api.mailboxes());
       } else if (view === "phones") {
@@ -715,16 +727,34 @@ function App() {
         setJobs(nextJobs);
         setEvents(nextEvents);
         setExceptionRecords(nextExceptionRecords);
-      } else if (view === "settings") {
+      } else if (view === "settings" && !background) {
         setSettings(await api.settings());
       }
+  }, [cacheApiKeyAccounts, loadUsageEstimate, loadUsageLimitSamples, settings.sub2api_base_url]);
+
+  const refreshCurrentViewInBackground = useCallback(async () => {
+    if (document.visibilityState !== "visible" || pageRefreshing || syncBusy) return;
+    try {
+      await refreshViewData(view, { background: true, refreshUsage: false });
+    } catch {
+      // Preserve the last successful snapshot; the next interval can recover.
+    }
+  }, [pageRefreshing, refreshViewData, syncBusy, view]);
+
+  const refreshCurrentView = useCallback(async () => {
+    if (pageRefreshing) return;
+    setPageRefreshing(true);
+    setNotice("");
+    loadAllRequestSequenceRef.current += 1;
+    try {
+      await refreshViewData(view, { background: false, refreshUsage: view === "usage" });
       setNotice("当前页面数据已刷新");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "当前页面刷新失败");
     } finally {
       setPageRefreshing(false);
     }
-  }, [cacheApiKeyAccounts, loadUsageEstimate, loadUsageLimitSamples, pageRefreshing, settings.sub2api_base_url, view]);
+  }, [pageRefreshing, refreshViewData, view]);
 
   useEffect(() => {
     const handleAuthExpired = () => {
@@ -764,14 +794,14 @@ function App() {
 
   useEffect(() => {
     if (authState !== "in") return;
-    const timer = window.setInterval(() => {
-      loadAll({ includePhones: view === "phones" }).catch(() => undefined);
-      if (view === "overview" || view === "accounts") {
-        loadUsageEstimate(false).catch(() => undefined);
-      }
-    }, 12_000);
-    return () => window.clearInterval(timer);
-  }, [authState, loadAll, loadUsageEstimate, view]);
+    const refreshWhenVisible = () => void refreshCurrentViewInBackground();
+    const timer = window.setInterval(refreshWhenVisible, activeViewRefreshIntervalMs);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [authState, refreshCurrentViewInBackground]);
 
   useEffect(() => {
     if (authState !== "in" || view !== "usage-samples" || usageLimitSamples || usageLimitSamplesLoading) return;
@@ -781,19 +811,11 @@ function App() {
   useEffect(() => {
     if (authState !== "in" || usageLoading) return;
     if (usageError) return;
-    if (view === "overview" || view === "accounts") {
-      if (usageEstimate) return;
+    if (usageEstimate) return;
+    if (view === "overview" || view === "accounts" || view === "usage") {
       loadUsageEstimate(false).catch(() => undefined);
-      return;
     }
-    if (view === "usage") {
-      if (!usageEstimate) {
-        loadUsageEstimate(false).catch(() => undefined);
-        return;
-      }
-      if (!usageEstimateRefreshed) loadUsageEstimate(true).catch(() => undefined);
-    }
-  }, [authState, loadUsageEstimate, usageError, usageEstimate, usageEstimateRefreshed, usageLoading, view]);
+  }, [authState, loadUsageEstimate, usageError, usageEstimate, usageLoading, view]);
 
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1251,7 +1273,6 @@ function App() {
                 async () => {
                   const result = await api.deleteRemoteAccount(account.sub2api_account_id || "");
                   setUsageEstimate(null);
-                  setUsageEstimateRefreshed(false);
                   return result;
                 },
                 "已删除 sub2api 账号",
@@ -3334,6 +3355,8 @@ function UsageEstimateView({
   const [detailAccountFilter, setDetailAccountFilter] = useState<UsageDetailAccountFilter>("normal");
   const [requestedDetailRateLimitWindowKey, setRequestedDetailRateLimitWindowKey] = useState("");
   const [subscriptionFilter, setSubscriptionFilter] = useState("");
+  const [detailPage, setDetailPage] = useState(1);
+  const [detailPageSize, setDetailPageSize] = useState<(typeof usageDetailPageSizeOptions)[number]>(25);
   const displayedEstimate = useMemo(
     () => (estimate ? buildDisplayedUsageEstimate(estimate, includePausedAccounts) : null),
     [estimate, includePausedAccounts],
@@ -3380,10 +3403,17 @@ function UsageEstimateView({
     () => detailBaseAccounts.filter((account) => !subscriptionFilter || usageSubscriptionLabel(account) === subscriptionFilter),
     [detailBaseAccounts, subscriptionFilter],
   );
+  const detailPageCount = Math.max(1, Math.ceil(detailAccounts.length / detailPageSize));
+  const activeDetailPage = Math.min(detailPage, detailPageCount);
+  const pagedDetailAccounts = useMemo(() => {
+    const start = (activeDetailPage - 1) * detailPageSize;
+    return detailAccounts.slice(start, start + detailPageSize);
+  }, [activeDetailPage, detailAccounts, detailPageSize]);
 
   useEffect(() => {
     if (subscriptionFilter && !subscriptionFilterOptions.some((option) => option.label === subscriptionFilter)) {
       setSubscriptionFilter("");
+      setDetailPage(1);
     }
   }, [subscriptionFilter, subscriptionFilterOptions]);
 
@@ -3472,6 +3502,7 @@ function UsageEstimateView({
                         onClick={() => {
                           setRequestedDetailRateLimitWindowKey(option.windowKey);
                           setSubscriptionFilter("");
+                          setDetailPage(1);
                         }}
                         role="tab"
                         type="button"
@@ -3491,6 +3522,7 @@ function UsageEstimateView({
                     onClick={() => {
                       setDetailAccountFilter("normal");
                       setSubscriptionFilter("");
+                      setDetailPage(1);
                     }}
                     role="tab"
                     type="button"
@@ -3504,6 +3536,7 @@ function UsageEstimateView({
                     onClick={() => {
                       setDetailAccountFilter("rate-limited");
                       setSubscriptionFilter("");
+                      setDetailPage(1);
                     }}
                     role="tab"
                     type="button"
@@ -3517,7 +3550,10 @@ function UsageEstimateView({
                     <button
                       aria-pressed={!subscriptionFilter}
                       className={!subscriptionFilter ? "usage-subscription-filter active" : "usage-subscription-filter"}
-                      onClick={() => setSubscriptionFilter("")}
+                      onClick={() => {
+                        setSubscriptionFilter("");
+                        setDetailPage(1);
+                      }}
                       type="button"
                     >
                       <span>全部订阅</span>
@@ -3528,7 +3564,10 @@ function UsageEstimateView({
                         aria-pressed={subscriptionFilter === option.label}
                         className={subscriptionFilter === option.label ? "usage-subscription-filter active" : "usage-subscription-filter"}
                         key={option.label}
-                        onClick={() => setSubscriptionFilter(option.label)}
+                        onClick={() => {
+                          setSubscriptionFilter(option.label);
+                          setDetailPage(1);
+                        }}
                         type="button"
                       >
                         <span>{option.label}</span>
@@ -3566,7 +3605,7 @@ function UsageEstimateView({
                   </tr>
                 </thead>
                 <tbody>
-                  {detailAccounts.map((account, index) => (
+                  {pagedDetailAccounts.map((account, index) => (
                     <tr key={`${account.email}:${account.sub2api_account_id || index}`}>
                       <td>
                         <button
@@ -3611,6 +3650,45 @@ function UsageEstimateView({
               </table>
               {!detailAccounts.length ? <Empty label={subscriptionFilter ? `暂无 ${subscriptionFilter} 账号额度` : detailAccountFilter === "normal" ? "暂无正常账号额度" : "暂无限流账号额度"} /> : null}
             </div>
+            {detailAccounts.length ? (
+              <nav aria-label="额度明细分页" className="usage-detail-pagination">
+                <span>第 {activeDetailPage} / {detailPageCount} 页 · 共 {detailAccounts.length} 个账号</span>
+                <div>
+                  <label className="usage-detail-page-size">
+                    <span>每页</span>
+                    <select
+                      onChange={(event) => {
+                        setDetailPageSize(Number(event.target.value) as (typeof usageDetailPageSizeOptions)[number]);
+                        setDetailPage(1);
+                      }}
+                      value={detailPageSize}
+                    >
+                      {usageDetailPageSizeOptions.map((size) => <option key={size} value={size}>{size} 条</option>)}
+                    </select>
+                  </label>
+                  <button
+                    aria-label="上一页额度明细"
+                    className="icon-button"
+                    disabled={activeDetailPage <= 1}
+                    onClick={() => setDetailPage(activeDetailPage - 1)}
+                    title="上一页"
+                    type="button"
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <button
+                    aria-label="下一页额度明细"
+                    className="icon-button"
+                    disabled={activeDetailPage >= detailPageCount}
+                    onClick={() => setDetailPage(activeDetailPage + 1)}
+                    title="下一页"
+                    type="button"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+              </nav>
+            ) : null}
           </section>
         </>
       ) : null}

@@ -5,12 +5,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.api import api_router
 from app.core.config import get_settings
 from app.core.database import init_db
 from app.core.validation import sanitized_request_validation_handler
+from app.frontend_delivery import ImmutableStaticFiles, frontend_file_response
 from app.services.monitor import get_monitor_service
 from app.services.notification_dispatcher import get_notification_dispatcher
 from app.services.discord_commands import get_discord_command_service
@@ -57,6 +58,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 app.include_router(api_router)
 
@@ -74,7 +76,7 @@ if frontend_index.is_file():
     if frontend_assets.is_dir():
         app.mount(
             "/assets",
-            StaticFiles(directory=frontend_assets),
+            ImmutableStaticFiles(directory=frontend_assets),
             name="frontend-assets",
         )
 
@@ -84,5 +86,5 @@ if frontend_index.is_file():
             raise HTTPException(status_code=404, detail="Not found.")
         candidate = (frontend_dist / full_path).resolve()
         if frontend_dist in candidate.parents and candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(frontend_index)
+            return frontend_file_response(candidate, html=candidate.suffix.lower() == ".html")
+        return frontend_file_response(frontend_index, html=True)

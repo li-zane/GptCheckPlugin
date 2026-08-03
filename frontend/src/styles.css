@@ -2288,6 +2288,31 @@ tbody tr:hover:not(.account-jump-highlight) {
   justify-content: flex-end;
 }
 
+.usage-detail-pagination {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 12px;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding-top: 14px;
+}
+
+.usage-detail-pagination > div,
+.usage-detail-page-size {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.usage-detail-page-size select {
+  min-height: 34px;
+  min-width: 78px;
+}
+
 .account-row-actions {
   display: grid;
   gap: 6px;
@@ -7342,16 +7367,18 @@ button.api-key-group-chip--more {
   }
 
   .topbar-actions {
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     justify-content: flex-start;
-    overflow-x: auto;
-    padding-bottom: 2px;
-    scrollbar-width: thin;
     width: 100%;
   }
 
   .topbar-actions > * {
     flex: 0 0 auto;
+  }
+
+  .topbar-actions .toolbar-time-button {
+    flex: 1 1 180px;
+    min-width: 0;
   }
 
   .settings-local-nav {
@@ -7491,6 +7518,17 @@ button.api-key-group-chip--more {
   min-width: 0;
   padding-top: 10px;
   width: 100%;
+}
+
+@media (max-width: 520px) {
+  .topbar-actions .toolbar-time-button {
+    flex-basis: 120px;
+    justify-content: center;
+  }
+
+  .topbar-actions .toolbar-time {
+    display: none;
+  }
 }
 
 .api-key-change-pagination {

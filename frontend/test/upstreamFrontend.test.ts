@@ -454,6 +454,39 @@ test("App navigation uses history state, a page refresh control, and a top setti
   assert.match(styleSource, /\.discord-bot-install-mode-grid[\s\S]*grid-template-columns:\s*repeat\(2/);
 });
 
+test("quota refreshes are explicit and background polling stays scoped to the visible view", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const refreshBlock = source.slice(
+    source.indexOf("const refreshViewData = useCallback"),
+    source.indexOf("const refreshCurrentView = useCallback"),
+  );
+  const pollingBlock = source.slice(
+    source.indexOf("const refreshCurrentViewInBackground = useCallback"),
+    source.indexOf("useEffect(() => {", source.indexOf("const refreshCurrentViewInBackground = useCallback")),
+  );
+
+  assert.match(source, /const activeViewRefreshIntervalMs = 30_000/);
+  assert.doesNotMatch(source, /usageEstimateRefreshed/);
+  assert.match(refreshBlock, /view === "usage"[\s\S]{0,160}loadUsageEstimate\(refreshUsage\)/);
+  assert.match(refreshBlock, /view === "mailboxes"[\s\S]{0,120}api\.mailboxes\(\)/);
+  assert.match(refreshBlock, /view === "settings"[\s\S]{0,80}!background/);
+  assert.match(pollingBlock, /document\.visibilityState !== "visible"/);
+  assert.doesNotMatch(pollingBlock, /loadAll\(/);
+  assert.match(source, /refreshViewData\(view, \{ background: false, refreshUsage: view === "usage" \}\)/);
+  assert.match(source, /document\.addEventListener\("visibilitychange", refreshWhenVisible\)/);
+});
+
+test("quota account details paginate before rows are rendered", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+  assert.match(source, /const usageDetailPageSizeOptions = \[25, 50, 100\] as const/);
+  assert.match(source, /const pagedDetailAccounts = useMemo/);
+  assert.match(source, /pagedDetailAccounts\.map\(/);
+  assert.match(source, /aria-label="额度明细分页"/);
+  assert.match(styles, /\.usage-detail-pagination\s*\{/);
+});
+
 test("OAuth account editor supports batch updates, notes, and revalidated reusable presets", () => {
   const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
