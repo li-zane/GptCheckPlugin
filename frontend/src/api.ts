@@ -10,6 +10,7 @@ import type {
   AccountExceptionRecord,
   AccountLivenessModels,
   AccountLivenessTestResult,
+  AccountNotes,
   AppEvent,
   AppSettings,
   AppSettingsUpdate,
@@ -209,6 +210,13 @@ export const api = {
   logout: () => request<{ message: string }>("/api/auth/logout", { method: "POST" }),
   summary: () => request<Summary>("/api/dashboard/summary"),
   accounts: () => request<Account[]>("/api/accounts"),
+  accountNotes: (accountId: string, signal?: AbortSignal) =>
+    request<AccountNotes>(`/api/accounts/${encodeURIComponent(accountId)}/notes`, { signal }),
+  updateAccountNotes: (accountId: string, notes: string, expectedIdentityFingerprint: string) =>
+    request<AccountNotes>(`/api/accounts/${encodeURIComponent(accountId)}/notes`, {
+      method: "PUT",
+      body: JSON.stringify({ notes, expected_identity_fingerprint: expectedIdentityFingerprint }),
+    }),
   accountEditor: (accountId: string, signal?: AbortSignal) =>
     request<AccountEditor>(`/api/accounts/editor/${encodeURIComponent(accountId)}`, { signal }),
   updateAccountEditor: (accountId: string, payload: AccountEditUpdate) =>

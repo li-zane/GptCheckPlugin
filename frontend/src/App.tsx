@@ -36,6 +36,7 @@ import {
   ShieldCheck,
   Smartphone,
   Sparkles,
+  StickyNote,
   Sun,
   TimerReset,
   Trash2,
@@ -151,6 +152,7 @@ import type {
   AccountExceptionRecord,
   AccountLivenessModel,
   AccountLivenessTestResult,
+  AccountNotes,
   AccountUsageEstimate,
   ApiKeyViewOperation,
   AppEvent,
@@ -206,7 +208,7 @@ function clearFrontendSessionCaches() {
 }
 const usageLimitWindowKeys = ["five_hour", "seven_day", "monthly"] as const;
 const coreSubscriptionTypes = new Set(["plus", "team", "pro", "free", "k12", "unknown"]);
-const seatBasedSubscriptionTypes = new Set(["team", "k12", "enterprise", "enterprise-edu", "edu"]);
+const nonExpiringSubscriptionTypes = new Set(["free", "team", "k12", "enterprise", "enterprise-edu", "edu"]);
 const defaultUsageLimitPlanRanges: UsageLimitPlanRanges = {
   five_hour: { lower: 15, upper: 25 },
   seven_day: { lower: 100, upper: 140 },
@@ -830,7 +832,7 @@ function App() {
       resizeObserver?.disconnect();
       window.removeEventListener("resize", updateLayoutOffsets);
     };
-  }, [authState, notice, siteName, view]);
+  }, [authState, siteName, view]);
 
   useLayoutEffect(() => {
     document.querySelector<HTMLElement>(".workspace")?.scrollTo({ top: 0, left: 0, behavior: "auto" });
@@ -1073,7 +1075,7 @@ function App() {
 
   const navItems: Array<{ id: View; label: string; icon: LucideIcon }> = [
     { id: "overview", label: "概览", icon: Activity },
-    { id: "accounts", label: "账号", icon: UsersRound },
+    { id: "accounts", label: "OAuth 账号", icon: UsersRound },
     { id: "api-keys", label: "API Key", icon: KeyRound },
     { id: "usage", label: "额度", icon: TimerReset },
     { id: "usage-samples", label: "样本", icon: Radar },
@@ -1087,6 +1089,20 @@ function App() {
     <TimeZoneContext.Provider value={settings.display_timezone || defaultTimeZone}>
       <NowContext.Provider value={now}>
       <main className="shell">
+      {notice ? (
+        <div aria-live="polite" className="global-notice" role="status">
+          <CheckCircle2 aria-hidden="true" size={18} />
+          <span>{notice}</span>
+          <button
+            aria-label="关闭提示"
+            onClick={() => setNotice("")}
+            title="关闭"
+            type="button"
+          >
+            <X size={15} />
+          </button>
+        </div>
+      ) : null}
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">
@@ -1159,19 +1175,6 @@ function App() {
             <h1>{titleFor(view)}</h1>
           </div>
           <div className="topbar-actions">
-            {notice ? (
-              <div className="notice" role="status">
-                <span>{notice}</span>
-                <button
-                  aria-label="关闭提示"
-                  onClick={() => setNotice("")}
-                  title="关闭"
-                  type="button"
-                >
-                  <X size={15} />
-                </button>
-              </div>
-            ) : null}
             <button
               aria-label="刷新当前页面数据"
               className="icon-button toolbar-page-refresh"
@@ -1278,6 +1281,7 @@ function App() {
               setNotice(message);
               void api.accounts().then(setAccounts);
             }}
+            onNotice={setNotice}
           />
         ) : null}
         {view === "api-keys" ? (
@@ -1353,6 +1357,7 @@ function App() {
             onImport={(content, provider) => runAction(() => api.importMailboxes(content, provider), "导入完成")}
             onDelete={(id) => runAction(() => api.deleteMailbox(id), "已删除")}
             onDeleteMany={(ids) => runAction(() => api.deleteMailboxes(ids), `已删除 ${ids.length} 个邮箱`)}
+            onNotice={setNotice}
           />
         ) : null}
         {view === "phones" ? (
@@ -1960,6 +1965,7 @@ function AccountsView({
   onAccountJumpHandled,
   onDeleteRemote,
   onAccountEdited,
+  onNotice,
   onToggleDeleteUnlock,
   onToggleRefreshLock,
   onRefresh,
@@ -1976,6 +1982,7 @@ function AccountsView({
   onAccountJumpHandled: () => void;
   onDeleteRemote: (account: Account) => void;
   onAccountEdited: (message: string) => void;
+  onNotice: (message: string) => void;
   onToggleDeleteUnlock: (account: Account, unlocked: boolean) => void;
   onToggleRefreshLock: (account: Account, unlocked: boolean) => void;
   onRefresh: (email: string) => void;
@@ -1991,6 +1998,7 @@ function AccountsView({
   const [accountSearch, setAccountSearch] = useState("");
   const [accountStatusFilter, setAccountStatusFilter] = useState<AccountStatusFilter>("all");
   const [accountSubscriptionFilter, setAccountSubscriptionFilter] = useState("");
+  const [accountGroupFilter, setAccountGroupFilter] = useState("");
   const [selectedAccountKeys, setSelectedAccountKeys] = useState<Record<string, boolean>>({});
   const [livenessAccounts, setLivenessAccounts] = useState<Account[] | null>(null);
   const [sessionDeleteUnlocks, setSessionDeleteUnlocks] = useState<Record<string, boolean>>({});
@@ -2001,7 +2009,8 @@ function AccountsView({
   const [mailError, setMailError] = useState("");
   const [selectedPhoneAccount, setSelectedPhoneAccount] = useState<Account | null>(null);
   const [selectedErrorAccount, setSelectedErrorAccount] = useState<Account | null>(null);
-  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [editingAccounts, setEditingAccounts] = useState<Account[] | null>(null);
+  const [notesAccount, setNotesAccount] = useState<Account | null>(null);
   const [highlightedAccountKey, setHighlightedAccountKey] = useState<string | null>(null);
   const handledJumpRequestRef = useRef<number | null>(null);
   const livenessTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -2038,9 +2047,13 @@ function AccountsView({
     () => availableAccountSubscriptionFilterOptions(accountFilterCandidates.subscriptionOptionAccounts),
     [accountFilterCandidates.subscriptionOptionAccounts],
   );
+  const accountGroupFilterOptions = useMemo(
+    () => availableAccountGroupFilterOptions(orderedAccounts),
+    [orderedAccounts],
+  );
   const filteredAccounts = useMemo(
     () =>
-      accountFilterCandidates.filteredAccounts.filter((account) => {
+      accountFilterCandidates.filteredAccounts.filter((account) => accountMatchesGroupFilter(account, accountGroupFilter)).filter((account) => {
         const usage = usageForAccount(account, usageByAccountId, usageByEmail);
         return textMatchesSearch(
           [
@@ -2071,6 +2084,8 @@ function AccountsView({
             account.subscription_billing_period,
             account.subscription_plan,
             account.has_active_subscription === null ? "" : account.has_active_subscription ? "订阅有效 active subscription" : "订阅无效 inactive subscription",
+            (account.groups || []).map((group) => `${group.name} ${group.id}`).join(" "),
+            account.notes,
             account.last_error,
             mailboxByEmail.get(account.email.toLowerCase())?.mailbox_email,
             mailboxByEmail.get(account.email.toLowerCase())?.provider,
@@ -2082,12 +2097,13 @@ function AccountsView({
           accountSearch,
         );
       }),
-    [accountFilterCandidates.filteredAccounts, accountSearch, mailboxByEmail, usageByAccountId, usageByEmail],
+    [accountFilterCandidates.filteredAccounts, accountGroupFilter, accountSearch, mailboxByEmail, usageByAccountId, usageByEmail],
   );
   const selectedAccounts = accounts.filter((account) => selectedAccountKeys[accountRowKey(account)]);
   const selectedAccountCount = selectedAccounts.length;
   const selectedLivenessAccounts = selectedAccounts.filter(accountCanBeLivenessTested);
   const selectedLivenessAccountCount = selectedLivenessAccounts.length;
+  const oauthAccountTotal = accounts.filter(accountCanBeLivenessTested).length;
   const currentLivenessAccounts = filteredAccounts.filter(accountCanBeLivenessTested);
   const selectableCurrentLivenessAccounts = currentLivenessAccounts.slice(0, MAX_LIVENESS_ACCOUNTS);
   const allCurrentLivenessAccountsSelected = Boolean(
@@ -2134,6 +2150,7 @@ function AccountsView({
 
     setAccountStatusFilter("all");
     setAccountSubscriptionFilter("");
+    setAccountGroupFilter("");
 
     if (!targetAccount) {
       setAccountSearch(searchText);
@@ -2288,7 +2305,7 @@ function AccountsView({
       <section className="panel">
         <div className="panel-toolbar accounts-panel-toolbar">
           <div className="accounts-toolbar-main">
-            <PanelTitle title="账号状态" icon={UsersRound} />
+            <PanelTitle title="OAuth 账号状态" icon={UsersRound} />
             <div className="accounts-filter-row">
               <SearchBox
                 count={filteredAccounts.length}
@@ -2306,6 +2323,11 @@ function AccountsView({
                 onChange={setAccountSubscriptionFilter}
                 options={accountSubscriptionFilterOptions}
                 value={accountSubscriptionFilter}
+              />
+              <AccountGroupFilterMenu
+                onChange={setAccountGroupFilter}
+                options={accountGroupFilterOptions}
+                value={accountGroupFilter}
               />
             </div>
           </div>
@@ -2333,15 +2355,18 @@ function AccountsView({
               <Activity size={17} />
               <span>测活 ({selectedLivenessAccountCount}/{MAX_LIVENESS_ACCOUNTS})</span>
             </button>
-            <span
-              className={
-                "liveness-selection-count"
-                + (selectedLivenessAccountCount > MAX_LIVENESS_ACCOUNTS ? " is-over-limit" : "")
-              }
-              role="status"
+            <button
+              className="secondary-button"
+              disabled={busy || selectedLivenessAccountCount < 2}
+              onClick={() => setEditingAccounts(selectedLivenessAccounts)}
+              onFocus={() => void loadAccountEditorDialog()}
+              onMouseEnter={() => void loadAccountEditorDialog()}
+              title={selectedLivenessAccountCount < 2 ? "请至少勾选 2 个 OAuth GPT 账号" : `批量编辑 ${selectedLivenessAccountCount} 个 OAuth GPT 账号`}
+              type="button"
             >
-              已选 {selectedLivenessAccountCount} 个 OAuth GPT 账号
-            </span>
+              <Pencil size={17} />
+              <span>批量编辑{selectedLivenessAccountCount ? ` (${selectedLivenessAccountCount})` : ""}</span>
+            </button>
             <button className="secondary-button" disabled={busy || !currentNoEmailAccountCount} onClick={selectCurrentNoEmailAccounts} type="button">
               勾选当前无邮箱{currentNoEmailAccountCount ? ` (${currentNoEmailAccountCount})` : ""}
             </button>
@@ -2404,12 +2429,15 @@ function AccountsView({
                   </label>
                 </th>
                 <th aria-sort={accountSortField === "account" ? (accountSortDirection === "asc" ? "ascending" : "descending") : "none"}>
-                  <AccountTableSortButton
-                    active={accountSortField === "account"}
-                    direction={accountSortDirection}
-                    label="账号"
-                    onClick={() => toggleAccountSort("account")}
-                  />
+                  <div className="account-header-with-selection">
+                    <AccountTableSortButton
+                      active={accountSortField === "account"}
+                      direction={accountSortDirection}
+                      label="账号"
+                      onClick={() => toggleAccountSort("account")}
+                    />
+                    <span className="account-selection-summary" role="status">已选 {selectedLivenessAccountCount}/{oauthAccountTotal}</span>
+                  </div>
                 </th>
                 <th>sub2api ID</th>
                 <th aria-sort={accountSortField === "imported_at" ? (accountSortDirection === "asc" ? "ascending" : "descending") : "none"}>
@@ -2444,7 +2472,8 @@ function AccountsView({
                   selected={Boolean(selectedAccountKeys[accountRowKey(account)])}
                   usage={usageForAccount(account, usageByAccountId, usageByEmail)}
                   onDeleteRemote={deleteRemote}
-                  onEdit={setEditingAccount}
+                  onEdit={(target) => setEditingAccounts([target])}
+                  onOpenNotes={setNotesAccount}
                   onToggleSelected={toggleSelectedAccount}
                   sessionDeleteUnlocked={Boolean(sessionDeleteUnlocks[accountRowKey(account)])}
                   onToggleRefreshLock={onToggleRefreshLock}
@@ -2476,11 +2505,13 @@ function AccountsView({
       {currentSelectedPhoneAccount ? <AccountPhoneDialog account={currentSelectedPhoneAccount} onClose={() => setSelectedPhoneAccount(null)} /> : null}
       {selectedErrorAccount ? <AccountErrorDialog account={selectedErrorAccount} onClose={() => setSelectedErrorAccount(null)} /> : null}
       {livenessAccounts ? <AccountLivenessDialog accounts={livenessAccounts} onClose={closeLivenessDialog} /> : null}
-      {editingAccount ? (
+      {notesAccount ? <AccountNotesDialog account={notesAccount} onClose={() => setNotesAccount(null)} onUpdated={onAccountEdited} /> : null}
+      {editingAccounts ? (
         <Suspense fallback={null}>
           <AccountEditorDialog
-            account={editingAccount}
-            onClose={() => setEditingAccount(null)}
+            accounts={editingAccounts}
+            onClose={() => setEditingAccounts(null)}
+            onNotice={onNotice}
             onUpdated={onAccountEdited}
           />
         </Suspense>
@@ -2772,6 +2803,117 @@ function AccountLivenessDialog({ accounts, onClose }: { accounts: Account[]; onC
   );
 }
 
+function AccountNotesDialog({
+  account,
+  onClose,
+  onUpdated,
+}: {
+  account: Account;
+  onClose: () => void;
+  onUpdated: (message: string) => Promise<void> | void;
+}) {
+  const accountId = account.sub2api_account_id || "";
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [detail, setDetail] = useState<AccountNotes | null>(null);
+  const [notes, setNotes] = useState(account.notes || "");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    setError("");
+    api.accountNotes(accountId, controller.signal)
+      .then((result) => {
+        setDetail(result);
+        setNotes(result.notes);
+      })
+      .catch((reason) => {
+        if (!(reason instanceof DOMException && reason.name === "AbortError")) {
+          setError(reason instanceof Error ? reason.message : "备注读取失败");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [accountId]);
+
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !saving) onClose();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, saving]);
+
+  const saveNotes = (event: FormEvent) => {
+    event.preventDefault();
+    if (!detail || saving) return;
+    setSaving(true);
+    setError("");
+    api.updateAccountNotes(accountId, notes, detail.identity_fingerprint)
+      .then(async (result) => {
+        setDetail(result);
+        setNotes(result.notes);
+        await onUpdated("备注已写回 sub2api，将在后续同步中保持一致。");
+        onClose();
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "备注写回失败"))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !saving) onClose();
+      }}
+      role="presentation"
+    >
+      <section aria-busy={loading || saving} aria-labelledby="account-notes-title" aria-modal="true" className="mail-dialog account-notes-dialog" role="dialog">
+        <header className="mail-dialog-head">
+          <div>
+            <p className="eyebrow">sub2api #{accountId}</p>
+            <h2 id="account-notes-title">OAuth 账号备注</h2>
+            <p className="account-notes-account">{detail?.account_name || account.account_name || account.email}</p>
+          </div>
+          <button aria-label="关闭备注" className="icon-button" disabled={saving} onClick={onClose} ref={closeButtonRef} title="关闭" type="button">
+            <X size={17} />
+          </button>
+        </header>
+        {error ? <div className="mail-error" role="alert">{error}</div> : null}
+        {loading ? (
+          <div className="account-notes-loading"><RefreshCcw className="spin" size={18} />正在读取 sub2api 备注...</div>
+        ) : (
+          <form className="account-notes-form" onSubmit={saveNotes}>
+            <label>
+              <span>备注内容</span>
+              <textarea
+                autoFocus
+                maxLength={10_000}
+                onChange={(event) => setNotes(event.currentTarget.value)}
+                placeholder="暂无备注"
+                rows={10}
+                value={notes}
+              />
+            </label>
+            <footer className="account-notes-footer">
+              <span>{notes.length}/10000</span>
+              <button className="primary-button" disabled={!detail || saving} type="submit">
+                {saving ? <RefreshCcw className="spin" size={17} /> : <Save size={17} />}
+                <span>{saving ? "写回中" : "保存备注"}</span>
+              </button>
+            </footer>
+          </form>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function AccountRow({
   account,
   busy,
@@ -2788,6 +2930,7 @@ function AccountRow({
   onToggleRefreshLock,
   onOpenMailbox,
   onOpenError,
+  onOpenNotes,
   onOpenPhone,
   onRefresh,
   onToggleUsageEstimate,
@@ -2807,6 +2950,7 @@ function AccountRow({
   onToggleRefreshLock?: (account: Account, unlocked: boolean) => void;
   onOpenMailbox?: (mailbox: Mailbox) => void;
   onOpenError?: (account: Account) => void;
+  onOpenNotes?: (account: Account) => void;
   onOpenPhone?: (account: Account) => void;
   onRefresh?: (email: string) => void;
   onToggleUsageEstimate?: (id: number, enabled: boolean) => void;
@@ -2977,6 +3121,16 @@ function AccountRow({
             <Smartphone size={16} />
           </button>
           <button
+            aria-label={`查看 ${account.account_name || account.email} 的备注`}
+            className="icon-button"
+            disabled={busy || !account.sub2api_account_id}
+            onClick={() => onOpenNotes?.(account)}
+            title="查看备注"
+            type="button"
+          >
+            <StickyNote size={16} />
+          </button>
+          <button
             aria-label={`编辑 ${account.account_name || account.email}`}
             className="icon-button"
             disabled={busy || !account.sub2api_account_id || !onEdit}
@@ -3143,7 +3297,7 @@ function AccountSubscriptionCell({ account, timeZone }: { account: Account; time
   const period = account.subscription_billing_period ? periodLabel(account.subscription_billing_period) : null;
   const activeTone = subscriptionIsInvalid(account) ? "warn" : account.has_active_subscription === true ? "ok" : "ink";
   const planLabelText = accountSubscriptionTypeLabel(account);
-  if (!account.subscription_expires_at && !account.subscription_starts_at && !account.subscription_renews_at) {
+  if (!account.subscription_expires_at && !account.subscription_starts_at) {
     return (
       <div className="subscription-cell">
         <Badge tone={activeTone}>{planLabelText}</Badge>
@@ -3159,8 +3313,6 @@ function AccountSubscriptionCell({ account, timeZone }: { account: Account; time
       </div>
       <span>开通 {account.subscription_starts_at ? formatDate(account.subscription_starts_at, timeZone) : "-"}</span>
       <span>到期 {account.subscription_expires_at ? formatDate(account.subscription_expires_at, timeZone) : "-"}</span>
-      {account.subscription_renews_at ? <span>续费 {formatDate(account.subscription_renews_at, timeZone)}</span> : null}
-      {account.subscription_cancels_at ? <span>取消 {formatDate(account.subscription_cancels_at, timeZone)}</span> : null}
     </div>
   );
 }
@@ -4017,12 +4169,14 @@ function MailboxView({
   onImport,
   onDelete,
   onDeleteMany,
+  onNotice,
 }: {
   mailboxes: Mailbox[];
   busy: boolean;
   onImport: (content: string, provider: string) => void;
   onDelete: (id: number) => void;
   onDeleteMany: (ids: number[]) => Promise<void> | void;
+  onNotice: (message: string) => void;
 }) {
   const timeZone = useDisplayTimeZone();
   const [content, setContent] = useState("");
@@ -4033,7 +4187,6 @@ function MailboxView({
   const [credentialLoading, setCredentialLoading] = useState(false);
   const [credentialError, setCredentialError] = useState("");
   const [credentialActionError, setCredentialActionError] = useState("");
-  const [credentialActionMessage, setCredentialActionMessage] = useState("");
   const [credentialExporting, setCredentialExporting] = useState(false);
   const [folder, setFolder] = useState<"inbox" | "junk">("inbox");
   const [messages, setMessages] = useState<MailMessage[]>([]);
@@ -4077,7 +4230,6 @@ function MailboxView({
     setCredentialDetail(null);
     setCredentialError("");
     setCredentialActionError("");
-    setCredentialActionMessage("");
     setCredentialLoading(true);
     api.mailboxCredentials(mailbox.id)
       .then((detail) => {
@@ -4102,12 +4254,12 @@ function MailboxView({
   const exportMailboxIds = async (mailboxIds: number[], fileName: string) => {
     if (!mailboxIds.length) return;
     setCredentialActionError("");
-    setCredentialActionMessage("");
+    onNotice("");
     setCredentialExporting(true);
     try {
       const result = await api.exportMailboxes(mailboxIds);
       downloadTextFile(fileName, result.content);
-      setCredentialActionMessage(`已导出 ${result.exported} 个邮箱凭据`);
+      onNotice(`已导出 ${result.exported} 个邮箱凭据`);
     } catch (error) {
       setCredentialActionError(error instanceof Error ? error.message : "导出邮箱凭据失败");
     } finally {
@@ -4117,12 +4269,12 @@ function MailboxView({
   const copyMailboxIds = async (mailboxIds: number[]) => {
     if (!mailboxIds.length) return;
     setCredentialActionError("");
-    setCredentialActionMessage("");
+    onNotice("");
     setCredentialExporting(true);
     try {
       const result = await api.exportMailboxes(mailboxIds);
       await copyTextToClipboard(result.content);
-      setCredentialActionMessage(`已按导入格式复制 ${result.exported} 个邮箱凭据`);
+      onNotice(`已按导入格式复制 ${result.exported} 个邮箱凭据`);
     } catch (error) {
       setCredentialActionError(error instanceof Error ? error.message : "复制邮箱凭据失败");
     } finally {
@@ -4278,7 +4430,6 @@ function MailboxView({
             </button>
           </div>
         </div>
-        {credentialActionMessage ? <p className="resource-action-message" role="status">{credentialActionMessage}</p> : null}
         {credentialActionError ? <p className="mail-error">{credentialActionError}</p> : null}
         <div className="table-wrap">
           <table className="mailbox-table">
@@ -7657,6 +7808,18 @@ function SignalLine({ label, value }: { label: string; value: string }) {
   );
 }
 
+function AccountGroupFilterMenu({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: Array<QuickFilterOption<string>>;
+  onChange: (value: string) => void;
+}) {
+  return <QuickFilterMenu ariaLabel="分组筛选选项" label="分组筛选" onChange={onChange} options={options} value={value} />;
+}
+
 function AutomationSettingsTable({ children }: { children: ReactNode }) {
   return (
     <div className="automation-settings-table">
@@ -8034,7 +8197,7 @@ function formatWindowRefreshTitle(label: string, window: UsageWindowEstimate, ti
 function titleFor(view: View) {
   return {
     overview: "调度恢复概览",
-    accounts: "GPT 账号状态",
+    accounts: "OAuth 账号状态",
     "api-keys": "API Key 账号管理",
     usage: "额度估算",
     "usage-samples": "额度样本",
@@ -8428,6 +8591,33 @@ function availableAccountSubscriptionFilterOptions(accounts: Account[]): Array<Q
   return [{ value: "", label: "全部订阅" }, ...options];
 }
 
+function availableAccountGroupFilterOptions(accounts: Account[]): Array<QuickFilterOption<string>> {
+  const options: Array<QuickFilterOption<string>> = [{ value: "", label: "全部分组" }];
+  const seen = new Set<string>();
+  let hasUngrouped = false;
+  for (const account of accounts) {
+    const groups = account.groups || [];
+    if (!groups.length) {
+      hasUngrouped = true;
+      continue;
+    }
+    for (const group of groups) {
+      if (seen.has(group.id)) continue;
+      seen.add(group.id);
+      options.push({ value: group.id, label: group.name });
+    }
+  }
+  if (hasUngrouped) options.push({ value: "__ungrouped__", label: "未分组" });
+  return options;
+}
+
+function accountMatchesGroupFilter(account: Account, filter: string) {
+  const groups = account.groups || [];
+  if (!filter) return true;
+  if (filter === "__ungrouped__") return groups.length === 0;
+  return groups.some((group) => group.id === filter);
+}
+
 function accountSubscriptionTypeLabel(
   account: Pick<
     Account,
@@ -8444,7 +8634,7 @@ function subscriptionIsInvalid(
   account: Pick<Account, "has_active_subscription" | "subscription_plan" | "subscription_type">,
 ) {
   const subscriptionType = normalizeSubscriptionType(account.subscription_type || account.subscription_plan);
-  return account.has_active_subscription === false && !seatBasedSubscriptionTypes.has(subscriptionType);
+  return account.has_active_subscription === false && !nonExpiringSubscriptionTypes.has(subscriptionType);
 }
 
 function accountScheduleTone(account: Account, usage?: AccountUsageEstimate) {

@@ -23,6 +23,13 @@ npm run dev
 
 默认访问 `http://127.0.0.1:5173`。根目录的 `npm run dev` 会先构建前端，再由同一个 FastAPI 进程提供前端页面和 `/api`，不会额外启动 Vite 或第二个端口。
 
+需要前端热更新时，Vite 开发服务器固定使用 `http://127.0.0.1:5176`，并将 `/api` 代理到 `http://127.0.0.1:8000`。分别启动后端和前端：
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+npm run frontend:dev
+```
+
 生产环境请把 `.env` 里的 `APP_ADMIN_KEY`、`APP_SESSION_SECRET`、`APP_ENCRYPTION_KEY` 换成长随机值，并把 `COOKIE_SECURE=true` 放在 HTTPS 反代之后使用。
 
 ## x1 部署流程

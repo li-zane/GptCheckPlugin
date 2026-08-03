@@ -43,6 +43,8 @@ export type Account = {
   delete_unlocked: boolean;
   rate_limited: boolean;
   rate_limited_windows: string[];
+  notes: string;
+  groups: AccountGroupRef[];
   subscription_starts_at: string | null;
   subscription_expires_at: string | null;
   subscription_renews_at: string | null;
@@ -56,6 +58,11 @@ export type Account = {
   phone_sms_url: string | null;
   phone_sms_cdk: string | null;
   phone_sms_recharge_url: string | null;
+};
+
+export type AccountGroupRef = {
+  id: string;
+  name: string;
 };
 
 export type AccountLivenessModel = {
@@ -136,6 +143,13 @@ export type AccountEditUpdate = AccountEditConfiguration & {
 export type AccountEditResult = {
   message: string;
   editor: AccountEditor;
+};
+
+export type AccountNotes = {
+  account_id: string;
+  account_name: string;
+  notes: string;
+  identity_fingerprint: string;
 };
 
 export type AccountLivenessTestItem = {

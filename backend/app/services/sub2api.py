@@ -1423,6 +1423,103 @@ class Sub2ApiClient:
             raise Sub2ApiRequestError("sub2api account readback did not complete after updating its name.")
         raise Sub2ApiRequestError("sub2api did not confirm the updated account name.")
 
+    def account_notes(self, account: dict[str, Any]) -> str:
+        value = account.get("notes")
+        return str(value).strip() if value is not None else ""
+
+    def account_groups(self, account: dict[str, Any]) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
+        raw_groups = account.get("groups")
+        if not isinstance(raw_groups, list):
+            raw_groups = account.get("account_groups")
+        if isinstance(raw_groups, list):
+            for item in raw_groups:
+                if not isinstance(item, dict):
+                    continue
+                group_id = str(item.get("id") or item.get("group_id") or "").strip()
+                if not group_id or group_id in seen:
+                    continue
+                group_name = str(item.get("name") or item.get("group_name") or group_id).strip()
+                result.append({"id": group_id, "name": group_name or group_id})
+                seen.add(group_id)
+        if result:
+            return result
+        raw_group_ids = account.get("group_ids")
+        if isinstance(raw_group_ids, list):
+            for value in raw_group_ids:
+                group_id = str(value or "").strip()
+                if group_id and group_id not in seen:
+                    result.append({"id": group_id, "name": f"分组 #{group_id}"})
+                    seen.add(group_id)
+        return result
+
+    async def update_account_notes(
+        self,
+        account_id: str | int,
+        notes: str,
+        *,
+        validate_current: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        numeric_id = _positive_int(account_id)
+        if numeric_id is None:
+            raise ValueError("A positive numeric sub2api account id is required.")
+        normalized_notes = str(notes or "").strip()
+        if len(normalized_notes) > 10_000:
+            raise ValueError("notes must not exceed 10000 characters.")
+
+        config = await get_runtime_config_service().get_sub2api_config()
+        current = await self.get_account_by_id(numeric_id, config=config)
+        if current is None:
+            raise Sub2ApiRequestError("sub2api account was not found.", status_code=404)
+        if validate_current is not None:
+            validate_current(current)
+
+        mutation_error: Exception | None = None
+        try:
+            await self._request(
+                "PUT",
+                f"{config.accounts_path}/{numeric_id}",
+                config=config,
+                json={"notes": normalized_notes or None},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            mutation_error = exc
+
+        account_was_seen = False
+        readback_completed = False
+        try:
+            async with asyncio.timeout(SUB2API_MUTATION_READBACK_TIMEOUT_SECONDS):
+                for attempt in range(SUB2API_MUTATION_READBACK_ATTEMPTS):
+                    try:
+                        updated = await self.get_account_by_id(numeric_id, config=config)
+                        readback_completed = True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        updated = None
+                    if updated is not None:
+                        account_was_seen = True
+                        if self.account_notes(updated) == normalized_notes:
+                            return updated
+                    if attempt + 1 < SUB2API_MUTATION_READBACK_ATTEMPTS:
+                        await asyncio.sleep(SUB2API_MUTATION_READBACK_DELAY_SECONDS)
+        except TimeoutError:
+            pass
+
+        if mutation_error is not None:
+            raise mutation_error
+        if readback_completed and not account_was_seen:
+            raise Sub2ApiRequestError(
+                "sub2api account was not found after updating its notes.",
+                status_code=404,
+            )
+        if not readback_completed:
+            raise Sub2ApiRequestError("sub2api account readback did not complete after updating its notes.")
+        raise Sub2ApiRequestError("sub2api did not confirm the updated account notes.")
+
     async def update_account_base_url(
         self,
         account_id: str | int,

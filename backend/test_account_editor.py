@@ -47,7 +47,10 @@ class FakeEditorSub2Api(Sub2ApiClient):
     def __init__(self) -> None:
         super().__init__()
         self.account = remote_account()
-        self.groups = [{"id": 3, "name": "Main", "status": "active", "rate_multiplier": 1.0}]
+        self.groups = [
+            {"id": 9, "name": "Second by name", "status": "active", "rate_multiplier": 1.0},
+            {"id": 3, "name": "First by name", "status": "active", "rate_multiplier": 1.0},
+        ]
         self.proxies = [{"id": 9, "name": "Proxy 9", "status": "active"}]
         self.models = [
             {"id": "gpt-5.4", "display_name": "GPT-5.4"},
@@ -78,6 +81,7 @@ class AccountEditorServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sub2api.assert_platform, "openai")
         self.assertEqual(sub2api.assert_model_platform, "openai")
+        self.assertEqual([group["id"] for group in resources.groups], [9, 3])
         self.assertEqual(configuration.proxy_id, 9)
         self.assertEqual(configuration.group_ids, [3])
         self.assertEqual(configuration.model_whitelist, ["gpt-5.4"])
@@ -131,6 +135,40 @@ class AccountEditorServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AccountEditorSub2ApiContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_notes_update_uses_one_put_and_confirms_readback(self) -> None:
+        state = remote_account(notes="old note")
+        requests: list[tuple[str, str, dict | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            requests.append((request.method, request.url.path, body))
+            if request.method == "PUT":
+                assert body is not None
+                state["notes"] = body["notes"]
+                return httpx.Response(200, json={"data": state})
+            return httpx.Response(200, json={"data": state})
+
+        config = SimpleNamespace(
+            base_url="http://sub2api.test/api/v1",
+            auth_token="test-token",
+            auth_header="X-API-Key",
+            auth_scheme="",
+            accounts_path="/admin/accounts",
+        )
+        runtime_config = SimpleNamespace(get_sub2api_config=AsyncMock(return_value=config))
+        client = Sub2ApiClient(transport=httpx.MockTransport(handler))
+
+        with patch("app.services.sub2api.get_runtime_config_service", return_value=runtime_config):
+            updated = await client.update_account_notes(17, "new synced note")
+
+        self.assertEqual(client.account_notes(updated), "new synced note")
+        self.assertEqual([item[:2] for item in requests], [
+            ("GET", "/api/v1/admin/accounts/17"),
+            ("PUT", "/api/v1/admin/accounts/17"),
+            ("GET", "/api/v1/admin/accounts/17"),
+        ])
+        self.assertEqual(requests[1][2], {"notes": "new synced note"})
+
     async def test_bulk_update_merges_model_whitelist_and_confirms_readback(self) -> None:
         state = remote_account()
         requests: list[tuple[str, str, dict | None]] = []

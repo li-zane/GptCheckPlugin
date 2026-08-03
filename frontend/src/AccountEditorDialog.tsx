@@ -20,8 +20,9 @@ import type {
 } from "./types";
 
 type Props = {
-  account: Account;
+  accounts: Account[];
   onClose: () => void;
+  onNotice: (message: string) => void;
   onUpdated: (message: string) => Promise<void> | void;
 };
 
@@ -57,15 +58,19 @@ function sortedPresets(presets: AccountEditPreset[]) {
   return [...presets].sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
 }
 
-export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
-  const accountId = account.sub2api_account_id || "";
+export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: Props) {
+  const accountIds = useMemo(
+    () => [...new Set(accounts.map((account) => account.sub2api_account_id || "").filter(Boolean))],
+    [accounts],
+  );
+  const accountId = accountIds[0] || "";
+  const batchMode = accountIds.length > 1;
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const [editor, setEditor] = useState<AccountEditor | null>(null);
   const [form, setForm] = useState<AccountEditCurrent | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState("");
   const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
   const [selectedPresetId, setSelectedPresetId] = useState("");
   const [newPresetName, setNewPresetName] = useState("");
   const [modelSearch, setModelSearch] = useState("");
@@ -146,7 +151,7 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
   const runMutation = async (action: string, operation: () => Promise<void>) => {
     setBusyAction(action);
     setError("");
-    setMessage("");
+    onNotice("");
     try {
       await operation();
     } catch (reason) {
@@ -156,16 +161,34 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
     }
   };
 
+  const loadTargetEditors = useCallback(async () => {
+    const results = await Promise.all(accountIds.map(async (targetAccountId) => {
+      if (targetAccountId === accountId && editor) return editor;
+      return api.accountEditor(targetAccountId);
+    }));
+    return results;
+  }, [accountId, accountIds, editor]);
+
   const saveAccount = (event: FormEvent) => {
     event.preventDefault();
     if (!form || !accountId) return;
     void runMutation("save", async () => {
-      const result = await api.updateAccountEditor(accountId, {
-        ...accountConfiguration(form),
-        name: form.name.trim(),
-        expected_identity_fingerprint: form.identity_fingerprint,
-      });
-      await onUpdated(result.message);
+      const configuration = accountConfiguration(form);
+      const targetEditors = batchMode ? await loadTargetEditors() : [editor].filter(Boolean) as AccountEditor[];
+      const results = await Promise.allSettled(targetEditors.map((targetEditor) => api.updateAccountEditor(
+        targetEditor.account.account_id,
+        {
+          ...configuration,
+          name: batchMode ? targetEditor.account.name : form.name.trim(),
+          expected_identity_fingerprint: targetEditor.account.identity_fingerprint,
+        },
+      )));
+      const failed = results.filter((result) => result.status === "rejected");
+      if (failed.length) {
+        await onUpdated("");
+        throw new Error(`已写入 ${results.length - failed.length}/${results.length} 个账号，${failed.length} 个失败：${failed.map((result) => result.reason instanceof Error ? result.reason.message : "未知错误").join("；")}`);
+      }
+      await onUpdated(batchMode ? `已批量更新 ${results.length} 个 OAuth GPT 账号。` : "账号配置已写入 sub2api 并完成回读校验。");
       onClose();
     });
   };
@@ -181,7 +204,7 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
       replacePreset(preset);
       setSelectedPresetId(String(preset.id));
       setNewPresetName("");
-      setMessage("模板已保存。");
+      onNotice("模板已保存。");
     });
   };
 
@@ -193,7 +216,7 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
         configuration: presetConfiguration(form),
       });
       replacePreset(preset);
-      setMessage("模板已更新。");
+      onNotice("模板已更新。");
     });
   };
 
@@ -206,22 +229,30 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
         presets: current.presets.filter((preset) => preset.id !== selectedPreset.id),
       } : current);
       setSelectedPresetId("");
-      setMessage(result.message);
+      onNotice(result.message);
     });
   };
 
   const applyPreset = () => {
     if (!form || !selectedPreset || !accountId) return;
     void runMutation("apply-preset", async () => {
-      const result = await api.applyAccountEditPreset(
+      const targetEditors = batchMode ? await loadTargetEditors() : [editor].filter(Boolean) as AccountEditor[];
+      const results = await Promise.allSettled(targetEditors.map((targetEditor) => api.applyAccountEditPreset(
         selectedPreset.id,
-        accountId,
-        form.identity_fingerprint,
-      );
-      installEditor(result.editor);
+        targetEditor.account.account_id,
+        targetEditor.account.identity_fingerprint,
+      )));
+      const failed = results.filter((result) => result.status === "rejected");
+      const sourceResult = results.find((result) => result.status === "fulfilled" && result.value.editor.account.account_id === accountId);
+      if (sourceResult?.status === "fulfilled") installEditor(sourceResult.value.editor);
       setSelectedPresetId(String(selectedPreset.id));
-      setMessage(result.message);
-      await onUpdated(result.message);
+      if (failed.length) {
+        await onUpdated("");
+        throw new Error(`模板已应用到 ${results.length - failed.length}/${results.length} 个账号，${failed.length} 个失败：${failed.map((result) => result.reason instanceof Error ? result.reason.message : "未知错误").join("；")}`);
+      }
+      await onUpdated(batchMode
+        ? `模板“${selectedPreset.name}”已通过有效性检查并应用到 ${results.length} 个账号。`
+        : `模板“${selectedPreset.name}”已通过有效性检查并应用。`);
     });
   };
 
@@ -247,7 +278,7 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
     } : current);
   };
 
-  const liveMessage = error || message || (busyAction === "apply-preset" ? "正在重新校验模板配置" : "");
+  const liveMessage = error || (busyAction === "apply-preset" ? "正在重新校验模板配置" : "");
 
   return (
     <div
@@ -266,8 +297,8 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
       >
         <header className="mail-dialog-head">
           <div>
-            <p className="eyebrow">sub2api #{accountId || "-"}</p>
-            <h2 id="account-editor-title">编辑账号</h2>
+            <p className="eyebrow">{batchMode ? `${accountIds.length} 个 OAuth GPT 账号` : `sub2api #${accountId || "-"}`}</p>
+            <h2 id="account-editor-title">{batchMode ? "批量编辑账号" : "编辑账号"}</h2>
           </div>
           <div className="account-editor-head-actions">
             <button
@@ -296,7 +327,6 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
 
         <span aria-atomic="true" aria-live="polite" className="sr-only">{liveMessage}</span>
         {error ? <div className="mail-error" role="alert">{error}</div> : null}
-        {message ? <div className="account-editor-success" role="status"><CheckCircle2 size={16} />{message}</div> : null}
         {loading && !form ? <div className="account-editor-loading"><RefreshCcw className="spin" size={18} />正在读取账号配置...</div> : null}
 
         {form && editor ? (
@@ -350,11 +380,13 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
 
             <section className="account-editor-section">
               <div className="account-editor-section-head"><h3>基础与调度</h3></div>
-              <div className="account-editor-fields">
-                <label className="account-editor-name-field">
-                  <span>账号名称</span>
-                  <input maxLength={100} onChange={(event) => setForm({ ...form, name: event.currentTarget.value })} required value={form.name} />
-                </label>
+              <div className={batchMode ? "account-editor-fields is-batch" : "account-editor-fields"}>
+                {!batchMode ? (
+                  <label className="account-editor-name-field">
+                    <span>账号名称</span>
+                    <input maxLength={100} onChange={(event) => setForm({ ...form, name: event.currentTarget.value })} required value={form.name} />
+                  </label>
+                ) : null}
                 <label>
                   <span>并发数</span>
                   <input min={1} max={1000} onChange={(event) => setNumber("concurrency", Number(event.currentTarget.value))} required type="number" value={form.concurrency} />
@@ -583,9 +615,9 @@ export function AccountEditorDialog({ account, onClose, onUpdated }: Props) {
 
             <footer className="account-editor-footer">
               <span>{form.platform} · {form.account_type}</span>
-              <button className="primary-button" disabled={Boolean(busyAction) || !form.name.trim()} type="submit">
+              <button className="primary-button" disabled={Boolean(busyAction) || (!batchMode && !form.name.trim())} type="submit">
                 {busyAction === "save" ? <RefreshCcw className="spin" size={17} /> : <Save size={17} />}
-                <span>{busyAction === "save" ? "保存中" : "保存账号"}</span>
+                <span>{busyAction === "save" ? "保存中" : batchMode ? `保存 ${accountIds.length} 个账号` : "保存账号"}</span>
               </button>
             </footer>
           </form>

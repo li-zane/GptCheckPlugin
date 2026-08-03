@@ -401,6 +401,7 @@ test("view routes canonicalize paths and keep every dashboard view addressable",
 test("App navigation uses history state, a page refresh control, and a top settings submit", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const rootPackage = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+  const frontendPackage = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   const productionServer = readFileSync(new URL("../../backend/run_production.py", import.meta.url), "utf8");
   assert.match(source, /window\.history\.pushState\(null, "", nextPath\)/);
   assert.match(source, /window\.addEventListener\("popstate", handlePopState\)/);
@@ -417,8 +418,9 @@ test("App navigation uses history state, a page refresh control, and a top setti
   assert.ok(refreshButton >= 0 && settingsButton > refreshButton && settingsButton < firstSyncButton);
   assert.match(source, /disabled=\{syncBusy \|\| settingsFormInvalid\}/);
   const viteConfig = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
-  assert.match(viteConfig, /port:\s*5173/);
+  assert.match(viteConfig, /port:\s*5176/);
   assert.match(viteConfig, /strictPort:\s*true/);
+  assert.match(frontendPackage.scripts.dev, /--port 5176 --strictPort$/);
   assert.match(viteConfig, /"\^\/api\(\?:\/\|\$\)"/);
   assert.match(rootPackage.scripts["backend:dev"], /--port 5173$/);
   assert.match(productionServer, /port=5173/);
@@ -452,7 +454,7 @@ test("App navigation uses history state, a page refresh control, and a top setti
   assert.match(styleSource, /\.discord-bot-install-mode-grid[\s\S]*grid-template-columns:\s*repeat\(2/);
 });
 
-test("account editor exposes live sub2api settings and revalidates reusable presets", () => {
+test("OAuth account editor supports batch updates, notes, and revalidated reusable presets", () => {
   const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const editorSource = readFileSync(new URL("../src/AccountEditorDialog.tsx", import.meta.url), "utf8");
@@ -461,20 +463,36 @@ test("account editor exposes live sub2api settings and revalidates reusable pres
   assert.match(apiSource, /`\/api\/accounts\/editor\/\$\{encodeURIComponent\(accountId\)\}`/);
   assert.match(apiSource, /"\/api\/accounts\/edit-presets"/);
   assert.match(apiSource, /`\/api\/accounts\/edit-presets\/\$\{presetId\}\/apply\/\$\{encodeURIComponent\(accountId\)\}`/);
+  assert.match(apiSource, /`\/api\/accounts\/\$\{encodeURIComponent\(accountId\)\}\/notes`/);
   assert.match(appSource, /const loadAccountEditorDialog = \(\) => import\("\.\/AccountEditorDialog"\)/);
+  assert.match(appSource, /label: "OAuth 账号"/);
+  assert.match(appSource, /title="OAuth 账号状态"/);
+  assert.match(appSource, /已选 \{selectedLivenessAccountCount\}\/\{oauthAccountTotal\}/);
+  assert.match(appSource, /<AccountGroupFilterMenu/);
+  assert.match(appSource, /label: "未分组"/);
+  assert.match(appSource, /<AccountNotesDialog/);
+  assert.match(appSource, /api\.updateAccountNotes\(accountId, notes, detail\.identity_fingerprint\)/);
   assert.match(appSource, /<Pencil size=\{16\} \/>/);
   assert.match(appSource, /onClick=\{\(\) => onEdit\?\.\(account\)\}/);
-  assert.match(editorSource, /api\.updateAccountEditor\(accountId/);
+  assert.match(editorSource, /accounts: Account\[\]/);
+  assert.match(editorSource, /Promise\.allSettled\(targetEditors\.map\(\(targetEditor\) => api\.updateAccountEditor\(/);
   assert.match(editorSource, /api\.createAccountEditPreset\(/);
   assert.match(editorSource, /api\.deleteAccountEditPreset\(selectedPreset\.id\)/);
-  assert.match(editorSource, /api\.applyAccountEditPreset\([\s\S]*?form\.identity_fingerprint/);
+  assert.match(editorSource, /api\.applyAccountEditPreset\([\s\S]*?targetEditor\.account\.identity_fingerprint/);
   assert.match(editorSource, /busyAction === "apply-preset"/);
   assert.match(editorSource, /resources_checked_at/);
   assert.match(editorSource, /invalidGroupIds/);
   assert.match(editorSource, /invalidModelIds/);
   assert.match(editorSource, /invalidProxy/);
   assert.match(editorSource, /model_candidates_complete/);
-  assert.match(editorSource, /expected_identity_fingerprint: form\.identity_fingerprint/);
+  assert.match(editorSource, /expected_identity_fingerprint: targetEditor\.account\.identity_fingerprint/);
+  assert.match(editorSource, /name: batchMode \? targetEditor\.account\.name : form\.name\.trim\(\)/);
+  assert.match(editorSource, /onNotice\("模板已保存。"\)/);
+  assert.match(editorSource, /onNotice\("模板已更新。"\)/);
+  assert.match(editorSource, /onNotice\(result\.message\)/);
+  assert.match(appSource, /onNotice=\{setNotice\}/);
+  assert.doesNotMatch(editorSource, /account-editor-toast|templateToast|setMessage\(/);
+  assert.match(editorSource, /await onUpdated\(""\)/);
   assert.match(editorSource, /account_type_scope: form\.account_type/);
   assert.match(editorSource, /OpenAI \/ Codex 高级设置/);
   assert.match(editorSource, /WS Mode/);
@@ -487,6 +505,9 @@ test("account editor exposes live sub2api settings and revalidates reusable pres
   assert.match(styles, /\.account-editor-choice-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,/s);
   assert.match(styles, /\.account-editor-model-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
   assert.match(styles, /\.account-editor-advanced-fields[\s\S]*?grid-template-columns:\s*repeat\(3,/);
+  assert.match(styles, /\.account-editor-fields > label > input,[\s\S]*?min-width:\s*0;[\s\S]*?width:\s*100%;/);
+  assert.doesNotMatch(styles, /\.account-editor-toast/);
+  assert.match(styles, /\.account-notes-dialog/);
   assert.match(styles, /@media \(max-width: 560px\)[\s\S]*?\.account-editor-advanced-fields[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
 });
 
@@ -733,7 +754,7 @@ test("API key change pages expose separate ledgers and unread highlighting", () 
   assert.match(styles, /\.api-key-scheduling-evidence/);
 });
 
-test("change ledger read state follows the active subview URL and retains leave fallback", () => {
+test("change ledger read state remains unread until the active subview is left", () => {
   assert.deepEqual(CHANGE_LOG_READ_RETRY_DELAYS_MS, [1_000, 2_000, 4_000]);
   assert.equal(pendingReadThroughId(null, [
     { id: 11, unread: false },
@@ -774,9 +795,10 @@ test("change ledger read state follows the active subview URL and retains leave 
   assert.match(source, /CHANGE_LOG_READ_RETRY_DELAYS_MS\[retryAttempt\]/);
   assert.match(source, /const nextRoute = routeFromPath\(window\.location\.pathname\)/);
   assert.match(source, /const stillViewingSameLog = nextRoute\.view === "api-keys"/);
-  assert.match(source, /urlConfirmsChangeLogSubview\(window\.location\.pathname, subview\)/);
-  assert.match(source, /rateLogsLoaded[\s\S]*?!rateLogsLoading[\s\S]*?markRateLogsReadOnLeave/);
-  assert.match(source, /scheduleLogsLoaded && !scheduleLogsLoading[\s\S]*?markScheduleLogsReadOnLeave/);
+  assert.doesNotMatch(source, /urlConfirmsChangeLogSubview\(window\.location\.pathname, subview\)/);
+  assert.doesNotMatch(source, /rateLogsLoaded[\s\S]*?!rateLogsLoading[\s\S]*?markRateLogsReadOnLeave/);
+  assert.doesNotMatch(source, /scheduleLogsLoaded && !scheduleLogsLoading[\s\S]*?markScheduleLogsReadOnLeave/);
+  assert.match(source, /departedChangeLogSubview\(previousSubview, subview\)/);
   assert.doesNotMatch(source, /retryAttempt > 0[\s\S]*?previousSubviewRef\.current === logSubview/);
   assert.doesNotMatch(source, /retryAttempt > 0[\s\S]*?previousSubviewRef\.current === "schedule-log"/);
   assert.match(source, /visibleChangeLogUnreadCounts\(changeLogUnreadCounts, subview\)/);
@@ -963,7 +985,10 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(styles, /\.api-key-subview-tabs\s*\{[\s\S]*?position:\s*sticky;/);
   assert.match(styles, /\.settings-local-nav\s*\{[\s\S]*?top:\s*calc\(var\(--app-sidebar-offset\) \+ var\(--app-header-height\)\);/);
   assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.settings-local-nav\s*\{\s*top:\s*calc\(var\(--app-sidebar-offset\) \+ var\(--app-header-height\)\);/);
-  assert.match(styles, /\.notice > button\s*\{/);
+  assert.match(styles, /\.global-notice\s*\{[^}]*left:\s*50%;[^}]*position:\s*fixed;[^}]*top:\s*max\(16px, env\(safe-area-inset-top\)\);[^}]*transform:\s*translateX\(-50%\);/s);
+  assert.match(styles, /\.global-notice > button\s*\{/);
+  assert.match(appSource, /<div aria-live="polite" className="global-notice" role="status">/);
+  assert.ok(appSource.indexOf('className="global-notice"') < appSource.indexOf('className="topbar"'));
   assert.match(styles, /\.api-key-monitor-current--success/);
   assert.match(styles, /\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 371px;/);
   assert.match(styles, /@media \(max-width: 680px\)[\s\S]*?\.api-key-channel-card\s*\{\s*height: auto;\s*min-height: 0;/);
@@ -1203,11 +1228,18 @@ test("subscription refresh concurrency preserves zero as unlimited", () => {
   );
 });
 
-test("subscription presentation keeps seat-based K12 plans visible", () => {
+test("subscription presentation keeps free and seat-based plans visible", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  assert.match(source, /seatBasedSubscriptionTypes = new Set\(\["team", "k12"/);
-  assert.match(source, /return account\.has_active_subscription === false && !seatBasedSubscriptionTypes\.has\(subscriptionType\)/);
+  assert.match(source, /nonExpiringSubscriptionTypes = new Set\(\["free", "team", "k12"/);
+  assert.match(source, /return account\.has_active_subscription === false && !nonExpiringSubscriptionTypes\.has\(subscriptionType\)/);
   assert.match(source, /return subscriptionIsInvalid\(account\) \? "订阅无效" : plan === "active" \? "正常" : plan/);
+  const subscriptionCellStart = source.indexOf("function AccountSubscriptionCell");
+  const subscriptionCellEnd = source.indexOf("function UsageEstimateView", subscriptionCellStart);
+  const subscriptionCell = source.slice(subscriptionCellStart, subscriptionCellEnd);
+  assert.doesNotMatch(subscriptionCell, /subscription_renews_at/);
+  assert.doesNotMatch(subscriptionCell, /subscription_cancels_at/);
+  assert.match(subscriptionCell, /<span>开通 /);
+  assert.match(subscriptionCell, /<span>到期 /);
 });
 
 test("upstream channels expose occupied, no-enabled, and empty upstream filters", () => {
@@ -3328,6 +3360,10 @@ test("mailbox and phone tables expose filtered select-all controls and URL mailb
   assert.match(styles, /\.resource-select-cell\s*\{[^}]*width:\s*42px;/s);
   assert.match(styles, /\.table-wrap tbody tr\.is-selected > td\s*\{[^}]*background:\s*var\(--green-tint\);/s);
   assert.match(appSource, /api\.exportMailboxes\(mailboxIds\)/);
+  assert.match(appSource, /onNotice\(`已按导入格式复制 \$\{result\.exported\} 个邮箱凭据`\)/);
+  assert.match(appSource, /onNotice\(`已导出 \$\{result\.exported\} 个邮箱凭据`\)/);
+  assert.doesNotMatch(appSource, /credentialActionMessage/);
+  assert.doesNotMatch(styles, /\.resource-action-message/);
   assert.match(appSource, /copyTextToClipboard\(result\.content\)/);
   assert.match(appSource, /title="按导入格式复制"/);
   assert.match(appSource, />复制已选<\/span>/);

@@ -43,6 +43,11 @@ class AccountSnapshotOut(BaseModel):
     updated_at: datetime
 
 
+class AccountGroupRef(BaseModel):
+    id: str
+    name: str
+
+
 class AccountOut(BaseModel):
     id: int
     email: str
@@ -74,6 +79,8 @@ class AccountOut(BaseModel):
     delete_unlocked: bool = False
     rate_limited: bool = False
     rate_limited_windows: list[str] = Field(default_factory=list)
+    notes: str = ""
+    groups: list[AccountGroupRef] = Field(default_factory=list)
     subscription_starts_at: str | None = None
     subscription_expires_at: str | None = None
     subscription_renews_at: str | None = None
@@ -87,8 +94,6 @@ class AccountOut(BaseModel):
     phone_sms_url: str | None = None
     phone_sms_cdk: str | None = None
     phone_sms_recharge_url: str | None = None
-
-
 class UsageGroupRef(BaseModel):
     id: str
     name: str
@@ -628,6 +633,23 @@ class AccountEditPresetApply(BaseModel):
     @classmethod
     def strip_account_edit_preset_fingerprint(cls, value: str) -> str:
         return value.strip()
+
+
+class AccountNotesUpdate(BaseModel):
+    notes: str = Field(default="", max_length=10_000)
+    expected_identity_fingerprint: str = Field(min_length=64, max_length=64)
+
+    @field_validator("notes", "expected_identity_fingerprint")
+    @classmethod
+    def strip_account_notes_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class AccountNotesOut(BaseModel):
+    account_id: str
+    account_name: str
+    notes: str
+    identity_fingerprint: str
 
 
 class AccountEditResourceOption(BaseModel):

@@ -464,27 +464,38 @@ h2 {
   padding: 3px 6px;
 }
 
-.notice {
+.global-notice {
   align-items: center;
   background: var(--notice-bg);
   border: 1px solid var(--notice-line);
   border-radius: var(--radius-sm);
+  box-shadow: var(--modal-shadow);
   color: var(--notice-ink);
   display: flex;
-  gap: 9px;
-  max-width: 460px;
-  padding: 7px 8px 7px 14px;
   font-size: 13px;
-  font-weight: 500;
-  box-shadow: 0 4px 12px var(--amber-tint);
+  font-weight: 600;
+  gap: 9px;
+  left: 50%;
+  max-width: min(560px, calc(100vw - 32px));
+  min-width: min(320px, calc(100vw - 32px));
+  padding: 10px 8px 10px 14px;
+  position: fixed;
+  top: max(16px, env(safe-area-inset-top));
+  transform: translateX(-50%);
+  z-index: 120;
 }
 
-.notice > span {
+.global-notice > svg {
+  flex: 0 0 auto;
+}
+
+.global-notice > span {
+  flex: 1 1 auto;
   min-width: 0;
   overflow-wrap: anywhere;
 }
 
-.notice > button {
+.global-notice > button {
   align-items: center;
   background: transparent;
   border: 0;
@@ -497,8 +508,8 @@ h2 {
   padding: 0;
 }
 
-.notice > button:hover,
-.notice > button:focus-visible {
+.global-notice > button:hover,
+.global-notice > button:focus-visible {
   background: color-mix(in srgb, currentColor 12%, transparent);
 }
 
@@ -790,15 +801,6 @@ h2 {
 .resource-bulk-export {
   min-height: 36px;
   padding: 6px 10px;
-}
-
-.resource-action-message {
-  background: var(--green-tint);
-  border: 1px solid color-mix(in srgb, var(--green) 32%, var(--line));
-  border-radius: 7px;
-  color: var(--green);
-  font-size: 13px;
-  padding: 9px 12px;
 }
 
 .accounts-panel-toolbar {
@@ -1825,7 +1827,7 @@ table {
 }
 
 .accounts-table {
-  min-width: 1932px;
+  min-width: 1972px;
   table-layout: fixed;
 }
 
@@ -1878,7 +1880,7 @@ table {
 }
 
 .accounts-col-actions {
-  width: 224px;
+  width: 264px;
 }
 
 .mailbox-table {
@@ -1921,6 +1923,21 @@ table {
 
 .accounts-select-header {
   text-align: center;
+}
+
+.account-header-with-selection {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.account-selection-summary {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .accounts-table tbody td:nth-child(5) > .badge,
@@ -3266,6 +3283,52 @@ select:focus {
 
 .mail-dialog-head h2 {
   overflow-wrap: anywhere;
+}
+
+.account-notes-dialog {
+  max-width: 680px;
+  min-width: min(680px, calc(100vw - 44px));
+}
+
+.account-notes-account {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.account-notes-loading,
+.account-notes-footer {
+  align-items: center;
+  display: flex;
+}
+
+.account-notes-loading {
+  color: var(--muted);
+  gap: 8px;
+  justify-content: center;
+  min-height: 220px;
+}
+
+.account-notes-form,
+.account-notes-form > label {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.account-notes-form textarea {
+  min-height: 240px;
+  resize: vertical;
+  width: 100%;
+}
+
+.account-notes-footer {
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  justify-content: space-between;
+  padding-top: 14px;
 }
 
 .mailbox-credential-dialog {
@@ -7263,17 +7326,6 @@ button.api-key-group-chip--more {
     flex: 0 0 auto;
   }
 
-  .topbar-actions:has(.notice) {
-    flex-wrap: wrap;
-    overflow-x: visible;
-  }
-
-  .notice {
-    flex: 1 1 100%;
-    max-width: none;
-    width: 100%;
-  }
-
   .settings-local-nav {
     top: calc(var(--app-sidebar-offset) + var(--app-header-height));
   }
@@ -10330,7 +10382,6 @@ button.api-key-group-chip--more {
 .account-editor-preset-create,
 .account-editor-model-toolbar,
 .account-editor-footer,
-.account-editor-success,
 .account-editor-loading,
 .account-editor-invalid {
   align-items: center;
@@ -10341,7 +10392,6 @@ button.api-key-group-chip--more {
   gap: 8px;
 }
 
-.account-editor-success,
 .account-editor-loading,
 .account-editor-invalid {
   border: 1px solid var(--line);
@@ -10350,12 +10400,6 @@ button.api-key-group-chip--more {
   gap: 8px;
   min-height: 42px;
   padding: 9px 12px;
-}
-
-.account-editor-success {
-  background: var(--ok-bg);
-  border-color: var(--green);
-  color: var(--ok-ink);
 }
 
 .account-editor-loading {
@@ -10447,6 +10491,22 @@ button.api-key-group-chip--more {
   display: grid;
   gap: 12px;
   grid-template-columns: minmax(220px, 1.5fr) repeat(3, minmax(110px, 0.55fr));
+}
+
+.account-editor-fields > label,
+.account-editor-advanced-fields > label,
+.account-editor-threshold-grid > label {
+  min-width: 0;
+}
+
+.account-editor-fields > label > input,
+.account-editor-fields > label > select,
+.account-editor-advanced-fields > label > input,
+.account-editor-advanced-fields > label > select,
+.account-editor-threshold-grid > label > input,
+.account-editor-threshold-grid > label > select {
+  min-width: 0;
+  width: 100%;
 }
 
 .account-editor-name-field {

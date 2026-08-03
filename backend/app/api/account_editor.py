@@ -22,6 +22,8 @@ from app.schemas import (
     AccountEditUpdate,
     AccountEditorOut,
     AccountLivenessModelOut,
+    AccountNotesOut,
+    AccountNotesUpdate,
     MessageResponse,
 )
 from app.services.account_editor import (
@@ -142,7 +144,7 @@ async def _editor_out(
             identity_fingerprint=account_identity_fingerprint(sub2api, account),
             **configuration.model_dump(),
         ),
-        groups=sorted(groups, key=lambda item: (item.name.casefold(), item.id)),
+        groups=groups,
         proxies=sorted(proxies, key=lambda item: (item.name.casefold(), item.id)),
         model_candidates=model_candidates,
         model_candidates_complete=resources.model_candidates_complete,
@@ -210,6 +212,68 @@ async def update_account_editor(
     )
     editor = await _editor_out(db, sub2api, replace(resources, account=updated, checked_at=utcnow()))
     return AccountEditResult(message="账号配置已写入 sub2api 并完成回读校验。", editor=editor)
+
+
+def _account_notes_out(sub2api: Sub2ApiClient, account: dict[str, Any]) -> AccountNotesOut:
+    account_id = sub2api.account_id(account)
+    account_name = sub2api.account_name(account)
+    if not account_id or not account_name:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="sub2api account response is missing note identity fields.",
+        )
+    return AccountNotesOut(
+        account_id=account_id,
+        account_name=account_name,
+        notes=sub2api.account_notes(account),
+        identity_fingerprint=account_identity_fingerprint(sub2api, account),
+    )
+
+
+@router.get("/{sub2api_account_id}/notes", response_model=AccountNotesOut)
+async def get_account_notes(
+    sub2api_account_id: int = Path(ge=1),
+    _: dict = Depends(require_admin),
+) -> AccountNotesOut:
+    sub2api = Sub2ApiClient()
+    try:
+        account = await sub2api.get_account_by_id(sub2api_account_id)
+    except Sub2ApiRequestError as exc:
+        raise _sub2api_http_error(exc) from exc
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sub2api 账号不存在。")
+    return _account_notes_out(sub2api, account)
+
+
+@router.put("/{sub2api_account_id}/notes", response_model=AccountNotesOut)
+async def update_account_notes(
+    payload: AccountNotesUpdate,
+    sub2api_account_id: int = Path(ge=1),
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AccountNotesOut:
+    sub2api = Sub2ApiClient()
+    try:
+        updated = await sub2api.update_account_notes(
+            sub2api_account_id,
+            payload.notes,
+            validate_current=lambda current: assert_account_identity(
+                sub2api,
+                current,
+                payload.expected_identity_fingerprint,
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except Sub2ApiRequestError as exc:
+        raise _sub2api_http_error(exc) from exc
+    await record_event(
+        db,
+        "account_notes_updated",
+        f"已更新 sub2api 账号 #{sub2api_account_id} 的备注。",
+        details={"sub2api_account_id": sub2api_account_id, "notes_length": len(payload.notes)},
+    )
+    return _account_notes_out(sub2api, updated)
 
 
 @router.get("/edit-presets", response_model=list[AccountEditPresetOut])

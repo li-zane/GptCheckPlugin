@@ -58,7 +58,6 @@ import {
   CHANGE_LOG_READ_RETRY_DELAYS_MS,
   departedChangeLogSubview,
   pendingReadThroughId,
-  urlConfirmsChangeLogSubview,
   visibleChangeLogUnreadCounts,
 } from "./changeLogReadState";
 import {
@@ -861,30 +860,6 @@ export function ApiKeyAccountsView({
       void markScheduleLogsReadOnLeave();
     }
   }, [markRateLogsReadOnLeave, markScheduleLogsReadOnLeave, subview]);
-
-  useEffect(() => {
-    if (!urlConfirmsChangeLogSubview(window.location.pathname, subview)) return;
-    if (
-      (subview === "rate-log" || subview === "account-rate-log")
-      && rateLogsLoaded
-      && !rateLogsLoading
-    ) {
-      void markRateLogsReadOnLeave(
-        subview === "account-rate-log" ? "account_rate" : "upstream",
-      );
-    }
-    if (subview === "schedule-log" && scheduleLogsLoaded && !scheduleLogsLoading) {
-      void markScheduleLogsReadOnLeave();
-    }
-  }, [
-    markRateLogsReadOnLeave,
-    markScheduleLogsReadOnLeave,
-    rateLogsLoaded,
-    rateLogsLoading,
-    scheduleLogsLoaded,
-    scheduleLogsLoading,
-    subview,
-  ]);
 
   useLayoutEffect(() => {
     if (subview !== "rate-log" && subview !== "account-rate-log") return;
