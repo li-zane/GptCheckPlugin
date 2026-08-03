@@ -310,12 +310,12 @@ class MonitorService:
                 present_remote_emails,
                 db=inventory_db,
             )
-            await self._sync_oauth_available_models(
-                inventory_db,
-                accounts,
-                force=model_whitelist_force,
-            )
             await inventory_db.commit()
+
+        await self._sync_oauth_available_models(
+            accounts,
+            force=model_whitelist_force,
+        )
 
         self._dispatch_initial_subscription_refresh(initial_subscription_candidates)
 
@@ -627,7 +627,6 @@ class MonitorService:
 
     async def _sync_oauth_available_models(
         self,
-        db: AsyncSession,
         accounts: list[dict[str, Any]],
         *,
         force: bool,
@@ -639,25 +638,42 @@ class MonitorService:
         }
         if not remote_by_id:
             return 0
-        await db.flush()
-        snapshots = list(
-            (
-                await db.execute(
-                    select(AccountSnapshot).where(
-                        AccountSnapshot.sub2api_account_id.in_(remote_by_id)
-                    )
+
+        # Keep only immutable identifiers after this short read transaction.
+        # The HTTP requests below must not retain a SQLite transaction.
+        async with AsyncSessionLocal() as read_db:
+            rows = (
+                await read_db.execute(
+                    select(
+                        AccountSnapshot.id,
+                        AccountSnapshot.sub2api_account_id,
+                        AccountSnapshot.available_models,
+                        AccountSnapshot.available_models_checked_at,
+                    ).where(AccountSnapshot.sub2api_account_id.in_(remote_by_id))
                 )
-            ).scalars()
-        )
+            ).all()
         targets = [
-            (snapshot, remote_by_id[str(snapshot.sub2api_account_id)])
-            for snapshot in snapshots
-            if str(snapshot.sub2api_account_id) in remote_by_id
-            and (force or snapshot.available_models is None)
+            (
+                int(snapshot_id),
+                str(account_id),
+                remote_by_id[str(account_id)],
+                checked_at,
+            )
+            for snapshot_id, account_id, available_models, checked_at in rows
+            if str(account_id) in remote_by_id
+            and (force or available_models is None)
         ]
+        if not targets:
+            return 0
+
         semaphore = asyncio.Semaphore(8)
 
-        async def fetch(snapshot: AccountSnapshot, account: dict[str, Any]) -> bool:
+        async def fetch(
+            snapshot_id: int,
+            account_id: str,
+            account: dict[str, Any],
+            baseline_checked_at: datetime | None,
+        ) -> tuple[int, str, datetime | None, list[dict[str, str]] | None, datetime]:
             async with semaphore:
                 try:
                     models = _normalize_available_models(
@@ -666,18 +682,43 @@ class MonitorService:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    snapshot.available_models_status = "error"
-                    snapshot.available_models_checked_at = utcnow()
-                    return False
-            snapshot.available_models = models
-            snapshot.available_models_status = "ok"
-            snapshot.available_models_checked_at = utcnow()
-            return True
+                    return snapshot_id, account_id, baseline_checked_at, None, utcnow()
+            return snapshot_id, account_id, baseline_checked_at, models, utcnow()
 
         results = await asyncio.gather(
-            *(fetch(snapshot, account) for snapshot, account in targets)
+            *(fetch(*target) for target in targets)
         )
-        return sum(results)
+
+        # Re-read before writing so a concurrent edit or newer refresh is not
+        # overwritten by a response obtained from an older snapshot.
+        async with AsyncSessionLocal() as write_db:
+            current_snapshots = list(
+                (
+                    await write_db.execute(
+                        select(AccountSnapshot).where(
+                            AccountSnapshot.id.in_([result[0] for result in results])
+                        )
+                    )
+                ).scalars()
+            )
+            current_by_id = {snapshot.id: snapshot for snapshot in current_snapshots}
+            synchronized = 0
+            for snapshot_id, account_id, baseline_checked_at, models, checked_at in results:
+                snapshot = current_by_id.get(snapshot_id)
+                if (
+                    snapshot is None
+                    or str(snapshot.sub2api_account_id or "") != account_id
+                    or snapshot.available_models_checked_at != baseline_checked_at
+                    or (not force and snapshot.available_models is not None)
+                ):
+                    continue
+                snapshot.available_models_status = "ok" if models is not None else "error"
+                snapshot.available_models_checked_at = checked_at
+                if models is not None:
+                    snapshot.available_models = models
+                    synchronized += 1
+            await write_db.commit()
+        return synchronized
 
     async def _has_enabled_mailbox(
         self,

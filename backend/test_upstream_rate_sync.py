@@ -3,8 +3,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from app.api import settings as settings_api
+from app.core.database import Base
 from app.main import app, lifespan
+from app.models import AccountSnapshot, UpstreamAccountConfig
 from app.schemas import AppSettingsUpdate
 from app.services.upstream_rate_sync import UpstreamRateSyncService
 
@@ -75,79 +80,118 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         priority_service.rebalance.assert_not_awaited()
 
     async def test_model_whitelist_run_refreshes_cached_oauth_and_api_key_rows(self) -> None:
-        oauth = SimpleNamespace(
-            sub2api_account_id="1",
-            available_models=None,
-            available_models_status="not_checked",
-            available_models_checked_at=None,
-        )
-        api_key = SimpleNamespace(
-            sub2api_account_id=2,
-            available_models=[{"id": "old", "display_name": "Old"}],
-            available_models_status="ok",
-            available_models_checked_at=None,
-        )
-        db = SimpleNamespace(
-            execute=AsyncMock(
-                side_effect=[
-                    SimpleNamespace(scalars=lambda: [oauth]),
-                    SimpleNamespace(scalars=lambda: [api_key]),
-                ]
-            ),
-            commit=AsyncMock(),
-        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        sessions = []
+
+        def tracked_session():
+            session = session_factory()
+            sessions.append(session)
+            return session
+
+        async def get_models(account_id):
+            self.assertFalse(any(session.in_transaction() for session in sessions))
+            return [{"id": f"model-{account_id}", "display_name": f"Model {account_id}"}]
+
         sub2api = SimpleNamespace(
-            get_account_models=AsyncMock(
-                side_effect=lambda account_id: [
-                    {"id": f"model-{account_id}", "display_name": f"Model {account_id}"}
-                ]
-            )
+            get_account_models=AsyncMock(side_effect=get_models)
         )
         service = UpstreamRateSyncService(_runtime(), SimpleNamespace(), sub2api)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                db.add_all(
+                    [
+                        AccountSnapshot(
+                            email="oauth@example.com",
+                            sub2api_account_id="1",
+                            available_models=None,
+                        ),
+                        UpstreamAccountConfig(
+                            sub2api_account_id=2,
+                            available_models=[{"id": "old", "display_name": "Old"}],
+                        ),
+                    ]
+                )
+                await db.commit()
 
-        with patch(
-            "app.services.upstream_rate_sync.AsyncSessionLocal",
-            return_value=_SessionContext(db),
-        ), patch.object(service, "_record_event", new=AsyncMock()):
-            await service._run_model_whitelist_once()
+            with (
+                patch("app.services.upstream_rate_sync.AsyncSessionLocal", new=tracked_session),
+                patch.object(service, "_record_event", new=AsyncMock()),
+            ):
+                await service._run_model_whitelist_once()
 
-        self.assertEqual(sub2api.get_account_models.await_count, 2)
-        self.assertEqual(oauth.available_models, [{"id": "model-1", "display_name": "Model 1"}])
-        self.assertEqual(api_key.available_models, [{"id": "model-2", "display_name": "Model 2"}])
-        self.assertEqual(oauth.available_models_status, "ok")
-        self.assertEqual(api_key.available_models_status, "ok")
-        db.commit.assert_awaited_once_with()
+            self.assertEqual(sub2api.get_account_models.await_count, 2)
+            async with session_factory() as db:
+                oauth = await db.scalar(
+                    select(AccountSnapshot).where(AccountSnapshot.sub2api_account_id == "1")
+                )
+                api_key = await db.scalar(
+                    select(UpstreamAccountConfig).where(
+                        UpstreamAccountConfig.sub2api_account_id == 2
+                    )
+                )
+                self.assertEqual(
+                    oauth.available_models,
+                    [{"id": "model-1", "display_name": "Model 1"}],
+                )
+                self.assertEqual(
+                    api_key.available_models,
+                    [{"id": "model-2", "display_name": "Model 2"}],
+                )
+                self.assertEqual(oauth.available_models_status, "ok")
+                self.assertEqual(api_key.available_models_status, "ok")
+        finally:
+            await engine.dispose()
 
     async def test_model_whitelist_run_keeps_last_good_rows_on_failure(self) -> None:
-        row = SimpleNamespace(
-            sub2api_account_id="1",
-            available_models=[{"id": "old", "display_name": "Old"}],
-            available_models_status="ok",
-            available_models_checked_at=None,
-        )
-        db = SimpleNamespace(
-            execute=AsyncMock(
-                side_effect=[
-                    SimpleNamespace(scalars=lambda: [row]),
-                    SimpleNamespace(scalars=lambda: []),
-                ]
-            ),
-            commit=AsyncMock(),
-        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        sessions = []
+
+        def tracked_session():
+            session = session_factory()
+            sessions.append(session)
+            return session
+
+        async def fail_without_transaction(_account_id):
+            self.assertFalse(any(session.in_transaction() for session in sessions))
+            raise RuntimeError("upstream unavailable")
+
         sub2api = SimpleNamespace(
-            get_account_models=AsyncMock(side_effect=RuntimeError("upstream unavailable"))
+            get_account_models=AsyncMock(side_effect=fail_without_transaction)
         )
         service = UpstreamRateSyncService(_runtime(), SimpleNamespace(), sub2api)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                db.add(
+                    AccountSnapshot(
+                        email="oauth@example.com",
+                        sub2api_account_id="1",
+                        available_models=[{"id": "old", "display_name": "Old"}],
+                        available_models_status="ok",
+                    )
+                )
+                await db.commit()
 
-        with patch(
-            "app.services.upstream_rate_sync.AsyncSessionLocal",
-            return_value=_SessionContext(db),
-        ), patch.object(service, "_record_event", new=AsyncMock()):
-            await service._run_model_whitelist_once()
+            with (
+                patch("app.services.upstream_rate_sync.AsyncSessionLocal", new=tracked_session),
+                patch.object(service, "_record_event", new=AsyncMock()),
+            ):
+                await service._run_model_whitelist_once()
 
-        self.assertEqual(row.available_models, [{"id": "old", "display_name": "Old"}])
-        self.assertEqual(row.available_models_status, "error")
-        db.commit.assert_awaited_once_with()
+            async with session_factory() as db:
+                row = await db.scalar(
+                    select(AccountSnapshot).where(AccountSnapshot.sub2api_account_id == "1")
+                )
+                self.assertEqual(row.available_models, [{"id": "old", "display_name": "Old"}])
+                self.assertEqual(row.available_models_status, "error")
+                self.assertIsNotNone(row.available_models_checked_at)
+        finally:
+            await engine.dispose()
 
     async def test_upstream_run_discovers_only_when_enabled_and_not_paused(self) -> None:
         session = object()

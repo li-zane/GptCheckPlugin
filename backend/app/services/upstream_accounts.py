@@ -135,6 +135,12 @@ def _normalize_available_models(value: Any) -> list[dict[str, str]]:
     return result
 
 
+def _model_check_version(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 @dataclass(frozen=True, slots=True)
 class UpstreamHealthTransition:
     old_key_status: str
@@ -1555,7 +1561,11 @@ class UpstreamAccountService:
             # whitelist scheduler. Inventory sync only repairs missing data.
             force = False
         targets = [
-            (account_id, config, remote_by_id[account_id])
+            (
+                account_id,
+                remote_by_id[account_id],
+                config.available_models_checked_at,
+            )
             for account_id, config in configs.items()
             if account_id in remote_by_id
             and (force or config.available_models is None)
@@ -1563,13 +1573,16 @@ class UpstreamAccountService:
         if not targets:
             return 0
 
+        # Inventory queries may have opened a new read transaction after their
+        # write commit. Close it before requesting model lists from sub2api.
+        await db.commit()
         semaphore = asyncio.Semaphore(8)
 
         async def fetch(
             account_id: int,
-            config: UpstreamAccountConfig,
             remote: dict[str, Any],
-        ) -> bool:
+            baseline_checked_at: datetime | None,
+        ) -> tuple[int, datetime | None, list[dict[str, str]] | None, datetime]:
             async with semaphore:
                 try:
                     models = _normalize_available_models(
@@ -1578,19 +1591,42 @@ class UpstreamAccountService:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    config.available_models_status = "error"
-                    config.available_models_checked_at = _utcnow()
-                    return False
-            config.available_models = models
-            config.available_models_status = "ok"
-            config.available_models_checked_at = _utcnow()
-            return True
+                    return account_id, baseline_checked_at, None, _utcnow()
+            return account_id, baseline_checked_at, models, _utcnow()
 
         results = await asyncio.gather(
-            *(fetch(account_id, config, remote) for account_id, config, remote in targets)
+            *(fetch(*target) for target in targets)
         )
+        current_result = await db.execute(
+            select(UpstreamAccountConfig)
+            .where(
+                UpstreamAccountConfig.sub2api_account_id.in_(
+                    [result[0] for result in results]
+                )
+            )
+            .execution_options(populate_existing=True)
+        )
+        current_by_account_id = {
+            config.sub2api_account_id: config
+            for config in current_result.scalars().all()
+        }
+        synchronized = 0
+        for account_id, baseline_checked_at, models, checked_at in results:
+            config = current_by_account_id.get(account_id)
+            if (
+                config is None
+                or _model_check_version(config.available_models_checked_at)
+                != _model_check_version(baseline_checked_at)
+                or (not force and config.available_models is not None)
+            ):
+                continue
+            config.available_models_status = "ok" if models is not None else "error"
+            config.available_models_checked_at = checked_at
+            if models is not None:
+                config.available_models = models
+                synchronized += 1
         await db.commit()
-        return sum(results)
+        return synchronized
 
     async def _remote_account(
         self,

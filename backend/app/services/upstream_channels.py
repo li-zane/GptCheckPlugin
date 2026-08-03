@@ -3613,6 +3613,10 @@ class UpstreamChannelService:
                             status = "skipped"
                         else:
                             self.accounts._require_config_binding(current_remote, config)
+                            # Release the SQLite writer before waiting for the
+                            # remote mutation and verification round trip.
+                            await db.flush()
+                            await db.commit()
                             await self.sub2api.update_account_rate_multiplier(
                                 config.sub2api_account_id,
                                 float(_quantize_rate(target)),
@@ -4060,6 +4064,12 @@ class UpstreamChannelService:
                 # Keep the existing upstream read behavior if an early upgrade
                 # has not created the local daily-usage tables yet.
                 include_yesterday_usage = not monitor_details_only
+
+            # Discovery input is fully materialized. End the read phase before
+            # upstream HTTP so a slow probe cannot retain a SQLite transaction.
+            # expire_on_commit=False keeps these snapshots available until the
+            # existing writeback revalidation below.
+            await db.commit()
 
             async def run_discovery(active_access_token: str | None, active_type: str) -> Any:
                 discovery_kwargs: dict[str, Any] = {

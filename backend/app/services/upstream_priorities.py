@@ -795,6 +795,9 @@ class UpstreamPriorityService:
                     failed=0,
                 )
 
+            # The locked ORM snapshot is complete. Persist local cleanup and
+            # release the database transaction before listing remote accounts.
+            await db.commit()
             if remote_by_id is None:
                 try:
                     remote_accounts = await self.accounts._remote_accounts()
@@ -878,6 +881,9 @@ class UpstreamPriorityService:
                     unchanged=0,
                     failed=0,
                 )
+            # Store the desired plan before its remote preflight and mutation.
+            # Account locks remain held, while SQLite is free for other jobs.
+            await db.commit()
             return await self._apply_desired_priorities(
                 db,
                 configs=configs,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from time import perf_counter
 
 from sqlalchemy import select
@@ -229,10 +230,10 @@ class UpstreamRateSyncService:
             return
 
         started_at = perf_counter()
-        async with AsyncSessionLocal() as db:
+        async with AsyncSessionLocal() as read_db:
             oauth_rows = list(
                 (
-                    await db.execute(
+                    await read_db.execute(
                         select(AccountSnapshot).where(
                             AccountSnapshot.sub2api_account_id.is_not(None)
                         )
@@ -241,41 +242,86 @@ class UpstreamRateSyncService:
             )
             api_key_rows = list(
                 (
-                    await db.execute(
+                    await read_db.execute(
                         select(UpstreamAccountConfig)
                     )
                 ).scalars()
             )
 
-            rows_by_account_id: dict[str, list[AccountSnapshot | UpstreamAccountConfig]] = {}
+            row_versions = {
+                (type(row), row.id): row.available_models_checked_at
+                for row in (*oauth_rows, *api_key_rows)
+            }
+            account_ids: set[str] = set()
             for row in (*oauth_rows, *api_key_rows):
                 account_id = str(row.sub2api_account_id or "").strip()
                 if account_id:
-                    rows_by_account_id.setdefault(account_id, []).append(row)
+                    account_ids.add(account_id)
 
-            semaphore = asyncio.Semaphore(8)
+        semaphore = asyncio.Semaphore(8)
 
-            async def refresh(account_id: str, rows: list[AccountSnapshot | UpstreamAccountConfig]) -> bool:
-                async with semaphore:
-                    try:
-                        models = await self.sub2api.get_account_models(account_id)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        for row in rows:
-                            row.available_models_status = "error"
-                            row.available_models_checked_at = utcnow()
-                        return False
-                for row in rows:
-                    row.available_models = models
-                    row.available_models_status = "ok"
-                    row.available_models_checked_at = utcnow()
-                return True
+        async def refresh(account_id: str) -> tuple[str, list[dict] | None, datetime]:
+            async with semaphore:
+                try:
+                    models = await self.sub2api.get_account_models(account_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return account_id, None, utcnow()
+            return account_id, models, utcnow()
 
-            results = await asyncio.gather(
-                *(refresh(account_id, rows) for account_id, rows in rows_by_account_id.items())
-            )
-            await db.commit()
+        results = await asyncio.gather(
+            *(refresh(account_id) for account_id in account_ids)
+        )
+        results_by_account_id = {result[0]: result[1:] for result in results}
+
+        if results:
+            oauth_account_ids = {
+                str(row.sub2api_account_id)
+                for row in oauth_rows
+                if row.sub2api_account_id is not None
+            }
+            api_key_account_ids = {
+                int(row.sub2api_account_id)
+                for row in api_key_rows
+                if row.sub2api_account_id is not None
+            }
+            async with AsyncSessionLocal() as write_db:
+                current_oauth_rows = list(
+                    (
+                        await write_db.execute(
+                            select(AccountSnapshot).where(
+                                AccountSnapshot.sub2api_account_id.in_(oauth_account_ids)
+                            )
+                        )
+                    ).scalars()
+                )
+                current_api_key_rows = list(
+                    (
+                        await write_db.execute(
+                            select(UpstreamAccountConfig).where(
+                                UpstreamAccountConfig.sub2api_account_id.in_(api_key_account_ids)
+                            )
+                        )
+                    ).scalars()
+                )
+                for row in (*current_oauth_rows, *current_api_key_rows):
+                    row_key = (type(row), row.id)
+                    if (
+                        row_key not in row_versions
+                        or row.available_models_checked_at != row_versions[row_key]
+                    ):
+                        continue
+                    account_id = str(row.sub2api_account_id or "").strip()
+                    result = results_by_account_id.get(account_id)
+                    if result is None:
+                        continue
+                    models, checked_at = result
+                    row.available_models_status = "ok" if models is not None else "error"
+                    row.available_models_checked_at = checked_at
+                    if models is not None:
+                        row.available_models = models
+                await write_db.commit()
 
         await self._record_event(
             "account_model_whitelist_sync",
@@ -284,8 +330,8 @@ class UpstreamRateSyncService:
                 "reason": "scheduled",
                 "duration_ms": elapsed_ms(started_at),
                 "total": len(results),
-                "succeeded": sum(results),
-                "failed": len(results) - sum(results),
+                "succeeded": sum(result[1] is not None for result in results),
+                "failed": sum(result[1] is None for result in results),
             },
         )
 

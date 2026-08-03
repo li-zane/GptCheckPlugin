@@ -393,6 +393,19 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             channel_monitors_message="Channel monitor data available.",
         )
 
+    async def test_upstream_probe_runs_after_read_transaction_is_closed(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+
+        async def discovery_without_transaction(**_kwargs):
+            self.assertFalse(self.db.in_transaction())
+            return self._discovery_result()
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=discovery_without_transaction,
+        ):
+            await self.service.discover_channel(self.db, channel_id)
+
     async def test_overview_groups_equivalent_v1_urls_into_one_channel(self) -> None:
         overview = await self.service.overview(self.db)
 
@@ -2910,6 +2923,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         async def detached_rate_update(account_id: str | int, rate: float) -> None:
+            self.assertFalse(self.db.in_transaction())
             parsed_id = int(account_id)
             self.sub2api.rate_update_calls.append((parsed_id, rate))
             remote_rates[parsed_id] = rate

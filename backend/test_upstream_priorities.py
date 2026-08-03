@@ -779,6 +779,46 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(account_lock.acquire(), timeout=1)
         account_lock.release()
 
+    async def test_rebalance_remote_calls_do_not_hold_a_database_transaction(self) -> None:
+        interval = await self._interval()
+        await self._add_config(7, interval.id, group=1.0, priority=99)
+        original_list = self.sub2api.list_api_key_accounts
+        original_detail = self.sub2api.get_account_by_id
+        original_update = self.sub2api.update_account_priorities
+
+        async def list_without_transaction():
+            self.assertFalse(self.db.in_transaction())
+            return await original_list()
+
+        async def detail_without_transaction(account_id: str | int, **kwargs):
+            self.assertFalse(self.db.in_transaction())
+            return await original_detail(account_id, **kwargs)
+
+        async def update_without_transaction(account_ids: list[int], priority: int):
+            self.assertFalse(self.db.in_transaction())
+            await original_update(account_ids, priority)
+
+        with (
+            patch.object(
+                self.sub2api,
+                "list_api_key_accounts",
+                new=list_without_transaction,
+            ),
+            patch.object(
+                self.sub2api,
+                "get_account_by_id",
+                new=detail_without_transaction,
+            ),
+            patch.object(
+                self.sub2api,
+                "update_account_priorities",
+                new=update_without_transaction,
+            ),
+        ):
+            result = await self.service.rebalance(self.db)
+
+        self.assertEqual((result.updated, result.failed), (1, 0))
+
     async def test_rebalance_refreshes_configs_after_waiting_for_account_lock(self) -> None:
         interval = await self._interval()
         await self._add_config(7, interval.id, group=0.5, priority=90)

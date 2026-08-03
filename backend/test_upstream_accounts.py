@@ -90,6 +90,7 @@ class FakeSub2Api(Sub2ApiClient):
             7: [{"id": "gpt-4o-mini", "display_name": "GPT-4o mini"}]
         }
         self.account_model_calls: list[int] = []
+        self.before_account_model = None
 
     async def list_api_key_accounts(self) -> list[dict]:
         return self.accounts
@@ -109,6 +110,8 @@ class FakeSub2Api(Sub2ApiClient):
         }
 
     async def get_account_models(self, account: dict | str) -> list[dict[str, str]]:
+        if self.before_account_model is not None:
+            self.before_account_model()
         account_id = int(account if isinstance(account, str) else account["id"])
         self.account_model_calls.append(account_id)
         return [dict(item) for item in self.account_models.get(account_id, [])]
@@ -290,6 +293,9 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
             {"id": "model-b", "display_name": ""},
             {"id": "bad\nmodel", "display_name": "bad"},
         ]
+        self.sub2api.before_account_model = lambda: self.assertFalse(
+            self.db.in_transaction()
+        )
 
         synchronized = await self.service.sync_available_models(
             self.db,

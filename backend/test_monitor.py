@@ -135,96 +135,189 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
             await engine.dispose()
 
     async def test_oauth_model_whitelist_syncs_when_missing_and_respects_force(self) -> None:
-        snapshot = AccountSnapshot(
-            email="oauth@example.com",
-            sub2api_account_id="1",
-            available_models=None,
-        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
         account = {"id": 1, "email": "oauth@example.com"}
         service = object.__new__(MonitorService)
         service.sub2api = Sub2ApiClient()
-        service.sub2api.get_account_models = AsyncMock(  # type: ignore[method-assign]
-            return_value=[
+        sessions = []
+
+        def tracked_session():
+            session = session_factory()
+            sessions.append(session)
+            return session
+
+        async def get_models(_account):
+            self.assertFalse(any(session.in_transaction() for session in sessions))
+            return [
                 {"id": " model-a ", "display_name": " Model A "},
                 {"id": "model-a", "display_name": "duplicate"},
                 {"id": "model-b", "display_name": ""},
                 {"id": "bad\nmodel", "display_name": "bad"},
             ]
-        )
-        result = MagicMock()
-        result.scalars.return_value = [snapshot]
-        db = AsyncMock()
-        db.execute.return_value = result
+        service.sub2api.get_account_models = AsyncMock(side_effect=get_models)  # type: ignore[method-assign]
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                db.add(
+                    AccountSnapshot(
+                        email="oauth@example.com",
+                        sub2api_account_id="1",
+                        available_models=None,
+                    )
+                )
+                await db.commit()
 
-        synchronized = await service._sync_oauth_available_models(
-            db,
-            [account],
-            force=False,
-        )
+            with patch("app.services.monitor.AsyncSessionLocal", new=tracked_session):
+                synchronized = await service._sync_oauth_available_models(
+                    [account],
+                    force=False,
+                )
+                self.assertEqual(synchronized, 1)
+                async with session_factory() as db:
+                    snapshot = await db.scalar(
+                        select(AccountSnapshot).where(AccountSnapshot.email == "oauth@example.com")
+                    )
+                    self.assertEqual(
+                        snapshot.available_models,
+                        [
+                            {"id": "model-a", "display_name": "Model A"},
+                            {"id": "model-b", "display_name": "model-b"},
+                        ],
+                    )
+                    self.assertEqual(snapshot.available_models_status, "ok")
 
-        self.assertEqual(synchronized, 1)
-        self.assertEqual(
-            snapshot.available_models,
-            [
-                {"id": "model-a", "display_name": "Model A"},
-                {"id": "model-b", "display_name": "model-b"},
-            ],
-        )
-        self.assertEqual(snapshot.available_models_status, "ok")
-        service.sub2api.get_account_models.assert_awaited_once_with(account)  # type: ignore[attr-defined]
+                service.sub2api.get_account_models.reset_mock()  # type: ignore[attr-defined]
+                skipped = await service._sync_oauth_available_models(
+                    [account],
+                    force=False,
+                )
+                self.assertEqual(skipped, 0)
+                service.sub2api.get_account_models.assert_not_awaited()  # type: ignore[attr-defined]
 
-        service.sub2api.get_account_models.reset_mock()  # type: ignore[attr-defined]
-        skipped = await service._sync_oauth_available_models(
-            db,
-            [account],
-            force=False,
-        )
-        self.assertEqual(skipped, 0)
-        service.sub2api.get_account_models.assert_not_awaited()  # type: ignore[attr-defined]
-
-        service.sub2api.get_account_models.return_value = [  # type: ignore[attr-defined]
-            {"id": "model-c", "display_name": "Model C"}
-        ]
-        refreshed = await service._sync_oauth_available_models(
-            db,
-            [account],
-            force=True,
-        )
-        self.assertEqual(refreshed, 1)
-        self.assertEqual(
-            snapshot.available_models,
-            [{"id": "model-c", "display_name": "Model C"}],
-        )
+                service.sub2api.get_account_models.side_effect = None  # type: ignore[attr-defined]
+                service.sub2api.get_account_models.return_value = [  # type: ignore[attr-defined]
+                    {"id": "model-c", "display_name": "Model C"}
+                ]
+                refreshed = await service._sync_oauth_available_models(
+                    [account],
+                    force=True,
+                )
+                self.assertEqual(refreshed, 1)
+                async with session_factory() as db:
+                    snapshot = await db.scalar(
+                        select(AccountSnapshot).where(AccountSnapshot.email == "oauth@example.com")
+                    )
+                    self.assertEqual(
+                        snapshot.available_models,
+                        [{"id": "model-c", "display_name": "Model C"}],
+                    )
+        finally:
+            await engine.dispose()
 
     async def test_oauth_model_whitelist_failure_keeps_last_good_models(self) -> None:
-        snapshot = AccountSnapshot(
-            email="oauth@example.com",
-            sub2api_account_id="1",
-            available_models=[{"id": "model-a", "display_name": "Model A"}],
-        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
         service = object.__new__(MonitorService)
         service.sub2api = Sub2ApiClient()
+        sessions = []
+
+        def tracked_session():
+            session = session_factory()
+            sessions.append(session)
+            return session
+
+        async def fail_without_transaction(_account):
+            self.assertFalse(any(session.in_transaction() for session in sessions))
+            raise RuntimeError("models unavailable")
+
         service.sub2api.get_account_models = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError("models unavailable")
+            side_effect=fail_without_transaction
         )
-        result = MagicMock()
-        result.scalars.return_value = [snapshot]
-        db = AsyncMock()
-        db.execute.return_value = result
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                db.add(
+                    AccountSnapshot(
+                        email="oauth@example.com",
+                        sub2api_account_id="1",
+                        available_models=[{"id": "model-a", "display_name": "Model A"}],
+                    )
+                )
+                await db.commit()
 
-        synchronized = await service._sync_oauth_available_models(
-            db,
-            [{"id": 1, "email": "oauth@example.com"}],
-            force=True,
-        )
+            with patch("app.services.monitor.AsyncSessionLocal", new=tracked_session):
+                synchronized = await service._sync_oauth_available_models(
+                    [{"id": 1, "email": "oauth@example.com"}],
+                    force=True,
+                )
 
-        self.assertEqual(synchronized, 0)
-        self.assertEqual(
-            snapshot.available_models,
-            [{"id": "model-a", "display_name": "Model A"}],
+            self.assertEqual(synchronized, 0)
+            async with session_factory() as db:
+                snapshot = await db.scalar(
+                    select(AccountSnapshot).where(AccountSnapshot.email == "oauth@example.com")
+                )
+                self.assertEqual(
+                    snapshot.available_models,
+                    [{"id": "model-a", "display_name": "Model A"}],
+                )
+                self.assertEqual(snapshot.available_models_status, "error")
+                self.assertIsNotNone(snapshot.available_models_checked_at)
+        finally:
+            await engine.dispose()
+
+    async def test_oauth_model_whitelist_does_not_overwrite_a_newer_result(self) -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        service = object.__new__(MonitorService)
+        service.sub2api = Sub2ApiClient()
+
+        async def fetch_stale_models(_account):
+            async with session_factory() as concurrent_db:
+                snapshot = await concurrent_db.scalar(
+                    select(AccountSnapshot).where(AccountSnapshot.email == "oauth@example.com")
+                )
+                snapshot.available_models = [{"id": "newer", "display_name": "Newer"}]
+                snapshot.available_models_status = "ok"
+                snapshot.available_models_checked_at = datetime.now(timezone.utc)
+                await concurrent_db.commit()
+            return [{"id": "stale", "display_name": "Stale"}]
+
+        service.sub2api.get_account_models = AsyncMock(  # type: ignore[method-assign]
+            side_effect=fetch_stale_models
         )
-        self.assertEqual(snapshot.available_models_status, "error")
-        self.assertIsNotNone(snapshot.available_models_checked_at)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_factory() as db:
+                db.add(
+                    AccountSnapshot(
+                        email="oauth@example.com",
+                        sub2api_account_id="1",
+                        available_models=None,
+                    )
+                )
+                await db.commit()
+
+            with patch("app.services.monitor.AsyncSessionLocal", new=session_factory):
+                synchronized = await service._sync_oauth_available_models(
+                    [{"id": 1, "email": "oauth@example.com"}],
+                    force=False,
+                )
+
+            self.assertEqual(synchronized, 0)
+            async with session_factory() as db:
+                snapshot = await db.scalar(
+                    select(AccountSnapshot).where(AccountSnapshot.email == "oauth@example.com")
+                )
+                self.assertEqual(
+                    snapshot.available_models,
+                    [{"id": "newer", "display_name": "Newer"}],
+                )
+        finally:
+            await engine.dispose()
 
     async def test_sync_once_excludes_openai_api_key_accounts(self) -> None:
         oauth_account = {
