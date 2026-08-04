@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+from copy import deepcopy
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
@@ -104,9 +105,79 @@ UPSTREAM_HISTORY_BACKFILL_TIMEOUT_SECONDS = 75.0
 API_KEY_EXPORT_BATCH_SIZE = 200
 logger = logging.getLogger(__name__)
 
+_AVAILABILITY_STATE_FIELDS = (
+    "availability_status",
+    "availability_unavailable_count",
+    "availability_recovery_count",
+    "availability_checked_at",
+    "availability_source",
+    "availability_message",
+)
+
+
+@dataclass(frozen=True)
+class _PreparedAccountAvailability:
+    action: str | None
+    evidence: dict[str, Any]
+    values: dict[str, Any]
+
+
+class _DiscoveryWritebackCoordinator:
+    """Let probes finish concurrently, then admit one channel writer at a time."""
+
+    def __init__(self, channel_ids: list[int], max_probe_concurrency: int) -> None:
+        self._channel_ids = tuple(channel_ids)
+        self._ready_ids: set[int] = set()
+        self._all_ready = asyncio.Event()
+        self._completed = {channel_id: asyncio.Event() for channel_id in channel_ids}
+        self._probe_semaphore = asyncio.Semaphore(max_probe_concurrency)
+        self._active_probe_ids: set[int] = set()
+
+    def includes(self, channel_id: int) -> bool:
+        return channel_id in self._completed
+
+    def _mark_ready(self, channel_id: int) -> None:
+        if channel_id not in self._completed:
+            return
+        self._ready_ids.add(channel_id)
+        if len(self._ready_ids) == len(self._channel_ids):
+            self._all_ready.set()
+
+    async def start_probe(self, channel_id: int) -> None:
+        await self._probe_semaphore.acquire()
+        self._active_probe_ids.add(channel_id)
+
+    def _finish_probe(self, channel_id: int) -> None:
+        if channel_id in self._active_probe_ids:
+            self._active_probe_ids.remove(channel_id)
+            self._probe_semaphore.release()
+
+    async def wait_for_turn(self, channel_id: int) -> None:
+        self._finish_probe(channel_id)
+        self._mark_ready(channel_id)
+        await self._all_ready.wait()
+        index = self._channel_ids.index(channel_id)
+        for preceding_channel_id in self._channel_ids[:index]:
+            await self._completed[preceding_channel_id].wait()
+
+    def task_done(self, channel_id: int) -> None:
+        self._finish_probe(channel_id)
+        self._mark_ready(channel_id)
+        completed = self._completed.get(channel_id)
+        if completed is not None:
+            completed.set()
+
 
 def _is_sqlite_locked_error(error: BaseException) -> bool:
     return isinstance(error, OperationalError) and "database is locked" in str(error).lower()
+
+
+def _copy_mapped_row(row: Any) -> Any:
+    values = {
+        column.key: deepcopy(getattr(row, column.key))
+        for column in row.__table__.columns
+    }
+    return type(row)(**values)
 
 
 def _account_group_rate_change_reason(
@@ -174,6 +245,7 @@ class UpstreamChannelService:
         self._locks_guard = asyncio.Lock()
         self._inventory_lock = asyncio.Lock()
         self._discover_all_lock = asyncio.Lock()
+        self._active_writeback_coordinator: _DiscoveryWritebackCoordinator | None = None
         self._background_discovery_tasks: set[asyncio.Task[None]] = set()
         self._background_discovery_counts: dict[int, int] = {}
         self._background_discovery_by_channel: dict[int, asyncio.Task[None]] = {}
@@ -470,7 +542,18 @@ class UpstreamChannelService:
         configs: list[UpstreamAccountConfig],
         channel_id: int,
         remote_by_id: dict[int, dict[str, Any]] | None = None,
+        *,
+        imported_api_keys: dict[int, str] | None = None,
+        persist_imported: bool = True,
     ) -> dict[int, str]:
+        refresh_remote_inventory = remote_by_id is None
+        if refresh_remote_inventory:
+            await db.commit()
+            remote_by_id = {
+                account_id: account
+                for account in await self.accounts._remote_accounts()
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
+            }
         channel = await self._load_channel(db, channel_id)
         try:
             channel_base_url = canonicalize_upstream_url(channel.canonical_base_url)
@@ -481,16 +564,9 @@ class UpstreamChannelService:
         async def live_strict_fingerprints(
             candidates: list[UpstreamAccountConfig],
         ) -> dict[int, str]:
-            live_remote_by_id = remote_by_id
-            if live_remote_by_id is None:
-                live_remote_by_id = {
-                    account_id: account
-                    for account in await self.accounts._remote_accounts()
-                    if (account_id := self.accounts._numeric_remote_id(account)) is not None
-                }
             fingerprints: dict[int, str] = {}
             for config in candidates:
-                remote = live_remote_by_id.get(config.sub2api_account_id)
+                remote = remote_by_id.get(config.sub2api_account_id)
                 if remote is None or self.accounts._config_binding_status(remote, config) != "bound":
                     continue
                 has_stored_key = bool(decrypt_text(config.encrypted_api_key))
@@ -569,12 +645,19 @@ class UpstreamChannelService:
             for config in configs
             if config.remote_identity_fingerprint
         }
+        await db.commit()
         try:
             exported: dict[int, str] = {}
             for start in range(0, len(missing_account_ids), API_KEY_EXPORT_BATCH_SIZE):
                 batch = missing_account_ids[start : start + API_KEY_EXPORT_BATCH_SIZE]
                 exported.update(await self.sub2api.export_api_key_secrets(batch))
         except Exception:
+            if refresh_remote_inventory:
+                remote_by_id = {
+                    account_id: account
+                    for account in await self.accounts._remote_accounts()
+                    if (account_id := self.accounts._numeric_remote_id(account)) is not None
+                }
             configs[:], _strict_fingerprints = await reload_current(
                 configs,
                 expected_strict_fingerprints=export_started_strict_fingerprints,
@@ -586,6 +669,12 @@ class UpstreamChannelService:
                     not config.api_key_origin_rebind_required
                     and (api_key := decrypt_text(config.encrypted_api_key))
                 )
+            }
+        if refresh_remote_inventory:
+            remote_by_id = {
+                account_id: account
+                for account in await self.accounts._remote_accounts()
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
             }
         configs[:], checked_strict_fingerprints = await reload_current(
             configs,
@@ -609,13 +698,15 @@ class UpstreamChannelService:
             for account_id, api_key in exported.items()
             if account_id in currently_bound_ids
         }
+        if imported_api_keys is not None:
+            imported_api_keys.update(exported)
         settings = get_settings()
         can_persist = not (
             settings.app_env == "production"
             and settings.app_encryption_key.strip() == DEFAULT_ENCRYPTION_KEY
         )
         persisted = False
-        if can_persist:
+        if can_persist and persist_imported:
             try:
                 for account_id in missing_account_ids:
                     api_key = exported.get(account_id)
@@ -1780,6 +1871,7 @@ class UpstreamChannelService:
         reason: str,
         time_zone: str,
         now: datetime,
+        log_failure: bool = True,
     ) -> None:
         decision = daily_usage_failure_decision(
             status=status,
@@ -1802,7 +1894,7 @@ class UpstreamChannelService:
             setattr(channel, f"{period}_balance_used", None)
             setattr(channel, f"{period}_balance_unit", None)
             setattr(channel, f"{period}_balance_checked_at", None)
-        if decision.should_log:
+        if log_failure and decision.should_log:
             logger.warning(
                 "Upstream daily usage probe unavailable: channel_id=%s "
                 "period=%s status=%s reason=%s retained=%s",
@@ -1820,6 +1912,7 @@ class UpstreamChannelService:
         *,
         refresh_channel_monitors: bool = True,
         time_zone: str = DEFAULT_TODAY_TIME_ZONE,
+        log_usage_failures: bool = True,
     ) -> bool:
         now = _utcnow()
         status = str(_value(result, "status") or "error").strip().lower()
@@ -1867,6 +1960,7 @@ class UpstreamChannelService:
                     ),
                     time_zone=time_zone,
                     now=now,
+                    log_failure=log_usage_failures,
                 )
             if refresh_channel_monitors:
                 self._apply_channel_monitor_discovery(channel, result, now=now)
@@ -1944,6 +2038,7 @@ class UpstreamChannelService:
                     ),
                     time_zone=time_zone,
                     now=now,
+                    log_failure=log_usage_failures,
                 )
                 continue
             used = _balance_number(_value(result, f"{period}_balance_used"))
@@ -1955,6 +2050,7 @@ class UpstreamChannelService:
                     reason="invalid_amount",
                     time_zone=time_zone,
                     now=now,
+                    log_failure=log_usage_failures,
                 )
                 continue
             setattr(channel, f"{period}_balance_status", "ok")
@@ -3219,13 +3315,10 @@ class UpstreamChannelService:
             self.accounts.sync_pause_compatibility_fields(config)
         return changed
 
-    async def _apply_api_key_balance_fallback(
+    async def _fetch_api_key_balance_fallback(
         self,
-        channel: UpstreamChannel,
         configs: list[UpstreamAccountConfig],
-    ) -> bool:
-        if channel.balance_status in {"ok", "success", "available"}:
-            return True
+    ) -> dict[str, Any] | None:
         for config in sorted(configs, key=lambda item: item.sub2api_account_id)[:10]:
             try:
                 result = await self.sub2api.get_account_balance(config.sub2api_account_id)
@@ -3243,20 +3336,36 @@ class UpstreamChannelService:
             )
             if remaining is None:
                 continue
-            channel.balance_remaining = remaining
-            channel.balance_total = _balance_number(
-                result.get("total", result.get("balance_total"))
-            )
-            channel.balance_used = _balance_number(
-                result.get("used", result.get("balance_used"))
-            )
-            channel.balance_unit = _safe_text(result.get("unit"), limit=32) or "USD"
-            channel.balance_status = "ok"
-            channel.balance_source = "local_api_key"
-            channel.balance_message = "API Key balance reported through the local sub2api account."
-            channel.balance_checked_at = _utcnow()
+            return dict(result)
+        return None
+
+    @staticmethod
+    def _apply_api_key_balance_fallback(
+        channel: UpstreamChannel,
+        result: dict[str, Any] | None,
+    ) -> bool:
+        if channel.balance_status in {"ok", "success", "available"}:
             return True
-        return False
+        if not isinstance(result, dict):
+            return False
+        remaining = _balance_number(
+            result.get("remaining", result.get("balance_remaining", result.get("balance")))
+        )
+        if remaining is None:
+            return False
+        channel.balance_remaining = remaining
+        channel.balance_total = _balance_number(
+            result.get("total", result.get("balance_total"))
+        )
+        channel.balance_used = _balance_number(
+            result.get("used", result.get("balance_used"))
+        )
+        channel.balance_unit = _safe_text(result.get("unit"), limit=32) or "USD"
+        channel.balance_status = "ok"
+        channel.balance_source = "local_api_key"
+        channel.balance_message = "API Key balance reported through the local sub2api account."
+        channel.balance_checked_at = _utcnow()
+        return True
 
     def _derive_account(
         self,
@@ -3363,9 +3472,11 @@ class UpstreamChannelService:
 
     async def _prepare_balance_guard(
         self,
-        db: AsyncSession,
+        db: AsyncSession | None,
         channel: UpstreamChannel,
         runtime_config: Any,
+        *,
+        persist_notifications: bool = True,
     ) -> str | None:
         try:
             configured = bool(
@@ -3393,9 +3504,10 @@ class UpstreamChannelService:
             return None
         if not configured:
             if channel.balance_guard_episode_id:
-                await NotificationService(db, runtime_config).cancel_unsent(
-                    dedupe_key=self._balance_guard_notification_key(channel)
-                )
+                if persist_notifications and db is not None:
+                    await NotificationService(db, runtime_config).cancel_unsent(
+                        dedupe_key=self._balance_guard_notification_key(channel)
+                    )
                 channel.balance_guard_episode_id = None
             channel.balance_guard_state = "disabled"
             channel.balance_guard_value = None
@@ -3425,29 +3537,31 @@ class UpstreamChannelService:
             channel.balance_guard_state = "insufficient"
             if not channel.balance_guard_episode_id:
                 channel.balance_guard_episode_id = uuid4().hex
-            await NotificationService(db, runtime_config).enqueue_if_enabled(
-                "upstream_balance_low",
-                self._balance_guard_notification_key(channel),
-                "Upstream channel balance is below the configured threshold",
-                (
-                    f"{channel.display_name} balance is {value:.2f} "
-                    f"{guard_unit}; threshold is {threshold:.2f}."
-                ),
-                {
-                    "channel_id": channel.id,
-                    "channel_name": channel.display_name,
-                    "balance": value,
-                    "basis": basis,
-                    "threshold": threshold,
-                    "unit": guard_unit,
-                },
-            )
+            if persist_notifications and db is not None:
+                await NotificationService(db, runtime_config).enqueue_if_enabled(
+                    "upstream_balance_low",
+                    self._balance_guard_notification_key(channel),
+                    "Upstream channel balance is below the configured threshold",
+                    (
+                        f"{channel.display_name} balance is {value:.2f} "
+                        f"{guard_unit}; threshold is {threshold:.2f}."
+                    ),
+                    {
+                        "channel_id": channel.id,
+                        "channel_name": channel.display_name,
+                        "balance": value,
+                        "basis": basis,
+                        "threshold": threshold,
+                        "unit": guard_unit,
+                    },
+                )
             return "hold"
         if value >= threshold:
             if channel.balance_guard_episode_id:
-                await NotificationService(db, runtime_config).cancel_unsent(
-                    dedupe_key=self._balance_guard_notification_key(channel)
-                )
+                if persist_notifications and db is not None:
+                    await NotificationService(db, runtime_config).cancel_unsent(
+                        dedupe_key=self._balance_guard_notification_key(channel)
+                    )
                 channel.balance_guard_episode_id = None
             channel.balance_guard_state = "healthy"
             return "clear"
@@ -3962,6 +4076,16 @@ class UpstreamChannelService:
     ) -> UpstreamChannelOut:
         lock = await self._lock_for(channel_id)
         async with lock:
+            if remote_by_id is None:
+                # Materialize the Sub2API inventory before opening the channel
+                # read transaction. Public callers usually provide this batch
+                # snapshot, while direct/background calls use this fallback.
+                await db.commit()
+                remote_by_id = {
+                    account_id: account
+                    for account in await self.accounts._remote_accounts()
+                    if (account_id := self.accounts._numeric_remote_id(account)) is not None
+                }
             channel = await self._load_channel(db, channel_id)
             configs = await self._bound_configs(
                 db,
@@ -3975,6 +4099,7 @@ class UpstreamChannelService:
                 )
             access_token = decrypt_text(channel.encrypted_access_token)
             refresh_token = decrypt_text(channel.encrypted_refresh_token)
+            imported_api_keys: dict[int, str] = {}
             account_api_keys = (
                 {}
                 if monitor_details_only
@@ -3983,6 +4108,8 @@ class UpstreamChannelService:
                     configs,
                     channel.id,
                     remote_by_id=remote_by_id,
+                    imported_api_keys=imported_api_keys,
+                    persist_imported=False,
                 )
             )
             account_api_key_record_ids = {
@@ -4182,8 +4309,11 @@ class UpstreamChannelService:
                             configs,
                             channel.id,
                             remote_by_id=remote_by_id,
+                            imported_api_keys=imported_api_keys,
+                            persist_imported=False,
                         )
                     )
+                    await db.commit()
 
                     access_token = token_pair.access_token
                     result = await run_discovery(access_token, preferred_type)
@@ -4239,13 +4369,279 @@ class UpstreamChannelService:
                 await db.commit()
                 await db.refresh(channel)
                 return self._channel_out(channel, [])
+
+            # The remote discovery result is only an observation at this point.
+            # Collect every remaining read-only Sub2API input before mutating
+            # persistent ORM objects so SQLite has no transaction to retain
+            # while these requests are in flight.
+            await db.commit()
+            token_invalid = bool(_value(result, "sub2api_auth_rejected"))
+            linked_account_ids = [config.sub2api_account_id for config in configs]
+
+            async def fetch_local_today_costs() -> dict[int, float]:
+                try:
+                    return await self.sub2api.get_account_today_costs(linked_account_ids)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return {}
+
+            async def fetch_yesterday_income() -> dict[int, float]:
+                daily_cost_getter = getattr(self.sub2api, "get_account_daily_costs", None)
+                if not include_yesterday_usage or not callable(daily_cost_getter):
+                    return {}
+                try:
+                    daily_costs = await daily_cost_getter(linked_account_ids, days=2)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return {}
+                yesterday = usage_day(usage_snapshot_now, today_timezone) - timedelta(days=1)
+                return {
+                    account_id: costs[yesterday]
+                    for account_id, costs in daily_costs.items()
+                    if isinstance(costs, dict) and yesterday in costs
+                }
+
+            async def fetch_balance_fallback() -> dict[str, Any] | None:
+                if token_invalid:
+                    return None
+                balance_status = str(
+                    _value(result, "balance_status") or "not_checked"
+                ).strip().lower()
+                if balance_status in {"ok", "success", "available"}:
+                    return None
+                return await self._fetch_api_key_balance_fallback(configs)
+
+            async def fetch_local_recharge() -> tuple[float | None, str | None, str]:
+                if local_recharge_snapshot is not None:
+                    return local_recharge_snapshot
+                return await self._local_recharge()
+
+            (
+                local_today_costs,
+                yesterday_income_by_account,
+                balance_fallback_result,
+                local_recharge_result,
+            ) = await asyncio.gather(
+                fetch_local_today_costs(),
+                fetch_yesterday_income(),
+                fetch_balance_fallback(),
+                fetch_local_recharge(),
+            )
+            local_recharge, local_source, local_status = local_recharge_result
+
+            try:
+                threshold_getter = getattr(
+                    runtime_config,
+                    "get_upstream_balance_pause_threshold",
+                    None,
+                )
+                balance_pause_threshold = (
+                    float(await threshold_getter()) if threshold_getter else 0.0
+                )
+            except Exception:
+                balance_pause_threshold = 0.0
+            if options is not None and options.sync_rates is False:
+                sync_enabled = False
+            else:
+                try:
+                    sync_enabled = await runtime_config.get_upstream_rate_sync_enabled()
+                except Exception:
+                    sync_enabled = False
+            try:
+                automation_paused = bool(await runtime_config.get_automation_paused())
+            except Exception:
+                automation_paused = True
+            if options is not None and options.evaluate_upstream_health is False:
+                upstream_health_pause_enabled = None
+            else:
+                try:
+                    upstream_health_pause_enabled = bool(
+                        await runtime_config.get_api_key_auto_disable_on_upstream_unavailable()
+                    )
+                except Exception:
+                    upstream_health_pause_enabled = None
+
+            # Build the availability plan against detached ORM-shaped copies.
+            # Existing policy helpers can therefore calculate and probe without
+            # placing the real Session into an autoflush-capable state.
+            planned_channel = _copy_mapped_row(channel)
+            planned_configs = {
+                config.id: _copy_mapped_row(config)
+                for config in configs
+            }
+            planning_result = deepcopy(result)
+            planned_previous_groups = _sanitize_group_options(planned_channel.group_options)
+            self._stabilize_discovery_groups(
+                planned_channel,
+                planning_result,
+                now=_utcnow(),
+            )
+            self._apply_stabilized_group_account_states(
+                planned_channel,
+                planning_result,
+                list(planned_configs.values()),
+                previous_groups=planned_previous_groups,
+            )
+            planned_discovery_succeeded = self._apply_discovery_to_channel(
+                planned_channel,
+                planning_result,
+                refresh_channel_monitors=refresh_channel_monitors,
+                time_zone=today_timezone,
+                log_usage_failures=False,
+            )
+            if not token_invalid:
+                self._apply_api_key_balance_fallback(
+                    planned_channel,
+                    balance_fallback_result,
+                )
+            planned_balance_guard_action = (
+                None
+                if options is not None and options.evaluate_balance_guard is False
+                else await self._prepare_balance_guard(
+                    None,
+                    planned_channel,
+                    runtime_config,
+                    persist_notifications=False,
+                )
+            )
+            await self._prepare_channel_monitor_guard(
+                planned_channel,
+                runtime_config,
+                monitor_probe_fresh=refresh_channel_monitors,
+            )
+
+            planned_record_owners = {
+                config.upstream_api_key_record_id: config.id
+                for config in planned_configs.values()
+                if config.upstream_api_key_record_id is not None
+            }
+            planned_unbound_counts: dict[int, int] = {}
+            if planned_discovery_succeeded:
+                for config in planned_configs.values():
+                    if config.upstream_api_key_record_id is not None:
+                        continue
+                    observed_id = self.accounts._upstream_record_id(
+                        self._synchronized_upstream_state(
+                            planning_result,
+                            config.sub2api_account_id,
+                        )
+                    )
+                    if observed_id is not None:
+                        planned_unbound_counts[observed_id] = (
+                            planned_unbound_counts.get(observed_id, 0) + 1
+                        )
+            planned_ambiguous_ids = {
+                record_id
+                for record_id, count in planned_unbound_counts.items()
+                if count > 1
+            }
+            planned_identity_status: dict[int, UpstreamRecordIdentityStatus] = {}
+            for config in planned_configs.values():
+                if planned_discovery_succeeded:
+                    planned_identity_status[config.id] = (
+                        await self.accounts.apply_upstream_record_identity(
+                            db,
+                            config,
+                            self._synchronized_upstream_state(
+                                planning_result,
+                                config.sub2api_account_id,
+                            ),
+                            observed_upstream_type=str(
+                                _value(planning_result, "upstream_type") or ""
+                            ).strip().lower(),
+                            record_owners=planned_record_owners,
+                            ambiguous_unbound_record_ids=planned_ambiguous_ids,
+                        )
+                    )
+                else:
+                    planned_identity_status[config.id] = (
+                        UpstreamRecordIdentityStatus.REBIND_REQUIRED
+                        if config.upstream_identity_rebind_required
+                        else UpstreamRecordIdentityStatus.VERIFIED
+                    )
+
+            # Identity validation may perform a read query. End it before the
+            # connection tests below, which can each take tens of seconds.
+            await db.commit()
+            availability_semaphore = asyncio.Semaphore(4)
+
+            async def prepare_availability(
+                config: UpstreamAccountConfig,
+            ) -> tuple[int, _PreparedAccountAvailability | None]:
+                if planned_identity_status.get(
+                    config.id,
+                    UpstreamRecordIdentityStatus.INCONCLUSIVE,
+                ) is not UpstreamRecordIdentityStatus.VERIFIED:
+                    return config.id, None
+                if options is not None and options.evaluate_account_availability is False:
+                    return config.id, None
+                current_remote = remote_by_id.get(config.sub2api_account_id)
+                if current_remote is None:
+                    return config.id, None
+                blocking_pause_reason = self._availability_test_blocker(
+                    config,
+                    current_remote,
+                )
+                if blocking_pause_reason is None and planned_balance_guard_action == "hold":
+                    blocking_pause_reason = AUTO_PAUSE_REASON_BALANCE
+                if (
+                    blocking_pause_reason is None
+                    and upstream_health_pause_enabled is True
+                    and int(config.upstream_health_invalid_count or 0) >= 1
+                ):
+                    upstream_state = self._synchronized_upstream_state(
+                        planning_result,
+                        config.sub2api_account_id,
+                    )
+                    key_status = str(_value(upstream_state, "key_status") or "").strip().lower()
+                    group_status = str(
+                        _value(upstream_state, "group_status") or ""
+                    ).strip().lower()
+                    if key_status in INVALID_UPSTREAM_KEY_STATUSES:
+                        blocking_pause_reason = AUTO_PAUSE_REASON_KEY
+                    elif group_status in INVALID_UPSTREAM_GROUP_STATUSES:
+                        blocking_pause_reason = AUTO_PAUSE_REASON_GROUP
+                async with availability_semaphore:
+                    action, evidence = await self._prepare_account_monitor_guard(
+                        config,
+                        planned_channel,
+                        runtime_config,
+                        automation_paused=automation_paused,
+                        blocking_pause_reason=blocking_pause_reason,
+                        monitor_probe_fresh=refresh_channel_monitors,
+                    )
+                return config.id, _PreparedAccountAvailability(
+                    action=action,
+                    evidence=evidence,
+                    values={
+                        field: deepcopy(getattr(config, field))
+                        for field in _AVAILABILITY_STATE_FIELDS
+                    },
+                )
+
+            availability_observations = {
+                config_id: prepared
+                for config_id, prepared in await asyncio.gather(
+                    *(prepare_availability(config) for config in planned_configs.values())
+                )
+                if prepared is not None
+            }
+
+            writeback_coordinator = self._active_writeback_coordinator
+            if (
+                writeback_coordinator is not None
+                and writeback_coordinator.includes(channel_id)
+            ):
+                await writeback_coordinator.wait_for_turn(channel_id)
+
             had_previous_discovery = channel.last_discovered_at is not None
             previous_channel_groups = _sanitize_group_options(channel.group_options)
             group_changes: list[dict[str, Any]] = []
             previous_channel_recharge = self._remember_channel_recharge_multiplier(channel)
             previous_channel_recharge_source = channel.recharge_multiplier_source
             previous_channel_recharge_status = channel.recharge_multiplier_status
-            token_invalid = bool(_value(result, "sub2api_auth_rejected"))
             self._stabilize_discovery_groups(channel, result, now=_utcnow())
             self._apply_stabilized_group_account_states(
                 channel,
@@ -4287,37 +4683,10 @@ class UpstreamChannelService:
                     observed_at=channel.last_discovered_at or _utcnow(),
                 )
             if not token_invalid:
-                await self._apply_api_key_balance_fallback(channel, configs)
-            # The local today-stats batch doubles as the revenue source for
-            # historical channel accounting.  The same response still feeds
-            # the pre-existing upstream-usage fallback below.
-            linked_account_ids = [config.sub2api_account_id for config in configs]
-            try:
-                local_today_costs = await self.sub2api.get_account_today_costs(
-                    linked_account_ids
+                self._apply_api_key_balance_fallback(
+                    channel,
+                    balance_fallback_result,
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                local_today_costs = {}
-            yesterday_income_by_account: dict[int, float] = {}
-            daily_cost_getter = getattr(self.sub2api, "get_account_daily_costs", None)
-            if include_yesterday_usage and callable(daily_cost_getter):
-                try:
-                    daily_costs = await daily_cost_getter(linked_account_ids, days=2)
-                    yesterday = usage_day(usage_snapshot_now, today_timezone) - timedelta(days=1)
-                    yesterday_income_by_account = {
-                        account_id: costs[yesterday]
-                        for account_id, costs in daily_costs.items()
-                        if isinstance(costs, dict) and yesterday in costs
-                    }
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # The wallet's finalized upstream reading remains usable
-                    # even when Sub2API cannot provide the companion income
-                    # history for a particular account.
-                    yesterday_income_by_account = {}
             balance_guard_action = (
                 None
                 if options is not None and options.evaluate_balance_guard is False
@@ -4328,44 +4697,6 @@ class UpstreamChannelService:
                 runtime_config,
                 monitor_probe_fresh=refresh_channel_monitors,
             )
-            try:
-                threshold_getter = getattr(
-                    runtime_config,
-                    "get_upstream_balance_pause_threshold",
-                    None,
-                )
-                balance_pause_threshold = (
-                    float(await threshold_getter()) if threshold_getter else 0.0
-                )
-            except Exception:
-                balance_pause_threshold = 0.0
-            local_recharge, local_source, local_status = (
-                local_recharge_snapshot
-                if local_recharge_snapshot is not None
-                else await self._local_recharge()
-            )
-            if options is not None and options.sync_rates is False:
-                sync_enabled = False
-            else:
-                try:
-                    sync_enabled = await runtime_config.get_upstream_rate_sync_enabled()
-                except Exception:
-                    # Discovery remains read-only if runtime settings are not yet
-                    # available during startup or isolated service tests.
-                    sync_enabled = False
-            try:
-                automation_paused = bool(await runtime_config.get_automation_paused())
-            except Exception:
-                automation_paused = True
-            if options is not None and options.evaluate_upstream_health is False:
-                upstream_health_pause_enabled = None
-            else:
-                try:
-                    upstream_health_pause_enabled = bool(
-                        await runtime_config.get_api_key_auto_disable_on_upstream_unavailable()
-                    )
-                except Exception:
-                    upstream_health_pause_enabled = None
             async with AsyncExitStack() as account_locks:
                 for config in sorted(
                     configs,
@@ -4393,6 +4724,11 @@ class UpstreamChannelService:
                 account_work_items: list[
                     tuple[UpstreamAccountConfig, dict[str, Any]]
                 ] = []
+                settings = get_settings()
+                can_persist_imported_keys = not (
+                    settings.app_env == "production"
+                    and settings.app_encryption_key.strip() == DEFAULT_ENCRYPTION_KEY
+                )
                 for pending_config in configs:
                     expected_inputs = account_input_snapshots.get(
                         pending_config.sub2api_account_id
@@ -4419,6 +4755,13 @@ class UpstreamChannelService:
                         self.accounts._require_config_binding(current_remote, config)
                     except UpstreamAccountServiceError:
                         continue
+                    imported_api_key = imported_api_keys.get(config.sub2api_account_id)
+                    if (
+                        can_persist_imported_keys
+                        and imported_api_key
+                        and not config.encrypted_api_key
+                    ):
+                        config.encrypted_api_key = encrypt_text(imported_api_key)
                     account_work_items.append((config, current_remote))
 
                 record_owners = {
@@ -4473,69 +4816,42 @@ class UpstreamChannelService:
                             else UpstreamRecordIdentityStatus.VERIFIED
                         )
 
-                availability_semaphore = asyncio.Semaphore(4)
-
-                async def prepare_account_monitor(
-                    config: UpstreamAccountConfig,
-                    current_remote: dict[str, Any],
-                ) -> tuple[int, str | None, dict[str, Any]]:
+                account_monitor_results: dict[int, tuple[str | None, dict[str, Any]]] = {}
+                for config, _current_remote in account_work_items:
                     if identity_status_by_config.get(
                         config.id,
                         UpstreamRecordIdentityStatus.INCONCLUSIVE,
                     ) is not UpstreamRecordIdentityStatus.VERIFIED:
-                        return config.id, None, {
+                        account_monitor_results[config.id] = (None, {
                             "mode": config.availability_check_mode,
                             "status": "upstream_identity_rebind_required",
-                        }
+                        })
+                        continue
                     if (
                         options is not None
                         and options.evaluate_account_availability is False
                     ):
-                        return config.id, None, {
+                        account_monitor_results[config.id] = (None, {
                             "mode": config.availability_check_mode,
                             "status": "manual_sync_skipped",
-                        }
-                    blocking_pause_reason = self._availability_test_blocker(
-                        config,
-                        current_remote,
+                        })
+                        continue
+                    prepared = availability_observations.get(config.id)
+                    if prepared is None:
+                        config.availability_status = "unknown"
+                        config.availability_source = None
+                        config.availability_message = "Availability observation was not prepared."
+                        account_monitor_results[config.id] = (None, {
+                            "mode": config.availability_check_mode,
+                            "status": "unknown",
+                        })
+                        continue
+                    for field, value in prepared.values.items():
+                        setattr(config, field, deepcopy(value))
+                    account_monitor_results[config.id] = (
+                        prepared.action,
+                        deepcopy(prepared.evidence),
                     )
-                    if blocking_pause_reason is None and balance_guard_action == "hold":
-                        blocking_pause_reason = AUTO_PAUSE_REASON_BALANCE
-                    if (
-                        blocking_pause_reason is None
-                        and upstream_health_pause_enabled is True
-                        and int(config.upstream_health_invalid_count or 0) >= 1
-                    ):
-                        upstream_state = self._synchronized_upstream_state(
-                            result,
-                            config.sub2api_account_id,
-                        )
-                        key_status = str(_value(upstream_state, "key_status") or "").strip().lower()
-                        group_status = str(_value(upstream_state, "group_status") or "").strip().lower()
-                        if key_status in INVALID_UPSTREAM_KEY_STATUSES:
-                            blocking_pause_reason = AUTO_PAUSE_REASON_KEY
-                        elif group_status in INVALID_UPSTREAM_GROUP_STATUSES:
-                            blocking_pause_reason = AUTO_PAUSE_REASON_GROUP
-                    async with availability_semaphore:
-                        action, evidence = await self._prepare_account_monitor_guard(
-                            config,
-                            channel,
-                            runtime_config,
-                            automation_paused=automation_paused,
-                            blocking_pause_reason=blocking_pause_reason,
-                            monitor_probe_fresh=refresh_channel_monitors,
-                        )
-                    return config.id, action, evidence
-
-                account_monitor_results = {
-                    config_id: (action, evidence)
-                    for config_id, action, evidence in await asyncio.gather(
-                        *(
-                            prepare_account_monitor(config, current_remote)
-                            for config, current_remote in account_work_items
-                        )
-                    )
-                }
 
                 rate_notification_events: list[dict[str, Any]] = []
                 for config, current_remote in account_work_items:
@@ -4961,38 +5277,39 @@ class UpstreamChannelService:
         *,
         options: UpstreamDiscoveryOptions | None = None,
     ) -> UpstreamChannelOut:
-        remote_accounts, local_recharge_snapshot = await asyncio.gather(
-            self.accounts._remote_accounts(),
-            self._local_recharge(),
-        )
-        remote_by_id = {
-            account_id: account
-            for account in remote_accounts
-            if (account_id := self.accounts._numeric_remote_id(account)) is not None
-        }
-        discover_kwargs: dict[str, Any] = {
-            "sync_inventory": False,
-            "remote_by_id": remote_by_id,
-            "local_recharge_snapshot": local_recharge_snapshot,
-        }
-        if options is not None:
-            discover_kwargs["options"] = options
-        result = await self._discover_channel(db, channel_id, **discover_kwargs)
-        if options is None or options.sync_priorities is not False:
-            await self._rebalance_priorities_best_effort(
-                db,
-                remote_by_id=remote_by_id,
+        async with self._discover_all_lock:
+            remote_accounts, local_recharge_snapshot = await asyncio.gather(
+                self.accounts._remote_accounts(),
+                self._local_recharge(),
             )
-        refreshed = await self.overview(
-            db,
-            sync_inventory=False,
-            remote_by_id=remote_by_id,
-            local_recharge_snapshot=local_recharge_snapshot,
-        )
-        return next(
-            (item for item in refreshed.channels if item.id == channel_id),
-            result,
-        )
+            remote_by_id = {
+                account_id: account
+                for account in remote_accounts
+                if (account_id := self.accounts._numeric_remote_id(account)) is not None
+            }
+            discover_kwargs: dict[str, Any] = {
+                "sync_inventory": False,
+                "remote_by_id": remote_by_id,
+                "local_recharge_snapshot": local_recharge_snapshot,
+            }
+            if options is not None:
+                discover_kwargs["options"] = options
+            result = await self._discover_channel(db, channel_id, **discover_kwargs)
+            if options is None or options.sync_priorities is not False:
+                await self._rebalance_priorities_best_effort(
+                    db,
+                    remote_by_id=remote_by_id,
+                )
+            refreshed = await self.overview(
+                db,
+                sync_inventory=False,
+                remote_by_id=remote_by_id,
+                local_recharge_snapshot=local_recharge_snapshot,
+            )
+            return next(
+                (item for item in refreshed.channels if item.id == channel_id),
+                result,
+            )
 
     async def refresh_channel_monitors(
         self,
@@ -5187,26 +5504,43 @@ class UpstreamChannelService:
                     if bind is not None
                     else AsyncSessionLocal
                 )
-            semaphore = asyncio.Semaphore(effective_concurrency)
-
             async def discover_with_session(channel_id: int) -> UpstreamChannelOut:
-                async with semaphore:
-                    async with session_factory() as worker_db:
-                        discover_kwargs = {
-                            "sync_inventory": False,
-                            "remote_by_id": remote_by_id,
-                            "local_recharge_snapshot": local_recharge_snapshot,
-                        }
-                        if options is not None:
-                            discover_kwargs["options"] = options
-                        return await self._discover_channel(worker_db, channel_id, **discover_kwargs)
+                coordinator = self._active_writeback_coordinator
+                if coordinator is not None:
+                    await coordinator.start_probe(channel_id)
+                async with session_factory() as worker_db:
+                    discover_kwargs = {
+                        "sync_inventory": False,
+                        "remote_by_id": remote_by_id,
+                        "local_recharge_snapshot": local_recharge_snapshot,
+                    }
+                    if options is not None:
+                        discover_kwargs["options"] = options
+                    return await self._discover_channel(worker_db, channel_id, **discover_kwargs)
 
-            results = list(
-                await asyncio.gather(
-                    *(discover_with_session(channel.id) for channel in channels_to_probe),
-                    return_exceptions=True,
-                )
+            writeback_coordinator = _DiscoveryWritebackCoordinator(
+                [channel.id for channel in channels_to_probe],
+                effective_concurrency,
             )
+            self._active_writeback_coordinator = writeback_coordinator
+            tasks: list[asyncio.Task[UpstreamChannelOut]] = []
+            try:
+                for channel in channels_to_probe:
+                    task = asyncio.create_task(discover_with_session(channel.id))
+                    task.add_done_callback(
+                        lambda _completed, channel_id=channel.id: (
+                            writeback_coordinator.task_done(channel_id)
+                        )
+                    )
+                    tasks.append(task)
+                results = list(
+                    await asyncio.gather(
+                        *tasks,
+                        return_exceptions=True,
+                    )
+                )
+            finally:
+                self._active_writeback_coordinator = None
         probe_duration_ms = elapsed_ms(probe_started_at)
 
         for channel, result in zip(channels_to_probe, results):

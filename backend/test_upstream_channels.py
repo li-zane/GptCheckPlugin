@@ -406,6 +406,148 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.service.discover_channel(self.db, channel_id)
 
+    async def test_discovery_collects_all_network_observations_without_a_transaction(self) -> None:
+        channel_id = await self._configure_sub2api_credentials()
+        config = await self.db.scalar(
+            select(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.sub2api_account_id == 7
+            )
+        )
+        config.availability_check_mode = "independent_model"
+        config.availability_test_model = "account-test-model"
+        config.available_models = [
+            {"id": "account-test-model", "display_name": "Account test"}
+        ]
+        await self.db.commit()
+        self.runtime_config.get_api_key_auto_pause_on_channel_monitor_unavailable_enabled.return_value = True
+        observed: set[str] = set()
+
+        def assert_transaction_closed(stage: str) -> None:
+            self.assertFalse(self.db.in_transaction(), stage)
+            observed.add(stage)
+
+        async def list_accounts() -> list[dict]:
+            assert_transaction_closed("account inventory")
+            return list(self.sub2api.accounts)
+
+        async def local_recharge() -> tuple[float, bool]:
+            assert_transaction_closed("local recharge")
+            return 10.0, True
+
+        async def export_api_keys(account_ids: list[int]) -> dict[int, str]:
+            assert_transaction_closed("API key export")
+            return {account_id: f"sk-imported-{account_id}" for account_id in account_ids}
+
+        async def discover_without_transaction(**_kwargs):
+            assert_transaction_closed("upstream discovery")
+            result = self._discovery_result(
+                balance_remaining=None,
+                account_upstream_states={
+                    account_id: AccountUpstreamState(
+                        key_status="active",
+                        group_status="available",
+                        group_id="default",
+                        group_name="Default",
+                    )
+                    for account_id in (7, 8)
+                },
+            )
+            result.balance_status = "error"
+            result.account_group_matches = {
+                account_id: {"id": "default", "name": "Default", "multiplier": 1.0}
+                for account_id in (7, 8)
+            }
+            return result
+
+        async def today_costs(_account_ids: list[int]) -> dict[int, float]:
+            assert_transaction_closed("today costs")
+            return {7: 1.25}
+
+        async def daily_costs(
+            _account_ids: list[int], *, days: int = 2
+        ) -> dict[int, dict]:
+            self.assertEqual(days, 2)
+            assert_transaction_closed("daily costs")
+            return {}
+
+        async def account_balance(_account_id: int) -> dict:
+            assert_transaction_closed("balance fallback")
+            return {"status": "ok", "remaining": 9.5, "unit": "USD"}
+
+        async def connection_test(
+            account_id: str | int, model: str
+        ) -> tuple[bool, str | None]:
+            self.assertEqual((int(account_id), model), (7, "account-test-model"))
+            assert_transaction_closed("availability test")
+            return True, None
+
+        with (
+            patch.object(
+                self.sub2api,
+                "list_api_key_accounts",
+                new=AsyncMock(side_effect=list_accounts),
+            ),
+            patch.object(
+                self.sub2api,
+                "get_payment_balance_recharge_multiplier_info",
+                new=AsyncMock(side_effect=local_recharge),
+            ),
+            patch.object(
+                self.sub2api,
+                "export_api_key_secrets",
+                new=AsyncMock(side_effect=export_api_keys),
+            ),
+            patch.object(
+                self.sub2api,
+                "get_account_today_costs",
+                new=AsyncMock(side_effect=today_costs),
+            ),
+            patch.object(
+                self.sub2api,
+                "get_account_daily_costs",
+                new=AsyncMock(side_effect=daily_costs),
+            ),
+            patch.object(
+                self.sub2api,
+                "get_account_balance",
+                new=AsyncMock(side_effect=account_balance),
+            ),
+            patch.object(
+                self.sub2api,
+                "test_account_connection",
+                new=AsyncMock(side_effect=connection_test),
+            ),
+            patch(
+                "app.services.upstream_channels.discover_upstream",
+                new=discover_without_transaction,
+            ),
+            patch(
+                "app.services.upstream_channels.finalize_cached_yesterday_usage",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            await self.service.discover_channel(
+                self.db,
+                channel_id,
+                options=UpstreamDiscoveryOptions(sync_priorities=False),
+            )
+
+        self.assertEqual(
+            observed,
+            {
+                "account inventory",
+                "local recharge",
+                "API key export",
+                "upstream discovery",
+                "today costs",
+                "daily costs",
+                "balance fallback",
+                "availability test",
+            },
+        )
+        await self.db.refresh(config)
+        self.assertEqual(decrypt_text(config.encrypted_api_key), "sk-imported-7")
+
     async def test_overview_groups_equivalent_v1_urls_into_one_channel(self) -> None:
         overview = await self.service.overview(self.db)
 
@@ -3700,6 +3842,7 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
 
             # A separate session can only see the pair after the durability
             # commit that must precede the retried upstream request.
+            self.assertFalse(self.db.in_transaction())
             async with self.session_factory() as verifier:
                 persisted = await verifier.get(UpstreamChannel, channel_id)
                 self.assertIsNotNone(persisted)
@@ -4636,6 +4779,68 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         for invalid in (-1, 51, True):
             with self.assertRaises(ValueError):
                 await self.service.discover_all(self.db, max_concurrency=invalid)
+
+    async def test_discover_all_serializes_writeback_after_parallel_probe_failure(self) -> None:
+        base = await self.service.overview(self.db)
+        first = base.channels[0].model_copy(update={"recharge_multiplier_status": "ok"})
+        second = first.model_copy(update={"id": first.id + 1000})
+        third = first.model_copy(update={"id": first.id + 2000})
+        synthetic = base.model_copy(update={"channels": [first, second, third]})
+        channels_by_id = {channel.id: channel for channel in synthetic.channels}
+        active_probes = 0
+        peak_probes = 0
+        active_writes = 0
+        peak_writes = 0
+        write_order: list[int] = []
+
+        async def discover(_db, channel_id: int, **_kwargs):
+            nonlocal active_probes, peak_probes, active_writes, peak_writes
+            active_probes += 1
+            peak_probes = max(peak_probes, active_probes)
+            await asyncio.sleep(0.02 if channel_id == second.id else 0.01)
+            active_probes -= 1
+            if channel_id == second.id:
+                raise UpstreamAccountServiceError("synthetic probe failure")
+            coordinator = self.service._active_writeback_coordinator
+            self.assertIsNotNone(coordinator)
+            await coordinator.wait_for_turn(channel_id)
+            active_writes += 1
+            peak_writes = max(peak_writes, active_writes)
+            write_order.append(channel_id)
+            await asyncio.sleep(0.02)
+            active_writes -= 1
+            return channels_by_id[channel_id]
+
+        with (
+            patch.object(
+                self.service,
+                "overview",
+                new=AsyncMock(return_value=synthetic),
+            ),
+            patch.object(
+                self.service,
+                "_discover_channel",
+                new=AsyncMock(side_effect=discover),
+            ),
+            patch.object(
+                self.service,
+                "_rebalance_priorities_best_effort",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await asyncio.wait_for(
+                self.service.discover_all(
+                    self.db,
+                    sync_inventory=False,
+                    max_concurrency=2,
+                ),
+                timeout=2,
+            )
+
+        self.assertEqual((result.total, result.succeeded, result.failed), (3, 2, 1))
+        self.assertEqual(peak_probes, 2)
+        self.assertEqual(peak_writes, 1)
+        self.assertEqual(write_order, [first.id, third.id])
 
     async def test_discover_all_isolates_sqlite_lock_to_failed_channel(self) -> None:
         base = await self.service.overview(self.db)
