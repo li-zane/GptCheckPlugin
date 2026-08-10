@@ -2720,6 +2720,25 @@ class Sub2ApiClient:
                 return str(value)
         return None
 
+    def account_last_used_at(self, account: dict[str, Any]) -> datetime | None:
+        """Return the upstream's own last-use timestamp for this account.
+
+        sub2api reports ``last_used_at`` as an offset-aware ISO 8601 string. It
+        is authoritative, so it is read rather than inferred locally. Aliases
+        cover deployments that expose the field under a camelCase spelling.
+        """
+
+        for key in ("last_used_at", "lastUsedAt", "last_used_time"):
+            value = account.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            try:
+                parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+
     def account_platform(self, account: dict[str, Any]) -> str | None:
         credentials = account.get("credentials")
         for source in (account, credentials):

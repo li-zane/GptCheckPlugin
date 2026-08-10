@@ -295,6 +295,7 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
     today_upstream_usage_status: nullableString(source.today_upstream_usage_status),
     today_upstream_usage_source: nullableString(source.today_upstream_usage_source),
     today_upstream_usage_checked_at: nullableString(source.today_upstream_usage_checked_at),
+    last_used_at: nullableString(source.last_used_at),
     last_error: nullableString(source.last_error),
     last_discovered_at: nullableString(source.last_discovered_at),
     last_applied_at: nullableString(source.last_applied_at),

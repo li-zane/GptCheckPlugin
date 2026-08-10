@@ -1325,6 +1325,10 @@ class UpstreamAccountService:
             "priority": self.sub2api.account_priority(remote),
             "rate_multiplier": self._remote_current_rate(remote),
             "created_at": created_at,
+            # Keep the upstream-owned timestamp in the local display snapshot.
+            # The account list endpoint intentionally reads this snapshot to
+            # avoid a remote request on every page load.
+            "last_used_at": _datetime_text(self.sub2api.account_last_used_at(remote)),
             "base_url": _safe_text(_remote_base_url(remote), secrets=secrets, limit=500),
             "_cached": True,
             "_identity_fingerprint": self._remote_identity_fingerprint(remote),
@@ -1381,6 +1385,7 @@ class UpstreamAccountService:
                     "created_at": (
                         config.created_at.isoformat() if config.created_at is not None else None
                     ),
+                    "last_used_at": None,
                     "base_url": config.base_url,
                     "_cached": True,
                     "_identity_fingerprint": hashlib.sha256(
@@ -2147,6 +2152,9 @@ class UpstreamAccountService:
             today_upstream_usage_checked_at=(
                 config.today_upstream_usage_checked_at if config else None
             ),
+            # Read live from the upstream payload: sub2api owns this timestamp,
+            # so there is nothing to persist or infer locally.
+            last_used_at=self.sub2api.account_last_used_at(account),
             last_error=(
                 config.last_error
                 if config

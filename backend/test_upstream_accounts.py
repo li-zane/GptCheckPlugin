@@ -720,6 +720,53 @@ class UpstreamAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.today_upstream_usage_amount, 12.375)
         self.assertEqual(stored.today_upstream_usage_status, "stale")
 
+    def test_upstream_last_used_at_is_read_from_the_authoritative_payload(self) -> None:
+        # sub2api reports this itself, so it is parsed rather than inferred.
+        self.assertEqual(
+            self.service.sub2api.account_last_used_at(
+                {"last_used_at": "2026-07-08T17:30:20.059702+08:00"}
+            ),
+            datetime(2026, 7, 8, 9, 30, 20, 59702, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            self.service.sub2api.account_last_used_at(
+                {"lastUsedAt": "2026-07-08T09:30:20Z"}
+            ),
+            datetime(2026, 7, 8, 9, 30, 20, tzinfo=timezone.utc),
+        )
+        for payload in ({}, {"last_used_at": None}, {"last_used_at": "not-a-date"}):
+            self.assertIsNone(self.service.sub2api.account_last_used_at(payload))
+
+    async def test_account_response_surfaces_upstream_last_used_at(self) -> None:
+        await self._manage(api_key="sk-managed-usage")
+
+        listed = await self.service.list_accounts(self.db)
+        self.assertIsNone(listed[0].last_used_at)
+
+        self.sub2api.accounts[0]["last_used_at"] = "2026-07-08T17:30:20.059702+08:00"
+        listed = await self.service.list_accounts(self.db)
+
+        self.assertEqual(
+            listed[0].last_used_at,
+            datetime(2026, 7, 8, 9, 30, 20, 59702, tzinfo=timezone.utc),
+        )
+
+    async def test_cached_account_response_surfaces_upstream_last_used_at(self) -> None:
+        self.sub2api.accounts[0]["last_used_at"] = "2026-07-08T17:30:20.059702+08:00"
+        await self._manage(api_key="sk-managed-usage")
+
+        listed = await self.service.list_accounts(self.db, use_cache=True)
+
+        self.assertEqual(
+            listed[0].last_used_at,
+            datetime(2026, 7, 8, 9, 30, 20, 59702, tzinfo=timezone.utc),
+        )
+        config = await self._config()
+        self.assertEqual(
+            config.remote_snapshot["last_used_at"],
+            "2026-07-08T17:30:20.059702+08:00",
+        )
+
     async def test_missing_usage_retains_cache_only_within_the_same_business_day(
         self,
     ) -> None:

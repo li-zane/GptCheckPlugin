@@ -888,7 +888,10 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(accountSource, /<option value="disabled">已停用<\/option>/);
   assert.match(accountSource, /<UpstreamBalanceSummary channels=\{assignedChannels\} \/>/);
   assert.match(accountSource, /<span>渠道状态 \{channel\.channel_monitor_count/);
-  assert.match(accountSource, /<span>今日使用<\/span>/);
+  assert.match(accountSource, /<span>今日消耗<\/span>/);
+  // The last-use time is the upstream's own last_used_at, never inferred locally.
+  assert.match(accountSource, /const lastUsedAt = account\.last_used_at;/);
+  assert.match(accountSource, /"最近使用 " \+ formatDate\(lastUsedAt, displayTimeZone\)/);
   assert.match(accountSource, /<section aria-label="上游余额" className="api-key-balance-summary">/);
   assert.match(accountSource, /<div className="api-key-balance-summary-head">\s*<span>上游余额<\/span>/s);
   assert.doesNotMatch(accountSource, /上游渠道余额/);
@@ -1376,7 +1379,7 @@ test("account usage is shown for Sub2API but omitted for NewAPI", () => {
   assert.equal(shouldShowUpstreamAccountUsage(null), true);
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(source, /account\.resolved_upstream_type \|\| account\.detected_upstream_type \|\| account\.upstream_type/);
-  assert.match(source, /\{showUsage \? <div className="api-key-account-usage">/);
+  assert.match(source, /\{showUsage \? <div className="api-key-account-usage" title=\{usageTitle\}>/);
   assert.match(source, /resolvedChannelType\(channel\) !== "newapi" && finiteNumber\(channel\.balance_used\)/);
 });
 
@@ -2500,6 +2503,7 @@ test("session cache strips credentials and credential hints", () => {
         today_upstream_usage_status: "ok",
         today_upstream_usage_source: "sub2api_daily_usage",
         today_upstream_usage_checked_at: "2026-07-16T08:02:30Z",
+        last_used_at: "2026-07-16T07:58:10Z",
         upstream_key_status: "disabled",
         upstream_group_status: "invalid",
         upstream_health_invalid_count: 2,
@@ -2597,6 +2601,7 @@ test("session cache strips credentials and credential hints", () => {
   assert.equal(safe.channels[0].accounts?.[0].today_upstream_usage_amount, 1.875);
   assert.equal(safe.channels[0].accounts?.[0].today_upstream_usage_status, "ok");
   assert.equal(safe.channels[0].accounts?.[0].today_upstream_usage_source, "sub2api_daily_usage");
+  assert.equal(safe.channels[0].accounts?.[0].last_used_at, "2026-07-16T07:58:10Z");
   assert.equal(safe.channels[0].accounts?.[0].upstream_key_status, "disabled");
   assert.equal(safe.channels[0].accounts?.[0].upstream_group_status, "invalid");
   assert.equal(safe.channels[0].accounts?.[0].upstream_health_invalid_count, 2);

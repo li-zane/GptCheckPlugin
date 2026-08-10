@@ -1547,6 +1547,8 @@ class UpstreamAccountOut(BaseModel):
     today_upstream_usage_status: str = "not_checked"
     today_upstream_usage_source: str | None = None
     today_upstream_usage_checked_at: datetime | None = None
+    # Reported by sub2api itself, not inferred from local polling.
+    last_used_at: datetime | None = None
     last_error: str | None = None
     last_discovered_at: datetime | None = None
     last_applied_at: datetime | None = None

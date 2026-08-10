@@ -3863,14 +3863,20 @@ function AccountCard({
   const usageAmount = finiteNumber(account.today_upstream_usage_amount);
   const usageUnit = account.today_upstream_usage_unit;
   const usageCheckedAt = account.today_upstream_usage_checked_at;
+  const lastUsedAt = account.last_used_at;
   const usageIsCached = account.today_upstream_usage_status === "stale";
-  const usageDetail = usageAmount === null
-    ? upstreamStatusLabel(account.today_upstream_usage_status || "not_checked")
-    : [
-        usageIsCached ? "本轮未确认，显示上次成功结果" : null,
-        account.today_upstream_usage_source ? sourceLabel(account.today_upstream_usage_source) : "上游余额消耗",
-        usageCheckedAt ? formatDate(usageCheckedAt, displayTimeZone) : null,
-      ].filter(Boolean).join(" · ");
+  const usageDetail = lastUsedAt
+    ? "最近使用 " + formatDate(lastUsedAt, displayTimeZone)
+    : usageAmount === null
+      ? upstreamStatusLabel(account.today_upstream_usage_status || "not_checked")
+      : "上游未记录使用时间";
+  // Source, staleness and probe time stay reachable on hover so the compact
+  // line can spend its width on the spend and the upstream last-use time.
+  const usageTitle = [
+    usageIsCached ? "本轮未确认，显示上次成功结果" : null,
+    account.today_upstream_usage_source ? sourceLabel(account.today_upstream_usage_source) : "上游余额消耗",
+    usageCheckedAt ? "探测于 " + formatDate(usageCheckedAt, displayTimeZone) : null,
+  ].filter(Boolean).join(" · ");
   const accountUpstreamType = channel
     ? resolvedChannelType(channel)
     : account.resolved_upstream_type || account.detected_upstream_type || account.upstream_type;
@@ -3932,8 +3938,8 @@ function AccountCard({
             </span>
           ) : null}
         </div>
-        {showUsage ? <div className="api-key-account-usage">
-          <span>今日使用</span>
+        {showUsage ? <div className="api-key-account-usage" title={usageTitle}>
+          <span>今日消耗</span>
           <strong>{formatUpstreamBalance(usageAmount, usageUnit, 2)}</strong>
           <small>{usageDetail}</small>
         </div> : null}

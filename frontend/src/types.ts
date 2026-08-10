@@ -890,6 +890,8 @@ export type UpstreamAccount = {
   today_upstream_usage_status?: string | null;
   today_upstream_usage_source?: string | null;
   today_upstream_usage_checked_at?: string | null;
+  /** Upstream-reported last use of this key, straight from sub2api. */
+  last_used_at?: string | null;
   last_error?: string | null;
   last_discovered_at?: string | null;
   last_applied_at?: string | null;
