@@ -130,7 +130,6 @@ import {
 import { upstreamOverviewHasLiveMutationData } from "./upstreamOverviewCache";
 import {
   formatUpstreamBalance,
-  shouldShowUpstreamAccountUsage,
   visibleUpstreamBalanceMessage,
 } from "./upstreamUsagePresentation";
 import { routeFromPath, type ApiKeySubview } from "./viewRouting";
@@ -3877,12 +3876,6 @@ function AccountCard({
     account.today_upstream_usage_source ? sourceLabel(account.today_upstream_usage_source) : "上游余额消耗",
     usageCheckedAt ? "探测于 " + formatDate(usageCheckedAt, displayTimeZone) : null,
   ].filter(Boolean).join(" · ");
-  const channelUpstreamType = channel ? resolvedChannelType(channel) : null;
-  const accountUpstreamType = account.resolved_upstream_type || account.detected_upstream_type || account.upstream_type;
-  // A stale channel cache can temporarily report `auto`; an account that is
-  // known to be NewAPI must still never show Sub2API-only usage fields.
-  const showUsage = shouldShowUpstreamAccountUsage(channelUpstreamType)
-    && shouldShowUpstreamAccountUsage(accountUpstreamType);
   const activePauseHolds = accountActivePauseHolds(account);
   const hasAccountMeta = identityBlocked;
   return (
@@ -3940,11 +3933,11 @@ function AccountCard({
             </span>
           ) : null}
         </div>
-        {showUsage ? <div className="api-key-account-usage" title={usageTitle}>
+        <div className="api-key-account-usage" title={usageTitle}>
           <span>今日消耗</span>
           <strong>{formatUpstreamBalance(usageAmount, usageUnit, 2)}</strong>
           <small>{usageDetail}</small>
-        </div> : null}
+        </div>
       </div>
       <div className="api-key-account-priority">
         <label>

@@ -151,7 +151,6 @@ import {
 import {
   formatUpstreamBalance,
   rechargeAdjustedUsage,
-  shouldShowUpstreamAccountUsage,
   visibleUpstreamBalanceMessage,
 } from "../src/upstreamUsagePresentation.ts";
 import {
@@ -1373,15 +1372,12 @@ test("upstream balance presentation keeps card amounts readable and hides techni
   assert.equal(visibleUpstreamBalanceMessage("上游余额读取失败"), "上游余额读取失败");
 });
 
-test("account usage is shown for Sub2API but omitted for NewAPI", () => {
-  assert.equal(shouldShowUpstreamAccountUsage("sub2api"), true);
-  assert.equal(shouldShowUpstreamAccountUsage("NEWAPI"), false);
-  assert.equal(shouldShowUpstreamAccountUsage(null), true);
+test("account usage rows stay consistent while recent use comes from Sub2API", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
-  assert.match(source, /account\.resolved_upstream_type \|\| account\.detected_upstream_type \|\| account\.upstream_type/);
-  assert.match(source, /const channelUpstreamType = channel \? resolvedChannelType\(channel\) : null;/);
-  assert.match(source, /shouldShowUpstreamAccountUsage\(channelUpstreamType\)\s*&&\s*shouldShowUpstreamAccountUsage\(accountUpstreamType\)/s);
-  assert.match(source, /\{showUsage \? <div className="api-key-account-usage" title=\{usageTitle\}>/);
+  assert.match(source, /<div className="api-key-account-usage" title=\{usageTitle\}>/);
+  assert.doesNotMatch(source, /\{showUsage \?/);
+  assert.match(source, /const lastUsedAt = account\.last_used_at;/);
+  assert.match(source, /"最近使用 " \+ formatDate\(lastUsedAt, displayTimeZone\)/);
   assert.match(source, /resolvedChannelType\(channel\) !== "newapi" && finiteNumber\(channel\.balance_used\)/);
 });
 

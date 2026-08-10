@@ -33,10 +33,6 @@ export function visibleUpstreamBalanceMessage(message?: string | null) {
   return value;
 }
 
-export function shouldShowUpstreamAccountUsage(upstreamType?: string | null) {
-  return String(upstreamType || "").trim().toLowerCase() !== "newapi";
-}
-
 function finiteNonNegative(value: unknown): number | null {
   const parsed = finiteNumber(value);
   if (parsed === null) return null;
