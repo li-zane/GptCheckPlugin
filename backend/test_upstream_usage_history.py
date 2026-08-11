@@ -199,6 +199,46 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(total.total_sub2api_cost, 9.0)
         self.assertEqual(total.total_income, 6.0)
 
+    async def test_history_import_clears_unverified_legacy_income(self) -> None:
+        imported_day = self.now.date() - timedelta(days=1)
+        await import_sub2api_daily_stats(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            stats_by_account={
+                7: {imported_day: {"cost": 8.0, "user_cost": 10.0}},
+            },
+            local_recharge_multiplier=0.5,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+
+        await import_sub2api_daily_stats(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            stats_by_account={
+                7: {imported_day: {"cost": 9.0, "user_cost": None}},
+            },
+            local_recharge_multiplier=0.5,
+            now=self.now + timedelta(minutes=20),
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+
+        account = (await self.db.execute(select(UpstreamAccountDailyUsage))).scalar_one()
+        daily = (await self.db.execute(select(UpstreamChannelDailyUsage))).scalar_one()
+        total = await self.db.get(UpstreamChannelUsageTotal, channel_identity(self.channel))
+        self.assertEqual(account.sub2api_cost, 9.0)
+        self.assertIsNone(account.sub2api_user_cost)
+        self.assertIsNone(account.income)
+        self.assertEqual(daily.sub2api_cost_cny, 4.5)
+        self.assertIsNone(daily.income)
+        self.assertIsNone(daily.profit_cny)
+        self.assertEqual(total.total_sub2api_cost, 9.0)
+        self.assertEqual(total.total_income, 0.0)
+
     async def test_missing_financial_series_stay_unknown_in_history_totals(self) -> None:
         await snapshot_today_usage(
             self.db,

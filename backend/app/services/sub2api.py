@@ -321,12 +321,11 @@ def _parse_account_stat_record(raw: Any) -> dict[str, float | None] | None:
             "todayUserCost",
         ),
     )
-    # Older sub2api versions exposed only actual_cost. Preserve their single
-    # accounting value on both sides until a newer response separates them.
+    # Older sub2api versions exposed only actual_cost. It is a cost-side
+    # value, not evidence of a user charge, so income stays unknown until the
+    # response explicitly provides a user-cost field.
     if cost is None:
         cost = legacy
-    if user_cost is None:
-        user_cost = legacy
     if cost is None and user_cost is None:
         return None
     return {"cost": cost, "user_cost": user_cost}

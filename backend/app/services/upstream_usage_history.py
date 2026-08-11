@@ -122,11 +122,13 @@ def _record_account_stats(
     multiplier = _finite_amount(row.local_recharge_multiplier)
     if multiplier is None:
         multiplier = _finite_amount(current_recharge_multiplier)
-    if cost is not None:
-        row.sub2api_cost = cost
-    if user_cost is not None:
-        row.sub2api_user_cost = user_cost
-        row.sub2api_actual_cost = user_cost
+    # Daily stats are a complete snapshot. Clear legacy synthetic user-charge
+    # values when the linked response does not explicitly expose user_cost.
+    row.sub2api_cost = cost
+    row.sub2api_user_cost = user_cost
+    row.sub2api_actual_cost = user_cost
+    row.income = None
+    row.income_unit = None
     if multiplier is None:
         return
     row.local_recharge_multiplier = multiplier

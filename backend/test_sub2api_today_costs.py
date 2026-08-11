@@ -42,10 +42,10 @@ class Sub2ApiTodayCostsTests(unittest.TestCase):
         self.assertEqual(
             _parse_account_today_stats(payload, {1, 2, 3, 4, 5, 6, 7}),
             {
-                1: {"cost": 1.25, "user_cost": 1.25},
-                2: {"cost": 2.5, "user_cost": 2.5},
-                3: {"cost": 3.0, "user_cost": 3.0},
-                4: {"cost": 4.75, "user_cost": 4.75},
+                1: {"cost": 1.25, "user_cost": None},
+                2: {"cost": 2.5, "user_cost": None},
+                3: {"cost": 3.0, "user_cost": None},
+                4: {"cost": 4.75, "user_cost": None},
                 5: {"cost": 5.0, "user_cost": None},
                 6: {"cost": 6.5, "user_cost": None},
                 7: {"cost": 7.0, "user_cost": 9.0},
@@ -77,8 +77,8 @@ class Sub2ApiTodayCostsTests(unittest.TestCase):
             },
             {
                 "2026-07-26": {"cost": 8.0, "user_cost": 10.0},
-                "2026-07-27": {"cost": 4.5, "user_cost": 4.5},
-                "2026-07-28": {"cost": 6.0, "user_cost": 6.0},
+                "2026-07-27": {"cost": 4.5, "user_cost": None},
+                "2026-07-28": {"cost": 6.0, "user_cost": None},
             },
         )
 
