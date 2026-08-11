@@ -1078,6 +1078,8 @@ export type UpstreamUsageHistoryAccountDay = UpstreamUsageHistoryAccount & {
   income: number | null;
   income_unit?: string | null;
   profit_cny?: number | null;
+  /** Profit divided by the effective cost, expressed as a percentage. */
+  profit_margin?: number | null;
 };
 
 export type UpstreamUsageHistoryDay = {
@@ -1102,6 +1104,8 @@ export type UpstreamUsageHistoryDay = {
   cost_adjusted: number | null;
   consumption_cny?: number | null;
   profit_cny?: number | null;
+  /** Profit divided by the effective cost, expressed as a percentage. */
+  profit_margin?: number | null;
   finalized?: boolean;
   api_key_accounts: UpstreamUsageHistoryAccountDay[];
 };
@@ -1120,6 +1124,8 @@ export type UpstreamUsageHistoryTotals = {
   cost_adjusted: number | null;
   consumption_cny?: number | null;
   profit_cny?: number | null;
+  /** Profit divided by the effective cost, expressed as a percentage. */
+  profit_margin?: number | null;
 };
 
 export type UpstreamUsageHistory = {

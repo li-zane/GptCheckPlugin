@@ -1663,6 +1663,7 @@ class UpstreamUsageHistoryAccountOut(BaseModel):
     income: float | None = None
     income_unit: str | None = None
     profit_cny: float | None = None
+    profit_margin: float | None = None
 
 
 class UpstreamUsageHistoryDayOut(BaseModel):
@@ -1684,6 +1685,7 @@ class UpstreamUsageHistoryDayOut(BaseModel):
     cost_adjusted: float | None = None
     consumption_cny: float | None = None
     profit_cny: float | None = None
+    profit_margin: float | None = None
     finalized: bool = False
     api_key_accounts: list[UpstreamUsageHistoryAccountOut] = Field(default_factory=list)
 
@@ -1702,6 +1704,7 @@ class UpstreamUsageHistoryTotalsOut(BaseModel):
     cost_adjusted: float | None = None
     consumption_cny: float | None = None
     profit_cny: float | None = None
+    profit_margin: float | None = None
 
 
 class UpstreamUsageHistoryOut(BaseModel):

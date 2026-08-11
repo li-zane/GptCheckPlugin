@@ -3480,7 +3480,9 @@ function UpstreamUsageHistoryDialog({
   const totals = history?.totals || null;
   const lifetimeTotals = history?.lifetime_totals || null;
   const totalProfit = historyProfit(totals);
+  const totalProfitMargin = historyProfitMargin(totals);
   const lifetimeProfit = historyProfit(lifetimeTotals);
+  const lifetimeProfitMargin = historyProfitMargin(lifetimeTotals);
   const appliedRange = history
     ? `${history.start_date} 至 ${history.end_date}`
     : [appliedFilters.startDate, appliedFilters.endDate].filter(Boolean).join(" 至 ");
@@ -3588,6 +3590,7 @@ function UpstreamUsageHistoryDialog({
             <UsageHistoryMetric label="sub2api 成本" tone="cost" value={formatHistoryAmount(totals?.sub2api_cost_cny, "CNY")} />
             <UsageHistoryMetric label="收入" tone="income" value={formatHistoryAmount(totals?.income, "CNY")} />
             <UsageHistoryMetric label="利润" tone={totalProfit !== null && totalProfit < 0 ? "negative" : "profit"} value={formatHistorySignedAmount(totalProfit, "CNY")} />
+            <UsageHistoryMetric label="利润率" tone={totalProfitMargin !== null && totalProfitMargin < 0 ? "negative" : "profit"} value={formatHistoryPercent(totalProfitMargin)} />
           </div>
 
           <UsageHistoryFinancialChart
@@ -3605,6 +3608,7 @@ function UpstreamUsageHistoryDialog({
                   <th scope="col">sub2api 成本</th>
                   <th scope="col">收入</th>
                   <th scope="col">利润</th>
+                  <th scope="col">利润率</th>
                 </tr>
               </thead>
               <tbody>
@@ -3616,6 +3620,7 @@ function UpstreamUsageHistoryDialog({
                     selectedAccountId ? selectedDayAccount?.income : day.income,
                   );
                   const dailyProfit = historyDayProfit(day, selectedAccountId);
+                  const dailyProfitMargin = historyDayProfitMargin(day, selectedAccountId, dailyProfit);
                   return (
                     <tr key={day.date}>
                       <th scope="row">{formatUsageHistoryDate(day.date, displayTimeZone)}</th>
@@ -3626,6 +3631,9 @@ function UpstreamUsageHistoryDialog({
                       </td>
                       <td className={dailyProfit !== null && dailyProfit < 0 ? "is-negative" : "is-positive"}>
                         {formatHistorySignedAmount(dailyProfit, "CNY")}
+                      </td>
+                      <td className={dailyProfitMargin !== null && dailyProfitMargin < 0 ? "is-negative" : "is-positive"}>
+                        {formatHistoryPercent(dailyProfitMargin)}
                       </td>
                     </tr>
                   );
@@ -3642,6 +3650,9 @@ function UpstreamUsageHistoryDialog({
               <strong>收入 {formatHistoryAmount(lifetimeTotals.income, "CNY")}</strong>
               <strong className={lifetimeProfit !== null && lifetimeProfit < 0 ? "is-negative" : "is-positive"}>
                 利润 {formatHistorySignedAmount(lifetimeProfit, "CNY")}
+              </strong>
+              <strong className={lifetimeProfitMargin !== null && lifetimeProfitMargin < 0 ? "is-negative" : "is-positive"}>
+                利润率 {formatHistoryPercent(lifetimeProfitMargin)}
               </strong>
             </div>
           ) : null}
@@ -6192,6 +6203,7 @@ function normalizeUsageHistory(history: UpstreamUsageHistory): UpstreamUsageHist
     cost_adjusted: null,
     consumption_cny: 0,
     profit_cny: 0,
+    profit_margin: null,
   };
   return {
     ...history,
@@ -6271,6 +6283,23 @@ function historyDayProfit(
   return income === null || !costs.length ? null : income - Math.max(...costs);
 }
 
+function historyDayProfitMargin(
+  day: UpstreamUsageHistory["days"][number],
+  selectedAccountId: string | null,
+  profit: number | null,
+) {
+  const account = usageHistoryDayAccount(day, selectedAccountId);
+  const persisted = selectedAccountId
+    ? finiteNumber(account?.profit_margin)
+    : finiteNumber(day.profit_margin);
+  if (persisted !== null) return persisted;
+  const costs = [
+    historyDayUpstreamCost(day, selectedAccountId),
+    historyDaySub2apiCost(day, selectedAccountId),
+  ].filter((value): value is number => value !== null);
+  return calculateProfitMargin(costs.length ? Math.max(...costs) : null, profit);
+}
+
 function historyIncomeBreakdownTitle(
   day: UpstreamUsageHistory["days"][number],
   selectedAccountId: string | null,
@@ -6293,6 +6322,23 @@ function historyProfit(value: UpstreamUsageHistory["totals"] | null) {
     finiteNumber(value?.sub2api_cost_cny),
   ].filter((item): item is number => item !== null);
   return income === null || !costs.length ? null : income - Math.max(...costs);
+}
+
+function historyProfitMargin(value: UpstreamUsageHistory["totals"] | null) {
+  const persisted = finiteNumber(value?.profit_margin);
+  if (persisted !== null) return persisted;
+  const costs = [
+    finiteNumber(value?.upstream_cost_cny ?? value?.cost_adjusted),
+    finiteNumber(value?.sub2api_cost_cny),
+  ].filter((item): item is number => item !== null);
+  return calculateProfitMargin(
+    finiteNumber(value?.consumption_cny) ?? (costs.length ? Math.max(...costs) : null),
+    historyProfit(value),
+  );
+}
+
+function calculateProfitMargin(cost: number | null, profit: number | null) {
+  return cost === null || profit === null || cost <= 0 ? null : profit / cost * 100;
 }
 
 function formatHistoryAmount(value: unknown, unit?: string | null) {
@@ -6387,6 +6433,12 @@ function formatDailyBalanceUsed(
     value: adjustedValue,
     detail: `${label}消耗：${adjustedValue}（已考虑充值倍率）${staleDetail}`,
   };
+}
+
+function formatHistoryPercent(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return "-";
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${value.toLocaleString("zh-CN", { maximumFractionDigits: 2 })}%`;
 }
 
 function formatMoney(value: unknown) {

@@ -110,6 +110,15 @@ def _profit(
     return value if math.isfinite(value) else None
 
 
+def _profit_margin(consumption_cny: float | None, profit_cny: float | None) -> float | None:
+    """Return profit as a percentage of the effective cost."""
+
+    if consumption_cny is None or profit_cny is None or consumption_cny <= 0:
+        return None
+    value = profit_cny / consumption_cny * 100
+    return value if math.isfinite(value) else None
+
+
 def _record_account_stats(
     row: UpstreamAccountDailyUsage,
     stats: Any,
@@ -906,6 +915,11 @@ async def usage_history(
                 item.sub2api_cost,
                 item.local_recharge_multiplier,
             )
+            account_profit_cny = _profit(
+                item.income,
+                upstream_cost_cny,
+                sub2api_cost_cny,
+            )
             account_items.append(
                 {
                     "sub2api_account_id": int(item.sub2api_account_id),
@@ -924,10 +938,10 @@ async def usage_history(
                     "local_recharge_multiplier": item.local_recharge_multiplier,
                     "income": item.income,
                     "income_unit": item.income_unit,
-                    "profit_cny": _profit(
-                        item.income,
-                        upstream_cost_cny,
-                        sub2api_cost_cny,
+                    "profit_cny": account_profit_cny,
+                    "profit_margin": _profit_margin(
+                        _maximum_cost(upstream_cost_cny, sub2api_cost_cny),
+                        account_profit_cny,
                     ),
                 }
             )
@@ -1032,6 +1046,10 @@ async def usage_history(
                 "cost_adjusted": upstream_cost_cny,
                 "consumption_cny": consumption_cny,
                 "profit_cny": profit_cny,
+                "profit_margin": _profit_margin(
+                    consumption_cny,
+                    profit_cny,
+                ),
                 "finalized": bool(channel_row.finalized) if channel_row is not None else False,
                 "api_key_accounts": account_items,
             }
@@ -1122,6 +1140,7 @@ async def usage_history(
             ),
             "consumption_cny": lifetime_consumption,
             "profit_cny": lifetime_profit,
+            "profit_margin": _profit_margin(lifetime_consumption, lifetime_profit),
         }
     else:
         lifetime_channel_rows = list(
@@ -1189,6 +1208,7 @@ async def usage_history(
             "cost_adjusted": lifetime_upstream_cost_cny,
             "consumption_cny": lifetime_consumption,
             "profit_cny": lifetime_profit,
+            "profit_margin": _profit_margin(lifetime_consumption, lifetime_profit),
         }
     return {
         "channel_id": channel.id,
@@ -1213,6 +1233,10 @@ async def usage_history(
             "cost_adjusted": sum_days("cost_adjusted"),
             "consumption_cny": sum_days("consumption_cny"),
             "profit_cny": sum_days("profit_cny"),
+            "profit_margin": _profit_margin(
+                sum_days("consumption_cny"),
+                sum_days("profit_cny"),
+            ),
         },
         "lifetime_totals": lifetime_values,
     }

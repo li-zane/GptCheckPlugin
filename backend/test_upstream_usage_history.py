@@ -146,7 +146,10 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["income"], 5.0)
         self.assertEqual(day["consumption_cny"], 4.0)
         self.assertEqual(day["profit_cny"], 1.0)
+        self.assertEqual(day["profit_margin"], 25.0)
         self.assertEqual(history["totals"]["profit_cny"], 1.0)
+        self.assertEqual(history["totals"]["profit_margin"], 25.0)
+        self.assertEqual(history["lifetime_totals"]["profit_margin"], 25.0)
 
     async def test_sub2api_history_import_is_upstream_independent_and_idempotent(self) -> None:
         imported_day = self.now.date() - timedelta(days=1)
@@ -188,6 +191,7 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(history["days"][0]["upstream_cost_cny"])
         self.assertEqual(history["days"][0]["consumption_cny"], 4.0)
         self.assertEqual(history["days"][0]["profit_cny"], 1.0)
+        self.assertEqual(history["days"][0]["profit_margin"], 25.0)
 
         await import_sub2api_daily_stats(
             self.db,
@@ -276,12 +280,15 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(totals["income"])
         self.assertEqual(totals["consumption_cny"], 2.0)
         self.assertIsNone(totals["profit_cny"])
+        self.assertIsNone(totals["profit_margin"])
         output = UpstreamUsageHistoryOut(**history)
         self.assertIsNone(output.totals.profit_cny)
+        self.assertIsNone(output.totals.profit_margin)
         self.assertEqual(output.lifetime_totals.upstream_cost_cny, 2.0)
         self.assertIsNone(output.lifetime_totals.sub2api_cost_cny)
         self.assertIsNone(output.lifetime_totals.income)
         self.assertIsNone(output.lifetime_totals.profit_cny)
+        self.assertIsNone(output.lifetime_totals.profit_margin)
 
         channel_history = await usage_history(
             self.db,
@@ -296,6 +303,33 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(channel_output.lifetime_totals.sub2api_cost_cny)
         self.assertIsNone(channel_output.lifetime_totals.income)
         self.assertIsNone(channel_output.lifetime_totals.profit_cny)
+        self.assertIsNone(channel_output.lifetime_totals.profit_margin)
+
+    async def test_profit_margin_uses_effective_cost_not_income(self) -> None:
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            sub2api_stats_by_account={7: {"cost": 8.0, "user_cost": 0.0}},
+            local_recharge_multiplier=0.5,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+
+        history = await usage_history(
+            self.db,
+            channel=self.channel,
+            start_date=self.now.date(),
+            end_date=self.now.date(),
+            api_key_account_id=7,
+            time_zone="Asia/Shanghai",
+        )
+        self.assertEqual(history["days"][0]["income"], 0.0)
+        self.assertEqual(history["days"][0]["profit_cny"], -4.0)
+        self.assertEqual(history["days"][0]["profit_margin"], -100.0)
+        self.assertEqual(history["totals"]["profit_margin"], -100.0)
+        self.assertEqual(history["lifetime_totals"]["profit_margin"], -100.0)
 
     async def test_income_history_freezes_each_days_recharge_multiplier(self) -> None:
         await snapshot_today_usage(
