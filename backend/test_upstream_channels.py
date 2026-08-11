@@ -2502,16 +2502,17 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
             "local_sub2api_today_cost_converted",
         )
         self.assertEqual(account.today_upstream_usage_status, "estimated")
-        daily_income = await self.db.scalar(
+        daily_usage = await self.db.scalar(
             select(UpstreamAccountDailyUsage).where(
                 UpstreamAccountDailyUsage.sub2api_account_id == 7
             )
         )
-        self.assertIsNotNone(daily_income)
-        self.assertAlmostEqual(daily_income.sub2api_actual_cost, 3.0)
-        self.assertAlmostEqual(daily_income.local_recharge_multiplier, 0.1)
-        self.assertAlmostEqual(daily_income.income, 0.3)
-        self.assertEqual(daily_income.income_unit, "CNY")
+        self.assertIsNotNone(daily_usage)
+        self.assertAlmostEqual(daily_usage.sub2api_cost, 3.0)
+        self.assertAlmostEqual(daily_usage.local_recharge_multiplier, 0.1)
+        self.assertIsNone(daily_usage.sub2api_actual_cost)
+        self.assertIsNone(daily_usage.income)
+        self.assertIsNone(daily_usage.income_unit)
 
     async def test_successful_discovery_keeps_same_day_usage_when_upstream_omits_a_key(self) -> None:
         channel_id = (await self.service.overview(self.db)).channels[0].id

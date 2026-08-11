@@ -302,7 +302,7 @@ def _account_stat_amount(raw: Any, fields: tuple[str, ...]) -> float | None:
 
 
 def _parse_account_stat_record(raw: Any) -> dict[str, float | None] | None:
-    legacy = _account_stat_amount(
+    actual_cost = _account_stat_amount(
         raw,
         ("today_actual_cost", "todayActualCost", "actual_cost", "actualCost"),
     )
@@ -321,11 +321,11 @@ def _parse_account_stat_record(raw: Any) -> dict[str, float | None] | None:
             "todayUserCost",
         ),
     )
-    # Older sub2api versions exposed only actual_cost. It is a cost-side
-    # value, not evidence of a user charge, so income stays unknown until the
-    # response explicitly provides a user-cost field.
-    if cost is None:
-        cost = legacy
+    # The account-stat endpoint may include both a billable ``cost`` and the
+    # actual upstream cost. The latter is the financial cost-side source; a
+    # plain cost field is retained solely as a compatibility fallback.
+    if actual_cost is not None:
+        cost = actual_cost
     if cost is None and user_cost is None:
         return None
     return {"cost": cost, "user_cost": user_cost}

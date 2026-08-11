@@ -791,7 +791,7 @@ class UpstreamAccountService:
         if not isinstance(legacy_values, dict):
             return {}
         return {
-            int(account_id): {"cost": cost, "user_cost": cost}
+            int(account_id): {"cost": cost, "user_cost": None}
             for account_id, raw_cost in legacy_values.items()
             if (cost := _balance_number(raw_cost)) is not None and cost >= 0
         }
@@ -828,7 +828,7 @@ class UpstreamAccountService:
             return {}
         return {
             int(account_id): {
-                usage_date: {"cost": cost, "user_cost": cost}
+                usage_date: {"cost": cost, "user_cost": None}
                 for usage_date, raw_cost in daily_costs.items()
                 if (cost := _balance_number(raw_cost)) is not None and cost >= 0
             }

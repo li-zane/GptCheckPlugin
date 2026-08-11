@@ -177,6 +177,17 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(daily.profit_cny, 1.0)
         self.assertTrue(account.finalized)
         self.assertTrue(daily.finalized)
+        history = await usage_history(
+            self.db,
+            channel=self.channel,
+            start_date=imported_day,
+            end_date=imported_day,
+            api_key_account_id=7,
+            time_zone="Asia/Shanghai",
+        )
+        self.assertIsNone(history["days"][0]["upstream_cost_cny"])
+        self.assertEqual(history["days"][0]["consumption_cny"], 4.0)
+        self.assertEqual(history["days"][0]["profit_cny"], 1.0)
 
         await import_sub2api_daily_stats(
             self.db,
