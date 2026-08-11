@@ -1630,6 +1630,34 @@ class UpstreamChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(stored.encrypted_refresh_token, refresh_secret)
         self.assertNotIn(refresh_secret, stored.encrypted_refresh_token or "")
 
+    async def test_channel_base_url_update_propagates_to_linked_sub2api_accounts(self) -> None:
+        channel = (await self.service.overview(self.db)).channels[0]
+
+        await self.service.update_channel(
+            self.db,
+            channel.id,
+            UpstreamChannelUpdate(
+                base_url="https://replacement.example",
+                confirm_credential_rebind=True,
+            ),
+        )
+
+        self.assertEqual(
+            self.sub2api.base_url_update_calls,
+            [(7, "https://replacement.example"), (8, "https://replacement.example")],
+        )
+        self.assertTrue(
+            all(
+                account["credentials"]["base_url"] == "https://replacement.example"
+                for account in self.sub2api.accounts
+            )
+        )
+        configs = list((await self.db.scalars(select(UpstreamAccountConfig))).all())
+        self.assertEqual(
+            {config.base_url for config in configs},
+            {"https://replacement.example"},
+        )
+
     async def test_account_discovery_redacts_channel_refresh_token_from_remote_name(self) -> None:
         refresh_secret = "rt-remote-name-must-not-leak"
         channel_id = await self._configure_sub2api_credentials(

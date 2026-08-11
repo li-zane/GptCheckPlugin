@@ -515,6 +515,51 @@ class UpstreamChannelService:
             remote_by_id=remote_by_id,
         )
 
+    async def _sync_linked_account_base_urls(
+        self,
+        configs: list[UpstreamAccountConfig],
+        target_base_url: str,
+    ) -> None:
+        """Keep each linked sub2api account on the channel's new endpoint."""
+
+        remote_by_id = {
+            account_id: account
+            for account in await self.accounts._remote_accounts()
+            if (account_id := self.accounts._numeric_remote_id(account)) is not None
+        }
+        for config in configs:
+            account_id = int(config.sub2api_account_id)
+            remote = remote_by_id.get(account_id)
+            if remote is None or _remote_base_url(remote) == target_base_url:
+                continue
+            expected_identity = self.accounts._remote_rename_guard_fingerprint(remote)
+
+            def validate_current(
+                candidate: dict[str, Any],
+                *,
+                expected: str = expected_identity,
+            ) -> None:
+                if self.accounts._remote_rename_guard_fingerprint(candidate) != expected:
+                    raise UpstreamAccountServiceError(
+                        "The sub2api account identity changed before the channel URL update completed.",
+                        status_code=409,
+                    )
+
+            try:
+                await self.sub2api.update_account_base_url(
+                    account_id,
+                    target_base_url,
+                    validate_current=validate_current,
+                )
+            except UpstreamAccountServiceError:
+                raise
+            except Exception as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise UpstreamAccountServiceError(
+                    "Unable to update and verify a linked sub2api account upstream address."
+                ) from None
+
     async def _filter_current_bindings(
         self,
         configs: list[UpstreamAccountConfig],
@@ -1739,6 +1784,11 @@ class UpstreamChannelService:
                 )
             )
             linked_configs = list(linked_configs_result.scalars().all())
+            if base_url_changed and linked_configs:
+                await self._sync_linked_account_base_urls(
+                    linked_configs,
+                    channel.canonical_base_url,
+                )
             # Rotating credentials does not change the upstream identity. Keep
             # the last known channel metrics visible until the next discovery
             # finishes; URL/type/user changes still invalidate them immediately.
@@ -1808,7 +1858,14 @@ class UpstreamChannelService:
                         config,
                         preserve_pause_ownership=True,
                     )
-            bound_configs = await self._bound_configs(db, channel_id)
+            # A URL change is the operation that repairs stale endpoint
+            # bindings, so every local config linked to this channel must be
+            # projected even when its remote endpoint still has the old URL.
+            bound_configs = (
+                linked_configs
+                if base_url_changed
+                else await self._bound_configs(db, channel_id)
+            )
             if bound_configs:
                 await db.execute(
                     update(UpstreamAccountConfig)

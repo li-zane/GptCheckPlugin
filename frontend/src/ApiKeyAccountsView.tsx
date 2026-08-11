@@ -3680,17 +3680,21 @@ function UsageHistoryFinancialChart({
   selectedAccountId: string | null;
   title: string;
 }) {
-  const series = days.map((day) => ({
-    date: day.date,
-    upstreamCost: historyDayUpstreamCost(day, selectedAccountId),
-    sub2apiCost: historyDaySub2apiCost(day, selectedAccountId),
-    income: finiteNumber(
-      selectedAccountId
-        ? usageHistoryDayAccount(day, selectedAccountId)?.income
-        : day.income,
-    ),
-    profit: historyDayProfit(day, selectedAccountId),
-  }));
+  const series = days.map((day) => {
+    const profit = historyDayProfit(day, selectedAccountId);
+    return {
+      date: day.date,
+      upstreamCost: historyDayUpstreamCost(day, selectedAccountId),
+      sub2apiCost: historyDaySub2apiCost(day, selectedAccountId),
+      income: finiteNumber(
+        selectedAccountId
+          ? usageHistoryDayAccount(day, selectedAccountId)?.income
+          : day.income,
+      ),
+      profit,
+      profitMargin: historyDayProfitMargin(day, selectedAccountId, profit),
+    };
+  });
   const maxHorizontalZoom = Math.max(1, Math.min(6, Math.ceil(series.length / 7)));
   const [horizontalZoom, setHorizontalZoom] = useState(1);
   useEffect(() => {
@@ -3724,10 +3728,26 @@ function UsageHistoryFinancialChart({
   const yMaximum = maximum === minimum ? maximum + 1 : maximum + margin;
   const yMinimum = maximum === minimum ? minimum - 1 : minimum - margin;
   const yRange = yMaximum - yMinimum;
+  const marginValues = series
+    .map((point) => point.profitMargin)
+    .filter((value): value is number => value !== null);
+  const marginMaximum = Math.max(...marginValues, 0);
+  const marginMinimum = Math.min(...marginValues, 0);
+  const marginPadding = Math.max(marginMaximum - marginMinimum, 1) * 0.08;
+  const marginYMaximum = marginMaximum === marginMinimum
+    ? marginMaximum + 1
+    : marginMaximum + marginPadding;
+  const marginYMinimum = marginMaximum === marginMinimum
+    ? marginMinimum - 1
+    : marginMinimum - marginPadding;
+  const marginYRange = marginYMaximum - marginYMinimum;
   const xFor = (index: number) => padding.left + (series.length <= 1 ? chartWidth / 2 : (index / (series.length - 1)) * chartWidth);
   const yFor = (value: number | null) => value === null
     ? null
     : padding.top + ((yMaximum - value) / yRange) * chartHeight;
+  const yForMargin = (value: number | null) => value === null
+    ? null
+    : padding.top + ((marginYMaximum - value) / marginYRange) * chartHeight;
   const linePoints = (field: "upstreamCost" | "sub2apiCost" | "income") => series
     .map((point, index) => {
       const y = yFor(point[field]);
@@ -3738,6 +3758,13 @@ function UsageHistoryFinancialChart({
   const upstreamPoints = linePoints("upstreamCost");
   const sub2apiPoints = linePoints("sub2apiCost");
   const incomePoints = linePoints("income");
+  const marginPoints = series
+    .map((point, index) => {
+      const y = yForMargin(point.profitMargin);
+      return y === null ? null : `${xFor(index).toFixed(1)},${y.toFixed(1)}`;
+    })
+    .filter((point): point is string => point !== null)
+    .join(" ");
   const zeroY = yFor(0) ?? padding.top + chartHeight;
   const barWidth = Math.max(3, Math.min(16, chartWidth / Math.max(series.length, 1) * 0.44));
   const labelIndexes = usageHistoryLabelIndexes(series.length);
@@ -3748,6 +3775,7 @@ function UsageHistoryFinancialChart({
       <div className="api-key-usage-history-chart-head">
         <div><ChartNoAxesCombined size={16} /><strong>{title}</strong></div>
         <div className="api-key-usage-history-chart-legend">
+          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--margin" />利润率（右轴）</span>
           <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--upstream" />上游成本</span>
           <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--sub2api" />sub2api 成本</span>
           <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--income" />收入</span>
@@ -3793,22 +3821,36 @@ function UsageHistoryFinancialChart({
             {upstreamPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--upstream" points={upstreamPoints} /> : null}
             {sub2apiPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--sub2api" points={sub2apiPoints} /> : null}
             {incomePoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--income" points={incomePoints} /> : null}
+            {marginPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--margin" points={marginPoints} /> : null}
             {series.map((point, index) => {
               const x = xFor(index);
               const upstreamY = yFor(point.upstreamCost);
               const sub2apiY = yFor(point.sub2apiCost);
               const incomeY = yFor(point.income);
+              const marginY = yForMargin(point.profitMargin);
               return (
                 <g key={point.date}>
                   {upstreamY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--upstream" cx={x} cy={upstreamY} r={2.7}><title>{`${point.date} 上游成本 ${formatHistoryAmount(point.upstreamCost, "CNY")}`}</title></circle> : null}
                   {sub2apiY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--sub2api" cx={x} cy={sub2apiY} r={2.7}><title>{`${point.date} sub2api 成本 ${formatHistoryAmount(point.sub2apiCost, "CNY")}`}</title></circle> : null}
                   {incomeY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--income" cx={x} cy={incomeY} r={2.7}><title>{`${point.date} 收入 ${formatHistoryAmount(point.income, "CNY")}`}</title></circle> : null}
+                  {marginY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--margin" cx={x} cy={marginY} r={2.7}><title>{`${point.date} 利润率 ${formatHistoryPercent(point.profitMargin)}`}</title></circle> : null}
                   {labelIndexes.has(index) ? <text className="api-key-usage-history-chart-axis" textAnchor="middle" x={x} y={height - 10}>{shortUsageHistoryDate(point.date)}</text> : null}
                 </g>
               );
             })}
           </svg>
         </div>
+        <svg aria-hidden="true" className="api-key-usage-history-chart-margin-axis" preserveAspectRatio="none" viewBox={`0 0 ${axisWidth} ${height}`}>
+          {gridValues.map((fraction) => {
+            const y = padding.top + chartHeight - chartHeight * fraction;
+            const value = marginYMinimum + marginYRange * fraction;
+            return (
+              <text className="api-key-usage-history-chart-axis" key={fraction} textAnchor="start" x={8} y={y + 4}>
+                {formatHistoryPercent(value)}
+              </text>
+            );
+          })}
+        </svg>
       </div>
       {maxHorizontalZoom > 1 ? (
         <div className="api-key-usage-history-chart-zoom">

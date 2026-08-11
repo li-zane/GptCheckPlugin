@@ -10305,8 +10305,8 @@ button.api-key-group-chip--more {
 
 .api-key-usage-history-totals {
   display: grid;
-  gap: 7px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .api-key-usage-history-metric {
@@ -10314,20 +10314,20 @@ button.api-key-group-chip--more {
   border: 1px solid var(--line);
   border-radius: 6px;
   display: grid;
-  gap: 4px;
+  gap: 3px;
   min-width: 0;
-  padding: 8px 9px;
+  padding: 6px 7px;
 }
 
 .api-key-usage-history-metric > span {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
 }
 
 .api-key-usage-history-metric > strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
   min-width: 0;
   overflow: hidden;
@@ -10424,6 +10424,10 @@ button.api-key-group-chip--more {
   background: var(--green);
 }
 
+.api-key-usage-history-line-key--margin {
+  background: var(--violet-ink);
+}
+
 .api-key-usage-history-bar-key {
   background: var(--violet-ink);
   display: inline-block;
@@ -10434,11 +10438,20 @@ button.api-key-group-chip--more {
 
 .api-key-usage-history-chart-viewport {
   display: grid;
-  grid-template-columns: 54px minmax(0, 1fr);
+  grid-template-columns: 54px minmax(0, 1fr) 54px;
   min-width: 0;
 }
 
 .api-key-usage-history-chart-y-axis {
+  background: var(--panel-2);
+  display: block;
+  height: 236px;
+  position: relative;
+  width: 54px;
+  z-index: 1;
+}
+
+.api-key-usage-history-chart-margin-axis {
   background: var(--panel-2);
   display: block;
   height: 236px;
@@ -10526,6 +10539,11 @@ button.api-key-group-chip--more {
   stroke: var(--green);
 }
 
+.api-key-usage-history-chart-line--margin {
+  stroke: var(--violet-ink);
+  stroke-dasharray: 5 3;
+}
+
 .api-key-usage-history-chart-dot {
   fill: var(--panel);
   stroke: var(--primary);
@@ -10544,6 +10562,10 @@ button.api-key-group-chip--more {
   stroke: var(--green);
 }
 
+.api-key-usage-history-chart-dot--margin {
+  stroke: var(--violet-ink);
+}
+
 .api-key-usage-history-profit-bar {
   fill: color-mix(in srgb, var(--violet-ink) 62%, transparent);
 }
@@ -10555,6 +10577,8 @@ button.api-key-group-chip--more {
 .api-key-usage-history-table-wrap {
   border: 1px solid var(--line);
   border-radius: 6px;
+  max-height: min(46vh, 420px);
+  min-height: 280px;
   overflow: auto;
 }
 
@@ -10578,6 +10602,9 @@ button.api-key-group-chip--more {
   color: var(--muted);
   font-size: 11px;
   font-weight: 750;
+  position: sticky;
+  top: 0;
+  z-index: 2;
   white-space: nowrap;
 }
 
@@ -10686,6 +10713,7 @@ button.api-key-group-chip--more {
   }
 
   .api-key-usage-history-chart-y-axis,
+  .api-key-usage-history-chart-margin-axis,
   .api-key-usage-history-chart-scroll > svg {
     height: 205px;
   }
