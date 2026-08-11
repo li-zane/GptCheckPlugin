@@ -10398,10 +10398,31 @@ button.api-key-group-chip--more {
   justify-content: flex-end;
 }
 
-.api-key-usage-history-chart-legend > span {
+.api-key-usage-history-chart-legend > button {
   align-items: center;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
   display: flex;
+  font: inherit;
   gap: 4px;
+  padding: 2px 0;
+  transition: opacity 140ms ease;
+}
+
+.api-key-usage-history-chart-legend > button.is-hidden {
+  opacity: 0.38;
+}
+
+.api-key-usage-history-chart-legend > button:hover {
+  color: var(--ink);
+}
+
+.api-key-usage-history-chart-legend > button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 62%, transparent);
+  outline-offset: 2px;
 }
 
 .api-key-usage-history-line-key {
@@ -10687,6 +10708,16 @@ button.api-key-group-chip--more {
 
   .api-key-usage-history-totals {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .api-key-usage-history-chart-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .api-key-usage-history-chart-legend {
+    justify-content: flex-start;
+    width: 100%;
   }
 }
 

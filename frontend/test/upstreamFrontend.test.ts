@@ -3167,14 +3167,21 @@ test("usage history profit subtracts the larger CNY cost series", () => {
   assert.match(source, /style=\{\{ width: `\$\{horizontalZoom \* 100\}%` \}\}/);
   assert.match(source, /className="api-key-usage-history-chart-y-axis"/);
   assert.match(source, /className="api-key-usage-history-chart-scroll"/);
+  assert.match(source, /aria-label="图表显示项"/);
+  assert.match(source, /aria-pressed=\{visibleSeries\.profitMargin\}/);
+  assert.match(source, /onClick=\{\(\) => toggleSeries\("sub2apiCost"\)\}/);
+  assert.doesNotMatch(source, /api-key-usage-history-chart-series-filter/);
+  assert.match(source, /visibleSeries\.profit \? series\.map/);
+  assert.match(source, /visibleSeries\.profitMargin && marginPoints/);
   assert.match(source, /aria-label="同倍率排序"/);
   assert.match(source, />字母<\/button>/);
   assert.match(source, />优先级<\/button>/);
-  assert.match(styles, /\.api-key-usage-history-chart-viewport\s*\{[^}]*grid-template-columns: 54px minmax\(0, 1fr\);/s);
+  assert.match(styles, /\.api-key-usage-history-chart-viewport\s*\{[^}]*grid-template-columns: 54px minmax\(0, 1fr\) 54px;/s);
   assert.match(styles, /\.api-key-usage-history-chart-scroll\s*\{[^}]*overflow-x: auto;/s);
   assert.match(styles, /\.api-key-usage-history-chart-scroll\s*\{[^}]*scroll-behavior: smooth;/s);
   assert.match(styles, /\.api-key-usage-history-chart-scroll > svg\s*\{[^}]*transition: width 180ms cubic-bezier\(0\.2, 0\.75, 0\.25, 1\);/s);
   assert.match(styles, /\.api-key-usage-history-chart-zoom input\[type="range"\]\s*\{[^}]*accent-color: var\(--primary\);/s);
+  assert.match(styles, /\.api-key-usage-history-chart-legend > button\s*\{[^}]*cursor: pointer;/s);
 });
 
 test("usage history income stays in CNY and explains the persisted recharge multiplier", () => {

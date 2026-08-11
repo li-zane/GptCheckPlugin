@@ -3671,6 +3671,8 @@ function UsageHistoryMetric({ label, tone, value }: { label: string; tone?: stri
   );
 }
 
+type UsageHistoryChartSeriesKey = "upstreamCost" | "sub2apiCost" | "income" | "profit" | "profitMargin";
+
 function UsageHistoryFinancialChart({
   days,
   selectedAccountId,
@@ -3697,9 +3699,19 @@ function UsageHistoryFinancialChart({
   });
   const maxHorizontalZoom = Math.max(1, Math.min(6, Math.ceil(series.length / 7)));
   const [horizontalZoom, setHorizontalZoom] = useState(1);
+  const [visibleSeries, setVisibleSeries] = useState<Record<UsageHistoryChartSeriesKey, boolean>>({
+    upstreamCost: true,
+    sub2apiCost: true,
+    income: true,
+    profit: true,
+    profitMargin: true,
+  });
   useEffect(() => {
     setHorizontalZoom((current) => Math.min(current, maxHorizontalZoom));
   }, [maxHorizontalZoom]);
+  const toggleSeries = (key: UsageHistoryChartSeriesKey) => {
+    setVisibleSeries((current) => ({ ...current, [key]: !current[key] }));
+  };
   const values = series.flatMap((point) => [
     point.upstreamCost,
     point.sub2apiCost,
@@ -3774,12 +3786,12 @@ function UsageHistoryFinancialChart({
     <section className="api-key-usage-history-chart" aria-label={title}>
       <div className="api-key-usage-history-chart-head">
         <div><ChartNoAxesCombined size={16} /><strong>{title}</strong></div>
-        <div className="api-key-usage-history-chart-legend">
-          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--margin" />利润率（右轴）</span>
-          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--upstream" />上游成本</span>
-          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--sub2api" />sub2api 成本</span>
-          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--income" />收入</span>
-          <span><i className="api-key-usage-history-bar-key" />利润</span>
+        <div aria-label="图表显示项" className="api-key-usage-history-chart-legend" role="group">
+          <button aria-pressed={visibleSeries.profitMargin} className={visibleSeries.profitMargin ? "" : "is-hidden"} onClick={() => toggleSeries("profitMargin")} type="button"><i className="api-key-usage-history-line-key api-key-usage-history-line-key--margin" />利润率（右轴）</button>
+          <button aria-pressed={visibleSeries.upstreamCost} className={visibleSeries.upstreamCost ? "" : "is-hidden"} onClick={() => toggleSeries("upstreamCost")} type="button"><i className="api-key-usage-history-line-key api-key-usage-history-line-key--upstream" />上游成本</button>
+          <button aria-pressed={visibleSeries.sub2apiCost} className={visibleSeries.sub2apiCost ? "" : "is-hidden"} onClick={() => toggleSeries("sub2apiCost")} type="button"><i className="api-key-usage-history-line-key api-key-usage-history-line-key--sub2api" />Sub2API 成本</button>
+          <button aria-pressed={visibleSeries.income} className={visibleSeries.income ? "" : "is-hidden"} onClick={() => toggleSeries("income")} type="button"><i className="api-key-usage-history-line-key api-key-usage-history-line-key--income" />收入</button>
+          <button aria-pressed={visibleSeries.profit} className={visibleSeries.profit ? "" : "is-hidden"} onClick={() => toggleSeries("profit")} type="button"><i className="api-key-usage-history-bar-key" />利润</button>
         </div>
       </div>
       <div className="api-key-usage-history-chart-viewport">
@@ -3802,7 +3814,7 @@ function UsageHistoryFinancialChart({
               return <line className="api-key-usage-history-chart-grid" key={fraction} x1={padding.left} x2={zoomedWidth - padding.right} y1={y} y2={y} />;
             })}
             <line className="api-key-usage-history-chart-zero" x1={padding.left} x2={zoomedWidth - padding.right} y1={zeroY} y2={zeroY} />
-            {series.map((point, index) => {
+            {visibleSeries.profit ? series.map((point, index) => {
               const profitY = yFor(point.profit);
               if (profitY === null) return null;
               return (
@@ -3817,11 +3829,11 @@ function UsageHistoryFinancialChart({
                   <title>{`${point.date} 利润 ${formatHistorySignedAmount(point.profit, "CNY")}`}</title>
                 </rect>
               );
-            })}
-            {upstreamPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--upstream" points={upstreamPoints} /> : null}
-            {sub2apiPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--sub2api" points={sub2apiPoints} /> : null}
-            {incomePoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--income" points={incomePoints} /> : null}
-            {marginPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--margin" points={marginPoints} /> : null}
+            }) : null}
+            {visibleSeries.upstreamCost && upstreamPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--upstream" points={upstreamPoints} /> : null}
+            {visibleSeries.sub2apiCost && sub2apiPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--sub2api" points={sub2apiPoints} /> : null}
+            {visibleSeries.income && incomePoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--income" points={incomePoints} /> : null}
+            {visibleSeries.profitMargin && marginPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--margin" points={marginPoints} /> : null}
             {series.map((point, index) => {
               const x = xFor(index);
               const upstreamY = yFor(point.upstreamCost);
@@ -3830,17 +3842,17 @@ function UsageHistoryFinancialChart({
               const marginY = yForMargin(point.profitMargin);
               return (
                 <g key={point.date}>
-                  {upstreamY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--upstream" cx={x} cy={upstreamY} r={2.7}><title>{`${point.date} 上游成本 ${formatHistoryAmount(point.upstreamCost, "CNY")}`}</title></circle> : null}
-                  {sub2apiY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--sub2api" cx={x} cy={sub2apiY} r={2.7}><title>{`${point.date} sub2api 成本 ${formatHistoryAmount(point.sub2apiCost, "CNY")}`}</title></circle> : null}
-                  {incomeY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--income" cx={x} cy={incomeY} r={2.7}><title>{`${point.date} 收入 ${formatHistoryAmount(point.income, "CNY")}`}</title></circle> : null}
-                  {marginY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--margin" cx={x} cy={marginY} r={2.7}><title>{`${point.date} 利润率 ${formatHistoryPercent(point.profitMargin)}`}</title></circle> : null}
+                  {visibleSeries.upstreamCost && upstreamY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--upstream" cx={x} cy={upstreamY} r={2.7}><title>{`${point.date} 上游成本 ${formatHistoryAmount(point.upstreamCost, "CNY")}`}</title></circle> : null}
+                  {visibleSeries.sub2apiCost && sub2apiY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--sub2api" cx={x} cy={sub2apiY} r={2.7}><title>{`${point.date} Sub2API 成本 ${formatHistoryAmount(point.sub2apiCost, "CNY")}`}</title></circle> : null}
+                  {visibleSeries.income && incomeY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--income" cx={x} cy={incomeY} r={2.7}><title>{`${point.date} 收入 ${formatHistoryAmount(point.income, "CNY")}`}</title></circle> : null}
+                  {visibleSeries.profitMargin && marginY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--margin" cx={x} cy={marginY} r={2.7}><title>{`${point.date} 利润率 ${formatHistoryPercent(point.profitMargin)}`}</title></circle> : null}
                   {labelIndexes.has(index) ? <text className="api-key-usage-history-chart-axis" textAnchor="middle" x={x} y={height - 10}>{shortUsageHistoryDate(point.date)}</text> : null}
                 </g>
               );
             })}
           </svg>
         </div>
-        <svg aria-hidden="true" className="api-key-usage-history-chart-margin-axis" preserveAspectRatio="none" viewBox={`0 0 ${axisWidth} ${height}`}>
+        {visibleSeries.profitMargin ? <svg aria-hidden="true" className="api-key-usage-history-chart-margin-axis" preserveAspectRatio="none" viewBox={`0 0 ${axisWidth} ${height}`}>
           {gridValues.map((fraction) => {
             const y = padding.top + chartHeight - chartHeight * fraction;
             const value = marginYMinimum + marginYRange * fraction;
@@ -3850,7 +3862,7 @@ function UsageHistoryFinancialChart({
               </text>
             );
           })}
-        </svg>
+        </svg> : <div aria-hidden="true" className="api-key-usage-history-chart-margin-axis" />}
       </div>
       {maxHorizontalZoom > 1 ? (
         <div className="api-key-usage-history-chart-zoom">
