@@ -559,7 +559,8 @@ test("automatic pause settings keep balance controls while multiplier policy bel
   assert.match(accountSource, /<option value="disabled">关闭<\/option>/);
   assert.match(accountSource, /<option value="custom">单独设置<\/option>/);
   assert.match(accountSource, /当前账号未绑定优先级区间，当前配置不会启用倍率上涨暂停/);
-  assert.match(accountSource, /const rateThreshold = account\.rate_pause_effective_enabled\s*\?\s*formatMultiplier\(account\.rate_absolute_threshold\)/);
+  assert.doesNotMatch(accountSource, /AccountCardConfigurationTags|api-key-account-config-tags/);
+  assert.doesNotMatch(accountSource, /查看倍率上涨暂停策略/);
   assert.match(accountSource, /几何中位数反比例曲线/);
   assert.match(accountSource, /低倍率优先/);
   assert.match(accountSource, /固定间隔/);
@@ -593,8 +594,9 @@ test("API key availability settings preserve unbound monitor mode and support ex
   assert.match(accountSource, /const submittedAvailabilityMode = accountForm\.availabilityCheckMode;/);
   assert.doesNotMatch(accountSource, /accountForm\.availabilityCheckMode === "channel_monitor"\s*&& !accountForm\.availabilityMonitorId\s*\? "disabled"/);
   assert.match(accountSource, /payload\.availability_test_model = submittedAvailabilityMode === "disabled"/);
-  assert.match(accountSource, /indicatorTone === "unconfigured"\s*\? <CircleOff size=\{13\}/);
-  assert.match(accountSource, /api-key-availability-indicator--\$\{indicatorTone\}/);
+  assert.match(accountSource, /const resultTone = available \? "available" : unavailable \? "unavailable" : "unknown";/);
+  assert.match(accountSource, /api-key-availability-icon--\$\{resultTone\}/);
+  assert.match(accountSource, /api-key-availability-icon--\$\{indicatorTone\}/);
   assert.match(accountSource, /automaticMonitoringPaused\s*\? "paused"/);
   assert.match(accountSource, /automaticMonitoringPaused/);
   assert.match(accountSource, /已暂停；手动检测仍可用/);
@@ -609,10 +611,9 @@ test("API key availability settings preserve unbound monitor mode and support ex
   assert.match(accountSource, /api\.testUpstreamAccountConnection\(/);
   assert.match(accountSource, /强制连接测试完成/);
   assert.match(accountSource, /已使用回退模型 \$2 完成 \$1 次连接测试，且全部成功/);
-  assert.match(accountSource, /<AccountCardConfigurationTags/);
-  assert.match(accountSource, /middleEllipsis\(monitorName \|\| "监控面板", 12\)/);
-  assert.match(accountSource, /api-key-account-config-tag-wrap--availability/);
-  assert.match(accountSource, /label="查看 API Key 可用性检测设置"/);
+  assert.doesNotMatch(accountSource, /AccountCardConfigurationTags|api-key-account-config-tags/);
+  assert.match(accountSource, /function AccountAvailabilityIndicator/);
+  assert.match(accountSource, /的可用性监测详情/);
   assert.match(accountSource, /正常账号使用暂停判定次数/);
   assert.doesNotMatch(accountSource, /连续不可用监测轮次/);
   assert.doesNotMatch(accountSource, /连续可用监测轮次/);
@@ -718,7 +719,7 @@ test("automation durations keep a seconds payload while allowing manual units", 
   assert.match(accountSource, /绑定监控面板判定（降级，视为可用）/);
   assert.match(accountSource, /监控面板当前为降级，按可用处理，不进行回退模型测试/);
   assert.match(appSource, /面板状态为可用或降级时都直接判定账号可用，不进行回退模型测试/);
-  assert.match(styles, /\.api-key-availability-indicator--monitor-degraded\s*\{[^}]*var\(--warn-bg\)[^}]*var\(--warn-ink\)/s);
+  assert.match(styles, /\.api-key-availability-icon--monitor-degraded[\s\S]*?--availability-ring: #fbbf24;/s);
   assert.match(accountSource, /disabled=\{busy \|\| identityBlocked\}\s+onClick=\{onForceConnectionTest\}/);
   assert.match(accountSource, /未绑定可用性监控面板，将使用账号白名单内的回退模型测试连接/);
   assert.match(accountSource, /api-key-scheduling-log-panel/);
@@ -887,10 +888,12 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(accountSource, /<option value="disabled">已停用<\/option>/);
   assert.match(accountSource, /<UpstreamBalanceSummary channels=\{assignedChannels\} \/>/);
   assert.match(accountSource, /<span>渠道状态 \{channel\.channel_monitor_count/);
-  assert.match(accountSource, /<span>今日消耗<\/span>/);
-  // The last-use time is the upstream's own last_used_at, never inferred locally.
+  assert.match(accountSource, /<span><small>消耗<\/small><strong>/);
+  assert.match(accountSource, /<span><small>收入<\/small><strong>/);
+  assert.match(accountSource, /<span><small>最近<\/small><strong>/);
+  // The last-use time comes from the linked sub2api account and uses the display time zone.
   assert.match(accountSource, /const lastUsedAt = account\.last_used_at;/);
-  assert.match(accountSource, /"最近使用 " \+ formatDate\(lastUsedAt, displayTimeZone\)/);
+  assert.match(accountSource, /lastUsedAt \? formatDate\(lastUsedAt, displayTimeZone\)/);
   assert.match(accountSource, /<section aria-label="上游余额" className="api-key-balance-summary">/);
   assert.match(accountSource, /<div className="api-key-balance-summary-head">\s*<span>上游余额<\/span>/s);
   assert.doesNotMatch(accountSource, /上游渠道余额/);
@@ -945,7 +948,7 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.doesNotMatch(appSource, /api_key_auto_pause_on_upstream_rate_increase_enabled:/);
   assert.doesNotMatch(appSource, /upstream_rate_increase_threshold_percent:/);
   assert.match(accountSource, /payload\.rate_pause_policy = accountForm\.ratePausePolicy/);
-  assert.match(accountSource, /rate_pause_effective_source === "account"/);
+  assert.doesNotMatch(accountSource, /查看倍率上涨暂停策略/);
   assert.match(appSource, /仅处理已绑定具体监控面板或已启用独立模型测试的账号/);
   assert.match(appSource, /没有可用回退模型时不会据此暂停账号/);
   assert.match(appSource, /自动探测上游渠道监控/);
@@ -1002,8 +1005,9 @@ test("new account and upstream controls are present without exposing Sub2API-onl
   assert.match(accountSource, /account\.active_pause_holds !== undefined/);
   assert.doesNotMatch(accountSource, /visiblePauseHolds\.map\(\(hold, index\) =>/);
   assert.match(accountSource, /pauseHoldReasonLabel\(hold\)/);
-  assert.match(accountSource, /<AccountStatusIndicator/);
-  assert.match(accountSource, /查看 \$\{accountDisplayName\(account\)\} 的停用详情/);
+  assert.match(accountSource, /<AccountMonitorBindingTag account=\{account\} channel=\{channel \|\| undefined\} \/>/);
+  assert.doesNotMatch(accountSource, /AccountGroupStatusTag/);
+  assert.match(accountSource, /查看 \$\{accountDisplayName\(account\)\} 的账号状态详情/);
   assert.match(accountSource, /查看 \$\{accountDisplayName\(account\)\} 的可用性监测详情/);
   assert.match(accountSource, /监控面板未能确认可用，随后由回退连接测试判定/);
   assert.match(accountSource, /为节省测试 token，暂不进行可用性测试/);
@@ -1377,7 +1381,9 @@ test("account usage rows stay consistent while recent use comes from Sub2API", (
   assert.match(source, /<div className="api-key-account-usage" title=\{usageTitle\}>/);
   assert.doesNotMatch(source, /\{showUsage \?/);
   assert.match(source, /const lastUsedAt = account\.last_used_at;/);
-  assert.match(source, /"最近使用 " \+ formatDate\(lastUsedAt, displayTimeZone\)/);
+  assert.match(source, /const consumptionCny = finiteNumber\(account\.today_consumption_cny\);/);
+  assert.match(source, /const incomeCny = finiteNumber\(account\.today_income_cny\);/);
+  assert.match(source, /lastUsedAt \? formatDate\(lastUsedAt, displayTimeZone\)/);
   assert.match(source, /resolvedChannelType\(channel\) !== "newapi" && finiteNumber\(channel\.balance_used\)/);
 });
 
@@ -1424,8 +1430,9 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.doesNotMatch(dailyBalanceFormatter, /value:\s*`原 /);
   assert.match(
     dailyBalanceFormatter,
-    /detail:\s*`[^`]*原始 \$\{rawValue\}[^`]*综合（考虑充值倍率）\$\{adjustedValue\}[^`]*`/,
+    /detail:\s*`[^`]*\$\{adjustedValue\}（已考虑充值倍率）[^`]*`/,
   );
+  assert.doesNotMatch(dailyBalanceFormatter, /rawValue|原始/);
   assert.match(source, /title=\{usage\.detail\}/);
   assert.match(source, /aria-label=\{usage\.detail\}/);
   assert.match(
@@ -1453,7 +1460,8 @@ test("API key dense views keep readable type and collapse change records on narr
   );
   assert.match(styles, /\.api-key-channel-section-label > span\s*\{[^}]*font-size: 13px;/s);
   assert.match(styles, /\.api-key-channel-section-label small\s*\{[^}]*font-size: 12px;/s);
-  assert.match(styles, /\.api-key-account-group-label > span:first-child\s*\{[^}]*font-size: 12px;/s);
+  assert.match(styles, /\.api-key-account-group-label-text\s*\{[^}]*font-size: 11px;/s);
+  assert.match(styles, /\.api-key-account-monitor-tag\.help-popover-trigger\s*\{[^}]*font-size: 10px;[^}]*min-height: 21px;/s);
   assert.match(styles, /\.api-key-priority-card-stats span\s*\{[^}]*font-size: 11px;/s);
   assert.match(styles, /@media \(max-width: 520px\)\s*\{\s*\.api-key-rate-log-filters,\s*\.api-key-rate-log-row\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/s);
 });
@@ -1474,13 +1482,42 @@ test("API key account numbers stay beside the account name", () => {
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   const nameIndex = source.indexOf('<div className="api-key-account-name">');
   const numberIndex = source.indexOf('<span className="api-key-mono">#{account.sub2api_account_id}</span>', nameIndex);
-  const statusIndex = source.indexOf('<AccountStatusIndicator', nameIndex);
-  assert.ok(nameIndex >= 0 && numberIndex > nameIndex && statusIndex > numberIndex);
-  assert.match(source, /<div className="api-key-account-side-chips">\s*<AccountStatusIndicator/s);
+  const sideChipsIndex = source.indexOf('<div className="api-key-account-side-chips">', numberIndex);
+  const monitoringIndex = source.indexOf('<AccountAvailabilityIndicator', sideChipsIndex);
+  const platformIndex = source.indexOf('<PlatformChip', monitoringIndex);
+  const deleteIndex = source.indexOf('className="api-key-account-delete-button"', platformIndex);
+  const groupLabelIndex = source.indexOf('<div className="api-key-account-group-label">', platformIndex);
+  const groupIndex = source.indexOf('<div className="api-key-account-group-line">', groupLabelIndex);
+  assert.ok(nameIndex >= 0 && numberIndex > nameIndex && sideChipsIndex > numberIndex && monitoringIndex > sideChipsIndex && platformIndex > monitoringIndex && deleteIndex > platformIndex && groupLabelIndex > deleteIndex && groupIndex > groupLabelIndex);
+  assert.match(source, /<AccountAvailabilityIndicator[\s\S]*?<PlatformChip/s);
+  assert.match(source, /<PlatformChip[\s\S]*?platform=\{account\.remote_platform\}[\s\S]*?status=\{schedulingStatus\}/s);
+  assert.match(source, /api-key-platform-chip api-key-chip api-key-chip--\$\{tone\}/);
+  assert.match(source, /className="api-key-account-delete-button"[\s\S]*?<X size=\{18\} strokeWidth=\{2\.4\}/);
   assert.match(styles, /\.api-key-account-name\s*\{[^}]*display: flex;[^}]*gap: 5px;/s);
   assert.match(styles, /\.api-key-account-name > strong\s*\{[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/s);
-  assert.match(styles, /\.api-key-account-side-chips\s*\{[^}]*margin-left: auto;/s);
+  assert.match(source, /<svg[\s\S]*?api-key-availability-icon--\$\{indicatorTone\}[\s\S]*?shapeRendering="geometricPrecision"[\s\S]*?viewBox="0 0 24 24"/s);
+  assert.match(source, /api-key-availability-icon-ring" cx="12" cy="12" r="11\.5"[\s\S]*?api-key-availability-icon-core" cx="12" cy="12" r="6"/s);
+  assert.match(styles, /\.help-popover-trigger\.api-key-availability-indicator\s*\{[^}]*border-radius: 50%;[^}]*height: 21px;[^}]*min-height: 21px;[^}]*min-width: 21px;[^}]*width: 21px;/s);
+  assert.match(styles, /\.api-key-availability-icon\s*\{[^}]*height: 21px;[^}]*width: 21px;/s);
+  assert.match(styles, /\.api-key-availability-icon--available\s*\{[^}]*--availability-core: #6ee7b7;/s);
+  assert.match(styles, /\.api-key-availability-icon--monitor-unavailable\s*\{[^}]*--availability-ring: #fb7185;/s);
+  assert.match(styles, /\.api-key-availability-icon--unavailable\s*\{[^}]*--availability-core: #f43f5e;/s);
+  assert.match(styles, /\.api-key-availability-icon--unknown\s*\{[^}]*--availability-core: #9aa9bb;/s);
+  assert.doesNotMatch(styles.match(/\.api-key-account-delete-button\s*\{[^}]*\}/s)?.[0] || "", /position: absolute/);
+  assert.match(source, /const tone = mode === "disabled"[\s\S]*?monitorDeleted[\s\S]*?unavailableStatuses[\s\S]*?healthyStatuses[\s\S]*?: "warn";/s);
+  assert.match(styles, /\.api-key-account-group-label\s*\{[^}]*display: flex;/s);
+  assert.match(styles, /\.api-key-account-group-label\s*> \.help-popover\s*\{[^}]*margin-left: auto;/s);
+  assert.match(styles, /\.api-key-account-monitor-tag\.help-popover-trigger\s*\{[^}]*margin-left: 0;/s);
+  assert.match(styles, /\.api-key-account-monitor-tag\.help-popover-trigger\.api-key-chip--success\s*\{[^}]*var\(--ok-bg\)/s);
+  assert.match(styles, /\.api-key-account-monitor-tag\.help-popover-trigger\.api-key-chip--danger\s*\{[^}]*var\(--danger-bg\)/s);
+  assert.match(styles, /\.api-key-account-monitor-tag\.help-popover-trigger\.api-key-chip--warn\s*\{[^}]*var\(--warn-bg\)/s);
+  assert.match(styles, /\.api-key-account-monitor-tag\.help-popover-trigger\.api-key-chip--muted\s*\{[^}]*var\(--panel-2\)/s);
+  assert.match(source, /const channelMonitorStatus = normalizeMonitorStatus\(channel\?\.channel_monitor_status\)/);
+  assert.match(source, /channelMonitorStatus === "available"/);
+  assert.match(styles, /\.api-key-platform-chip\.help-popover-trigger\.api-key-chip--success\s*\{[^}]*var\(--ok-bg\)/s);
+  assert.match(styles, /\.api-key-account-card--disabled\s*\{[^}]*background: var\(--panel-2\);/s);
   assert.match(styles, /\.api-key-account-priority\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/s);
+  assert.match(styles, /\.api-key-account-priority\s*\{[^}]*background: transparent;/s);
   assert.match(styles, /\.api-key-account-priority-value\s*\{[^}]*border-left: 0;[^}]*border-top: 1px solid var\(--line\);/s);
 });
 
@@ -2059,6 +2096,7 @@ test("equal multiplier accounts sort by name and expose persistent neighbor move
       sub2api_account_id: 2,
       remote_name: "Beta",
       composite_multiplier: 0.1,
+      priority: 10,
       desired_priority: 42,
       priority_interval_id: 7,
     },
@@ -2066,6 +2104,7 @@ test("equal multiplier accounts sort by name and expose persistent neighbor move
       sub2api_account_id: 1,
       remote_name: "alpha",
       composite_multiplier: 0.1,
+      priority: 20,
       desired_priority: 40,
       priority_interval_id: 7,
     },
@@ -2075,6 +2114,10 @@ test("equal multiplier accounts sort by name and expose persistent neighbor move
   assert.deepEqual(
     sortUpstreamAccountEntries(entries).map(({ account }) => account.sub2api_account_id),
     [1, 2],
+  );
+  assert.deepEqual(
+    sortUpstreamAccountEntries(entries, "priority").map(({ account }) => account.sub2api_account_id),
+    [2, 1],
   );
   assert.deepEqual(
     sortUpstreamAccountEntriesByName([...entries].reverse()).map(({ account }) => account.sub2api_account_id),
@@ -3099,28 +3142,51 @@ test("upstream usage history query encodes channel, date, account, and display t
   assert.equal(upstreamUsageHistoryPath("channel / 1"), "/api/upstream-channels/channel%20%2F%201/usage-history");
 });
 
-test("key-filtered usage history displays the selected key usage rather than the channel aggregate", () => {
+test("key-filtered usage history displays both selected-key cost series", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(
     source,
-    /function historyDayUsage\(day: UpstreamUsageHistory\["days"\]\[number\], selectedAccountId: string \| null\) \{\s+if \(!selectedAccountId\) return finiteNumber\(day\.balance_used\);\s+return finiteNumber\(usageHistoryDayAccount\(day, selectedAccountId\)\?\.upstream_usage\);\s+\}/,
+    /function historyDayUpstreamCost\([^]*?account\?\.upstream_cost_cny \?\? account\?\.upstream_usage_adjusted/,
+  );
+  assert.match(source, /function historyDaySub2apiCost\([^]*?account\?\.sub2api_cost_cny/);
+  assert.match(
+    source,
+    /const dailyIncome = finiteNumber\([^]*?selectedAccountId \? selectedDayAccount\?\.income : day\.income/,
   );
 });
 
-test("usage history net income uses recharge-adjusted cost in the revenue currency", () => {
+test("usage history profit subtracts the larger CNY cost series", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
-  assert.match(
-    source,
-    /function historyNetIncome\([^]*?const cost = finiteNumber\(value\?\.cost_adjusted\);/,
-  );
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(source, /function historyDayProfit\([^]*?income - Math\.max\(\.\.\.costs\)/);
+  assert.match(source, /function historyProfit\([^]*?income - Math\.max\(\.\.\.costs\)/);
+  assert.match(source, /api-key-usage-history-profit-bar/);
+  assert.match(source, /const maxHorizontalZoom = Math\.max\(1, Math\.min\(6, Math\.ceil\(series\.length \/ 7\)\)\)/);
+  assert.match(source, /aria-label=\{`\$\{title\} 横向缩放`\}/);
+  assert.match(source, /type="range"/);
+  assert.match(source, /style=\{\{ width: `\$\{horizontalZoom \* 100\}%` \}\}/);
+  assert.match(source, /className="api-key-usage-history-chart-y-axis"/);
+  assert.match(source, /className="api-key-usage-history-chart-scroll"/);
+  assert.match(source, /aria-label="同倍率排序"/);
+  assert.match(source, />字母<\/button>/);
+  assert.match(source, />优先级<\/button>/);
+  assert.match(styles, /\.api-key-usage-history-chart-viewport\s*\{[^}]*grid-template-columns: 54px minmax\(0, 1fr\);/s);
+  assert.match(styles, /\.api-key-usage-history-chart-scroll\s*\{[^}]*overflow-x: auto;/s);
+  assert.match(styles, /\.api-key-usage-history-chart-scroll\s*\{[^}]*scroll-behavior: smooth;/s);
+  assert.match(styles, /\.api-key-usage-history-chart-scroll > svg\s*\{[^}]*transition: width 180ms cubic-bezier\(0\.2, 0\.75, 0\.25, 1\);/s);
+  assert.match(styles, /\.api-key-usage-history-chart-zoom input\[type="range"\]\s*\{[^}]*accent-color: var\(--primary\);/s);
 });
 
-test("usage history income explains the persisted charge and recharge multiplier", () => {
+test("usage history income stays in CNY and explains the persisted recharge multiplier", () => {
   const source = readFileSync(new URL("../src/ApiKeyAccountsView.tsx", import.meta.url), "utf8");
   assert.match(
     source,
-    /function historyIncomeBreakdownTitle\([^]*?account\?\.sub2api_actual_cost[^]*?account\?\.local_recharge_multiplier[^]*?day\.income_recharge_multiplier/,
+    /function historyIncomeBreakdownTitle\([^]*?account\?\.local_recharge_multiplier[^]*?day\.income_recharge_multiplier[^]*?用户扣费（人民币）/,
   );
+  const breakdownStart = source.indexOf("function historyIncomeBreakdownTitle");
+  const breakdownEnd = source.indexOf("function historyProfit", breakdownStart);
+  assert.ok(breakdownStart >= 0 && breakdownEnd > breakdownStart);
+  assert.doesNotMatch(source.slice(breakdownStart, breakdownEnd), /"USD"/);
   assert.match(source, /title=\{historyIncomeBreakdownTitle\(day, selectedAccountId\)\}/);
 });
 

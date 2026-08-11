@@ -6669,10 +6669,27 @@ button.api-key-group-chip--more {
   grid-template-rows: auto minmax(58px, 1fr) auto;
   min-width: 0;
   overflow: hidden;
+  position: relative;
 }
 
 .api-key-account-card--disabled {
   background: var(--panel-2);
+  border-color: color-mix(in srgb, var(--muted) 42%, var(--line));
+}
+
+.api-key-account-card--disabled .api-key-account-card-head > strong,
+.api-key-account-card--disabled .api-key-account-name > strong,
+.api-key-account-card--disabled .api-key-account-group-line > strong,
+.api-key-account-card--disabled .api-key-account-usage strong,
+.api-key-account-card--disabled .api-key-account-priority-number,
+.api-key-account-card--disabled .api-key-account-priority-value strong {
+  color: var(--muted);
+}
+
+.api-key-account-card--disabled .api-key-account-rate-chips,
+.api-key-account-card--disabled .api-key-account-card-actions {
+  filter: grayscale(1);
+  opacity: 0.72;
 }
 
 .api-key-account-card-head {
@@ -6712,72 +6729,86 @@ button.api-key-group-chip--more {
 
 .api-key-availability-indicator {
   align-items: center;
-  border: 2px solid currentColor;
-  border-radius: 999px;
+  background: currentColor;
+  border: 0;
+  border-radius: 50%;
+  box-sizing: border-box;
   display: inline-flex;
   flex: 0 0 auto;
-  height: 23px;
+  height: 22px;
   justify-content: center;
-  width: 23px;
+  min-height: 22px;
+  min-width: 22px;
+  overflow: hidden;
+  padding: 0;
+  position: relative;
+  width: 22px;
 }
 
 .api-key-availability-indicator--monitor-available {
-  background: color-mix(in srgb, var(--ok-bg) 78%, var(--panel));
+  background: transparent;
   color: var(--ok-ink);
 }
 
 .api-key-availability-indicator--monitor-unavailable {
-  background: color-mix(in srgb, var(--danger-bg) 78%, var(--panel));
+  background: transparent;
   color: var(--danger-ink);
 }
 
 .api-key-availability-indicator--monitor-unbound {
-  background: color-mix(in srgb, var(--warn-bg) 78%, var(--panel));
+  background: transparent;
   color: var(--warn-ink);
 }
 
 .api-key-availability-indicator--monitor-degraded {
-  background: color-mix(in srgb, var(--warn-bg) 78%, var(--panel));
+  background: transparent;
   color: var(--warn-ink);
 }
 
 .api-key-availability-indicator--monitor-unknown {
-  background: color-mix(in srgb, var(--warn-bg) 78%, var(--panel));
+  background: transparent;
   color: var(--warn-ink);
 }
 
 .api-key-availability-indicator--monitor-independent {
-  background: var(--panel-2);
+  background: transparent;
   color: var(--muted);
 }
 
 .api-key-availability-indicator--paused {
-  background: var(--warn-bg);
+  background: transparent;
   color: var(--warn-ink);
 }
 
 .api-key-availability-indicator--unconfigured {
-  background: var(--panel-2);
+  background: transparent;
   color: var(--muted);
 }
 
+.api-key-availability-indicator.api-key-availability-indicator {
+  background: currentColor;
+}
+
 .api-key-availability-result {
-  align-items: center;
-  display: inline-flex;
-  border-radius: 999px;
-  height: 14px;
-  justify-content: center;
-  width: 14px;
+  background: var(--muted);
+  border-radius: 50%;
+  display: block;
+  height: 12px;
+  inset: 5px;
+  position: absolute;
+  width: 12px;
 }
 
 .api-key-availability-result--available {
   background: var(--ok-ink);
-  color: var(--panel);
 }
 
 .api-key-availability-result--unavailable {
   background: var(--danger-ink);
-  color: var(--panel);
+}
+
+.api-key-availability-result--unknown {
+  background: var(--muted);
 }
 
 .help-popover-trigger.api-key-availability-indicator--monitor-available:hover,
@@ -6834,6 +6865,81 @@ button.api-key-group-chip--more {
 .help-popover.is-open .help-popover-trigger.api-key-availability-indicator--unconfigured {
   background: var(--panel-2);
   color: var(--muted);
+}
+
+.help-popover-trigger.api-key-availability-indicator:hover,
+.help-popover-trigger.api-key-availability-indicator:focus-visible,
+.help-popover.is-open .help-popover-trigger.api-key-availability-indicator {
+  background: currentColor;
+  outline: 2px solid color-mix(in srgb, currentColor 42%, transparent);
+  outline-offset: 1px;
+}
+
+.help-popover-trigger.api-key-availability-indicator {
+  background: transparent;
+  border-radius: 50%;
+  box-sizing: border-box;
+  height: 21px;
+  min-height: 21px;
+  min-width: 21px;
+  overflow: visible;
+  width: 21px;
+}
+
+.help-popover-trigger.api-key-availability-indicator:hover,
+.help-popover-trigger.api-key-availability-indicator:focus-visible,
+.help-popover.is-open .help-popover-trigger.api-key-availability-indicator {
+  background: transparent;
+  outline: 2px solid color-mix(in srgb, currentColor 36%, transparent);
+}
+
+.api-key-availability-icon {
+  --availability-core: #9aa9bb;
+  --availability-ring: #dbe4ee;
+  display: block;
+  height: 21px;
+  overflow: visible;
+  width: 21px;
+}
+
+.api-key-availability-icon-ring {
+  fill: var(--availability-ring);
+}
+
+.api-key-availability-icon-core {
+  fill: var(--availability-core);
+}
+
+.api-key-availability-icon--monitor-available {
+  --availability-ring: #a7f3d0;
+}
+
+.api-key-availability-icon--monitor-unavailable {
+  --availability-ring: #fb7185;
+}
+
+.api-key-availability-icon--monitor-unbound,
+.api-key-availability-icon--monitor-degraded,
+.api-key-availability-icon--monitor-unknown,
+.api-key-availability-icon--paused {
+  --availability-ring: #fbbf24;
+}
+
+.api-key-availability-icon--monitor-independent,
+.api-key-availability-icon--unconfigured {
+  --availability-ring: #dbe4ee;
+}
+
+.api-key-availability-icon--available {
+  --availability-core: #6ee7b7;
+}
+
+.api-key-availability-icon--unavailable {
+  --availability-core: #f43f5e;
+}
+
+.api-key-availability-icon--unknown {
+  --availability-core: #9aa9bb;
 }
 
 .api-key-popover-details,
@@ -6918,11 +7024,74 @@ button.api-key-group-chip--more {
   gap: 4px;
 }
 
-.api-key-account-group-label > span:first-child {
+.api-key-account-group-label-text {
   color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  margin-right: auto;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.api-key-account-group-label > .help-popover {
+  margin-left: auto;
+  min-width: 0;
+}
+
+.api-key-account-monitor-tag.help-popover-trigger {
+  font-size: 10px;
+  max-width: min(100%, 180px);
+  margin-left: 0;
+  min-height: 21px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 2px 6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-key-account-monitor-tag.help-popover-trigger > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-key-account-monitor-tag.help-popover-trigger.api-key-chip--success {
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+}
+
+.api-key-account-monitor-tag.help-popover-trigger.api-key-chip--danger {
+  background: var(--danger-bg);
+  color: var(--danger-ink);
+}
+
+.api-key-account-monitor-tag.help-popover-trigger.api-key-chip--warn {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+
+.api-key-account-monitor-tag.help-popover-trigger.api-key-chip--muted {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.api-key-platform-chip.help-popover-trigger {
+  font-size: 11px;
+  min-height: 21px;
+  padding: 2px 6px;
+}
+
+.api-key-platform-chip.help-popover-trigger.api-key-chip--success {
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+}
+
+.api-key-platform-chip.help-popover-trigger.api-key-chip--danger {
+  background: var(--danger-bg);
+  color: var(--danger-ink);
+}
+
+.api-key-platform-chip.help-popover-trigger.api-key-chip--info {
+  background: var(--info-bg);
+  color: var(--info-ink);
 }
 
 .api-key-account-card-group > span {
@@ -6933,7 +7102,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-account-group-line {
-  align-items: flex-start;
+  align-items: center;
   display: flex;
   gap: 5px;
   min-width: 0;
@@ -6964,29 +7133,43 @@ button.api-key-group-chip--more {
 }
 
 .api-key-account-usage {
-  align-items: baseline;
   border-top: 1px dashed var(--line);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 3px 6px;
+  display: grid;
+  gap: 0;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 1.35fr);
   margin-top: 2px;
   padding-top: 6px;
 }
 
-.api-key-account-usage > span,
-.api-key-account-usage > small {
+.api-key-account-usage > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 0 6px;
+}
+
+.api-key-account-usage > span:first-child {
+  padding-left: 0;
+}
+
+.api-key-account-usage > span + span {
+  border-left: 1px solid var(--line);
+}
+
+.api-key-account-usage small {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 10px;
+  font-weight: 700;
 }
 
-.api-key-account-usage > strong {
+.api-key-account-usage strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
-}
-
-.api-key-account-usage > small {
-  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .api-key-account-rate-chip {
@@ -7037,74 +7220,28 @@ button.api-key-group-chip--more {
   padding: 5px 8px;
 }
 
-.api-key-account-config-tags {
+.api-key-account-delete-button {
   align-items: center;
-  border-top: 1px solid var(--line);
-  display: flex;
-  flex-wrap: nowrap;
-  gap: 4px;
-  min-height: 31px;
-  min-width: 0;
-  overflow: hidden;
-  padding: 5px 8px;
-}
-
-.api-key-account-config-tag-wrap {
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: var(--danger-ink);
   display: inline-flex;
-  flex: 0 0 auto;
-  min-width: 0;
+  height: 24px;
+  justify-content: center;
+  padding: 0;
+  width: 24px;
 }
 
-.api-key-account-config-tag-wrap--availability {
-  flex: 1 1 112px;
-  max-width: 174px;
-}
-
-.api-key-account-config-tag-wrap .help-popover,
-.api-key-account-config-tag-wrap .help-popover-trigger {
-  max-width: 100%;
-  min-width: 0;
-}
-
-.api-key-account-config-popover {
-  overflow: hidden;
-}
-
-.api-key-account-config-tag {
-  min-width: 0;
-  flex: 0 1 auto;
-  font-size: 11px;
-  max-width: 100%;
-}
-
-.api-key-account-config-tag--success {
-  background: var(--ok-bg);
-  color: var(--ok-ink);
-}
-
-.api-key-account-config-tag--muted {
-  background: var(--panel-2);
-  color: var(--muted);
-}
-
-.api-key-account-config-tag--info {
-  background: var(--info-bg);
-  color: var(--info-ink);
-}
-
-.api-key-account-config-tag--inherit {
+.api-key-account-delete-button:hover:not(:disabled),
+.api-key-account-delete-button:focus-visible {
   background: var(--danger-bg);
   color: var(--danger-ink);
 }
 
-.api-key-account-config-tag--warn {
-  background: var(--warn-bg);
-  color: var(--warn-ink);
-}
-
-.api-key-account-config-tag--danger {
-  background: var(--danger-bg);
-  color: var(--danger-ink);
+.api-key-account-delete-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
 }
 
 .api-key-icon-button--disable {
@@ -8278,15 +8415,31 @@ button.api-key-group-chip--more {
 /* API Key account priority management */
 .api-key-account-filters {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) repeat(4, minmax(125px, 160px));
+  grid-template-columns: minmax(240px, 1fr) repeat(5, minmax(125px, 160px));
   padding-inline: 14px;
   padding-top: 12px;
 }
 
 .api-key-account-filters .api-key-search,
-.api-key-account-filters .api-key-filter-select {
+.api-key-account-filters .api-key-filter-select,
+.api-key-account-tie-sort {
   min-width: 0;
   width: 100%;
+}
+
+.api-key-account-tie-sort {
+  display: grid;
+  gap: 4px;
+}
+
+.api-key-account-tie-sort > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.api-key-account-tie-sort .api-key-segmented {
+  min-height: 38px;
 }
 
 .api-key-account-management-grid {
@@ -8299,7 +8452,7 @@ button.api-key-group-chip--more {
 }
 
 .api-key-account-priority {
-  background: var(--panel-2);
+  background: transparent;
   border-top: 1px solid var(--line);
   display: grid;
   gap: 8px;
@@ -8744,7 +8897,7 @@ button.api-key-group-chip--more {
 
 @media (max-width: 1180px) {
   .api-key-account-filters {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 
   .api-key-account-filters .api-key-search {
@@ -8951,6 +9104,14 @@ button.api-key-group-chip--more {
   font-size: 13px;
   font-weight: 750;
   overflow: hidden;
+  white-space: nowrap;
+}
+
+.api-key-account-priority-participation {
+  flex: 0 0 auto;
+  font-size: 10px;
+  min-height: 20px;
+  padding: 2px 5px;
   white-space: nowrap;
 }
 
@@ -10145,7 +10306,7 @@ button.api-key-group-chip--more {
 .api-key-usage-history-totals {
   display: grid;
   gap: 7px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .api-key-usage-history-metric {
@@ -10180,7 +10341,12 @@ button.api-key-group-chip--more {
   color: var(--danger-ink);
 }
 
+.api-key-usage-history-metric--upstream > strong {
+  color: var(--primary);
+}
+
 .api-key-usage-history-metric--income > strong,
+.api-key-usage-history-metric--profit > strong,
 .api-key-usage-history-table .is-positive,
 .api-key-usage-history-lifetime .is-positive {
   color: var(--ok-ink);
@@ -10228,6 +10394,8 @@ button.api-key-group-chip--more {
   display: flex;
   font-size: 11px;
   gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .api-key-usage-history-chart-legend > span {
@@ -10244,20 +10412,92 @@ button.api-key-group-chip--more {
   width: 15px;
 }
 
-.api-key-usage-history-line-key--adjusted {
+.api-key-usage-history-line-key--upstream {
+  background: var(--primary);
+}
+
+.api-key-usage-history-line-key--sub2api {
+  background: var(--warn-ink);
+}
+
+.api-key-usage-history-line-key--income {
   background: var(--green);
 }
 
-.api-key-usage-history-chart > svg {
+.api-key-usage-history-bar-key {
+  background: var(--violet-ink);
+  display: inline-block;
+  height: 9px;
+  opacity: 0.72;
+  width: 9px;
+}
+
+.api-key-usage-history-chart-viewport {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  min-width: 0;
+}
+
+.api-key-usage-history-chart-y-axis {
+  background: var(--panel-2);
   display: block;
   height: 236px;
+  position: relative;
+  width: 54px;
+  z-index: 1;
+}
+
+.api-key-usage-history-chart-scroll {
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scroll-behavior: smooth;
+  scrollbar-gutter: stable;
+}
+
+.api-key-usage-history-chart-scroll > svg {
+  display: block;
+  height: 236px;
+  min-width: 100%;
   overflow: visible;
+  transition: width 180ms cubic-bezier(0.2, 0.75, 0.25, 1);
+  will-change: width;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .api-key-usage-history-chart-scroll {
+    scroll-behavior: auto;
+  }
+
+  .api-key-usage-history-chart-scroll > svg {
+    transition: none;
+  }
+}
+
+.api-key-usage-history-chart-zoom {
+  align-items: center;
+  color: var(--muted);
+  display: grid;
+  gap: 6px;
+  grid-template-columns: 14px minmax(0, 1fr) 14px;
+  margin: 5px 2px 0;
+}
+
+.api-key-usage-history-chart-zoom input[type="range"] {
+  accent-color: var(--primary);
+  margin: 0;
+  min-width: 0;
   width: 100%;
 }
 
 .api-key-usage-history-chart-grid {
   stroke: color-mix(in srgb, var(--line) 85%, transparent);
   stroke-width: 1;
+}
+
+.api-key-usage-history-chart-zero {
+  stroke: color-mix(in srgb, var(--ink) 36%, transparent);
+  stroke-width: 1.2;
 }
 
 .api-key-usage-history-chart-axis {
@@ -10274,7 +10514,15 @@ button.api-key-group-chip--more {
   stroke-width: 2.4;
 }
 
-.api-key-usage-history-chart-line--adjusted {
+.api-key-usage-history-chart-line--upstream {
+  stroke: var(--primary);
+}
+
+.api-key-usage-history-chart-line--sub2api {
+  stroke: var(--warn-ink);
+}
+
+.api-key-usage-history-chart-line--income {
   stroke: var(--green);
 }
 
@@ -10284,8 +10532,24 @@ button.api-key-group-chip--more {
   stroke-width: 2;
 }
 
-.api-key-usage-history-chart-dot--adjusted {
+.api-key-usage-history-chart-dot--upstream {
+  stroke: var(--primary);
+}
+
+.api-key-usage-history-chart-dot--sub2api {
+  stroke: var(--warn-ink);
+}
+
+.api-key-usage-history-chart-dot--income {
   stroke: var(--green);
+}
+
+.api-key-usage-history-profit-bar {
+  fill: color-mix(in srgb, var(--violet-ink) 62%, transparent);
+}
+
+.api-key-usage-history-profit-bar.is-negative {
+  fill: color-mix(in srgb, var(--danger-ink) 68%, transparent);
 }
 
 .api-key-usage-history-table-wrap {
@@ -10421,7 +10685,8 @@ button.api-key-group-chip--more {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .api-key-usage-history-chart > svg {
+  .api-key-usage-history-chart-y-axis,
+  .api-key-usage-history-chart-scroll > svg {
     height: 205px;
   }
 

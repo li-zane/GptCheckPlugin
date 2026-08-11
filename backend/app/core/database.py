@@ -360,6 +360,10 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "today_upstream_usage_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
         "today_upstream_usage_source": "VARCHAR(64)",
         "today_upstream_usage_checked_at": "DATETIME",
+        "today_sub2api_cost_amount": "FLOAT",
+        "today_sub2api_user_cost_amount": "FLOAT",
+        "today_sub2api_stats_status": "VARCHAR(32) NOT NULL DEFAULT 'not_checked'",
+        "today_sub2api_stats_checked_at": "DATETIME",
         "last_error": "TEXT",
         "last_discovered_at": "DATETIME",
         "last_applied_at": "DATETIME",
@@ -790,10 +794,15 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "balance_unit VARCHAR(32), "
                 "recharge_multiplier FLOAT, "
                 "upstream_api_key_usage FLOAT, "
+                "upstream_api_key_cost_cny FLOAT, "
+                "sub2api_cost FLOAT, "
+                "sub2api_cost_cny FLOAT, "
+                "sub2api_user_cost FLOAT, "
                 "sub2api_actual_cost FLOAT, "
                 "income FLOAT, "
                 "income_recharge_multiplier FLOAT, "
                 "income_unit VARCHAR(32), "
+                "profit_cny FLOAT, "
                 "finalized BOOLEAN NOT NULL DEFAULT 0, "
                 "observed_at DATETIME, "
                 "finalized_at DATETIME, "
@@ -831,7 +840,15 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             await conn.execute(text("PRAGMA table_info(upstream_channel_daily_usages)"))
         ).fetchall()
     }
-    for column_name in ("sub2api_actual_cost", "income_recharge_multiplier"):
+    for column_name in (
+        "upstream_api_key_cost_cny",
+        "sub2api_cost",
+        "sub2api_cost_cny",
+        "sub2api_user_cost",
+        "sub2api_actual_cost",
+        "income_recharge_multiplier",
+        "profit_cny",
+    ):
         if channel_columns and column_name not in channel_columns:
             await conn.execute(
                 text(
@@ -839,6 +856,41 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                     f"ADD COLUMN {column_name} FLOAT"
                 )
             )
+            channel_columns.add(column_name)
+
+    if channel_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_daily_usages SET "
+                "sub2api_cost = COALESCE(sub2api_cost, sub2api_actual_cost), "
+                "sub2api_user_cost = COALESCE(sub2api_user_cost, sub2api_actual_cost), "
+                "sub2api_cost_cny = COALESCE("
+                "sub2api_cost_cny, sub2api_cost * income_recharge_multiplier)"
+            )
+        )
+        if {"upstream_api_key_usage", "recharge_multiplier"}.issubset(channel_columns):
+            await conn.execute(
+                text(
+                    "UPDATE upstream_channel_daily_usages SET "
+                    "upstream_api_key_cost_cny = COALESCE("
+                    "upstream_api_key_cost_cny, "
+                    "upstream_api_key_usage * recharge_multiplier)"
+                )
+            )
+    if channel_columns and "income" in channel_columns:
+        upstream_cost_expression = (
+            "COALESCE(upstream_api_key_cost_cny, balance_used_adjusted, 0)"
+            if "balance_used_adjusted" in channel_columns
+            else "COALESCE(upstream_api_key_cost_cny, 0)"
+        )
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_daily_usages SET profit_cny = COALESCE("
+                "profit_cny, income - MAX("
+                f"{upstream_cost_expression}, "
+                "COALESCE(sub2api_cost_cny, 0))) WHERE income IS NOT NULL"
+            )
+        )
 
     if channel_columns:
         for statement in (
@@ -870,7 +922,14 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "ADD COLUMN channel_identity VARCHAR(500)"
             )
         )
-    for column_name in ("sub2api_actual_cost", "local_recharge_multiplier"):
+        account_columns.add("channel_identity")
+    for column_name in (
+        "upstream_recharge_multiplier",
+        "sub2api_cost",
+        "sub2api_user_cost",
+        "sub2api_actual_cost",
+        "local_recharge_multiplier",
+    ):
         if account_columns and column_name not in account_columns:
             await conn.execute(
                 text(
@@ -878,10 +937,14 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                     f"ADD COLUMN {column_name} FLOAT"
                 )
             )
+            account_columns.add(column_name)
     if account_columns:
         await conn.execute(
             text(
-                "UPDATE upstream_account_daily_usages SET channel_identity = COALESCE("
+                "UPDATE upstream_account_daily_usages SET "
+                "sub2api_cost = COALESCE(sub2api_cost, sub2api_actual_cost), "
+                "sub2api_user_cost = COALESCE(sub2api_user_cost, sub2api_actual_cost), "
+                "channel_identity = COALESCE("
                 "NULLIF(TRIM(channel_identity), ''), "
                 "(SELECT canonical_base_url FROM upstream_channels "
                 "WHERE upstream_channels.id = upstream_account_daily_usages.channel_id), "
@@ -892,6 +955,19 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "'channel:' || channel_id)"
             )
         )
+        if "recharge_multiplier" in channel_columns:
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_daily_usages SET "
+                    "upstream_recharge_multiplier = COALESCE("
+                    "upstream_recharge_multiplier, (SELECT recharge_multiplier "
+                    "FROM upstream_channel_daily_usages WHERE "
+                    "upstream_channel_daily_usages.channel_identity = "
+                    "upstream_account_daily_usages.channel_identity AND "
+                    "upstream_channel_daily_usages.usage_date = "
+                    "upstream_account_daily_usages.usage_date LIMIT 1))"
+                )
+            )
         await conn.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS ix_upstream_account_daily_usage_identity_date "
@@ -922,8 +998,13 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "total_balance_used FLOAT NOT NULL, "
                 "total_balance_used_adjusted FLOAT NOT NULL, "
                 "total_upstream_api_key_usage FLOAT NOT NULL, "
+                "total_upstream_api_key_cost_cny FLOAT NOT NULL DEFAULT 0, "
+                "total_sub2api_cost FLOAT NOT NULL DEFAULT 0, "
+                "total_sub2api_cost_cny FLOAT NOT NULL DEFAULT 0, "
+                "total_sub2api_user_cost FLOAT NOT NULL DEFAULT 0, "
                 "total_sub2api_actual_cost FLOAT NOT NULL DEFAULT 0, "
                 "total_income FLOAT NOT NULL, "
+                "total_profit_cny FLOAT NOT NULL DEFAULT 0, "
                 "created_at DATETIME NOT NULL, "
                 "updated_at DATETIME NOT NULL)"
             )
@@ -933,7 +1014,9 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "INSERT INTO upstream_channel_usage_totals_new ("
                 "channel_identity, channel_id, channel_name, total_balance_used, "
                 "total_balance_used_adjusted, total_upstream_api_key_usage, "
-                "total_sub2api_actual_cost, total_income, "
+                "total_upstream_api_key_cost_cny, total_sub2api_cost, "
+                "total_sub2api_cost_cny, total_sub2api_user_cost, "
+                "total_sub2api_actual_cost, total_income, total_profit_cny, "
                 "created_at, updated_at) "
                 "SELECT COALESCE((SELECT canonical_base_url FROM upstream_channels "
                 "WHERE upstream_channels.id = upstream_channel_usage_totals.channel_id), "
@@ -941,7 +1024,11 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
                 "SUM(COALESCE(total_balance_used, 0)), "
                 "SUM(COALESCE(total_balance_used_adjusted, 0)), "
                 "SUM(COALESCE(total_upstream_api_key_usage, 0)), "
-                "0, SUM(COALESCE(total_income, 0)), MIN(created_at), MAX(updated_at) "
+                "SUM(COALESCE(total_balance_used_adjusted, 0)), 0, 0, 0, 0, "
+                "SUM(COALESCE(total_income, 0)), "
+                "SUM(COALESCE(total_income, 0)) - "
+                "SUM(COALESCE(total_balance_used_adjusted, 0)), "
+                "MIN(created_at), MAX(updated_at) "
                 "FROM upstream_channel_usage_totals "
                 "GROUP BY COALESCE((SELECT canonical_base_url FROM upstream_channels "
                 "WHERE upstream_channels.id = upstream_channel_usage_totals.channel_id), "
@@ -961,11 +1048,75 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             await conn.execute(text("PRAGMA table_info(upstream_channel_usage_totals)"))
         ).fetchall()
     }
-    if total_columns and "total_sub2api_actual_cost" not in total_columns:
+    added_total_columns: set[str] = set()
+    for column_name in (
+        "total_upstream_api_key_cost_cny",
+        "total_sub2api_cost",
+        "total_sub2api_cost_cny",
+        "total_sub2api_user_cost",
+        "total_sub2api_actual_cost",
+        "total_profit_cny",
+    ):
+        if total_columns and column_name not in total_columns:
+            await conn.execute(
+                text(
+                    "ALTER TABLE upstream_channel_usage_totals "
+                    f"ADD COLUMN {column_name} FLOAT NOT NULL DEFAULT 0"
+                )
+            )
+            total_columns.add(column_name)
+            added_total_columns.add(column_name)
+    if "total_sub2api_cost" in added_total_columns:
         await conn.execute(
             text(
-                "ALTER TABLE upstream_channel_usage_totals "
-                "ADD COLUMN total_sub2api_actual_cost FLOAT NOT NULL DEFAULT 0"
+                "UPDATE upstream_channel_usage_totals SET "
+                "total_sub2api_cost = COALESCE(total_sub2api_actual_cost, 0)"
+            )
+        )
+    if "total_sub2api_user_cost" in added_total_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_usage_totals SET "
+                "total_sub2api_user_cost = COALESCE(total_sub2api_actual_cost, 0)"
+            )
+        )
+    if (
+        "total_upstream_api_key_cost_cny" in added_total_columns
+        and "total_balance_used_adjusted" in total_columns
+    ):
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_usage_totals SET "
+                "total_upstream_api_key_cost_cny = COALESCE("
+                "(SELECT SUM(upstream_api_key_cost_cny) "
+                "FROM upstream_channel_daily_usages WHERE "
+                "upstream_channel_daily_usages.channel_identity = "
+                "upstream_channel_usage_totals.channel_identity), "
+                "total_balance_used_adjusted, 0)"
+            )
+        )
+    if "total_sub2api_cost_cny" in added_total_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_usage_totals SET "
+                "total_sub2api_cost_cny = COALESCE("
+                "(SELECT SUM(sub2api_cost_cny) "
+                "FROM upstream_channel_daily_usages WHERE "
+                "upstream_channel_daily_usages.channel_identity = "
+                "upstream_channel_usage_totals.channel_identity), 0)"
+            )
+        )
+    if "total_profit_cny" in added_total_columns and "total_income" in total_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_usage_totals SET "
+                "total_profit_cny = COALESCE("
+                "(SELECT SUM(profit_cny) FROM upstream_channel_daily_usages WHERE "
+                "upstream_channel_daily_usages.channel_identity = "
+                "upstream_channel_usage_totals.channel_identity), "
+                "COALESCE(total_income, 0) - MAX("
+                "COALESCE(total_upstream_api_key_cost_cny, 0), "
+                "COALESCE(total_sub2api_cost_cny, 0)))"
             )
         )
     if total_columns:

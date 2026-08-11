@@ -23,6 +23,7 @@ from app.services.upstream_usage_history import (
     finalize_cached_yesterday_usage,
     finalize_yesterday_usage,
     hydrate_yesterday_usage,
+    import_sub2api_daily_stats,
     missing_finalized_usage_dates,
     prune_upstream_usage_history,
     should_fetch_yesterday_usage,
@@ -106,6 +107,144 @@ class UpstreamUsageHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(total.total_balance_used_adjusted, 8.0)
         self.assertEqual(total.total_upstream_api_key_usage, 2.0)
         self.assertEqual(total.total_income, 5.0)
+
+    async def test_separated_costs_use_frozen_site_multipliers_and_max_cost_profit(self) -> None:
+        self.config.effective_recharge_multiplier = 3.0
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            sub2api_stats_by_account={7: {"cost": 8.0, "user_cost": 10.0}},
+            local_recharge_multiplier=0.5,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+
+        account = (await self.db.execute(select(UpstreamAccountDailyUsage))).scalar_one()
+        daily = (await self.db.execute(select(UpstreamChannelDailyUsage))).scalar_one()
+        self.assertEqual(account.upstream_recharge_multiplier, 3.0)
+        self.assertEqual(account.sub2api_cost, 8.0)
+        self.assertEqual(account.sub2api_user_cost, 10.0)
+        self.assertEqual(account.income, 5.0)
+        self.assertEqual(daily.upstream_api_key_cost_cny, 3.0)
+        self.assertEqual(daily.sub2api_cost_cny, 4.0)
+        self.assertEqual(daily.income, 5.0)
+        self.assertEqual(daily.profit_cny, 1.0)
+
+        history = await usage_history(
+            self.db,
+            channel=self.channel,
+            start_date=self.now.date(),
+            end_date=self.now.date(),
+            api_key_account_id=7,
+            time_zone="Asia/Shanghai",
+        )
+        day = history["days"][0]
+        self.assertEqual(day["upstream_cost_cny"], 3.0)
+        self.assertEqual(day["sub2api_cost_cny"], 4.0)
+        self.assertEqual(day["income"], 5.0)
+        self.assertEqual(day["consumption_cny"], 4.0)
+        self.assertEqual(day["profit_cny"], 1.0)
+        self.assertEqual(history["totals"]["profit_cny"], 1.0)
+
+    async def test_sub2api_history_import_is_upstream_independent_and_idempotent(self) -> None:
+        imported_day = self.now.date() - timedelta(days=1)
+        imported = await import_sub2api_daily_stats(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            stats_by_account={
+                7: {imported_day: {"cost": 8.0, "user_cost": 10.0}},
+            },
+            local_recharge_multiplier=0.5,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+        self.assertEqual(imported, 1)
+        account = (
+            await self.db.execute(select(UpstreamAccountDailyUsage))
+        ).scalar_one()
+        daily = (
+            await self.db.execute(select(UpstreamChannelDailyUsage))
+        ).scalar_one()
+        self.assertIsNone(account.upstream_usage)
+        self.assertEqual(account.sub2api_cost, 8.0)
+        self.assertEqual(account.income, 5.0)
+        self.assertEqual(daily.sub2api_cost_cny, 4.0)
+        self.assertEqual(daily.income, 5.0)
+        self.assertEqual(daily.profit_cny, 1.0)
+        self.assertTrue(account.finalized)
+        self.assertTrue(daily.finalized)
+
+        await import_sub2api_daily_stats(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            stats_by_account={
+                7: {imported_day: {"cost": 9.0, "user_cost": 12.0}},
+            },
+            local_recharge_multiplier=0.5,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+        daily = (
+            await self.db.execute(select(UpstreamChannelDailyUsage))
+        ).scalar_one()
+        total = await self.db.get(UpstreamChannelUsageTotal, channel_identity(self.channel))
+        self.assertEqual(daily.sub2api_cost, 9.0)
+        self.assertEqual(daily.income, 6.0)
+        self.assertEqual(total.total_sub2api_cost, 9.0)
+        self.assertEqual(total.total_income, 6.0)
+
+    async def test_missing_financial_series_stay_unknown_in_history_totals(self) -> None:
+        await snapshot_today_usage(
+            self.db,
+            channel=self.channel,
+            configs=[self.config],
+            sub2api_stats_by_account={},
+            local_recharge_multiplier=0.5,
+            now=self.now,
+            time_zone="Asia/Shanghai",
+        )
+        await self.db.commit()
+
+        history = await usage_history(
+            self.db,
+            channel=self.channel,
+            start_date=self.now.date(),
+            end_date=self.now.date(),
+            api_key_account_id=7,
+            time_zone="Asia/Shanghai",
+        )
+        totals = history["totals"]
+        self.assertEqual(totals["upstream_cost_cny"], 2.0)
+        self.assertIsNone(totals["sub2api_cost_cny"])
+        self.assertIsNone(totals["income"])
+        self.assertEqual(totals["consumption_cny"], 2.0)
+        self.assertIsNone(totals["profit_cny"])
+        output = UpstreamUsageHistoryOut(**history)
+        self.assertIsNone(output.totals.profit_cny)
+        self.assertEqual(output.lifetime_totals.upstream_cost_cny, 2.0)
+        self.assertIsNone(output.lifetime_totals.sub2api_cost_cny)
+        self.assertIsNone(output.lifetime_totals.income)
+        self.assertIsNone(output.lifetime_totals.profit_cny)
+
+        channel_history = await usage_history(
+            self.db,
+            channel=self.channel,
+            start_date=self.now.date(),
+            end_date=self.now.date(),
+            api_key_account_id=None,
+            time_zone="Asia/Shanghai",
+        )
+        channel_output = UpstreamUsageHistoryOut(**channel_history)
+        self.assertEqual(channel_output.lifetime_totals.upstream_cost_cny, 2.0)
+        self.assertIsNone(channel_output.lifetime_totals.sub2api_cost_cny)
+        self.assertIsNone(channel_output.lifetime_totals.income)
+        self.assertIsNone(channel_output.lifetime_totals.profit_cny)
 
     async def test_income_history_freezes_each_days_recharge_multiplier(self) -> None:
         await snapshot_today_usage(

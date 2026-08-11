@@ -6,7 +6,7 @@
     "dev": "npm run frontend:build && npm run backend:dev",
     "frontend:dev": "npm --prefix frontend run dev",
     "frontend:build": "npm --prefix frontend run build",
-    "backend:dev": "python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 5173",
+    "backend:dev": ".\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 5173",
     "backend:prod": "python backend/run_production.py"
   }
 }

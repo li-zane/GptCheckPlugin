@@ -108,44 +108,6 @@ async def upstream_channel_usage_history(
     channel = await db.get(UpstreamChannel, channel_id)
     if channel is None:
         raise HTTPException(status_code=404, detail="Upstream channel not found.")
-    historical_end = min(effective_end, today - timedelta(days=1))
-    if historical_end >= effective_start:
-        retention_days = 90
-        try:
-            retention_days = (
-                await get_runtime_config_service().get_upstream_usage_data_retention_days()
-            )
-        except Exception:
-            logger.warning(
-                "Could not read upstream usage retention; using 90 days.",
-                exc_info=True,
-            )
-        historical_start = max(
-            effective_start,
-            today - timedelta(days=max(1, int(retention_days)) - 1),
-        )
-        if historical_end >= historical_start:
-            try:
-                await service.backfill_missing_usage_history(
-                    db,
-                    channel_id,
-                    start_date=historical_start,
-                    end_date=historical_end,
-                    time_zone=normalized_time_zone,
-                )
-            except Exception:
-                await db.rollback()
-                logger.warning(
-                    "Could not backfill missing upstream usage history for channel %s.",
-                    channel_id,
-                    exc_info=True,
-                )
-                channel = await db.get(UpstreamChannel, channel_id)
-                if channel is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Upstream channel not found.",
-                    )
     try:
         history = await usage_history(
             db,

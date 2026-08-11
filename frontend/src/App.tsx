@@ -7453,7 +7453,7 @@ function SettingsView({
                 />
               </label>
               <label>
-                上游数据存储天数
+                API Key 账号统计数据存储天数
                 <input
                   max={3650}
                   min={1}

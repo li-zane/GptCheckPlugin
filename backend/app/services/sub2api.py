@@ -294,7 +294,48 @@ def _bounded_number(value: Any, *, minimum: float = 0, maximum: float = 1000) ->
     return parsed
 
 
-def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int, float]:
+def _account_stat_amount(raw: Any, fields: tuple[str, ...]) -> float | None:
+    if not isinstance(raw, dict):
+        return _bounded_number(raw, minimum=0, maximum=1_000_000_000_000_000)
+    value = next((raw.get(field) for field in fields if raw.get(field) is not None), None)
+    return _bounded_number(value, minimum=0, maximum=1_000_000_000_000_000)
+
+
+def _parse_account_stat_record(raw: Any) -> dict[str, float | None] | None:
+    legacy = _account_stat_amount(
+        raw,
+        ("today_actual_cost", "todayActualCost", "actual_cost", "actualCost"),
+    )
+    cost = _account_stat_amount(
+        raw,
+        ("cost", "total_cost", "today_cost", "todayCost", "totalCost"),
+    )
+    user_cost = _account_stat_amount(
+        raw,
+        (
+            "user_cost",
+            "total_user_cost",
+            "today_user_cost",
+            "userCost",
+            "totalUserCost",
+            "todayUserCost",
+        ),
+    )
+    # Older sub2api versions exposed only actual_cost. Preserve their single
+    # accounting value on both sides until a newer response separates them.
+    if cost is None:
+        cost = legacy
+    if user_cost is None:
+        user_cost = legacy
+    if cost is None and user_cost is None:
+        return None
+    return {"cost": cost, "user_cost": user_cost}
+
+
+def _parse_account_today_stats(
+    payload: Any,
+    expected_ids: set[int],
+) -> dict[int, dict[str, float | None]]:
     if not expected_ids or not isinstance(payload, (dict, list)):
         return {}
     if isinstance(payload, dict):
@@ -312,7 +353,7 @@ def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int
                 data = data[key]
                 break
 
-    parsed: dict[int, float] = {}
+    parsed: dict[int, dict[str, float | None]] = {}
     records: list[tuple[Any, Any]] = []
     if isinstance(data, list):
         records = [(None, item) for item in data]
@@ -327,26 +368,61 @@ def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int
         account_id = _positive_int(explicit_id if explicit_id is not None else keyed_id)
         if account_id not in expected_ids:
             continue
-        raw_cost = (
-            next(
-                (
-                    raw.get(field)
-                    for field in (
-                        "today_actual_cost",
-                        "todayActualCost",
-                        "actual_cost",
-                        "actualCost",
-                    )
-                    if raw.get(field) is not None
-                ),
-                None,
-            )
+        stats = _parse_account_stat_record(raw)
+        if stats is not None:
+            parsed[account_id] = stats
+    return parsed
+
+
+def _parse_account_today_costs(payload: Any, expected_ids: set[int]) -> dict[int, float]:
+    """Compatibility view for the pre-split actual-cost contract."""
+
+    # Older callers consumed ``actual_cost``.  Keep that value authoritative
+    # when a mixed-version response contains both it and the newer ``cost``
+    # field; newer responses with only ``cost`` still remain readable.
+    if not expected_ids or not isinstance(payload, (dict, list)):
+        return {}
+    if isinstance(payload, dict):
+        data: Any = payload.get("data", payload)
+        if payload.get("success") is False:
+            return {}
+        code = payload.get("code")
+        if code is not None and code not in {0, 200, "0", "200"}:
+            return {}
+    else:
+        data = payload
+    if isinstance(data, dict):
+        for key in ("stats", "results", "items"):
+            if isinstance(data.get(key), (dict, list)):
+                data = data[key]
+                break
+    records = [(None, item) for item in data] if isinstance(data, list) else list(data.items()) if isinstance(data, dict) else []
+    parsed: dict[int, float] = {}
+    for keyed_id, raw in records:
+        explicit_id = (
+            raw.get("account_id", raw.get("accountId", raw.get("id")))
             if isinstance(raw, dict)
-            else raw
+            else None
         )
-        cost = _bounded_number(raw_cost, minimum=0, maximum=1_000_000_000_000_000)
-        if cost is not None:
-            parsed[account_id] = cost
+        account_id = _positive_int(explicit_id if explicit_id is not None else keyed_id)
+        if account_id not in expected_ids:
+            continue
+        raw_cost = _account_stat_amount(
+            raw,
+            (
+                "today_actual_cost",
+                "todayActualCost",
+                "actual_cost",
+                "actualCost",
+                "cost",
+                "total_cost",
+                "today_cost",
+                "todayCost",
+                "totalCost",
+            ),
+        )
+        if raw_cost is not None:
+            parsed[account_id] = raw_cost
     return parsed
 
 
@@ -368,8 +444,8 @@ def _mapping_patch_matches(source: dict[str, Any], patch: dict[str, Any]) -> boo
     return True
 
 
-def _parse_account_daily_costs(payload: Any) -> dict[date, float]:
-    """Extract per-calendar-day actual costs from one account's stats payload."""
+def _parse_account_daily_stats(payload: Any) -> dict[date, dict[str, float | None]]:
+    """Extract separated cost and user-charge values for each calendar day."""
 
     if not isinstance(payload, dict) or payload.get("success") is False:
         return {}
@@ -383,7 +459,7 @@ def _parse_account_daily_costs(payload: Any) -> dict[date, float]:
     if not isinstance(history, list):
         return {}
 
-    parsed: dict[date, float] = {}
+    parsed: dict[date, dict[str, float | None]] = {}
     for item in history:
         if not isinstance(item, dict):
             continue
@@ -394,22 +470,47 @@ def _parse_account_daily_costs(payload: Any) -> dict[date, float]:
             usage_date = date.fromisoformat(raw_day.strip()[:10])
         except ValueError:
             continue
-        raw_cost = next(
+        stats = _parse_account_stat_record(item)
+        if stats is not None:
+            parsed[usage_date] = stats
+    return parsed
+
+
+def _parse_account_daily_costs(payload: Any) -> dict[date, float]:
+    """Compatibility view for the pre-split daily actual-cost contract."""
+
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        return {}
+    code = payload.get("code")
+    if code is not None and code not in {0, 200, "0", "200"}:
+        return {}
+    data = payload.get("data", payload)
+    if not isinstance(data, dict) or not isinstance(data.get("history"), list):
+        return {}
+    parsed: dict[date, float] = {}
+    for item in data["history"]:
+        if not isinstance(item, dict) or not isinstance(item.get("date"), str):
+            continue
+        try:
+            usage_date = date.fromisoformat(item["date"].strip()[:10])
+        except ValueError:
+            continue
+        raw_cost = _account_stat_amount(
+            item,
             (
-                item.get(field)
-                for field in (
-                    "actual_cost",
-                    "actualCost",
-                    "today_actual_cost",
-                    "todayActualCost",
-                )
-                if item.get(field) is not None
+                "actual_cost",
+                "actualCost",
+                "today_actual_cost",
+                "todayActualCost",
+                "cost",
+                "total_cost",
+                "today_cost",
+                "todayCost",
+                "totalCost",
             ),
-            None,
         )
-        cost = _bounded_number(raw_cost, minimum=0, maximum=1_000_000_000_000_000)
-        if cost is not None:
-            parsed[usage_date] = cost
+        if raw_cost is not None:
+            parsed[usage_date] = raw_cost
     return parsed
 
 
@@ -1193,10 +1294,10 @@ class Sub2ApiClient:
         balance = self._unwrap(payload)
         return balance if isinstance(balance, dict) else {}
 
-    async def get_account_today_costs(
+    async def get_account_today_stats(
         self,
         account_ids: list[int],
-    ) -> dict[int, float]:
+    ) -> dict[int, dict[str, float | None]]:
         normalized_ids: list[int] = []
         seen: set[int] = set()
         for account_id in account_ids:
@@ -1211,6 +1312,43 @@ class Sub2ApiClient:
         if not normalized_ids:
             return {}
 
+        config = await get_runtime_config_service().get_sub2api_config()
+        stats: dict[int, dict[str, float | None]] = {}
+        try:
+            async with asyncio.timeout(SUB2API_TODAY_STATS_TIMEOUT_SECONDS):
+                for offset in range(0, len(normalized_ids), SUB2API_TODAY_STATS_BATCH_SIZE):
+                    batch = normalized_ids[offset : offset + SUB2API_TODAY_STATS_BATCH_SIZE]
+                    payload = await self._request(
+                        "POST",
+                        "/admin/accounts/today-stats/batch",
+                        config=config,
+                        total_timeout_seconds=SUB2API_TODAY_STATS_TIMEOUT_SECONDS,
+                        json={"account_ids": batch},
+                    )
+                    stats.update(_parse_account_today_stats(payload, set(batch)))
+        except TimeoutError as exc:
+            raise Sub2ApiRequestError("sub2api today statistics request timed out.") from exc
+        return stats
+
+    async def get_account_today_costs(
+        self,
+        account_ids: list[int],
+    ) -> dict[int, float]:
+        """Return the legacy actual-cost view without changing its field precedence."""
+
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for account_id in account_ids:
+            parsed_id = _positive_int(account_id)
+            if parsed_id is None:
+                raise ValueError("Account ids must be positive integers.")
+            if parsed_id not in seen:
+                normalized_ids.append(parsed_id)
+                seen.add(parsed_id)
+        if len(normalized_ids) > MAX_SUB2API_ACCOUNTS:
+            raise ValueError("Too many account ids were provided.")
+        if not normalized_ids:
+            return {}
         config = await get_runtime_config_service().get_sub2api_config()
         costs: dict[int, float] = {}
         try:
@@ -1229,13 +1367,13 @@ class Sub2ApiClient:
             raise Sub2ApiRequestError("sub2api today statistics request timed out.") from exc
         return costs
 
-    async def get_account_daily_costs(
+    async def get_account_daily_stats(
         self,
         account_ids: list[int],
         *,
         days: int = 2,
-    ) -> dict[int, dict[date, float]]:
-        """Return historic actual-cost readings keyed by account and local date."""
+    ) -> dict[int, dict[date, dict[str, float | None]]]:
+        """Return historic cost and user-charge readings by account and date."""
 
         normalized_ids: list[int] = []
         seen: set[int] = set()
@@ -1255,6 +1393,60 @@ class Sub2ApiClient:
                 f"days must be between 1 and {SUB2API_DAILY_STATS_MAX_DAYS}."
             )
 
+        config = await get_runtime_config_service().get_sub2api_config()
+        semaphore = asyncio.Semaphore(SUB2API_DAILY_STATS_CONCURRENCY)
+
+        async def fetch(
+            account_id: int,
+        ) -> tuple[int, dict[date, dict[str, float | None]]]:
+            async with semaphore:
+                payload = await self._request(
+                    "GET",
+                    f"{config.accounts_path}/{account_id}/stats",
+                    config=config,
+                    params={"days": int(days)},
+                    total_timeout_seconds=SUB2API_TODAY_STATS_TIMEOUT_SECONDS,
+                )
+            return account_id, _parse_account_daily_stats(payload)
+
+        results = await asyncio.gather(
+            *(fetch(account_id) for account_id in normalized_ids),
+            return_exceptions=True,
+        )
+        values: dict[int, dict[date, dict[str, float | None]]] = {}
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                continue
+            account_id, costs = result
+            if costs:
+                values[account_id] = costs
+        return values
+
+    async def get_account_daily_costs(
+        self,
+        account_ids: list[int],
+        *,
+        days: int = 2,
+    ) -> dict[int, dict[date, float]]:
+        """Return historic linked costs for compatibility with older callers."""
+
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for account_id in account_ids:
+            parsed_id = _positive_int(account_id)
+            if parsed_id is None:
+                raise ValueError("Account ids must be positive integers.")
+            if parsed_id not in seen:
+                normalized_ids.append(parsed_id)
+                seen.add(parsed_id)
+        if len(normalized_ids) > MAX_SUB2API_ACCOUNTS:
+            raise ValueError("Too many account ids were provided.")
+        if not normalized_ids:
+            return {}
+        if not 1 <= int(days) <= SUB2API_DAILY_STATS_MAX_DAYS:
+            raise ValueError(f"days must be between 1 and {SUB2API_DAILY_STATS_MAX_DAYS}.")
         config = await get_runtime_config_service().get_sub2api_config()
         semaphore = asyncio.Semaphore(SUB2API_DAILY_STATS_CONCURRENCY)
 

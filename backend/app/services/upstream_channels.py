@@ -87,8 +87,10 @@ from app.services.upstream_client import (
 )
 from app.services.upstream_usage_history import (
     finalize_cached_yesterday_usage,
+    finalize_elapsed_usage,
     finalize_yesterday_usage,
     hydrate_yesterday_usage,
+    import_sub2api_daily_stats,
     missing_finalized_usage_dates,
     snapshot_today_usage,
     upsert_historical_channel_usage,
@@ -4378,29 +4380,31 @@ class UpstreamChannelService:
             token_invalid = bool(_value(result, "sub2api_auth_rejected"))
             linked_account_ids = [config.sub2api_account_id for config in configs]
 
-            async def fetch_local_today_costs() -> dict[int, float]:
+            async def fetch_local_today_stats() -> dict[int, dict[str, float | None]]:
                 try:
-                    return await self.sub2api.get_account_today_costs(linked_account_ids)
+                    return await self.accounts.get_sub2api_today_stats(linked_account_ids)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     return {}
 
-            async def fetch_yesterday_income() -> dict[int, float]:
-                daily_cost_getter = getattr(self.sub2api, "get_account_daily_costs", None)
-                if not include_yesterday_usage or not callable(daily_cost_getter):
+            async def fetch_yesterday_stats() -> dict[int, dict[str, float | None]]:
+                if not include_yesterday_usage:
                     return {}
                 try:
-                    daily_costs = await daily_cost_getter(linked_account_ids, days=2)
+                    daily_stats = await self.accounts.get_sub2api_daily_stats(
+                        linked_account_ids,
+                        days=2,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     return {}
                 yesterday = usage_day(usage_snapshot_now, today_timezone) - timedelta(days=1)
                 return {
-                    account_id: costs[yesterday]
-                    for account_id, costs in daily_costs.items()
-                    if isinstance(costs, dict) and yesterday in costs
+                    account_id: stats[yesterday]
+                    for account_id, stats in daily_stats.items()
+                    if isinstance(stats, dict) and yesterday in stats
                 }
 
             async def fetch_balance_fallback() -> dict[str, Any] | None:
@@ -4419,13 +4423,13 @@ class UpstreamChannelService:
                 return await self._local_recharge()
 
             (
-                local_today_costs,
-                yesterday_income_by_account,
+                local_today_stats,
+                yesterday_stats_by_account,
                 balance_fallback_result,
                 local_recharge_result,
             ) = await asyncio.gather(
-                fetch_local_today_costs(),
-                fetch_yesterday_income(),
+                fetch_local_today_stats(),
+                fetch_yesterday_stats(),
                 fetch_balance_fallback(),
                 fetch_local_recharge(),
             )
@@ -4880,6 +4884,12 @@ class UpstreamChannelService:
                         config.local_recharge_multiplier = local_recharge
                         config.local_recharge_source = local_source
                         config.local_recharge_status = local_status
+                        self.accounts.apply_sub2api_today_stats(
+                            config,
+                            local_today_stats.get(config.sub2api_account_id),
+                            now=channel.last_discovered_at or _utcnow(),
+                            time_zone=today_timezone,
+                        )
                         config.group_multiplier_status = "discovery_failed"
                         config.last_discovered_at = channel.last_discovered_at
                         config.last_error = (
@@ -4993,9 +5003,18 @@ class UpstreamChannelService:
                         local_source=local_source,
                         local_status=local_status,
                     )
+                    self.accounts.apply_sub2api_today_stats(
+                        config,
+                        local_today_stats.get(config.sub2api_account_id),
+                        now=channel.last_discovered_at or _utcnow(),
+                        time_zone=today_timezone,
+                    )
                     self.accounts.apply_local_today_usage_fallback(
                         config,
-                        local_today_costs.get(config.sub2api_account_id),
+                        _value(
+                            local_today_stats.get(config.sub2api_account_id),
+                            "cost",
+                        ),
                         self.accounts._remote_current_rate(current_remote),
                         now=channel.last_discovered_at or _utcnow(),
                     )
@@ -5168,7 +5187,7 @@ class UpstreamChannelService:
                         db,
                         channel=channel,
                         configs=history_configs,
-                        income_actual_cost_by_account=local_today_costs,
+                        sub2api_stats_by_account=local_today_stats,
                         local_recharge_multiplier=local_recharge,
                         now=history_now,
                         time_zone=today_timezone,
@@ -5176,7 +5195,7 @@ class UpstreamChannelService:
                     await finalize_yesterday_usage(
                         db,
                         channel=channel,
-                        income_actual_cost_by_account=yesterday_income_by_account,
+                        sub2api_stats_by_account=yesterday_stats_by_account,
                         local_recharge_multiplier=local_recharge,
                         now=history_now,
                         time_zone=today_timezone,
@@ -5269,6 +5288,83 @@ class UpstreamChannelService:
             if stored:
                 await db.commit()
             return stored
+
+    async def import_sub2api_usage_history(
+        self,
+        db: AsyncSession,
+        channel_id: int,
+        *,
+        retention_days: int,
+        time_zone: str,
+    ) -> int:
+        """Import retained linked-account history without reading upstream data."""
+
+        if not 1 <= retention_days <= 3650:
+            raise ValueError("retention_days must be between 1 and 3650.")
+        lock = await self._lock_for(channel_id)
+        async with lock:
+            channel = await self._load_channel(db, channel_id)
+            configs = list(
+                (
+                    await db.execute(
+                        select(UpstreamAccountConfig).where(
+                            UpstreamAccountConfig.channel_id == channel.id,
+                        )
+                    )
+                ).scalars()
+            )
+            account_ids = [int(config.sub2api_account_id) for config in configs]
+            if not account_ids:
+                return 0
+            now = _utcnow()
+            current_day = usage_day(now, time_zone)
+            start_day = current_day - timedelta(days=retention_days - 1)
+            request_days = min(retention_days, 366)
+            stats_by_account = await self.accounts.get_sub2api_daily_stats(
+                account_ids,
+                days=request_days,
+            )
+            filtered_stats = {
+                account_id: {
+                    usage_date: stats
+                    for usage_date, stats in account_stats.items()
+                    if start_day <= usage_date <= current_day
+                }
+                for account_id, account_stats in stats_by_account.items()
+            }
+            local_recharge, _source, _status = await self._local_recharge()
+            if local_recharge is None:
+                cached = [
+                    config.local_recharge_multiplier
+                    for config in configs
+                    if config.local_recharge_multiplier is not None
+                ]
+                local_recharge = cached[0] if cached else None
+            imported = await import_sub2api_daily_stats(
+                db,
+                channel=channel,
+                configs=configs,
+                stats_by_account=filtered_stats,
+                local_recharge_multiplier=local_recharge,
+                now=now,
+                time_zone=time_zone,
+            )
+            await db.commit()
+            return imported
+
+    async def finalize_elapsed_usage_history(
+        self,
+        db: AsyncSession,
+        *,
+        time_zone: str,
+    ) -> int:
+        """Freeze elapsed local snapshots without contacting an upstream."""
+
+        return await finalize_elapsed_usage(
+            db,
+            now=_utcnow(),
+            time_zone=time_zone,
+        )
 
     async def discover_channel(
         self,

@@ -12,7 +12,6 @@ import {
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
-  CircleOff,
   ExternalLink,
   Globe2,
   History,
@@ -35,6 +34,8 @@ import {
   UsersRound,
   WalletCards,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import {
   FormEvent,
@@ -125,6 +126,7 @@ import {
   upstreamAccountPlatforms,
   upstreamAccountMatchesStatus,
   type UpstreamAccountEntry,
+  type UpstreamAccountTieSort,
   type PriorityTieMoveState,
 } from "./upstreamPriorityPresentation";
 import { upstreamOverviewHasLiveMutationData } from "./upstreamOverviewCache";
@@ -154,6 +156,7 @@ import type {
 
 type ChannelStatusFilter = "all" | "pending" | "attention" | "undiscovered";
 type AccountStatusFilter = ChannelStatusFilter | "enabled" | "disabled";
+type AccountTieSort = UpstreamAccountTieSort;
 type ChannelOccupancyFilter = "occupied" | "no_enabled" | "empty";
 type RateLogFilters = { startDate: string; endDate: string };
 type PriorityIntervalFilter = "all" | "unassigned" | string;
@@ -303,6 +306,7 @@ export function ApiKeyAccountsView({
   const [channelStatusFilter, setChannelStatusFilter] = useState<ChannelStatusFilter>("all");
   const [channelOccupancyFilter, setChannelOccupancyFilter] = useState<ChannelOccupancyFilter>("occupied");
   const [accountSearch, setAccountSearch] = useState("");
+  const [accountTieSort, setAccountTieSort] = useState<AccountTieSort>("name");
   const [accountStatusFilter, setAccountStatusFilter] = useState<AccountStatusFilter>("all");
   const [accountUpstreamFilter, setAccountUpstreamFilter] = useState<AccountUpstreamFilter>("all");
   const [priorityIntervalFilter, setPriorityIntervalFilter] = useState<PriorityIntervalFilter>("all");
@@ -1157,8 +1161,8 @@ export function ApiKeyAccountsView({
       platform: platformFilter,
       query: accountSearch,
     }).filter(({ account }) => upstreamAccountMatchesStatus(account, accountStatusFilter));
-    return sortUpstreamAccountEntries(filtered);
-  }, [accountSearch, accountStatusFilter, accountUpstreamFilter, allAccountEntries, platformFilter, priorityIntervalFilter]);
+    return sortUpstreamAccountEntries(filtered, accountTieSort);
+  }, [accountSearch, accountStatusFilter, accountTieSort, accountUpstreamFilter, allAccountEntries, platformFilter, priorityIntervalFilter]);
   const viewPriorityIntervalAccounts = useCallback((interval: PriorityInterval) => {
     setAccountSearch("");
     setAccountStatusFilter("all");
@@ -1382,10 +1386,16 @@ export function ApiKeyAccountsView({
     }
   }, [displayTimeZone]);
 
-  const openChannelUsageHistory = (channel: UpstreamChannel) => {
+  const openChannelUsageHistory = (
+    channel: UpstreamChannel,
+    apiKeyAccountId?: number | string | null,
+  ) => {
     rememberDialogTrigger();
     channelUsageHistoryRequestSequence.current += 1;
-    const filters = usageHistoryDefaultFilters(displayTimeZone);
+    const filters = {
+      ...usageHistoryDefaultFilters(displayTimeZone),
+      apiKeyAccountId: apiKeyAccountId == null ? "" : String(apiKeyAccountId),
+    };
     setAccountCollectionDialog(null);
     setAccountUpstreamDialog(null);
     setChannelGroupDialog(null);
@@ -2150,6 +2160,23 @@ export function ApiKeyAccountsView({
               />
               <small>{filteredAccountEntries.length}/{allAccountEntries.length}</small>
             </label>
+            <div className="api-key-account-tie-sort" role="group" aria-label="同倍率排序">
+              <span>同倍率排序</span>
+              <div className="api-key-segmented api-key-segmented--two">
+                <button
+                  aria-pressed={accountTieSort === "name"}
+                  className={accountTieSort === "name" ? "active" : ""}
+                  onClick={() => setAccountTieSort("name")}
+                  type="button"
+                >字母</button>
+                <button
+                  aria-pressed={accountTieSort === "priority"}
+                  className={accountTieSort === "priority" ? "active" : ""}
+                  onClick={() => setAccountTieSort("priority")}
+                  type="button"
+                >优先级</button>
+              </div>
+            </div>
             <label className="api-key-filter-select">
               <span>优先级区间</span>
               <select
@@ -2222,6 +2249,9 @@ export function ApiKeyAccountsView({
                   onPriorityIntervalChange={(intervalId) => void setAccountPriorityInterval(entry.account, intervalId)}
                   onPriorityTieMove={(direction) => void moveAccountPriority(entry.account, direction)}
                   onShowChannel={() => openAccountUpstream(entry)}
+                  onShowUsageHistory={() => entry.channel
+                    ? openChannelUsageHistory(entry.channel, entry.account.sub2api_account_id)
+                    : undefined}
                   onTestAvailability={() => void testAccountAvailability(entry.account)}
                   onForceConnectionTest={() => void forceAccountConnectionTest(entry.account)}
                   onToggle={() => toggleAccountEnabled(entry.account)}
@@ -2386,6 +2416,9 @@ export function ApiKeyAccountsView({
                   onPriorityIntervalChange={(intervalId) => void setAccountPriorityInterval(entry.account, intervalId)}
                   onPriorityTieMove={(direction) => void moveAccountPriority(entry.account, direction)}
                   onShowChannel={() => openAccountUpstream(entry)}
+                  onShowUsageHistory={() => entry.channel
+                    ? openChannelUsageHistory(entry.channel, entry.account.sub2api_account_id)
+                    : undefined}
                   onTestAvailability={() => void testAccountAvailability(entry.account)}
                   onForceConnectionTest={() => void forceAccountConnectionTest(entry.account)}
                   onToggle={() => void toggleAccountEnabled(entry.account)}
@@ -2459,7 +2492,9 @@ export function ApiKeyAccountsView({
       {channelUsageHistoryDialog ? (
         <Modal
           dialogRef={dialogRef}
-          eyebrow="历史用量与每日收支"
+          eyebrow={channelUsageHistoryFilters.apiKeyAccountId
+            ? "API Key 账号统计数据"
+            : "上游渠道统计数据"}
           onClose={closeDialog}
           saving={false}
           title={channelDisplayName(channelUsageHistoryDialog)}
@@ -3444,8 +3479,8 @@ function UpstreamUsageHistoryDialog({
     : null;
   const totals = history?.totals || null;
   const lifetimeTotals = history?.lifetime_totals || null;
-  const totalNet = historyNetIncome(totals);
-  const lifetimeNet = historyNetIncome(lifetimeTotals);
+  const totalProfit = historyProfit(totals);
+  const lifetimeProfit = historyProfit(lifetimeTotals);
   const appliedRange = history
     ? `${history.start_date} 至 ${history.end_date}`
     : [appliedFilters.startDate, appliedFilters.endDate].filter(Boolean).join(" 至 ");
@@ -3549,15 +3584,16 @@ function UpstreamUsageHistoryDialog({
       {history && days.length ? (
         <>
           <div className="api-key-usage-history-totals" aria-label="筛选期间汇总">
-            <UsageHistoryMetric label="成本" tone="cost" value={formatHistoryAmount(totals?.cost_adjusted, "CNY")} />
-            <UsageHistoryMetric label="收入" tone="income" value={formatHistoryAmount(totals?.income, historyIncomeUnit(days))} />
-            <UsageHistoryMetric label="净收入" tone={totalNet !== null && totalNet < 0 ? "negative" : "income"} value={formatHistorySignedAmount(totalNet, historyIncomeUnit(days))} />
+            <UsageHistoryMetric label="上游成本" tone="upstream" value={formatHistoryAmount(totals?.upstream_cost_cny, "CNY")} />
+            <UsageHistoryMetric label="sub2api 成本" tone="cost" value={formatHistoryAmount(totals?.sub2api_cost_cny, "CNY")} />
+            <UsageHistoryMetric label="收入" tone="income" value={formatHistoryAmount(totals?.income, "CNY")} />
+            <UsageHistoryMetric label="利润" tone={totalProfit !== null && totalProfit < 0 ? "negative" : "profit"} value={formatHistorySignedAmount(totalProfit, "CNY")} />
           </div>
 
-          <UsageHistoryLineChart
+          <UsageHistoryFinancialChart
             days={days}
             selectedAccountId={selectedAccountId}
-            title={selectedAccount ? "每日密钥用量" : "每日上游消耗"}
+            title={selectedAccount ? "API Key 账号每日收支" : "上游渠道每日收支"}
           />
 
           <div className="api-key-usage-history-table-wrap">
@@ -3565,31 +3601,31 @@ function UpstreamUsageHistoryDialog({
               <thead>
                 <tr>
                   <th scope="col">日期</th>
-                  <th scope="col">用量</th>
-                  <th scope="col">成本（人民币）</th>
+                  <th scope="col">上游成本</th>
+                  <th scope="col">sub2api 成本</th>
                   <th scope="col">收入</th>
-                  <th scope="col">净收入</th>
+                  <th scope="col">利润</th>
                 </tr>
               </thead>
               <tbody>
                 {days.map((day) => {
-                  const dailyAdjustedCost = historyDayAdjustedCost(day, selectedAccountId);
-                  const dailyNet = historyNetIncome({
-                    income: day.income,
-                    cost_adjusted: dailyAdjustedCost,
-                  });
+                  const upstreamCost = historyDayUpstreamCost(day, selectedAccountId);
+                  const sub2apiCost = historyDaySub2apiCost(day, selectedAccountId);
+                  const selectedDayAccount = usageHistoryDayAccount(day, selectedAccountId);
+                  const dailyIncome = finiteNumber(
+                    selectedAccountId ? selectedDayAccount?.income : day.income,
+                  );
+                  const dailyProfit = historyDayProfit(day, selectedAccountId);
                   return (
                     <tr key={day.date}>
                       <th scope="row">{formatUsageHistoryDate(day.date, displayTimeZone)}</th>
-                      <td>{formatHistoryUsage(historyDayUsage(day, selectedAccountId), historyDayUsageUnit(day, selectedAccountId))}</td>
-                      <td>
-                        <span>{formatHistoryAmount(dailyAdjustedCost, "CNY")}</span>
-                      </td>
+                      <td>{formatHistoryAmount(upstreamCost, "CNY")}</td>
+                      <td>{formatHistoryAmount(sub2apiCost, "CNY")}</td>
                       <td title={historyIncomeBreakdownTitle(day, selectedAccountId)}>
-                        {formatHistoryAmount(day.income, day.income_unit || historyIncomeUnit(days))}
+                        {formatHistoryAmount(dailyIncome, "CNY")}
                       </td>
-                      <td className={dailyNet !== null && dailyNet < 0 ? "is-negative" : "is-positive"}>
-                        {formatHistorySignedAmount(dailyNet, day.income_unit || historyIncomeUnit(days))}
+                      <td className={dailyProfit !== null && dailyProfit < 0 ? "is-negative" : "is-positive"}>
+                        {formatHistorySignedAmount(dailyProfit, "CNY")}
                       </td>
                     </tr>
                   );
@@ -3600,11 +3636,12 @@ function UpstreamUsageHistoryDialog({
 
           {lifetimeTotals ? (
             <div className="api-key-usage-history-lifetime" aria-label="累计收支">
-              <span>累计</span>
-              <strong>综合成本 {formatHistoryAmount(lifetimeTotals.cost_adjusted, "CNY")}</strong>
-              <strong>收入 {formatHistoryAmount(lifetimeTotals.income, historyIncomeUnit(days))}</strong>
-              <strong className={lifetimeNet !== null && lifetimeNet < 0 ? "is-negative" : "is-positive"}>
-                净收入 {formatHistorySignedAmount(lifetimeNet, historyIncomeUnit(days))}
+              <span>数据库累计</span>
+              <strong>上游成本 {formatHistoryAmount(lifetimeTotals.upstream_cost_cny, "CNY")}</strong>
+              <strong>sub2api 成本 {formatHistoryAmount(lifetimeTotals.sub2api_cost_cny, "CNY")}</strong>
+              <strong>收入 {formatHistoryAmount(lifetimeTotals.income, "CNY")}</strong>
+              <strong className={lifetimeProfit !== null && lifetimeProfit < 0 ? "is-negative" : "is-positive"}>
+                利润 {formatHistorySignedAmount(lifetimeProfit, "CNY")}
               </strong>
             </div>
           ) : null}
@@ -3623,7 +3660,7 @@ function UsageHistoryMetric({ label, tone, value }: { label: string; tone?: stri
   );
 }
 
-function UsageHistoryLineChart({
+function UsageHistoryFinancialChart({
   days,
   selectedAccountId,
   title,
@@ -3634,34 +3671,64 @@ function UsageHistoryLineChart({
 }) {
   const series = days.map((day) => ({
     date: day.date,
-    cost: historyDayAdjustedUsage(day, selectedAccountId),
+    upstreamCost: historyDayUpstreamCost(day, selectedAccountId),
+    sub2apiCost: historyDaySub2apiCost(day, selectedAccountId),
+    income: finiteNumber(
+      selectedAccountId
+        ? usageHistoryDayAccount(day, selectedAccountId)?.income
+        : day.income,
+    ),
+    profit: historyDayProfit(day, selectedAccountId),
   }));
-  const values = series.map((point) => point.cost).filter((value): value is number => value !== null);
+  const maxHorizontalZoom = Math.max(1, Math.min(6, Math.ceil(series.length / 7)));
+  const [horizontalZoom, setHorizontalZoom] = useState(1);
+  useEffect(() => {
+    setHorizontalZoom((current) => Math.min(current, maxHorizontalZoom));
+  }, [maxHorizontalZoom]);
+  const values = series.flatMap((point) => [
+    point.upstreamCost,
+    point.sub2apiCost,
+    point.income,
+    point.profit,
+  ]).filter((value): value is number => value !== null);
   if (!values.length) {
     return (
       <section className="api-key-usage-history-chart api-key-usage-history-chart--empty" aria-label={title}>
         <div><ChartNoAxesCombined size={16} /><strong>{title}</strong></div>
-        <span>筛选期间没有可绘制的用量数据</span>
+        <span>筛选期间没有可绘制的收支数据</span>
       </section>
     );
   }
 
   const width = 760;
   const height = 236;
-  const padding = { top: 20, right: 18, bottom: 34, left: 54 };
-  const chartWidth = width - padding.left - padding.right;
+  const axisWidth = 54;
+  const padding = { top: 20, right: 18, bottom: 34, left: 8 };
+  const zoomedWidth = (width - axisWidth) * horizontalZoom;
+  const chartWidth = zoomedWidth - padding.left - padding.right;
   const chartHeight = height - padding.top - padding.bottom;
   const maximum = Math.max(...values, 0);
-  const yMaximum = maximum === 0 ? 1 : maximum * 1.08;
+  const minimum = Math.min(...values, 0);
+  const margin = Math.max(maximum - minimum, 1) * 0.08;
+  const yMaximum = maximum === minimum ? maximum + 1 : maximum + margin;
+  const yMinimum = maximum === minimum ? minimum - 1 : minimum - margin;
+  const yRange = yMaximum - yMinimum;
   const xFor = (index: number) => padding.left + (series.length <= 1 ? chartWidth / 2 : (index / (series.length - 1)) * chartWidth);
-  const yFor = (value: number | null) => value === null ? null : padding.top + chartHeight - (value / yMaximum) * chartHeight;
-  const points = series
+  const yFor = (value: number | null) => value === null
+    ? null
+    : padding.top + ((yMaximum - value) / yRange) * chartHeight;
+  const linePoints = (field: "upstreamCost" | "sub2apiCost" | "income") => series
     .map((point, index) => {
-      const y = yFor(point.cost);
+      const y = yFor(point[field]);
       return y === null ? null : `${xFor(index).toFixed(1)},${y.toFixed(1)}`;
     })
     .filter((point): point is string => point !== null)
     .join(" ");
+  const upstreamPoints = linePoints("upstreamCost");
+  const sub2apiPoints = linePoints("sub2apiCost");
+  const incomePoints = linePoints("income");
+  const zeroY = yFor(0) ?? padding.top + chartHeight;
+  const barWidth = Math.max(3, Math.min(16, chartWidth / Math.max(series.length, 1) * 0.44));
   const labelIndexes = usageHistoryLabelIndexes(series.length);
   const gridValues = [0, 0.25, 0.5, 0.75, 1];
 
@@ -3670,34 +3737,84 @@ function UsageHistoryLineChart({
       <div className="api-key-usage-history-chart-head">
         <div><ChartNoAxesCombined size={16} /><strong>{title}</strong></div>
         <div className="api-key-usage-history-chart-legend">
-          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--adjusted" />人民币综合成本</span>
+          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--upstream" />上游成本</span>
+          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--sub2api" />sub2api 成本</span>
+          <span><i className="api-key-usage-history-line-key api-key-usage-history-line-key--income" />收入</span>
+          <span><i className="api-key-usage-history-bar-key" />利润</span>
         </div>
       </div>
-      <svg preserveAspectRatio="none" role="img" viewBox={`0 0 ${width} ${height}`}>
-        <title>{title}</title>
-        {gridValues.map((fraction) => {
-          const y = padding.top + chartHeight - chartHeight * fraction;
-          return (
-            <g key={fraction}>
-              <line className="api-key-usage-history-chart-grid" x1={padding.left} x2={width - padding.right} y1={y} y2={y} />
-              <text className="api-key-usage-history-chart-axis" textAnchor="end" x={padding.left - 8} y={y + 4}>
-                {formatHistoryChartNumber(yMaximum * fraction)}
+      <div className="api-key-usage-history-chart-viewport">
+        <svg aria-hidden="true" className="api-key-usage-history-chart-y-axis" preserveAspectRatio="none" viewBox={`0 0 ${axisWidth} ${height}`}>
+          {gridValues.map((fraction) => {
+            const y = padding.top + chartHeight - chartHeight * fraction;
+            const value = yMinimum + yRange * fraction;
+            return (
+              <text className="api-key-usage-history-chart-axis" key={fraction} textAnchor="end" x={axisWidth - 8} y={y + 4}>
+                {formatHistoryChartNumber(value)}
               </text>
-            </g>
-          );
-        })}
-        {points ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--adjusted" points={points} /> : null}
-        {series.map((point, index) => {
-          const costY = yFor(point.cost);
-          const x = xFor(index);
-          return (
-            <g key={point.date}>
-              {costY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--adjusted" cx={x} cy={costY} r={3}><title>{`${point.date} 成本 ${formatHistoryAmount(point.cost, "CNY")}`}</title></circle> : null}
-              {labelIndexes.has(index) ? <text className="api-key-usage-history-chart-axis" textAnchor="middle" x={x} y={height - 10}>{shortUsageHistoryDate(point.date)}</text> : null}
-            </g>
-          );
-        })}
-      </svg>
+            );
+          })}
+        </svg>
+        <div className="api-key-usage-history-chart-scroll">
+          <svg preserveAspectRatio="none" role="img" style={{ width: `${horizontalZoom * 100}%` }} viewBox={`0 0 ${zoomedWidth} ${height}`}>
+            <title>{title}</title>
+            {gridValues.map((fraction) => {
+              const y = padding.top + chartHeight - chartHeight * fraction;
+              return <line className="api-key-usage-history-chart-grid" key={fraction} x1={padding.left} x2={zoomedWidth - padding.right} y1={y} y2={y} />;
+            })}
+            <line className="api-key-usage-history-chart-zero" x1={padding.left} x2={zoomedWidth - padding.right} y1={zeroY} y2={zeroY} />
+            {series.map((point, index) => {
+              const profitY = yFor(point.profit);
+              if (profitY === null) return null;
+              return (
+                <rect
+                  className={"api-key-usage-history-profit-bar" + (point.profit !== null && point.profit < 0 ? " is-negative" : "")}
+                  height={Math.max(1, Math.abs(zeroY - profitY))}
+                  key={`profit:${point.date}`}
+                  width={barWidth}
+                  x={xFor(index) - barWidth / 2}
+                  y={Math.min(zeroY, profitY)}
+                >
+                  <title>{`${point.date} 利润 ${formatHistorySignedAmount(point.profit, "CNY")}`}</title>
+                </rect>
+              );
+            })}
+            {upstreamPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--upstream" points={upstreamPoints} /> : null}
+            {sub2apiPoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--sub2api" points={sub2apiPoints} /> : null}
+            {incomePoints ? <polyline className="api-key-usage-history-chart-line api-key-usage-history-chart-line--income" points={incomePoints} /> : null}
+            {series.map((point, index) => {
+              const x = xFor(index);
+              const upstreamY = yFor(point.upstreamCost);
+              const sub2apiY = yFor(point.sub2apiCost);
+              const incomeY = yFor(point.income);
+              return (
+                <g key={point.date}>
+                  {upstreamY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--upstream" cx={x} cy={upstreamY} r={2.7}><title>{`${point.date} 上游成本 ${formatHistoryAmount(point.upstreamCost, "CNY")}`}</title></circle> : null}
+                  {sub2apiY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--sub2api" cx={x} cy={sub2apiY} r={2.7}><title>{`${point.date} sub2api 成本 ${formatHistoryAmount(point.sub2apiCost, "CNY")}`}</title></circle> : null}
+                  {incomeY !== null ? <circle className="api-key-usage-history-chart-dot api-key-usage-history-chart-dot--income" cx={x} cy={incomeY} r={2.7}><title>{`${point.date} 收入 ${formatHistoryAmount(point.income, "CNY")}`}</title></circle> : null}
+                  {labelIndexes.has(index) ? <text className="api-key-usage-history-chart-axis" textAnchor="middle" x={x} y={height - 10}>{shortUsageHistoryDate(point.date)}</text> : null}
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+      </div>
+      {maxHorizontalZoom > 1 ? (
+        <div className="api-key-usage-history-chart-zoom">
+          <ZoomOut aria-hidden="true" size={14} />
+          <input
+            aria-label={`${title} 横向缩放`}
+            max={maxHorizontalZoom}
+            min="1"
+            onChange={(event) => setHorizontalZoom(Number(event.target.value))}
+            step="0.25"
+            title="横向缩放"
+            type="range"
+            value={horizontalZoom}
+          />
+          <ZoomIn aria-hidden="true" size={14} />
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -3779,6 +3896,7 @@ function AccountCard({
   onPriorityIntervalChange,
   onPriorityTieMove,
   onShowChannel,
+  onShowUsageHistory,
   onTestAvailability,
   onForceConnectionTest,
   onToggle,
@@ -3797,6 +3915,7 @@ function AccountCard({
   onPriorityIntervalChange: (intervalId: number | string | null) => void;
   onPriorityTieMove: (direction: "up" | "down") => void;
   onShowChannel: () => void;
+  onShowUsageHistory: () => void;
   onTestAvailability: () => void;
   onForceConnectionTest: () => void;
   onToggle: () => void;
@@ -3824,11 +3943,7 @@ function AccountCard({
         + "（分组倍率 × 上游充值成本）";
   const enabled = account.remote_schedulable === true;
   const disabled = account.remote_schedulable === false;
-  const effectiveStatus = enabled
-    ? account.remote_status || "enabled"
-    : disabled
-      ? "disabled"
-      : "not_checked";
+  const schedulingStatus = enabled ? "enabled" : disabled ? "disabled" : "not_checked";
   const currentRateLabel = formatMultiplier(current);
   const targetRateLabel = formatMultiplier(target);
   const combinedRateLabel = formatMultiplier(normalizedMultiplier);
@@ -3859,22 +3974,18 @@ function AccountCard({
         : priorityPending
           ? "等待写入"
           : priorityStatusLabel(account.priority_sync_status);
-  const usageAmount = finiteNumber(account.today_upstream_usage_amount);
-  const usageUnit = account.today_upstream_usage_unit;
-  const usageCheckedAt = account.today_upstream_usage_checked_at;
+  const consumptionCny = finiteNumber(account.today_consumption_cny);
+  const upstreamCostCny = finiteNumber(account.today_upstream_cost_cny);
+  const sub2apiCostCny = finiteNumber(account.today_sub2api_cost_cny);
+  const incomeCny = finiteNumber(account.today_income_cny);
   const lastUsedAt = account.last_used_at;
-  const usageIsCached = account.today_upstream_usage_status === "stale";
-  const usageDetail = lastUsedAt
-    ? "最近使用 " + formatDate(lastUsedAt, displayTimeZone)
-    : usageAmount === null
-      ? upstreamStatusLabel(account.today_upstream_usage_status || "not_checked")
-      : "上游未记录使用时间";
-  // Source, staleness and probe time stay reachable on hover so the compact
-  // line can spend its width on the spend and the upstream last-use time.
   const usageTitle = [
-    usageIsCached ? "本轮未确认，显示上次成功结果" : null,
-    account.today_upstream_usage_source ? sourceLabel(account.today_upstream_usage_source) : "上游余额消耗",
-    usageCheckedAt ? "探测于 " + formatDate(usageCheckedAt, displayTimeZone) : null,
+    `上游成本 ${formatHistoryAmount(upstreamCostCny, "CNY")}`,
+    `sub2api 成本 ${formatHistoryAmount(sub2apiCostCny, "CNY")}`,
+    account.today_upstream_usage_status === "stale"
+      || account.today_sub2api_stats_status === "stale"
+      ? "本轮未确认，显示当天最后一次有效值"
+      : null,
   ].filter(Boolean).join(" · ");
   const activePauseHolds = accountActivePauseHolds(account);
   const hasAccountMeta = identityBlocked;
@@ -3887,12 +3998,6 @@ function AccountCard({
             <span className="api-key-mono">#{account.sub2api_account_id}</span>
           </div>
           <div className="api-key-account-side-chips">
-            <AccountStatusIndicator
-              account={account}
-              activePauseHolds={activePauseHolds}
-              displayTimeZone={displayTimeZone}
-              status={effectiveStatus}
-            />
             <AccountAvailabilityIndicator
               account={account}
               activePauseHolds={activePauseHolds}
@@ -3900,7 +4005,25 @@ function AccountCard({
               channelMonitorFallbackTestModels={channelMonitorFallbackTestModels}
               displayTimeZone={displayTimeZone}
             />
-            {account.remote_platform?.trim() ? <PlatformChip platform={account.remote_platform} /> : null}
+            {account.remote_platform?.trim() ? (
+              <PlatformChip
+                account={account}
+                activePauseHolds={activePauseHolds}
+                displayTimeZone={displayTimeZone}
+                platform={account.remote_platform}
+                status={schedulingStatus}
+              />
+            ) : null}
+            <button
+              aria-label={"从 sub2api 删除 " + accountDisplayName(account)}
+              className="api-key-account-delete-button"
+              disabled={busy || identityBlocked}
+              onClick={onDelete}
+              title="删除 sub2api 账号"
+              type="button"
+            >
+              <X size={18} strokeWidth={2.4} />
+            </button>
           </div>
         </div>
         {hasAccountMeta ? <div className="api-key-inline-chips api-key-account-meta-chips">
@@ -3917,7 +4040,8 @@ function AccountCard({
       </header>
       <div className="api-key-account-card-group">
         <div className="api-key-account-group-label">
-          <span>上游分组</span>
+          <span className="api-key-account-group-label-text">上游分组</span>
+          <AccountMonitorBindingTag account={account} channel={channel || undefined} />
         </div>
         <div className="api-key-account-group-line">
           <strong title={account.selected_group_name || account.selected_group_id || "未识别"}>
@@ -3934,9 +4058,9 @@ function AccountCard({
           ) : null}
         </div>
         <div className="api-key-account-usage" title={usageTitle}>
-          <span>今日消耗</span>
-          <strong>{formatUpstreamBalance(usageAmount, usageUnit, 2)}</strong>
-          <small>{usageDetail}</small>
+          <span><small>消耗</small><strong>{formatHistoryAmount(consumptionCny, "CNY")}</strong></span>
+          <span><small>收入</small><strong>{formatHistoryAmount(incomeCny, "CNY")}</strong></span>
+          <span><small>最近</small><strong>{lastUsedAt ? formatDate(lastUsedAt, displayTimeZone) : "尚未使用"}</strong></span>
         </div>
       </div>
       <div className="api-key-account-priority">
@@ -3971,6 +4095,7 @@ function AccountCard({
           <span className="api-key-account-priority-heading">
             <span>调度优先级</span>
             <small>{account.priority_sync_error || priorityState}</small>
+            <PriorityParticipationTag account={account} />
             <span className="api-key-account-priority-number">
               <strong>{formatPriority(priority)}</strong>
               {priorityPending ? <><ArrowRight size={13} /><b>{formatPriority(desiredPriority)}</b></> : null}
@@ -3983,11 +4108,6 @@ function AccountCard({
           </div>
         </div>
       </div>
-      <AccountCardConfigurationTags
-        account={account}
-        channel={channel || undefined}
-        channelMonitorFallbackTestModels={channelMonitorFallbackTestModels}
-      />
       <footer className="api-key-account-card-actions">
         {priorityTieMove ? (
           <span className="api-key-priority-tie-controls" aria-label="同倍率账号优先级排位">
@@ -4038,6 +4158,16 @@ function AccountCard({
           {busyAction === "connection-test" ? <RefreshCcw className="spin" size={15} /> : <PlugZap size={15} />}
         </button>
         <button
+          aria-label={`查看 ${accountDisplayName(account)} 的统计数据`}
+          className="api-key-icon-button"
+          disabled={!channel}
+          onClick={onShowUsageHistory}
+          title={channel ? "查看 API Key 账号统计数据" : "未分配上游渠道"}
+          type="button"
+        >
+          <ChartNoAxesCombined size={15} />
+        </button>
+        <button
           aria-label={channel ? `查看 ${accountDisplayName(account)} 的上游渠道` : `${accountDisplayName(account)} 未分配上游渠道`}
           className="api-key-icon-button"
           disabled={!channel}
@@ -4068,214 +4198,36 @@ function AccountCard({
         >
           {enabled ? <PowerOff size={15} /> : <Power size={15} />}
         </button>
-        <button
-          aria-label={"从 sub2api 删除 " + accountDisplayName(account)}
-          className="api-key-icon-button api-key-icon-button--danger"
-          disabled={busy || identityBlocked}
-          onClick={onDelete}
-          title="删除 sub2api 账号"
-          type="button"
-        >
-          <Trash2 size={15} />
-        </button>
       </footer>
     </article>
   );
 }
 
-function AccountCardConfigurationTags({
-  account,
-  channel,
-  channelMonitorFallbackTestModels,
-}: {
-  account: UpstreamAccount;
-  channel?: UpstreamChannel;
-  channelMonitorFallbackTestModels: string[];
-}) {
-  const priorityParticipation = account.priority_assignment_when_disabled_effective
-    ? "停用后：参与优先级"
-    : "停用后：不参与优先级";
-  const ratePolicy = account.rate_pause_policy === "disabled"
-    ? "关闭"
-    : account.rate_pause_policy === "custom"
-      ? "独立"
-      : "跟随区间";
-  // The API resolves an account override and its priority interval into these
-  // effective fields.  Using the raw account policy here left inherited
-  // thresholds blank even when the interval had enabled the pause rule.
-  const rateThreshold = account.rate_pause_effective_enabled
-    ? formatMultiplier(account.rate_absolute_threshold)
-    : null;
-  const mode = account.availability_check_mode || "disabled";
-  const selectedMonitor = account.availability_monitor_id == null
-    ? null
-    : (channel?.channel_monitors || []).find(
-        (monitor) => String(monitor.id) === String(account.availability_monitor_id),
-      );
-  const selectedMonitorStatus = selectedMonitor
-    ? latestChannelMonitorStatus(selectedMonitor.primary_status, selectedMonitor.timeline)
-    : "";
-  const healthyMonitorStatuses = ["available", "healthy", "operational", "ok", "success"];
-  const failedMonitorStatuses = ["unavailable", "error", "failed", "timeout", "invalid"];
-  const monitorDeleted = account.availability_monitor_id != null
-    && channel?.channel_monitor_status === "ok"
-    && !selectedMonitor;
-  const channelStatus = String(channel?.channel_monitor_status || "").trim().toLowerCase();
-  const monitorDegraded = selectedMonitorStatus === "degraded" || channelStatus === "degraded";
-  const monitorTone = account.availability_monitor_id == null
-    ? "warn"
-    : monitorDegraded
-      ? "warn"
-      : monitorDeleted || failedMonitorStatuses.includes(selectedMonitorStatus)
-      || failedMonitorStatuses.includes(channelStatus)
-      ? "danger"
-      : selectedMonitor && channelStatus === "ok" && healthyMonitorStatuses.includes(selectedMonitorStatus)
-        ? "success"
-        : "warn";
-  const fallbackModel = channelMonitorFallbackTestModels.find((candidate) =>
-    (account.available_models || []).some((model) => model.id === candidate),
-  );
-  const configuredTestModel = account.availability_test_model?.trim() || fallbackModel;
-  const availabilityTag = mode === "disabled"
-    ? { label: "检测：关闭", tone: "muted", title: "API Key 可用性自动检测已关闭" }
-    : mode === "independent_model"
-      ? {
-          label: `检测：独立模型 ${configuredTestModel || "未选择模型"}`,
-          tone: configuredTestModel ? "info" : "warn",
-          title: configuredTestModel
-            ? `使用 ${configuredTestModel} 进行 API Key 连接测试`
-            : "尚未从账号白名单中选出可用于连接测试的模型",
-        }
-      : {
-          label: account.availability_monitor_id == null
-            ? "检测：未绑定监控面板"
-            : monitorDeleted
-              ? `检测：面板 #${account.availability_monitor_id} 已删除`
-              : `检测：面板 ${selectedMonitor?.name || `#${account.availability_monitor_id}`} · ${
-                selectedMonitorStatus ? upstreamStatusLabel(selectedMonitorStatus) : "等待同步"
-              }`,
-          tone: monitorTone,
-          title: account.availability_monitor_id == null
-            ? "已选择绑定监控面板，但尚未选择具体面板"
-            : monitorDeleted
-              ? "原绑定的上游监控面板已被删除，请重新绑定"
-              : selectedMonitorStatus
-                ? `当前监控面板状态：${upstreamStatusLabel(selectedMonitorStatus)}`
-                : "尚未获得绑定监控面板的当前状态",
-        };
-  const priorityTagLabel = account.priority_assignment_when_disabled_effective ? "参与" : "排除";
-  const prioritySettingLabel = account.priority_assignment_when_disabled === true
+function PriorityParticipationTag({ account }: { account: UpstreamAccount }) {
+  const participates = account.priority_assignment_when_disabled_effective === true;
+  const setting = account.priority_assignment_when_disabled === true
     ? "此账号强制参与"
     : account.priority_assignment_when_disabled === false
       ? "此账号强制排除"
       : "继承全局设置";
-  const rateSourceLabel = account.rate_pause_effective_source === "account"
-    ? "账号的独立设置"
-    : account.rate_pause_effective_source === "priority_interval"
-      ? `优先级区间：${account.priority_interval_name || "未命名区间"}`
-      : account.rate_pause_policy === "disabled"
-        ? "账号明确关闭"
-        : account.priority_interval_id == null
-          ? "未分配优先级区间（默认不暂停）"
-          : `优先级区间：${account.priority_interval_name || "未命名区间"} 已关闭`;
-  const rateEffectiveLabel = account.rate_pause_effective_enabled
-    ? "倍率上涨时会自动暂停"
-    : "倍率上涨时不自动暂停";
-  const monitorName = selectedMonitor?.name?.trim()
-    || (account.availability_monitor_id == null ? null : `#${account.availability_monitor_id}`);
-  const monitorStatusLabel = selectedMonitorStatus
-    ? upstreamStatusLabel(selectedMonitorStatus)
-    : monitorDeleted
-      ? "已删除"
-      : account.availability_monitor_id == null
-        ? "未绑定"
-        : "等待同步";
-  const availabilityMethodLabel = mode === "disabled"
-    ? "已关闭"
-    : mode === "independent_model"
-      ? "独立模型"
-      : "绑定监控面板";
-  const availabilityCompactLabel = mode === "disabled"
-    ? "关闭"
-    : mode === "independent_model"
-      ? "独立模型"
-      : account.availability_monitor_id == null
-        ? "未绑面板"
-        : monitorDeleted
-          ? "面板已删"
-          : `${middleEllipsis(monitorName || "监控面板", 12)} · ${monitorStatusLabel}`;
   return (
-    <div className="api-key-account-config-tags" aria-label="账号自动化配置摘要">
-      <span className="api-key-account-config-tag-wrap">
-        <HelpPopover
-          label="查看停用后优先级分配设置"
-          trigger={
-            <span className={
-              "api-key-chip api-key-account-config-tag "
-              + (account.priority_assignment_when_disabled_effective
-                ? "api-key-account-config-tag--success"
-                : "api-key-account-config-tag--muted")
-            }>
-              {priorityTagLabel}
-            </span>
-          }
-          triggerClassName="help-popover-trigger--content api-key-account-config-popover"
-        >
-          <PopoverDetails rows={[
-            ["账号停用后", priorityParticipation],
-            ["配置来源", prioritySettingLabel],
-          ]} />
-        </HelpPopover>
-      </span>
-      <span className="api-key-account-config-tag-wrap">
-        <HelpPopover
-          label="查看倍率上涨暂停策略"
-          trigger={
-            <span
-              className={
-                "api-key-chip api-key-account-config-tag "
-                + (ratePolicy === "关闭"
-                  ? "api-key-account-config-tag--muted"
-                  : ratePolicy === "独立"
-                    ? "api-key-account-config-tag--info"
-                    : "api-key-account-config-tag--inherit")
-              }
-            >
-              {ratePolicy}
-            </span>
-          }
-          triggerClassName="help-popover-trigger--content api-key-account-config-popover"
-        >
-          <PopoverDetails rows={[
-            ["暂停策略", ratePolicy],
-            ["倍率上涨时", rateEffectiveLabel],
-            ["规则取自", rateSourceLabel],
-            ["暂停阈值", account.rate_pause_effective_enabled ? rateThreshold : "未启用"],
-          ]} />
-        </HelpPopover>
-      </span>
-      <span className="api-key-account-config-tag-wrap api-key-account-config-tag-wrap--availability">
-        <HelpPopover
-          label="查看 API Key 可用性检测设置"
-          trigger={
-            <span
-              className={`api-key-chip api-key-account-config-tag api-key-account-config-tag--${availabilityTag.tone}`}
-            >
-              {availabilityCompactLabel}
-            </span>
-          }
-          triggerClassName="help-popover-trigger--content api-key-account-config-popover"
-        >
-          <PopoverDetails rows={[
-            ["检测方式", availabilityMethodLabel],
-            ["绑定监控面板", monitorName],
-            ["面板当前状态", mode === "channel_monitor" ? monitorStatusLabel : null],
-            ["测试模型", configuredTestModel || null],
-            ["具体说明", availabilityTag.title],
-          ]} />
-        </HelpPopover>
-      </span>
-    </div>
+    <HelpPopover
+      label="查看停用后优先级计算设置"
+      trigger={
+        <span className={
+          "api-key-chip api-key-account-priority-participation "
+          + (participates ? "api-key-chip--success" : "api-key-chip--muted")
+        }>
+          {participates ? "停用后参与" : "停用后排除"}
+        </span>
+      }
+      triggerClassName="help-popover-trigger--content"
+    >
+      <PopoverDetails rows={[
+        ["账号停用后", participates ? "参与优先级计算" : "不参与优先级计算"],
+        ["配置来源", setting],
+      ]} />
+    </HelpPopover>
   );
 }
 
@@ -4305,7 +4257,7 @@ function AccountAvailabilityIndicator({
   const selectedMonitorStatus = selectedMonitor
     ? latestChannelMonitorStatus(selectedMonitor.primary_status, selectedMonitor.timeline)
     : null;
-  const channelMonitorStatus = String(channel?.channel_monitor_status || "").trim().toLowerCase();
+  const channelMonitorStatus = normalizeMonitorStatus(channel?.channel_monitor_status);
   const monitorDegraded = mode === "channel_monitor"
     && (selectedMonitorStatus === "degraded" || channelMonitorStatus === "degraded");
   const available = status === "available" || monitorDegraded;
@@ -4343,10 +4295,10 @@ function AccountAvailabilityIndicator({
     && account.availability_monitor_id == null;
   const monitorWasDeleted = account.availability_check_mode === "channel_monitor"
     && account.availability_monitor_id != null
-    && channel?.channel_monitor_status === "ok"
+    && channelMonitorStatus === "available"
     && !selectedMonitor;
   const monitorAvailable = mode === "channel_monitor"
-    && channel?.channel_monitor_status === "ok"
+    && channelMonitorStatus === "available"
     && [
     "available",
     "healthy",
@@ -4426,23 +4378,23 @@ function AccountAvailabilityIndicator({
         : monitorAvailable
           ? "monitor-available"
           : "monitor-unavailable";
-  const trigger = indicatorTone === "unconfigured"
-    ? <CircleOff size={13} />
-    : (
-      <span className={
-        "api-key-availability-result"
-        + (available ? " api-key-availability-result--available" : "")
-        + (unavailable ? " api-key-availability-result--unavailable" : "")
-      }>
-        {available ? <CheckCircle2 size={11} /> : null}
-        {unavailable ? <X size={11} /> : null}
-      </span>
-    );
+  const resultTone = available ? "available" : unavailable ? "unavailable" : "unknown";
+  const trigger = (
+    <svg
+      aria-hidden="true"
+      className={`api-key-availability-icon api-key-availability-icon--${indicatorTone} api-key-availability-icon--${resultTone}`}
+      shapeRendering="geometricPrecision"
+      viewBox="0 0 24 24"
+    >
+      <circle className="api-key-availability-icon-ring" cx="12" cy="12" r="11.5" />
+      <circle className="api-key-availability-icon-core" cx="12" cy="12" r="6" />
+    </svg>
+  );
   return (
     <HelpPopover
       label={`查看 ${accountDisplayName(account)} 的可用性监测详情`}
       trigger={trigger}
-      triggerClassName={`api-key-availability-indicator api-key-availability-indicator--${indicatorTone}`}
+      triggerClassName="api-key-availability-indicator"
     >
       <PopoverDetails
         rows={[
@@ -4464,36 +4416,74 @@ function AccountAvailabilityIndicator({
   );
 }
 
-function AccountStatusIndicator({
+function AccountMonitorBindingTag({
   account,
-  activePauseHolds,
-  displayTimeZone,
-  status,
+  channel,
 }: {
   account: UpstreamAccount;
-  activePauseHolds: UpstreamAccountPauseHold[];
-  displayTimeZone: string;
-  status: string;
+  channel?: UpstreamChannel;
 }) {
-  const value = String(status || "unknown").trim().toLowerCase();
-  if (value !== "disabled") return <StatusChip status={value} />;
+  const mode = account.availability_check_mode || "disabled";
+  const selectedMonitor = account.availability_monitor_id == null
+    ? null
+    : (channel?.channel_monitors || []).find(
+        (monitor) => String(monitor.id) === String(account.availability_monitor_id),
+      );
+  const selectedMonitorStatus = selectedMonitor
+    ? latestChannelMonitorStatus(selectedMonitor.primary_status, selectedMonitor.timeline)
+    : "";
+  const channelStatus = normalizeMonitorStatus(channel?.channel_monitor_status);
+  const monitorDeleted = mode === "channel_monitor"
+    && account.availability_monitor_id != null
+    && channelStatus === "available"
+    && !selectedMonitor;
+  const healthyStatuses = ["available", "healthy", "operational", "ok", "success"];
+  const unavailableStatuses = ["unavailable", "error", "failed", "timeout", "invalid"];
+  const monitorName = selectedMonitor?.name?.trim()
+    || (account.availability_monitor_id == null ? null : `#${account.availability_monitor_id}`);
+  const monitorStatus = selectedMonitorStatus
+    ? upstreamStatusLabel(selectedMonitorStatus)
+    : monitorDeleted
+      ? "已删除"
+      : account.availability_monitor_id == null
+        ? "未绑定"
+        : "等待同步";
+  const tone = mode === "disabled"
+    || mode === "independent_model"
+    || account.availability_monitor_id == null
+    ? "muted"
+    : monitorDeleted
+      || unavailableStatuses.includes(selectedMonitorStatus)
+      || unavailableStatuses.includes(channelStatus)
+      ? "danger"
+      : healthyStatuses.includes(selectedMonitorStatus) && channelStatus === "available"
+        ? "success"
+        : "warn";
+  const label = mode === "disabled"
+    ? "监控面板：未启用"
+    : mode === "independent_model"
+      ? "监控面板：独立模型"
+      : account.availability_monitor_id == null
+        ? "监控面板：未绑定"
+        : monitorDeleted
+          ? "监控面板：已删除"
+          : `监控面板：${middleEllipsis(monitorName || "等待同步", 14)}`;
   return (
     <HelpPopover
-      label={`查看 ${accountDisplayName(account)} 的停用详情`}
-      trigger={<span className="api-key-chip api-key-chip--danger">{statusLabel(value)}</span>}
-      triggerClassName="help-popover-trigger--content"
+      label={`查看 ${accountDisplayName(account)} 的监控面板绑定`}
+      trigger={<span>{label}</span>}
+      triggerClassName={`api-key-account-monitor-tag api-key-chip api-key-chip--${tone} help-popover-trigger--content`}
     >
-      <span className="api-key-status-detail">
-        <strong>账号已停用</strong>
-        {activePauseHolds.length ? activePauseHolds.map((hold, index) => (
-          <span className="api-key-status-detail-reason" key={`${hold.reason}:${index}`}>
-            <strong>{pauseHoldReasonLabel(hold)}</strong>
-            <PopoverDetails rows={pauseHoldDetailRows(hold, displayTimeZone)} />
-          </span>
-        )) : (
-          <span>未记录自动暂停原因，账号可能在 sub2api 中被手动停用。</span>
-        )}
-      </span>
+      <PopoverDetails rows={[
+        ["检测方式", mode === "channel_monitor" ? "绑定监控面板" : mode === "independent_model" ? "独立模型测试" : "未启用"],
+        ["绑定监控面板", mode === "channel_monitor" ? monitorName || "未绑定" : null],
+        ["面板当前状态", mode === "channel_monitor" ? monitorStatus : null],
+        ["具体说明", monitorDeleted
+          ? "原绑定的监控面板已被上游删除，请重新绑定。"
+          : account.availability_monitor_id == null && mode === "channel_monitor"
+            ? "已选择绑定监控面板，但尚未选择具体面板。"
+            : null],
+      ]} />
     </HelpPopover>
   );
 }
@@ -5569,7 +5559,7 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
     : `综合余额：平台余额 × 充值倍率${rechargeMultiplier === null ? "" : ` ${rechargeMultiplier.toLocaleString("zh-CN", { maximumFractionDigits: 6 })}`} = ${adjustedBalance}`;
   const balanceNote = `${platformBalanceNote}；${adjustedBalanceNote}`;
   const todayUsage = formatBalanceSummaryTodayUsage(channel);
-  const todayUsageNote = `今日消耗余额：原始 ${todayUsage.rawValue}；综合 ${todayUsage.adjustedValue}${todayUsage.stale ? "（显示当天最后一次有效值）" : ""}`;
+  const todayUsageNote = `今日消耗：${todayUsage.value}${todayUsage.stale ? "（显示当天最后一次有效值）" : ""}`;
 
   return (
     <article className="api-key-balance-channel-card">
@@ -5585,7 +5575,7 @@ function UpstreamBalanceCard({ channel }: { channel: UpstreamChannel }) {
       </div>
       <div aria-label={todayUsageNote} className="api-key-balance-metric api-key-balance-today-usage" title={todayUsageNote}>
         <small>今日消耗</small>
-        <strong><span>原 {todayUsage.rawValue}</span><span>综 {todayUsage.adjustedValue}</span></strong>
+        <strong>{todayUsage.value}</strong>
       </div>
     </article>
   );
@@ -5716,9 +5706,52 @@ function StatusChip({ status }: { status?: string | null }) {
   return <span className={"api-key-chip api-key-chip--" + statusTone(value)}>{statusLabel(value)}</span>;
 }
 
-function PlatformChip({ platform }: { platform: string }) {
+function PlatformChip({
+  account,
+  activePauseHolds,
+  displayTimeZone,
+  platform,
+  status,
+}: {
+  account: UpstreamAccount;
+  activePauseHolds: UpstreamAccountPauseHold[];
+  displayTimeZone: string;
+  platform: string;
+  status?: string;
+}) {
   const value = platform.trim();
-  return <span className="api-key-chip api-key-chip--info" title={`平台：${value}`}>{value}</span>;
+  const schedulingStatus = String(status || "not_checked").trim().toLowerCase();
+  const tone = schedulingStatus === "enabled"
+    ? "success"
+    : schedulingStatus === "disabled"
+      ? "danger"
+      : "info";
+  const disabled = schedulingStatus === "disabled";
+  return (
+    <HelpPopover
+      label={`查看 ${accountDisplayName(account)} 的账号状态详情`}
+      trigger={<span>{value}</span>}
+      triggerClassName={`api-key-platform-chip api-key-chip api-key-chip--${tone} help-popover-trigger--content`}
+    >
+      <span className="api-key-status-detail">
+        <strong>{disabled ? "账号已停用" : schedulingStatus === "enabled" ? "账号已启用" : "账号状态待确认"}</strong>
+        <PopoverDetails rows={[
+          ["平台", value],
+          ["调度状态", statusLabel(schedulingStatus)],
+        ]} />
+        {disabled ? activePauseHolds.length ? activePauseHolds.map((hold, index) => (
+          <span className="api-key-status-detail-reason" key={`${hold.reason}:${index}`}>
+            <strong>{pauseHoldReasonLabel(hold)}</strong>
+            <PopoverDetails rows={pauseHoldDetailRows(hold, displayTimeZone)} />
+          </span>
+        )) : (
+          <span>未记录自动暂停原因，账号可能在 sub2api 中被手动停用。</span>
+        ) : (
+          <span>{schedulingStatus === "enabled" ? "账号当前可参与调度。" : "等待下一次账号状态同步。"}</span>
+        )}
+      </span>
+    </HelpPopover>
+  );
 }
 
 function channelKey(channel: UpstreamChannel) {
@@ -6000,6 +6033,16 @@ function formatMonitorAvailability(value: unknown) {
   return `${normalized.toLocaleString("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 2 })}%`;
 }
 
+function normalizeMonitorStatus(value: unknown) {
+  const status = String(value || "").trim().toLowerCase();
+  return ({
+    active: "available",
+    enabled: "available",
+    ok: "available",
+    success: "available",
+  } as Record<string, string>)[status] || status;
+}
+
 function monitorCurrentProbe(monitor: UpstreamChannelMonitor) {
   const status = latestChannelMonitorStatus(monitor.primary_status, monitor.timeline);
   if (["available", "healthy", "operational", "ok", "success"].includes(status)) {
@@ -6139,10 +6182,16 @@ function normalizeUsageHistory(history: UpstreamUsageHistory): UpstreamUsageHist
     balance_used: 0,
     balance_used_adjusted: 0,
     upstream_api_key_usage: 0,
+    upstream_cost_cny: 0,
+    sub2api_cost: 0,
+    sub2api_cost_cny: 0,
+    sub2api_user_cost: 0,
     income_actual_cost: 0,
     income: 0,
     cost: null,
     cost_adjusted: null,
+    consumption_cny: 0,
+    profit_cny: 0,
   };
   return {
     ...history,
@@ -6182,27 +6231,44 @@ function usageHistoryDayAccount(day: UpstreamUsageHistory["days"][number], selec
   return day.api_key_accounts.find((account) => String(account.sub2api_account_id) === selectedAccountId) || null;
 }
 
-function historyDayUsage(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
-  if (!selectedAccountId) return finiteNumber(day.balance_used);
-  return finiteNumber(usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage);
+function historyDayUpstreamCost(
+  day: UpstreamUsageHistory["days"][number],
+  selectedAccountId: string | null,
+) {
+  const account = usageHistoryDayAccount(day, selectedAccountId);
+  if (selectedAccountId) {
+    return finiteNumber(account?.upstream_cost_cny ?? account?.upstream_usage_adjusted);
+  }
+  return finiteNumber(day.upstream_cost_cny ?? day.cost_adjusted);
 }
 
-function historyDayAdjustedUsage(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
-  if (!selectedAccountId) return finiteNumber(day.balance_used_adjusted);
-  return finiteNumber(usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage_adjusted);
+function historyDaySub2apiCost(
+  day: UpstreamUsageHistory["days"][number],
+  selectedAccountId: string | null,
+) {
+  const account = usageHistoryDayAccount(day, selectedAccountId);
+  return selectedAccountId
+    ? finiteNumber(account?.sub2api_cost_cny)
+    : finiteNumber(day.sub2api_cost_cny);
 }
 
-function historyDayUsageUnit(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
-  if (!selectedAccountId) return day.balance_unit || null;
-  return usageHistoryDayAccount(day, selectedAccountId)?.upstream_usage_unit || day.balance_unit || null;
-}
-
-function historyDayAdjustedCost(day: UpstreamUsageHistory["days"][number], selectedAccountId: string | null) {
-  return finiteNumber(day.cost_adjusted) ?? historyDayAdjustedUsage(day, selectedAccountId);
-}
-
-function historyIncomeUnit(days: UpstreamUsageHistory["days"]) {
-  return days.find((day) => day.income_unit)?.income_unit || "CNY";
+function historyDayProfit(
+  day: UpstreamUsageHistory["days"][number],
+  selectedAccountId: string | null,
+) {
+  const account = usageHistoryDayAccount(day, selectedAccountId);
+  const persisted = selectedAccountId
+    ? finiteNumber(account?.profit_cny)
+    : finiteNumber(day.profit_cny);
+  if (persisted !== null) return persisted;
+  const income = selectedAccountId
+    ? finiteNumber(account?.income)
+    : finiteNumber(day.income);
+  const costs = [
+    historyDayUpstreamCost(day, selectedAccountId),
+    historyDaySub2apiCost(day, selectedAccountId),
+  ].filter((value): value is number => value !== null);
+  return income === null || !costs.length ? null : income - Math.max(...costs);
 }
 
 function historyIncomeBreakdownTitle(
@@ -6210,31 +6276,27 @@ function historyIncomeBreakdownTitle(
   selectedAccountId: string | null,
 ) {
   const account = usageHistoryDayAccount(day, selectedAccountId);
-  const actualCost = finiteNumber(
-    selectedAccountId ? account?.sub2api_actual_cost : day.income_actual_cost,
-  );
   const multiplier = finiteNumber(
     selectedAccountId ? account?.local_recharge_multiplier : day.income_recharge_multiplier,
   );
   const income = finiteNumber(selectedAccountId ? account?.income : day.income);
-  if (actualCost === null || multiplier === null || income === null) return undefined;
-  return `用户实际扣费 ${formatHistoryAmount(actualCost, "USD")} × 当日充值倍率 ${formatCostPerUsd(multiplier)} = ${formatHistoryAmount(income, "CNY")}`;
+  if (multiplier === null || income === null) return undefined;
+  return `用户扣费（人民币）${formatHistoryAmount(income, "CNY")}；按当日充值倍率 ${formatCostPerUsd(multiplier)} 折算`;
 }
 
-function historyNetIncome(value: Pick<UpstreamUsageHistory["totals"], "income" | "cost_adjusted"> | null) {
+function historyProfit(value: UpstreamUsageHistory["totals"] | null) {
+  const persisted = finiteNumber(value?.profit_cny);
+  if (persisted !== null) return persisted;
   const income = finiteNumber(value?.income);
-  // Sub2API income is recorded in CNY, so only the recharge-adjusted cost can form a net value.
-  const cost = finiteNumber(value?.cost_adjusted);
-  if (income === null && cost === null) return null;
-  return (income || 0) - (cost || 0);
+  const costs = [
+    finiteNumber(value?.upstream_cost_cny ?? value?.cost_adjusted),
+    finiteNumber(value?.sub2api_cost_cny),
+  ].filter((item): item is number => item !== null);
+  return income === null || !costs.length ? null : income - Math.max(...costs);
 }
 
 function formatHistoryAmount(value: unknown, unit?: string | null) {
   return finiteNumber(value) === null ? "—" : formatUpstreamBalance(value, unit || "CNY", 2);
-}
-
-function formatHistoryUsage(value: unknown, unit?: string | null) {
-  return finiteNumber(value) === null ? "—" : formatUpstreamBalance(value, unit || undefined, 2);
 }
 
 function formatHistorySignedAmount(value: number | null, unit?: string | null) {
@@ -6273,10 +6335,7 @@ function formatBalanceSummaryTodayUsage(channel: UpstreamChannel) {
   const status = String(channel.today_balance_status || "not_checked").toLowerCase();
   const visible = finiteNumber(amount) !== null && ["ok", "stale", "stored"].includes(status);
   return {
-    rawValue: visible
-      ? formatUpstreamBalance(amount, channel.today_balance_unit || channel.balance_unit, 2)
-      : "-",
-    adjustedValue: visible
+    value: visible
       ? formatRechargeAdjustedBalance(
           channel.today_recharge_adjusted_balance_used,
           amount,
@@ -6295,7 +6354,6 @@ function formatDailyBalanceUsed(
   const yesterday = period === "yesterday";
   const amount = yesterday ? channel.yesterday_balance_used : channel.today_balance_used;
   const adjustedAmount = yesterday ? null : channel.today_recharge_adjusted_balance_used;
-  const unit = yesterday ? channel.yesterday_balance_unit : channel.today_balance_unit;
   const status = String(
     (yesterday ? channel.yesterday_balance_status : channel.today_balance_status) || "not_checked",
   ).toLowerCase();
@@ -6308,9 +6366,6 @@ function formatDailyBalanceUsed(
   const stale = status === "stale" && hasCurrentValue;
   const unsupported = /^(?:credentials_missing|not_available|unsupported)$/.test(status);
   const visible = current || stale;
-  const rawValue = visible
-    ? formatUpstreamBalance(amount, unit || channel.balance_unit, 2)
-    : "-";
   const adjustedValue = visible
     ? formatRechargeAdjustedBalance(adjustedAmount, amount, channel.effective_recharge_multiplier)
     : "-";
@@ -6328,10 +6383,9 @@ function formatDailyBalanceUsed(
           : isFailureStatus(status)
             ? "danger"
             : "muted",
-    rawValue,
     adjustedValue,
     value: adjustedValue,
-    detail: `${label}消耗余额：原始 ${rawValue}；综合（考虑充值倍率）${adjustedValue}${staleDetail}`,
+    detail: `${label}消耗：${adjustedValue}（已考虑充值倍率）${staleDetail}`,
   };
 }
 

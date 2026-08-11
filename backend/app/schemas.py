@@ -1547,6 +1547,13 @@ class UpstreamAccountOut(BaseModel):
     today_upstream_usage_status: str = "not_checked"
     today_upstream_usage_source: str | None = None
     today_upstream_usage_checked_at: datetime | None = None
+    today_upstream_cost_cny: float | None = None
+    today_sub2api_cost_cny: float | None = None
+    today_income_cny: float | None = None
+    today_consumption_cny: float | None = None
+    today_profit_cny: float | None = None
+    today_sub2api_stats_status: str = "not_checked"
+    today_sub2api_stats_checked_at: datetime | None = None
     # Reported by sub2api itself, not inferred from local polling.
     last_used_at: datetime | None = None
     last_error: str | None = None
@@ -1646,10 +1653,16 @@ class UpstreamUsageHistoryAccountOut(BaseModel):
     upstream_usage_adjusted: float | None = None
     upstream_usage_unit: str | None = None
     upstream_usage_source: str | None = None
+    upstream_recharge_multiplier: float | None = None
+    upstream_cost_cny: float | None = None
+    sub2api_cost: float | None = None
+    sub2api_cost_cny: float | None = None
+    sub2api_user_cost: float | None = None
     sub2api_actual_cost: float | None = None
     local_recharge_multiplier: float | None = None
     income: float | None = None
     income_unit: str | None = None
+    profit_cny: float | None = None
 
 
 class UpstreamUsageHistoryDayOut(BaseModel):
@@ -1659,24 +1672,36 @@ class UpstreamUsageHistoryDayOut(BaseModel):
     balance_unit: str | None = None
     recharge_multiplier: float | None = None
     upstream_api_key_usage: float | None = None
+    upstream_cost_cny: float | None = None
+    sub2api_cost: float | None = None
+    sub2api_cost_cny: float | None = None
+    sub2api_user_cost: float | None = None
     income_actual_cost: float | None = None
     income_recharge_multiplier: float | None = None
     income: float | None = None
     income_unit: str | None = None
     cost: float | None = None
     cost_adjusted: float | None = None
+    consumption_cny: float | None = None
+    profit_cny: float | None = None
     finalized: bool = False
     api_key_accounts: list[UpstreamUsageHistoryAccountOut] = Field(default_factory=list)
 
 
 class UpstreamUsageHistoryTotalsOut(BaseModel):
-    balance_used: float = 0.0
-    balance_used_adjusted: float = 0.0
-    upstream_api_key_usage: float = 0.0
-    income_actual_cost: float = 0.0
-    income: float = 0.0
+    balance_used: float | None = None
+    balance_used_adjusted: float | None = None
+    upstream_api_key_usage: float | None = None
+    upstream_cost_cny: float | None = None
+    sub2api_cost: float | None = None
+    sub2api_cost_cny: float | None = None
+    sub2api_user_cost: float | None = None
+    income_actual_cost: float | None = None
+    income: float | None = None
     cost: float | None = None
     cost_adjusted: float | None = None
+    consumption_cny: float | None = None
+    profit_cny: float | None = None
 
 
 class UpstreamUsageHistoryOut(BaseModel):

@@ -890,6 +890,13 @@ export type UpstreamAccount = {
   today_upstream_usage_status?: string | null;
   today_upstream_usage_source?: string | null;
   today_upstream_usage_checked_at?: string | null;
+  today_upstream_cost_cny?: number | null;
+  today_sub2api_cost_cny?: number | null;
+  today_income_cny?: number | null;
+  today_consumption_cny?: number | null;
+  today_profit_cny?: number | null;
+  today_sub2api_stats_status?: string | null;
+  today_sub2api_stats_checked_at?: string | null;
   /** Upstream-reported last use of this key, straight from sub2api. */
   last_used_at?: string | null;
   last_error?: string | null;
@@ -1061,10 +1068,16 @@ export type UpstreamUsageHistoryAccountDay = UpstreamUsageHistoryAccount & {
   upstream_usage_adjusted?: number | null;
   upstream_usage_unit?: string | null;
   upstream_usage_source?: string | null;
+  upstream_recharge_multiplier?: number | null;
+  upstream_cost_cny?: number | null;
+  sub2api_cost?: number | null;
+  sub2api_cost_cny?: number | null;
+  sub2api_user_cost?: number | null;
   sub2api_actual_cost?: number | null;
   local_recharge_multiplier?: number | null;
   income: number | null;
   income_unit?: string | null;
+  profit_cny?: number | null;
 };
 
 export type UpstreamUsageHistoryDay = {
@@ -1076,6 +1089,10 @@ export type UpstreamUsageHistoryDay = {
   recharge_multiplier?: number | null;
   /** Linked sub2api API-key consumption, optionally filtered by account. */
   upstream_api_key_usage: number | null;
+  upstream_cost_cny?: number | null;
+  sub2api_cost?: number | null;
+  sub2api_cost_cny?: number | null;
+  sub2api_user_cost?: number | null;
   income_actual_cost?: number | null;
   income_recharge_multiplier?: number | null;
   income: number | null;
@@ -1083,6 +1100,8 @@ export type UpstreamUsageHistoryDay = {
   /** Cost is channel balance consumption without a key filter, otherwise that key's consumption. */
   cost: number | null;
   cost_adjusted: number | null;
+  consumption_cny?: number | null;
+  profit_cny?: number | null;
   finalized?: boolean;
   api_key_accounts: UpstreamUsageHistoryAccountDay[];
 };
@@ -1091,10 +1110,16 @@ export type UpstreamUsageHistoryTotals = {
   balance_used: number | null;
   balance_used_adjusted: number | null;
   upstream_api_key_usage: number | null;
+  upstream_cost_cny?: number | null;
+  sub2api_cost?: number | null;
+  sub2api_cost_cny?: number | null;
+  sub2api_user_cost?: number | null;
   income_actual_cost?: number | null;
   income: number | null;
   cost: number | null;
   cost_adjusted: number | null;
+  consumption_cny?: number | null;
+  profit_cny?: number | null;
 };
 
 export type UpstreamUsageHistory = {

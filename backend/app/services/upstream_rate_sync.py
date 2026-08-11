@@ -391,6 +391,16 @@ class UpstreamRateSyncService:
             except Exception:
                 pass
         async with AsyncSessionLocal() as db:
+            finalized_usage = 0
+            finalize_usage = getattr(
+                self.channel_service,
+                "finalize_elapsed_usage_history",
+                None,
+            )
+            if callable(finalize_usage):
+                finalized_usage = int(
+                    await finalize_usage(db, time_zone=usage_history_time_zone)
+                )
             await prune_upstream_rate_change_logs(
                 db,
                 retention_days=retention_days,
@@ -408,9 +418,11 @@ class UpstreamRateSyncService:
                     retention_days=usage_retention_days,
                     time_zone=usage_history_time_zone,
                 )
-                commit = getattr(db, "commit", None)
-                if callable(commit):
-                    await commit()
+            commit = getattr(db, "commit", None)
+            if callable(commit) and (
+                finalized_usage > 0 or usage_retention_days is not None
+            ):
+                await commit()
 
         enabled = await self.runtime_config.get_upstream_sync_enabled()
         paused = await self.runtime_config.get_automation_paused()

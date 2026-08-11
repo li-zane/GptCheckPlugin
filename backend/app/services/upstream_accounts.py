@@ -8,7 +8,7 @@ import logging
 import math
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from typing import Any
@@ -204,6 +204,25 @@ def _balance_number(value: Any) -> float | None:
     if not math.isfinite(parsed) or abs(parsed) > 1_000_000_000_000_000:
         return None
     return parsed
+
+
+def _cny_amount(amount: Any, multiplier: Any) -> float | None:
+    parsed_amount = _balance_number(amount)
+    parsed_multiplier = _balance_number(multiplier)
+    if (
+        parsed_amount is None
+        or parsed_amount < 0
+        or parsed_multiplier is None
+        or parsed_multiplier < 0
+    ):
+        return None
+    converted = parsed_amount * parsed_multiplier
+    return converted if math.isfinite(converted) else None
+
+
+def _maximum_known_cost(*values: float | None) -> float | None:
+    known = [value for value in values if value is not None]
+    return max(known) if known else None
 
 
 def _quantize_rate(value: Decimal) -> Decimal:
@@ -504,6 +523,10 @@ class UpstreamAccountService:
         config.today_upstream_usage_status = "not_checked"
         config.today_upstream_usage_source = None
         config.today_upstream_usage_checked_at = None
+        config.today_sub2api_cost_amount = None
+        config.today_sub2api_user_cost_amount = None
+        config.today_sub2api_stats_status = "not_checked"
+        config.today_sub2api_stats_checked_at = None
 
     def archive_data_before_invalidation(
         self,
@@ -558,6 +581,15 @@ class UpstreamAccountService:
                 "today_usage_unit": _safe_text(config.today_upstream_usage_unit, limit=32),
                 "today_usage_status": _safe_text(config.today_upstream_usage_status, limit=32),
                 "today_usage_checked_at": _datetime_text(config.today_upstream_usage_checked_at),
+                "today_sub2api_cost": config.today_sub2api_cost_amount,
+                "today_sub2api_user_cost": config.today_sub2api_user_cost_amount,
+                "today_sub2api_stats_status": _safe_text(
+                    config.today_sub2api_stats_status,
+                    limit=32,
+                ),
+                "today_sub2api_stats_checked_at": _datetime_text(
+                    config.today_sub2api_stats_checked_at
+                ),
                 "upstream_usage_amount": config.upstream_usage_amount,
                 "upstream_usage_unit": _safe_text(config.upstream_usage_unit, limit=32),
                 "upstream_usage_checked_at": _datetime_text(config.upstream_usage_checked_at),
@@ -574,6 +606,7 @@ class UpstreamAccountService:
                 config.remote_snapshot_updated_at,
                 config.balance_checked_at,
                 config.today_upstream_usage_checked_at,
+                config.today_sub2api_stats_checked_at,
                 config.upstream_usage_checked_at,
                 config.last_discovered_at,
                 config.last_applied_at,
@@ -585,6 +618,7 @@ class UpstreamAccountService:
             config.remote_snapshot_updated_at,
             config.balance_checked_at,
             config.today_upstream_usage_checked_at,
+            config.today_sub2api_stats_checked_at,
             config.upstream_usage_checked_at,
             config.last_discovered_at,
             config.last_applied_at,
@@ -721,6 +755,123 @@ class UpstreamAccountService:
         config.upstream_usage_unit = "USD"
         config.upstream_usage_checked_at = now
         return True
+
+    async def get_sub2api_today_stats(
+        self,
+        account_ids: list[int],
+    ) -> dict[int, dict[str, float | None]]:
+        client_methods = type(self.sub2api).__dict__
+        client_instance_methods = getattr(self.sub2api, "__dict__", {})
+        legacy_overridden = (
+            "get_account_today_costs" in client_methods
+            or "get_account_today_costs" in client_instance_methods
+        )
+        stats_overridden = (
+            "get_account_today_stats" in client_methods
+            or "get_account_today_stats" in client_instance_methods
+        )
+        prefer_legacy = legacy_overridden and not stats_overridden
+
+        getter = getattr(self.sub2api, "get_account_today_stats", None)
+        if callable(getter) and not prefer_legacy:
+            values = await getter(account_ids)
+            if isinstance(values, dict):
+                return {
+                    int(account_id): {
+                        "cost": _balance_number(_value(stats, "cost")),
+                        "user_cost": _balance_number(_value(stats, "user_cost")),
+                    }
+                    for account_id, stats in values.items()
+                    if _balance_number(account_id) is not None
+                }
+        legacy_getter = getattr(self.sub2api, "get_account_today_costs", None)
+        if not callable(legacy_getter):
+            return {}
+        legacy_values = await legacy_getter(account_ids)
+        if not isinstance(legacy_values, dict):
+            return {}
+        return {
+            int(account_id): {"cost": cost, "user_cost": cost}
+            for account_id, raw_cost in legacy_values.items()
+            if (cost := _balance_number(raw_cost)) is not None and cost >= 0
+        }
+
+    async def get_sub2api_daily_stats(
+        self,
+        account_ids: list[int],
+        *,
+        days: int = 2,
+    ) -> dict[int, dict[date, dict[str, float | None]]]:
+        client_methods = type(self.sub2api).__dict__
+        client_instance_methods = getattr(self.sub2api, "__dict__", {})
+        legacy_overridden = (
+            "get_account_daily_costs" in client_methods
+            or "get_account_daily_costs" in client_instance_methods
+        )
+        stats_overridden = (
+            "get_account_daily_stats" in client_methods
+            or "get_account_daily_stats" in client_instance_methods
+        )
+        prefer_legacy = legacy_overridden and not stats_overridden
+
+        getter = getattr(self.sub2api, "get_account_daily_stats", None)
+        if callable(getter) and not prefer_legacy:
+            values = await getter(account_ids, days=days)
+            if isinstance(values, dict):
+                return values
+
+        legacy_getter = getattr(self.sub2api, "get_account_daily_costs", None)
+        if not callable(legacy_getter):
+            return {}
+        legacy_values = await legacy_getter(account_ids, days=days)
+        if not isinstance(legacy_values, dict):
+            return {}
+        return {
+            int(account_id): {
+                usage_date: {"cost": cost, "user_cost": cost}
+                for usage_date, raw_cost in daily_costs.items()
+                if (cost := _balance_number(raw_cost)) is not None and cost >= 0
+            }
+            for account_id, daily_costs in legacy_values.items()
+            if isinstance(daily_costs, dict)
+        }
+
+    @staticmethod
+    def apply_sub2api_today_stats(
+        config: UpstreamAccountConfig,
+        stats: Any,
+        *,
+        now: datetime,
+        time_zone: str = DEFAULT_TODAY_TIME_ZONE,
+    ) -> None:
+        cost = _balance_number(_value(stats, "cost"))
+        user_cost = _balance_number(_value(stats, "user_cost"))
+        cost = cost if cost is not None and cost >= 0 else None
+        user_cost = user_cost if user_cost is not None and user_cost >= 0 else None
+        if cost is not None or user_cost is not None:
+            config.today_sub2api_cost_amount = cost
+            config.today_sub2api_user_cost_amount = user_cost
+            config.today_sub2api_stats_status = "ok"
+            config.today_sub2api_stats_checked_at = now
+            return
+        cached_cost = _balance_number(config.today_sub2api_cost_amount)
+        cached_user_cost = _balance_number(config.today_sub2api_user_cost_amount)
+        if (
+            (cached_cost is not None or cached_user_cost is not None)
+            and daily_usage_cache_is_current(
+                cached_amount=cached_cost if cached_cost is not None else cached_user_cost,
+                checked_at=config.today_sub2api_stats_checked_at,
+                time_zone=time_zone,
+                fallback_time_zone=DEFAULT_TODAY_TIME_ZONE,
+                now=now,
+            )
+        ):
+            config.today_sub2api_stats_status = "stale"
+            return
+        config.today_sub2api_cost_amount = None
+        config.today_sub2api_user_cost_amount = None
+        config.today_sub2api_stats_status = "not_available"
+        config.today_sub2api_stats_checked_at = None
 
     @staticmethod
     def active_pause_holds(
@@ -1919,6 +2070,27 @@ class UpstreamAccountService:
             discovered_recharge = None
         active_pause_holds = self.active_pause_holds(config) if config is not None else []
         rate_pause_policy = resolve_rate_pause_policy(config, priority_interval)
+        today_upstream_cost_cny = _cny_amount(
+            config.today_upstream_usage_amount if config else None,
+            config.effective_recharge_multiplier if config else None,
+        )
+        today_sub2api_cost_cny = _cny_amount(
+            config.today_sub2api_cost_amount if config else None,
+            config.local_recharge_multiplier if config else None,
+        )
+        today_income_cny = _cny_amount(
+            config.today_sub2api_user_cost_amount if config else None,
+            config.local_recharge_multiplier if config else None,
+        )
+        today_consumption_cny = _maximum_known_cost(
+            today_upstream_cost_cny,
+            today_sub2api_cost_cny,
+        )
+        today_profit_cny = (
+            today_income_cny - today_consumption_cny
+            if today_income_cny is not None and today_consumption_cny is not None
+            else None
+        )
 
         return UpstreamAccountOut(
             sub2api_account_id=account_id,
@@ -2151,6 +2323,17 @@ class UpstreamAccountService:
             ),
             today_upstream_usage_checked_at=(
                 config.today_upstream_usage_checked_at if config else None
+            ),
+            today_upstream_cost_cny=today_upstream_cost_cny,
+            today_sub2api_cost_cny=today_sub2api_cost_cny,
+            today_income_cny=today_income_cny,
+            today_consumption_cny=today_consumption_cny,
+            today_profit_cny=today_profit_cny,
+            today_sub2api_stats_status=(
+                config.today_sub2api_stats_status if config else "not_checked"
+            ),
+            today_sub2api_stats_checked_at=(
+                config.today_sub2api_stats_checked_at if config else None
             ),
             # Read live from the upstream payload: sub2api owns this timestamp,
             # so there is nothing to persist or infer locally.
@@ -3118,7 +3301,8 @@ class UpstreamAccountService:
 
         balance_task = self.sub2api.get_account_balance(config.sub2api_account_id)
         local_recharge_task = self.sub2api.get_payment_balance_recharge_multiplier_info()
-        tasks: list[Any] = [balance_task, local_recharge_task]
+        today_stats_task = self.get_sub2api_today_stats([config.sub2api_account_id])
+        tasks: list[Any] = [balance_task, local_recharge_task, today_stats_task]
         upstream_attempted = has_credentials and has_base_url
         if upstream_attempted:
             tasks.append(
@@ -3130,7 +3314,8 @@ class UpstreamAccountService:
             )
         results = await asyncio.gather(*tasks, return_exceptions=True)
         balance_result, local_recharge_result = results[0], results[1]
-        upstream_result = results[2] if upstream_attempted else None
+        today_stats_result = results[2]
+        upstream_result = results[3] if upstream_attempted else None
 
         errors: list[str] = []
         if not self._apply_balance_result(
@@ -3171,6 +3356,17 @@ class UpstreamAccountService:
         else:
             config.local_recharge_status = "error"
             errors.append("Target recharge multiplier result is invalid.")
+        today_stats = (
+            today_stats_result
+            if isinstance(today_stats_result, dict)
+            else {}
+        )
+        self.apply_sub2api_today_stats(
+            config,
+            today_stats.get(config.sub2api_account_id),
+            now=now,
+            time_zone=today_timezone,
+        )
 
         fresh_group: Decimal | None = None
         fresh_recharge: Decimal | None = None
@@ -3424,17 +3620,9 @@ class UpstreamAccountService:
             config.current_rate = current_rate
 
         if config.today_upstream_usage_status != "ok":
-            try:
-                local_today_costs = await self.sub2api.get_account_today_costs(
-                    [config.sub2api_account_id]
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                local_today_costs = {}
             self.apply_local_today_usage_fallback(
                 config,
-                local_today_costs.get(config.sub2api_account_id),
+                _value(today_stats.get(config.sub2api_account_id), "cost"),
                 current_rate,
                 now=now,
             )

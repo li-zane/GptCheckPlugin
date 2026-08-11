@@ -5,6 +5,8 @@ export type UpstreamAccountEntry = {
   channel: UpstreamChannel | null;
 };
 
+export type UpstreamAccountTieSort = "name" | "priority";
+
 export type UpstreamAccountFilters = {
   channel: "all" | "__unassigned__" | string;
   interval: "all" | "unassigned" | string;
@@ -54,7 +56,10 @@ export function flattenUpstreamAccounts(data: UpstreamChannelsResponse): Upstrea
   return [...entries.values()];
 }
 
-export function sortUpstreamAccountEntries(entries: UpstreamAccountEntry[]) {
+export function sortUpstreamAccountEntries(
+  entries: UpstreamAccountEntry[],
+  tieSort: UpstreamAccountTieSort = "name",
+) {
   return [...entries].sort((left, right) => {
     const leftMultiplier = accountCompositeMultiplier(left.account);
     const rightMultiplier = accountCompositeMultiplier(right.account);
@@ -63,7 +68,9 @@ export function sortUpstreamAccountEntries(entries: UpstreamAccountEntry[]) {
     if (leftMultiplier !== null && rightMultiplier !== null && leftMultiplier !== rightMultiplier) {
       return leftMultiplier - rightMultiplier;
     }
-    return compareAccountNames(left.account, right.account);
+    return tieSort === "priority"
+      ? compareAccountSchedulingPriority(left.account, right.account)
+      : compareAccountNames(left.account, right.account);
   });
 }
 
@@ -235,6 +242,17 @@ function comparePriorityTieOrder(left: UpstreamAccount, right: UpstreamAccount) 
   }
   if (leftOrder !== null && rightOrder === null) return -1;
   if (leftOrder === null && rightOrder !== null) return 1;
+  return compareAccountNames(left, right);
+}
+
+function compareAccountSchedulingPriority(left: UpstreamAccount, right: UpstreamAccount) {
+  const leftPriority = finiteNumber(left.priority) ?? finiteNumber(left.desired_priority);
+  const rightPriority = finiteNumber(right.priority) ?? finiteNumber(right.desired_priority);
+  if (leftPriority !== null && rightPriority !== null && leftPriority !== rightPriority) {
+    return leftPriority - rightPriority;
+  }
+  if (leftPriority !== null && rightPriority === null) return -1;
+  if (leftPriority === null && rightPriority !== null) return 1;
   return compareAccountNames(left, right);
 }
 
