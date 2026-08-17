@@ -2671,6 +2671,9 @@ async def init_db() -> None:
             await _migrate_management_site_setting_keys(conn)
             if legacy_upstream_domain:
                 await _migrate_upstream_domain_v2(conn)
+                # Domain-v2 tables are populated after the first normalization pass.
+                # Normalize copied enum values once the new tables contain legacy rows.
+                await _migrate_persisted_domain_values(conn)
             await _migrate_notification_outbox(conn)
             await _migrate_upstream_priority_intervals(conn)
             result = await conn.execute(text("PRAGMA table_info(mailbox_credentials)"))

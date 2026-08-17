@@ -281,6 +281,26 @@ class UpstreamDomainV2MigrationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await conn.execute(
                     text(
+                        "CREATE TABLE upstream_account_pause_holds ("
+                        "id INTEGER PRIMARY KEY, account_config_id INTEGER NOT NULL, "
+                        "reason VARCHAR(64) NOT NULL, active BOOLEAN NOT NULL, "
+                        "scope_channel_id INTEGER, triggered_at DATETIME NOT NULL, "
+                        "resolved_at DATETIME, recovery_mode VARCHAR(64) NOT NULL, "
+                        "evidence_json JSON, created_at DATETIME NOT NULL, "
+                        "updated_at DATETIME NOT NULL)"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO upstream_account_pause_holds VALUES "
+                        "(1, 3, 'channel_monitor_unavailable', 1, 7, CURRENT_TIMESTAMP, "
+                        "NULL, 'automatic', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+                        "(2, 3, 'upstream_monitor_unavailable', 0, 7, CURRENT_TIMESTAMP, "
+                        "CURRENT_TIMESTAMP, 'automatic', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    )
+                )
+                await conn.execute(
+                    text(
                         "CREATE TABLE upstream_channel_daily_usages ("
                         "id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, "
                         "channel_identity VARCHAR(500) NOT NULL, channel_name VARCHAR(200), "
@@ -327,6 +347,7 @@ class UpstreamDomainV2MigrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await _prepare_upstream_domain_v2(conn))
                 await conn.run_sync(Base.metadata.create_all)
                 await _migrate_upstream_domain_v2(conn)
+                await _migrate_persisted_domain_values(conn)
 
                 tables = {
                     row[0]
@@ -353,6 +374,19 @@ class UpstreamDomainV2MigrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ).one()
                 self.assertEqual(tuple(account), (3, 101, UPSTREAM_ID, 1, 0.1, 0.2, 0.5, 0.4))
+
+                pause_holds = (
+                    await conn.execute(
+                        text(
+                            "SELECT reason, active, resolved_at FROM api_account_pause_holds "
+                            "WHERE api_account_id = 3"
+                        )
+                    )
+                ).all()
+                self.assertEqual(len(pause_holds), 1)
+                self.assertEqual(pause_holds[0][0], "upstream_monitor_unavailable")
+                self.assertTrue(bool(pause_holds[0][1]))
+                self.assertIsNone(pause_holds[0][2])
 
                 segments = (
                     await conn.execute(
