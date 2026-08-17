@@ -1627,6 +1627,13 @@ class ApiAccountConnectionTestOut(BaseModel):
     attempts: int = Field(default=1, ge=1, le=1)
 
 
+class UpstreamCredentialsOut(BaseModel):
+    access_token: str | None = None
+    refresh_token: str | None = None
+    login_username: str | None = None
+    login_password: str | None = None
+
+
 class UpstreamOut(BaseModel):
     upstream_id: str = Field(
         default="00000000-0000-0000-0000-000000000000",

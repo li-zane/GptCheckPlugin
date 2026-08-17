@@ -480,6 +480,13 @@ export type UpstreamDiscoverAllRequest = (
   skip_upstream_ids?: string[];
 };
 
+export type UpstreamCredentials = {
+  access_token: string | null;
+  refresh_token: string | null;
+  login_username: string | null;
+  login_password: string | null;
+};
+
 export type UpstreamUpdate = {
   display_name?: string | null;
   api_endpoint_url?: string | null;

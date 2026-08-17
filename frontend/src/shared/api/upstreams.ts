@@ -12,6 +12,7 @@ import type {
   PriorityRebalanceResult,
   PriorityTieMoveInput,
   Upstream,
+  UpstreamCredentials,
   UpstreamChangeEvent,
   UpstreamChangeLog,
   UpstreamDiscoverAllRequest,
@@ -146,6 +147,10 @@ export const upstreamsApi = {
     90_000,
   ),
   upstreams: (refresh = false) => request<UpstreamOverviewResponse>(`/api/upstreams?refresh=${refresh ? "true" : "false"}`),
+  upstreamCredentials: (upstreamId: number | string) => request<UpstreamCredentials>(
+    `/api/upstreams/${encodeURIComponent(String(upstreamId))}/credentials`,
+    { cache: "no-store" },
+  ),
   upstreamUsageHistory: (upstreamId: number | string, filters?: UpstreamUsageHistoryFilters) =>
     request<UpstreamUsageHistory>(upstreamUsageHistoryPath(upstreamId, filters), {}, 90_000),
   syncApiKeyInventory: () => request<UpstreamOverviewResponse>("/api/upstreams/sync-inventory", { method: "POST" }, 90_000),

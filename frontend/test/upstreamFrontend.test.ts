@@ -1812,6 +1812,57 @@ test("API key inventory sync uses the lightweight inventory endpoint", async () 
   }]);
 });
 
+test("upstream credentials are fetched only on demand without browser caching", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ path: string; method: string; cache: RequestCache | undefined }> = [];
+  const credentials = {
+    access_token: "access-token-private",
+    refresh_token: "refresh-token-private",
+    login_username: "user@example.com",
+    login_password: "password-private",
+  };
+  globalThis.window = {
+    clearTimeout,
+    dispatchEvent: () => true,
+    setTimeout,
+  } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({
+      path: String(input),
+      method: String(init?.method || "GET"),
+      cache: init?.cache,
+    });
+    return new Response(JSON.stringify(credentials), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as typeof fetch;
+  try {
+    assert.deepEqual(await api.upstreamCredentials("00000000-0000-4000-8000-000000000007"), credentials);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requests, [{
+    path: "/api/upstreams/00000000-0000-4000-8000-000000000007/credentials",
+    method: "GET",
+    cache: "no-store",
+  }]);
+});
+
+test("upstream credential fields expose independent reveal controls", () => {
+  const source = readFileSync(new URL("../src/features/api-accounts/ApiKeyWorkspace.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../src/features/legacy/legacy.css", import.meta.url), "utf8");
+  for (const field of ["accessToken", "refreshToken", "loginUsername", "loginPassword"]) {
+    assert.match(source, new RegExp(`toggleUpstreamCredential\\(\\"${field}\\"\\)`));
+    assert.match(source, new RegExp(`upstreamCredentialVisibility\\.${field}`));
+  }
+  assert.match(source, /api\.upstreamCredentials\(editingUpstream\.upstream_id\)/);
+  assert.match(source, /requestId !== upstreamCredentialRequestSequence\.current/);
+  assert.match(styles, /\.api-key-secret-toggle\s*\{/);
+});
+
 test("upstream overview reads the persisted snapshot unless an explicit refresh is requested", async () => {
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;

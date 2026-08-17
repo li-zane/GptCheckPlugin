@@ -13,6 +13,8 @@ import {
   ChevronsLeft,
   ChevronsRight,
   ExternalLink,
+  Eye,
+  EyeOff,
   Globe2,
   History,
   KeyRound,
@@ -182,6 +184,16 @@ type UpstreamForm = {
   manualRechargeMultiplier: string;
 };
 
+type UpstreamCredentialField = "accessToken" | "refreshToken" | "loginUsername" | "loginPassword";
+type UpstreamCredentialVisibility = Record<UpstreamCredentialField, boolean>;
+
+const hiddenUpstreamCredentials: UpstreamCredentialVisibility = {
+  accessToken: false,
+  refreshToken: false,
+  loginUsername: false,
+  loginPassword: false,
+};
+
 type AccountForm = {
   upstreamId: string;
   apiKey: string;
@@ -344,6 +356,8 @@ export function ApiKeyAccountsView({
   const visibleUnreadCounts = visibleChangeLogUnreadCounts(changeLogUnreadCounts, subview);
   const [editingUpstream, setEditingUpstream] = useState<Upstream | null>(null);
   const [upstreamForm, setUpstreamForm] = useState<UpstreamForm>(emptyUpstreamForm);
+  const [upstreamCredentialVisibility, setUpstreamCredentialVisibility] = useState<UpstreamCredentialVisibility>(hiddenUpstreamCredentials);
+  const [loadingUpstreamCredential, setLoadingUpstreamCredential] = useState<UpstreamCredentialField | null>(null);
   const [editingAccount, setEditingAccount] = useState<ApiAccount | null>(null);
   const [accountForm, setAccountForm] = useState<AccountForm>(emptyAccountForm);
   const [priorityIntervalDialogOpen, setPriorityIntervalDialogOpen] = useState(false);
@@ -376,6 +390,7 @@ export function ApiKeyAccountsView({
   const backgroundRefreshGeneration = useRef(0);
   const rateLogsRequestSequence = useRef(0);
   const scheduleLogsRequestSequence = useRef(0);
+  const upstreamCredentialRequestSequence = useRef(0);
   const upstreamUsageHistoryRequestSequence = useRef(0);
   const unreadCountsRequestSequence = useRef(0);
   const rateLogsRef = useRef<UpstreamChangeEvent[]>([]);
@@ -1070,6 +1085,9 @@ export function ApiKeyAccountsView({
     setUpstreamMonitorLoading(false);
     setUpstreamMonitorError("");
     setUpstreamForm(emptyUpstreamForm);
+    upstreamCredentialRequestSequence.current += 1;
+    setUpstreamCredentialVisibility(hiddenUpstreamCredentials);
+    setLoadingUpstreamCredential(null);
     setAccountForm(emptyAccountForm);
     setDialogError("");
     setSavingDialog(false);
@@ -1238,6 +1256,9 @@ export function ApiKeyAccountsView({
     setUpstreamMonitorDialog(null);
     setEditingUpstream(upstream);
     setDialogError("");
+    upstreamCredentialRequestSequence.current += 1;
+    setUpstreamCredentialVisibility(hiddenUpstreamCredentials);
+    setLoadingUpstreamCredential(null);
     setUpstreamForm({
       displayName: upstream.display_name || "",
       baseUrl: upstreamBaseUrl(upstream),
@@ -1254,6 +1275,57 @@ export function ApiKeyAccountsView({
       upstreamUserId: upstream.upstream_user_id || "",
       manualRechargeMultiplier: numberInputValue(upstream.upstream_recharge_multiplier_override),
     });
+  };
+
+  const toggleUpstreamCredential = async (field: UpstreamCredentialField) => {
+    if (!editingUpstream) return;
+    if (upstreamCredentialVisibility[field]) {
+      setUpstreamCredentialVisibility((current) => ({ ...current, [field]: false }));
+      return;
+    }
+
+    const hasStoredValue = field === "accessToken"
+      ? Boolean(editingUpstream.access_token_set)
+      : field === "refreshToken"
+        ? Boolean(editingUpstream.refresh_token_set)
+        : Boolean(editingUpstream.login_credentials_set);
+    const hasCurrentValue = field === "loginUsername" || field === "loginPassword"
+      ? Boolean(upstreamForm.loginUsername || upstreamForm.loginPassword)
+      : Boolean(upstreamForm[field]);
+    if (!hasStoredValue || hasCurrentValue) {
+      setUpstreamCredentialVisibility((current) => ({ ...current, [field]: true }));
+      return;
+    }
+
+    const requestId = ++upstreamCredentialRequestSequence.current;
+    setLoadingUpstreamCredential(field);
+    setDialogError("");
+    try {
+      const credentials = await api.upstreamCredentials(editingUpstream.upstream_id);
+      if (requestId !== upstreamCredentialRequestSequence.current) return;
+      setUpstreamForm((current) => {
+        if (field === "accessToken") {
+          return { ...current, accessToken: current.accessToken || credentials.access_token || "" };
+        }
+        if (field === "refreshToken") {
+          return { ...current, refreshToken: current.refreshToken || credentials.refresh_token || "" };
+        }
+        return {
+          ...current,
+          loginUsername: current.loginUsername || credentials.login_username || "",
+          loginPassword: current.loginPassword || credentials.login_password || "",
+        };
+      });
+      setUpstreamCredentialVisibility((current) => ({ ...current, [field]: true }));
+    } catch (reason) {
+      if (requestId === upstreamCredentialRequestSequence.current) {
+        setDialogError(errorMessage(reason, "已保存凭据读取失败"));
+      }
+    } finally {
+      if (requestId === upstreamCredentialRequestSequence.current) {
+        setLoadingUpstreamCredential(null);
+      }
+    }
   };
 
   const openAccountConfig = (account: ApiAccount, fallbackUpstream?: Upstream) => {
@@ -2734,18 +2806,35 @@ export function ApiKeyAccountsView({
 
               <label className="api-key-field">
                 <span>{editingUpstreamType === "newapi" ? "访问令牌" : "Access Token"}</span>
-                <input
-                  autoComplete="new-password"
-                  disabled={upstreamForm.clearAccessToken}
-                  onChange={(event) => setUpstreamForm((current) => ({ ...current, accessToken: event.target.value }))}
-                  placeholder={editingUpstream.access_token_set
-                    ? "已保存；留空保持"
-                    : editingUpstreamType === "newapi"
-                      ? "粘贴上游访问令牌"
-                      : "粘贴上游 Access Token"}
-                  type="password"
-                  value={upstreamForm.accessToken}
-                />
+                <div className="api-key-secret-input">
+                  <input
+                    autoComplete="new-password"
+                    disabled={upstreamForm.clearAccessToken}
+                    onChange={(event) => setUpstreamForm((current) => ({ ...current, accessToken: event.target.value }))}
+                    placeholder={editingUpstream.access_token_set
+                      ? "已保存；留空保持"
+                      : editingUpstreamType === "newapi"
+                        ? "粘贴上游访问令牌"
+                        : "粘贴上游 Access Token"}
+                    type={upstreamCredentialVisibility.accessToken ? "text" : "password"}
+                    value={upstreamForm.accessToken}
+                  />
+                  <button
+                    aria-label={upstreamCredentialVisibility.accessToken ? "隐藏 Access Token" : "查看 Access Token"}
+                    aria-pressed={upstreamCredentialVisibility.accessToken}
+                    className="api-key-secret-toggle"
+                    disabled={upstreamForm.clearAccessToken || loadingUpstreamCredential !== null}
+                    onClick={() => void toggleUpstreamCredential("accessToken")}
+                    title={upstreamCredentialVisibility.accessToken ? "隐藏 Access Token" : "查看 Access Token"}
+                    type="button"
+                  >
+                    {loadingUpstreamCredential === "accessToken"
+                      ? <RefreshCcw className="spin" size={16} />
+                      : upstreamCredentialVisibility.accessToken
+                        ? <EyeOff size={16} />
+                        : <Eye size={16} />}
+                  </button>
+                </div>
                 <label className="api-key-clear-token">
                   <input
                     checked={upstreamForm.clearAccessToken}
@@ -2766,16 +2855,33 @@ export function ApiKeyAccountsView({
               {showUpstreamRefreshToken ? (
                 <label className="api-key-field">
                   <span>Refresh Token（自动续期）</span>
-                  <input
-                    autoComplete="new-password"
-                    disabled={upstreamForm.clearRefreshToken}
-                    onChange={(event) =>
-                      setUpstreamForm((current) => ({ ...current, refreshToken: event.target.value }))
-                    }
-                    placeholder={editingUpstream.refresh_token_set ? "已保存；留空保持" : "粘贴上游 Refresh Token"}
-                    type="password"
-                    value={upstreamForm.refreshToken}
-                  />
+                  <div className="api-key-secret-input">
+                    <input
+                      autoComplete="new-password"
+                      disabled={upstreamForm.clearRefreshToken}
+                      onChange={(event) =>
+                        setUpstreamForm((current) => ({ ...current, refreshToken: event.target.value }))
+                      }
+                      placeholder={editingUpstream.refresh_token_set ? "已保存；留空保持" : "粘贴上游 Refresh Token"}
+                      type={upstreamCredentialVisibility.refreshToken ? "text" : "password"}
+                      value={upstreamForm.refreshToken}
+                    />
+                    <button
+                      aria-label={upstreamCredentialVisibility.refreshToken ? "隐藏 Refresh Token" : "查看 Refresh Token"}
+                      aria-pressed={upstreamCredentialVisibility.refreshToken}
+                      className="api-key-secret-toggle"
+                      disabled={upstreamForm.clearRefreshToken || loadingUpstreamCredential !== null}
+                      onClick={() => void toggleUpstreamCredential("refreshToken")}
+                      title={upstreamCredentialVisibility.refreshToken ? "隐藏 Refresh Token" : "查看 Refresh Token"}
+                      type="button"
+                    >
+                      {loadingUpstreamCredential === "refreshToken"
+                        ? <RefreshCcw className="spin" size={16} />
+                        : upstreamCredentialVisibility.refreshToken
+                          ? <EyeOff size={16} />
+                          : <Eye size={16} />}
+                    </button>
+                  </div>
                   <label className="api-key-clear-token">
                     <input
                       checked={upstreamForm.clearRefreshToken}
@@ -2801,25 +2907,59 @@ export function ApiKeyAccountsView({
                   <div className="api-key-config-fields api-key-config-fields--nested">
                     <label className="api-key-field">
                       <span>登录账号</span>
-                      <input
-                        autoComplete="username"
-                        disabled={upstreamForm.clearLoginCredentials}
-                        onChange={(event) => setUpstreamForm((current) => ({ ...current, loginUsername: event.target.value }))}
-                        placeholder={editingUpstream.login_credentials_set ? "已保存；留空保持" : "邮箱或登录账号"}
-                        type="text"
-                        value={upstreamForm.loginUsername}
-                      />
+                      <div className="api-key-secret-input">
+                        <input
+                          autoComplete="username"
+                          disabled={upstreamForm.clearLoginCredentials}
+                          onChange={(event) => setUpstreamForm((current) => ({ ...current, loginUsername: event.target.value }))}
+                          placeholder={editingUpstream.login_credentials_set ? "已保存；留空保持" : "邮箱或登录账号"}
+                          type={upstreamCredentialVisibility.loginUsername ? "text" : "password"}
+                          value={upstreamForm.loginUsername}
+                        />
+                        <button
+                          aria-label={upstreamCredentialVisibility.loginUsername ? "隐藏登录账号" : "查看登录账号"}
+                          aria-pressed={upstreamCredentialVisibility.loginUsername}
+                          className="api-key-secret-toggle"
+                          disabled={upstreamForm.clearLoginCredentials || loadingUpstreamCredential !== null}
+                          onClick={() => void toggleUpstreamCredential("loginUsername")}
+                          title={upstreamCredentialVisibility.loginUsername ? "隐藏登录账号" : "查看登录账号"}
+                          type="button"
+                        >
+                          {loadingUpstreamCredential === "loginUsername"
+                            ? <RefreshCcw className="spin" size={16} />
+                            : upstreamCredentialVisibility.loginUsername
+                              ? <EyeOff size={16} />
+                              : <Eye size={16} />}
+                        </button>
+                      </div>
                     </label>
                     <label className="api-key-field">
                       <span>登录密码</span>
-                      <input
-                        autoComplete="new-password"
-                        disabled={upstreamForm.clearLoginCredentials}
-                        onChange={(event) => setUpstreamForm((current) => ({ ...current, loginPassword: event.target.value }))}
-                        placeholder={editingUpstream.login_credentials_set ? "已保存；留空保持" : "登录密码"}
-                        type="password"
-                        value={upstreamForm.loginPassword}
-                      />
+                      <div className="api-key-secret-input">
+                        <input
+                          autoComplete="new-password"
+                          disabled={upstreamForm.clearLoginCredentials}
+                          onChange={(event) => setUpstreamForm((current) => ({ ...current, loginPassword: event.target.value }))}
+                          placeholder={editingUpstream.login_credentials_set ? "已保存；留空保持" : "登录密码"}
+                          type={upstreamCredentialVisibility.loginPassword ? "text" : "password"}
+                          value={upstreamForm.loginPassword}
+                        />
+                        <button
+                          aria-label={upstreamCredentialVisibility.loginPassword ? "隐藏登录密码" : "查看登录密码"}
+                          aria-pressed={upstreamCredentialVisibility.loginPassword}
+                          className="api-key-secret-toggle"
+                          disabled={upstreamForm.clearLoginCredentials || loadingUpstreamCredential !== null}
+                          onClick={() => void toggleUpstreamCredential("loginPassword")}
+                          title={upstreamCredentialVisibility.loginPassword ? "隐藏登录密码" : "查看登录密码"}
+                          type="button"
+                        >
+                          {loadingUpstreamCredential === "loginPassword"
+                            ? <RefreshCcw className="spin" size={16} />
+                            : upstreamCredentialVisibility.loginPassword
+                              ? <EyeOff size={16} />
+                              : <Eye size={16} />}
+                        </button>
+                      </div>
                     </label>
                   </div>
                   <label className="api-key-clear-token">
@@ -5834,7 +5974,6 @@ function TokenGuide({ upstreamType }: { upstreamType: UpstreamType }) {
       {upstreamType !== "newapi" ? (
         <p><b>Sub2API：</b>同时填写登录响应中的 Access Token（AT）和 Refresh Token（RT）。AT 返回 401 时，系统会调用 <code>/api/v1/auth/refresh</code>，保存轮换后的 AT/RT 并重试一次。不要使用模型 API Key。</p>
       ) : null}
-      <p>编辑时令牌留空会保留已保存值；页面和接口只显示是否已配置，绝不会回显令牌。</p>
     </div>
   );
 }

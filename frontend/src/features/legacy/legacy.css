@@ -5873,6 +5873,42 @@ fieldset.api-key-field {
   width: 100%;
 }
 
+.api-key-secret-input {
+  min-width: 0;
+  position: relative;
+}
+
+.api-key-secret-input input {
+  padding-right: 42px;
+}
+
+.api-key-secret-toggle {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  padding: 0;
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 32px;
+}
+
+.api-key-secret-toggle:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+.api-key-secret-toggle:focus-visible {
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--primary);
+  outline: none;
+}
+
 .automation-setting-duration select {
   padding-inline: 7px 24px;
 }

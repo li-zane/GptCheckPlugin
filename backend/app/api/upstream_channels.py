@@ -4,10 +4,11 @@ from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import decrypt_text
 from app.core.database import get_db
 from app.core.security import require_admin
 from app.models import Upstream
@@ -15,6 +16,7 @@ from app.schemas import (
     MessageResponse,
     UpstreamDiscoverAllRequest,
     UpstreamDiscoverAllOut,
+    UpstreamCredentialsOut,
     UpstreamMonitorsOut,
     UpstreamOut,
     UpstreamUpdate,
@@ -99,6 +101,25 @@ async def upstream_channel_overview(
         return await service.overview(db, sync_inventory=False)
     except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
+
+
+@router.get("/{upstream_id}/credentials", response_model=UpstreamCredentialsOut)
+async def upstream_channel_credentials(
+    upstream_id: UpstreamId,
+    response: Response,
+    _: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UpstreamCredentialsOut:
+    upstream = await _load_upstream(db, upstream_id)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return UpstreamCredentialsOut(
+        access_token=decrypt_text(upstream.encrypted_access_token),
+        refresh_token=decrypt_text(upstream.encrypted_refresh_token),
+        login_username=decrypt_text(upstream.encrypted_login_username),
+        login_password=decrypt_text(upstream.encrypted_login_password),
+    )
 
 
 @router.get("/{upstream_id}/usage-history", response_model=UpstreamUsageHistoryOut)

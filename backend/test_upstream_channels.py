@@ -2179,7 +2179,7 @@ class UpstreamServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.sub2api.accounts[0]["schedulable"])
         self.assertEqual(self.sub2api.schedulable_calls, [(7, True)])
 
-    async def test_channel_routes_never_echo_access_token_or_ciphertext(self) -> None:
+    async def test_channel_routes_only_reveal_credentials_from_explicit_no_store_endpoint(self) -> None:
         upstream_id = (await self.service.overview(self.db)).upstreams[0].upstream_id
         app = FastAPI()
         app.include_router(router, prefix="/api/upstreams")
@@ -2193,22 +2193,51 @@ class UpstreamServiceTests(unittest.IsolatedAsyncioTestCase):
         app.dependency_overrides[get_upstream_service] = lambda: self.service
         secret = "fictional-route-access-token-private"
         refresh_secret = "fictional-route-refresh-token-private"
+        login_username = "fictional-route-user@example.com"
+        login_password = "fictional-route-password-private"
         with TestClient(app) as client:
             updated_response = client.put(
                 f"/api/upstreams/{upstream_id}",
-                json={"access_token": secret, "refresh_token": refresh_secret},
+                json={
+                    "access_token": secret,
+                    "refresh_token": refresh_secret,
+                    "login_username": login_username,
+                    "login_password": login_password,
+                },
             )
             overview_response = client.get("/api/upstreams")
+            credentials_response = client.get(
+                f"/api/upstreams/{upstream_id}/credentials"
+            )
 
         self.assertEqual(updated_response.status_code, 200, updated_response.text)
         self.assertEqual(overview_response.status_code, 200, overview_response.text)
+        self.assertEqual(
+            credentials_response.status_code, 200, credentials_response.text
+        )
+        self.assertEqual(
+            credentials_response.json(),
+            {
+                "access_token": secret,
+                "refresh_token": refresh_secret,
+                "login_username": login_username,
+                "login_password": login_password,
+            },
+        )
+        self.assertEqual(credentials_response.headers["cache-control"], "no-store")
+        self.assertEqual(credentials_response.headers["pragma"], "no-cache")
+        self.assertEqual(credentials_response.headers["expires"], "0")
         async with self.session_factory() as session:
             stored = await session.get(Upstream, upstream_id)
             self.assertIsNotNone(stored)
             ciphertext = stored.encrypted_access_token or ""
             refresh_ciphertext = stored.encrypted_refresh_token or ""
+            username_ciphertext = stored.encrypted_login_username or ""
+            password_ciphertext = stored.encrypted_login_password or ""
         self.assertTrue(ciphertext)
         self.assertTrue(refresh_ciphertext)
+        self.assertTrue(username_ciphertext)
+        self.assertTrue(password_ciphertext)
 
         for payload in (updated_response.json(), overview_response.json()):
             serialized = str(payload)
@@ -2216,10 +2245,18 @@ class UpstreamServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(ciphertext, serialized)
             self.assertNotIn(refresh_secret, serialized)
             self.assertNotIn(refresh_ciphertext, serialized)
+            self.assertNotIn(login_username, serialized)
+            self.assertNotIn(username_ciphertext, serialized)
+            self.assertNotIn(login_password, serialized)
+            self.assertNotIn(password_ciphertext, serialized)
             self.assertNotIn("access_token", nested_keys(payload))
             self.assertNotIn("encrypted_access_token", nested_keys(payload))
             self.assertNotIn("refresh_token", nested_keys(payload))
             self.assertNotIn("encrypted_refresh_token", nested_keys(payload))
+            self.assertNotIn("login_username", nested_keys(payload))
+            self.assertNotIn("encrypted_login_username", nested_keys(payload))
+            self.assertNotIn("login_password", nested_keys(payload))
+            self.assertNotIn("encrypted_login_password", nested_keys(payload))
 
     async def test_channel_discovery_sets_one_balance_and_derives_each_account_rate(self) -> None:
         overview = await self.service.overview(self.db)
@@ -8207,6 +8244,7 @@ class UpstreamAuthenticationTests(unittest.TestCase):
             ("GET", "/api/upstreams", None),
             ("POST", "/api/upstreams/sync-inventory", None),
             ("POST", "/api/upstreams/discover-all", None),
+            ("GET", f"/api/upstreams/{self.upstream_id}/credentials", None),
             ("PUT", f"/api/upstreams/{self.upstream_id}", {"display_name": "test"}),
             ("POST", f"/api/upstreams/{self.upstream_id}/discover", None),
             (
