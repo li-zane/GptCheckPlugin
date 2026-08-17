@@ -3009,6 +3009,29 @@ class UpstreamService:
                 return model, None
         return "", "None of the fallback test models are in this API Key account's available model whitelist."
 
+    @staticmethod
+    async def _api_account_availability_guard_enabled(runtime_config: Any) -> bool:
+        """Read the canonical guard setting while accepting pre-rename runtimes."""
+
+        getter = getattr(
+            runtime_config,
+            "get_api_account_auto_pause_on_upstream_monitor_unavailable_enabled",
+            None,
+        )
+        if not callable(getter):
+            # Older test doubles and sidecar workers used the pre-domain-v2
+            # name. Keep them readable while the persisted setting migrates.
+            getter = getattr(
+                runtime_config,
+                "get_api_key_auto_pause_on_upstream_monitor_unavailable_enabled",
+                None,
+            )
+        if not callable(getter):
+            raise AttributeError(
+                "Runtime config does not expose the API account availability guard setting."
+            )
+        return bool(await getter())
+
     async def _prepare_account_monitor_guard(
         self,
         config: ApiAccount,
@@ -3027,9 +3050,7 @@ class UpstreamService:
         config.availability_unavailable_count = 0
         config.availability_recovery_count = 0
         try:
-            enabled = bool(
-                await runtime_config.get_api_key_auto_pause_on_upstream_monitor_unavailable_enabled()
-            )
+            enabled = await self._api_account_availability_guard_enabled(runtime_config)
             attempts = max(
                 1,
                 min(

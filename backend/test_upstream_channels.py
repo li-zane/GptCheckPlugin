@@ -6345,6 +6345,39 @@ class UpstreamServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("concrete", config.availability_message.lower())
         self.assertEqual(self.sub2api.connection_test_calls, [])
 
+    async def test_account_availability_guard_reads_canonical_runtime_setting_name(self) -> None:
+        config = ApiAccount(
+            management_account_id=7,
+            availability_check_mode="disabled",
+            availability_status="unavailable",
+            availability_unavailable_count=1,
+        )
+        channel = Upstream(
+            display_name="Canonical setting",
+            api_endpoint_url="https://canonical-setting.example",
+        )
+        runtime_config = SimpleNamespace(
+            get_api_account_auto_pause_on_upstream_monitor_unavailable_enabled=AsyncMock(
+                return_value=True
+            ),
+            get_upstream_monitor_fallback_test_models=AsyncMock(return_value=[]),
+            get_upstream_monitor_fallback_test_attempts=AsyncMock(return_value=1),
+            get_upstream_monitor_recovery_test_attempts=AsyncMock(return_value=1),
+            get_upstream_monitor_test_attempt_interval_seconds=AsyncMock(return_value=0),
+            get_api_key_availability_all_tests_must_succeed=AsyncMock(return_value=False),
+        )
+
+        action, evidence = await self.service._prepare_account_monitor_guard(
+            config,
+            channel,
+            runtime_config,
+            automation_paused=False,
+        )
+
+        self.assertEqual(action, "clear")
+        self.assertEqual(evidence, {"mode": "disabled", "status": "disabled"})
+        runtime_config.get_api_account_auto_pause_on_upstream_monitor_unavailable_enabled.assert_awaited_once_with()
+
     async def test_account_without_selected_monitor_can_use_ordered_fallback_chain(self) -> None:
         self.runtime_config.get_api_key_auto_pause_on_upstream_monitor_unavailable_enabled.return_value = True
         self.runtime_config.get_upstream_monitor_fallback_without_monitor_enabled.return_value = True

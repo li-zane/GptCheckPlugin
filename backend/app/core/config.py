@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.sub2api_urls import normalize_management_site_base_url
@@ -26,12 +26,23 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/sub2api_at_guardian.db"
     mail_manager_route_config_path: str = ""
 
-    management_site_base_url: str = "http://localhost:8080/api/v1"
-    management_site_x_api_key: str = ""
+    management_site_base_url: str = Field(
+        default="http://localhost:8080/api/v1",
+        validation_alias=AliasChoices("MANAGEMENT_SITE_BASE_URL", "SUB2API_BASE_URL"),
+    )
+    management_site_x_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("MANAGEMENT_SITE_X_API_KEY", "SUB2API_AUTH_TOKEN"),
+    )
     sub2api_accounts_path: str = "/admin/accounts"
     sub2api_access_token_path: str = "credentials.access_token"
     sub2api_auto_clear_error: bool = True
-    management_site_auto_recover_state: bool = True
+    management_site_auto_recover_state: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "MANAGEMENT_SITE_AUTO_RECOVER_STATE", "SUB2API_AUTO_RECOVER_STATE"
+        ),
+    )
     management_site_scan_ports: list[int] = Field(
         default_factory=lambda: [
             8080,
@@ -47,9 +58,15 @@ class Settings(BaseSettings):
             9001,
             18080,
             18081,
-        ]
+        ],
+        validation_alias=AliasChoices("MANAGEMENT_SITE_SCAN_PORTS", "SUB2API_SCAN_PORTS"),
     )
-    management_site_scan_timeout_seconds: float = 0.8
+    management_site_scan_timeout_seconds: float = Field(
+        default=0.8,
+        validation_alias=AliasChoices(
+            "MANAGEMENT_SITE_SCAN_TIMEOUT_SECONDS", "SUB2API_SCAN_TIMEOUT_SECONDS"
+        ),
+    )
 
     monitor_enabled: bool = True
     automation_paused: bool = False
@@ -72,25 +89,96 @@ class Settings(BaseSettings):
     manual_upstream_sync_rate_enabled: bool = True
     manual_upstream_sync_priority_enabled: bool = True
     manual_upstream_sync_upstream_health_enabled: bool = True
-    manual_upstream_monitor_sync_enabled: bool = True
+    manual_upstream_monitor_sync_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "MANUAL_UPSTREAM_MONITOR_SYNC_ENABLED",
+            "MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED",
+        ),
+    )
     manual_upstream_sync_account_availability_enabled: bool = False
     manual_upstream_sync_balance_guard_enabled: bool = True
     manual_upstream_sync_rate_pause_enabled: bool = True
     api_key_auto_disable_on_upstream_unavailable: bool = False
-    api_account_auto_pause_on_upstream_monitor_unavailable_enabled: bool = False
+    api_account_auto_pause_on_upstream_monitor_unavailable_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "API_ACCOUNT_AUTO_PAUSE_ON_UPSTREAM_MONITOR_UNAVAILABLE_ENABLED",
+            "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED",
+        ),
+    )
     api_key_availability_all_tests_must_succeed: bool = False
-    upstream_monitor_auto_probe_enabled: bool = True
+    upstream_monitor_auto_probe_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_AUTO_PROBE_ENABLED", "CHANNEL_MONITOR_AUTO_PROBE_ENABLED"
+        ),
+    )
     account_model_whitelist_sync_enabled: bool = False
     account_model_whitelist_sync_interval_seconds: int = 3600
     account_model_whitelist_sync_each_time: bool = False
-    upstream_monitor_unavailable_consecutive_threshold: int = Field(default=2, ge=1, le=100)
-    upstream_monitor_recovery_consecutive_threshold: int = Field(default=2, ge=1, le=100)
-    upstream_monitor_fallback_without_monitor_enabled: bool = False
-    upstream_monitor_fallback_test_models: list[str] = Field(default_factory=list)
-    upstream_monitor_fallback_test_model: str = ""
-    upstream_monitor_fallback_test_attempts: int = Field(default=1, ge=1, le=5)
-    upstream_monitor_recovery_test_attempts: int = Field(default=1, ge=1, le=5)
-    upstream_monitor_test_attempt_interval_seconds: int = Field(default=0, ge=0, le=300)
+    upstream_monitor_unavailable_consecutive_threshold: int = Field(
+        default=2,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD",
+            "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD",
+        ),
+    )
+    upstream_monitor_recovery_consecutive_threshold: int = Field(
+        default=2,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD",
+            "CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD",
+        ),
+    )
+    upstream_monitor_fallback_without_monitor_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED",
+            "CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED",
+        ),
+    )
+    upstream_monitor_fallback_test_models: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_FALLBACK_TEST_MODELS", "CHANNEL_MONITOR_FALLBACK_TEST_MODELS"
+        ),
+    )
+    upstream_monitor_fallback_test_model: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_FALLBACK_TEST_MODEL", "CHANNEL_MONITOR_FALLBACK_TEST_MODEL"
+        ),
+    )
+    upstream_monitor_fallback_test_attempts: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_FALLBACK_TEST_ATTEMPTS", "CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS"
+        ),
+    )
+    upstream_monitor_recovery_test_attempts: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_RECOVERY_TEST_ATTEMPTS", "CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS"
+        ),
+    )
+    upstream_monitor_test_attempt_interval_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=300,
+        validation_alias=AliasChoices(
+            "UPSTREAM_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS",
+            "CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS",
+        ),
+    )
     api_key_auto_pause_on_negative_balance_enabled: bool = False
     upstream_negative_balance_basis: Literal["wallet", "recharge_adjusted"] = "wallet"
     upstream_balance_pause_threshold: float = Field(
@@ -101,7 +189,13 @@ class Settings(BaseSettings):
     )
     show_stale_negative_balance_alert: bool = True
     priority_assign_disabled_api_key_accounts: bool = False
-    priority_share_same_upstream_actual_multiplier: bool = False
+    priority_share_same_upstream_actual_multiplier: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "PRIORITY_SHARE_SAME_UPSTREAM_ACTUAL_MULTIPLIER",
+            "PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER",
+        ),
+    )
     upstream_rate_log_retention_days: int = Field(default=90, ge=1, le=3650)
     upstream_usage_data_retention_days: int = Field(default=90, ge=1, le=3650)
     change_log_page_size: int = Field(default=50, ge=1, le=200)
@@ -172,6 +266,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     @field_validator("management_site_base_url")

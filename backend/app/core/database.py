@@ -2610,7 +2610,7 @@ async def _migrate_upstream_domain_v2(conn: AsyncConnection) -> None:
 
 
 async def _migrate_management_site_setting_keys(conn: AsyncConnection) -> None:
-    """Move persisted v1 setting names to the one-time management-site contract."""
+    """Move persisted legacy setting names to the current runtime contract."""
 
     key_map = {
         "sub2api_base_url": "management_site_base_url",
@@ -2620,6 +2620,33 @@ async def _migrate_management_site_setting_keys(conn: AsyncConnection) -> None:
         "sub2api_last_scan_at": "management_site_last_scan_at",
         "sub2api_last_scan_status": "management_site_last_scan_status",
         "sub2api_last_scan_message": "management_site_last_scan_message",
+        # The availability/monitoring domain was renamed from channel-scoped
+        # to upstream/account-scoped. Preserve values written by deployments
+        # before that rename instead of silently falling back to defaults.
+        "api_key_auto_pause_on_channel_monitor_unavailable_enabled": (
+            "api_account_auto_pause_on_upstream_monitor_unavailable_enabled"
+        ),
+        "channel_monitor_auto_probe_enabled": "upstream_monitor_auto_probe_enabled",
+        "channel_monitor_unavailable_consecutive_threshold": (
+            "upstream_monitor_unavailable_consecutive_threshold"
+        ),
+        "channel_monitor_recovery_consecutive_threshold": (
+            "upstream_monitor_recovery_consecutive_threshold"
+        ),
+        "channel_monitor_fallback_without_monitor_enabled": (
+            "upstream_monitor_fallback_without_monitor_enabled"
+        ),
+        "channel_monitor_fallback_test_models": "upstream_monitor_fallback_test_models",
+        "channel_monitor_fallback_test_model": "upstream_monitor_fallback_test_model",
+        "channel_monitor_fallback_test_attempts": "upstream_monitor_fallback_test_attempts",
+        "channel_monitor_recovery_test_attempts": "upstream_monitor_recovery_test_attempts",
+        "channel_monitor_test_attempt_interval_seconds": (
+            "upstream_monitor_test_attempt_interval_seconds"
+        ),
+        "manual_upstream_sync_channel_monitors_enabled": "manual_upstream_monitor_sync_enabled",
+        "priority_share_same_composite_multiplier": (
+            "priority_share_same_upstream_actual_multiplier"
+        ),
     }
     for old_key, new_key in key_map.items():
         await conn.execute(

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -31,6 +32,24 @@ class ProductionSecurityConfigTests(unittest.TestCase):
         settings = Settings(_env_file=None)
         self.assertEqual(settings.app_env, "development")
         self.assertFalse(settings.cookie_secure)
+
+    def test_legacy_environment_names_keep_management_and_availability_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(
+                "SUB2API_BASE_URL=http://127.0.0.1:18080/api/v1\n"
+                "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED=true\n"
+                "CHANNEL_MONITOR_FALLBACK_TEST_MODEL=legacy-model\n"
+                "MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED=false\n",
+                encoding="utf-8",
+            )
+
+            settings = Settings(_env_file=env_path)
+
+        self.assertEqual(settings.management_site_base_url, "http://127.0.0.1:18080/api/v1")
+        self.assertTrue(settings.api_account_auto_pause_on_upstream_monitor_unavailable_enabled)
+        self.assertEqual(settings.upstream_monitor_fallback_test_model, "legacy-model")
+        self.assertFalse(settings.manual_upstream_monitor_sync_enabled)
 
     def test_production_rejects_default_and_example_secrets(self) -> None:
         placeholders = {

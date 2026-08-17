@@ -343,6 +343,11 @@ class RuntimeConfigService:
             ),
         )
 
+    async def get_api_key_auto_pause_on_upstream_monitor_unavailable_enabled(self) -> bool:
+        """Compatibility alias for workers using the pre-account setting name."""
+
+        return await self.get_api_account_auto_pause_on_upstream_monitor_unavailable_enabled()
+
     async def get_api_key_availability_all_tests_must_succeed(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(

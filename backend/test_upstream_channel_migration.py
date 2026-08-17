@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.database import (
     Base,
+    _migrate_management_site_setting_keys,
     _migrate_upstream_domain_v2,
     _prepare_upstream_domain_v2,
 )
@@ -97,6 +98,44 @@ class UpstreamSchemaUpgradeTests(unittest.IsolatedAsyncioTestCase):
             db.add(UpstreamApiKey(upstream_id=first.id, remote_key_id=7))
             with self.assertRaises(IntegrityError):
                 await db.commit()
+
+    async def test_legacy_availability_setting_names_are_migrated_without_overwriting_new_values(self) -> None:
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "CREATE TABLE app_settings ("
+                    "key VARCHAR(128) PRIMARY KEY, value TEXT, updated_at DATETIME)"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO app_settings (key, value) VALUES "
+                    "('api_key_auto_pause_on_channel_monitor_unavailable_enabled', 'true'), "
+                    "('channel_monitor_fallback_test_models', :models), "
+                    "('api_account_auto_pause_on_upstream_monitor_unavailable_enabled', 'false')"
+                ),
+                {"models": '["model-a"]'},
+            )
+
+            await _migrate_management_site_setting_keys(connection)
+            rows = {
+                row[0]: row[1]
+                for row in (
+                    await connection.execute(
+                        text("SELECT key, value FROM app_settings")
+                    )
+                ).all()
+            }
+
+        self.assertEqual(
+            rows["api_account_auto_pause_on_upstream_monitor_unavailable_enabled"],
+            "false",
+        )
+        self.assertEqual(rows["upstream_monitor_fallback_test_models"], '["model-a"]')
+        self.assertNotIn(
+            "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+            rows,
+        )
 
 
 if __name__ == "__main__":
