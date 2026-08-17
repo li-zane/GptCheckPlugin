@@ -21,6 +21,7 @@ playwright/.cache/
 node_modules/
 dist/
 frontend/dist/
+frontend/dist-ladle/
 frontend/.vite/
 npm-debug.log*
 yarn-debug.log*
