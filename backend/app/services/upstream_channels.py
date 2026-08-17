@@ -4691,10 +4691,13 @@ class UpstreamService:
                     or channel.resolved_platform_type == "sub2api"
                 )
             )
+            # Some Xingchen endpoints are public, so a no-token probe can look
+            # healthy even though the channel still needs a fresh AT.
             login_needed = bool(
                 login_supported
                 and (
-                    result is None
+                    not access_token
+                    or result is None
                     or str(_value(result, "status") or "error").strip().lower() != "ok"
                     or bool(_value(result, "sub2api_auth_rejected"))
                 )

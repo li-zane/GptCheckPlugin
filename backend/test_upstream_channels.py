@@ -1716,6 +1716,46 @@ class UpstreamServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(configs)
         self.assertTrue(all(decrypt_text(config.encrypted_access_token) == new_access_token for config in configs))
 
+    async def test_batch_discovery_logs_in_when_missing_access_token_even_if_public_probe_succeeds(self) -> None:
+        upstream_id = await self._configure_sub2api_credentials(access_token="", refresh_token="")
+        await self.service.update_channel(
+            self.db,
+            upstream_id,
+            UpstreamUpdate(
+                login_username="xingchen@example.com",
+                login_password="login-password-private",
+            ),
+        )
+        new_access_token = "at-login-public-probe-private"
+        discovery = AsyncMock(return_value=self._discovery_result(status="ok", auth_rejected=False))
+        with (
+            patch("app.services.upstream_channels.discover_upstream", new=discovery),
+            patch(
+                "app.services.upstream_channels.login_sub2api_tokens",
+                new=AsyncMock(
+                    return_value=Sub2ApiLoginTokenPair(access_token=new_access_token)
+                ),
+            ) as login,
+        ):
+            result = await self.service.discover_all(
+                self.db,
+                max_concurrency=1,
+                require_management_credentials=True,
+            )
+
+        login.assert_awaited_once_with(
+            "https://upstream.example",
+            "xingchen@example.com",
+            "login-password-private",
+        )
+        self.assertEqual(discovery.await_count, 2)
+        self.assertIsNone(discovery.await_args_list[0].kwargs["access_token"])
+        self.assertEqual(discovery.await_args_list[1].kwargs["access_token"], new_access_token)
+        self.assertEqual((result.succeeded, result.failed, result.skipped), (1, 0, 0))
+        stored = await self.db.get(Upstream, upstream_id)
+        await self.db.refresh(stored)
+        self.assertEqual(decrypt_text(stored.encrypted_access_token), new_access_token)
+
     async def test_login_without_refresh_token_clears_failed_refresh_token(self) -> None:
         upstream_id = await self._configure_sub2api_credentials()
         await self.service.update_channel(
