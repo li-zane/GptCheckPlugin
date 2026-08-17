@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { api } from "./api";
+import { api } from "./shared/api";
 import type {
   Account,
   AccountEditConfiguration,
@@ -17,7 +17,7 @@ import type {
   AccountEditPreset,
   AccountEditPresetConfiguration,
   AccountEditor,
-} from "./types";
+} from "./domain";
 
 type Props = {
   accounts: Account[];
@@ -60,7 +60,7 @@ function sortedPresets(presets: AccountEditPreset[]) {
 
 export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: Props) {
   const accountIds = useMemo(
-    () => [...new Set(accounts.map((account) => account.sub2api_account_id || "").filter(Boolean))],
+    () => [...new Set(accounts.map((account) => account.management_account_id || "").filter(Boolean))],
     [accounts],
   );
   const accountId = accountIds[0] || "";
@@ -188,7 +188,7 @@ export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: 
         await onUpdated("");
         throw new Error(`已写入 ${results.length - failed.length}/${results.length} 个账号，${failed.length} 个失败：${failed.map((result) => result.reason instanceof Error ? result.reason.message : "未知错误").join("；")}`);
       }
-      await onUpdated(batchMode ? `已批量更新 ${results.length} 个 OAuth GPT 账号。` : "账号配置已写入 sub2api 并完成回读校验。");
+      await onUpdated(batchMode ? `已批量更新 ${results.length} 个 OAuth GPT 账号。` : "账号配置已写入管理站点并完成回读校验。");
       onClose();
     });
   };
@@ -297,7 +297,7 @@ export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: 
       >
         <header className="mail-dialog-head">
           <div>
-            <p className="eyebrow">{batchMode ? `${accountIds.length} 个 OAuth GPT 账号` : `sub2api #${accountId || "-"}`}</p>
+            <p className="eyebrow">{batchMode ? `${accountIds.length} 个 OAuth GPT 账号` : `管理站点 #${accountId || "-"}`}</p>
             <h2 id="account-editor-title">{batchMode ? "批量编辑账号" : "编辑账号"}</h2>
           </div>
           <div className="account-editor-head-actions">
@@ -455,7 +455,7 @@ export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: 
                       onChange={(event) => setForm({ ...form, codex_image_tool_mode: event.currentTarget.value as NonNullable<AccountEditCurrent["codex_image_tool_mode"]> })}
                       value={form.codex_image_tool_mode || "inherit"}
                     >
-                      <option value="inherit">跟随渠道</option>
+                      <option value="inherit">跟随上游</option>
                       <option value="enabled">启用 Hosted 桥接</option>
                       <option value="disabled">不注入 Hosted 工具</option>
                       <option value="block">移除客户端图片工具</option>
@@ -580,7 +580,7 @@ export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: 
               {!editor.model_candidates_complete ? (
                 <div className="account-editor-invalid" role="alert">
                   <AlertTriangle size={16} />
-                  <span>当前 sub2api 未返回完整模型候选，含白名单的模板将停止应用。</span>
+                  <span>当前管理站点未返回完整模型候选，含白名单的模板将停止应用。</span>
                 </div>
               ) : null}
               <div className="account-editor-model-toolbar">

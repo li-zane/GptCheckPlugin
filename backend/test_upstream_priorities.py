@@ -19,7 +19,7 @@ from app.core.database import (
     get_db,
 )
 from app.core.security import require_admin
-from app.models import UpstreamAccountConfig, UpstreamPriorityInterval
+from app.models import ApiAccount, UpstreamPriorityInterval
 from app.schemas import (
     PriorityIntervalCreate,
     PriorityIntervalAssignment,
@@ -28,12 +28,12 @@ from app.schemas import (
     PriorityTieMoveRequest,
 )
 from app.services.sub2api import Sub2ApiClient
-from app.services.upstream_accounts import UpstreamAccountService, UpstreamAccountServiceError
+from app.services.upstream_accounts import ApiAccountService, ApiAccountServiceError
 from app.services.upstream_priorities import (
     UpstreamPriorityService,
     _tie_multiplier_key,
     allocate_interval_priorities,
-    composite_multiplier,
+    upstream_actual_multiplier,
     get_upstream_priority_service,
 )
 
@@ -89,13 +89,13 @@ def remote_account(account_id: int, *, priority: int = 50) -> dict:
 
 class PriorityAllocatorTests(unittest.TestCase):
     @staticmethod
-    def _config(account_id: int, multiplier: float | None) -> UpstreamAccountConfig:
-        config = UpstreamAccountConfig(
-            sub2api_account_id=account_id,
+    def _config(account_id: int, multiplier: float | None) -> ApiAccount:
+        config = ApiAccount(
+            management_account_id=account_id,
             priority_sync_status="unassigned",
         )
-        config.effective_group_multiplier = multiplier
-        config.effective_recharge_multiplier = 1.0 if multiplier is not None else None
+        config.upstream_group_multiplier = multiplier
+        config.upstream_recharge_multiplier = 1.0 if multiplier is not None else None
         return config
 
     def test_allocator_uses_full_span_and_reports_capacity_collisions(self) -> None:
@@ -122,7 +122,7 @@ class PriorityAllocatorTests(unittest.TestCase):
         self.assertEqual(assignments[2], 41)
         self.assertEqual(assignments[31], 69)
 
-    def test_allocator_uses_composite_multiplier_and_excludes_unknown_values(self) -> None:
+    def test_allocator_uses_upstream_actual_multiplier_and_excludes_unknown_values(self) -> None:
         interval = UpstreamPriorityInterval(
             id=1,
             name="main",
@@ -219,7 +219,7 @@ class PriorityAllocatorTests(unittest.TestCase):
         assignments, effective_step = allocate_interval_priorities(
             interval,
             configs,
-            share_same_composite_multiplier=True,
+            share_same_upstream_actual_multiplier=True,
         )
 
         self.assertEqual(effective_step, 1)
@@ -267,7 +267,7 @@ class PriorityAllocatorTests(unittest.TestCase):
         assignments, effective_step = allocate_interval_priorities(
             interval,
             [expensive, beta, alpha],
-            share_same_composite_multiplier=True,
+            share_same_upstream_actual_multiplier=True,
         )
 
         self.assertEqual(effective_step, 1)
@@ -291,7 +291,7 @@ class PriorityAllocatorTests(unittest.TestCase):
         assignments, effective_step = allocate_interval_priorities(
             interval,
             configs,
-            share_same_composite_multiplier=True,
+            share_same_upstream_actual_multiplier=True,
         )
 
         self.assertEqual(effective_step, 1)
@@ -306,15 +306,15 @@ class PriorityAllocatorTests(unittest.TestCase):
             step=2,
         )
         alpha = self._config(8, 1.23456789012345)
-        alpha.effective_recharge_multiplier = 9.87654321098765
+        alpha.upstream_recharge_multiplier = 9.87654321098765
         alpha.remote_name = "Alpha"
         beta = self._config(7, 1.23456789012345)
-        beta.effective_recharge_multiplier = 9.87654321098765
+        beta.upstream_recharge_multiplier = 9.87654321098765
         beta.remote_name = "Beta"
         alpha.priority_tiebreak_order = 1
-        alpha.priority_tiebreak_multiplier = float(composite_multiplier(alpha))
+        alpha.priority_tiebreak_multiplier = float(upstream_actual_multiplier(alpha))
         beta.priority_tiebreak_order = 0
-        beta.priority_tiebreak_multiplier = float(composite_multiplier(beta))
+        beta.priority_tiebreak_multiplier = float(upstream_actual_multiplier(beta))
 
         assignments, _ = allocate_interval_priorities(interval, [alpha, beta])
 
@@ -326,12 +326,12 @@ class PriorityAllocatorTests(unittest.TestCase):
         self.assertEqual(_tie_multiplier_key(Decimal("5e-14")), Decimal("0E-13"))
 
         large_alpha = self._config(10, 195.3507753057386)
-        large_alpha.effective_recharge_multiplier = 361.49042130810847
+        large_alpha.upstream_recharge_multiplier = 361.49042130810847
         large_alpha.remote_name = "Alpha"
         large_beta = self._config(11, 195.3507753057386)
-        large_beta.effective_recharge_multiplier = 361.49042130810847
+        large_beta.upstream_recharge_multiplier = 361.49042130810847
         large_beta.remote_name = "Beta"
-        stored_large_multiplier = float(composite_multiplier(large_alpha))
+        stored_large_multiplier = float(upstream_actual_multiplier(large_alpha))
         large_alpha.priority_tiebreak_order = 1
         large_alpha.priority_tiebreak_multiplier = stored_large_multiplier
         large_beta.priority_tiebreak_order = 0
@@ -352,7 +352,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
         self.db = self.session_factory()
         self.sub2api = FakePrioritySub2Api()
-        self.accounts = UpstreamAccountService(self.sub2api)
+        self.accounts = ApiAccountService(self.sub2api)
         self.service = UpstreamPriorityService(accounts=self.accounts)
 
     async def asyncTearDown(self) -> None:
@@ -386,15 +386,15 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         recharge: float | None = 1.0,
         priority: int = 50,
         name: str | None = None,
-    ) -> UpstreamAccountConfig:
+    ) -> ApiAccount:
         remote = remote_account(account_id, priority=priority)
         if name is not None:
             remote["name"] = name
         self.sub2api.accounts.append(remote)
         config = self.accounts._new_config(remote, account_id)
         config.priority_interval_id = interval_id
-        config.effective_group_multiplier = group
-        config.effective_recharge_multiplier = recharge
+        config.upstream_group_multiplier = group
+        config.upstream_recharge_multiplier = recharge
         self.db.add(config)
         await self.db.commit()
         return config
@@ -405,7 +405,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         beta = await self._add_config(8, interval.id, group=0.1, name="Beta")
         runtime = SimpleNamespace(
             get_priority_assign_disabled_api_key_accounts=AsyncMock(return_value=False),
-            get_priority_share_same_composite_multiplier=AsyncMock(return_value=False),
+            get_priority_share_same_upstream_actual_multiplier=AsyncMock(return_value=False),
         )
 
         with patch(
@@ -448,7 +448,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         await self._add_config(9, interval.id, group=0.2, name="Gamma")
         runtime = SimpleNamespace(
             get_priority_assign_disabled_api_key_accounts=AsyncMock(return_value=False),
-            get_priority_share_same_composite_multiplier=AsyncMock(return_value=True),
+            get_priority_share_same_upstream_actual_multiplier=AsyncMock(return_value=True),
         )
 
         with patch(
@@ -456,7 +456,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
             return_value=runtime,
         ):
             result = await self.service.rebalance(self.db)
-            with self.assertRaises(UpstreamAccountServiceError) as raised:
+            with self.assertRaises(ApiAccountServiceError) as raised:
                 await self.service.move_equal_multiplier_priority(
                     self.db,
                     7,
@@ -496,10 +496,10 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.updated, result.failed), (3, 0))
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
         self.assertEqual(priorities, {7: 69, 8: 40, 9: 55})
-        stored = (await self.db.execute(select(UpstreamAccountConfig))).scalars().all()
+        stored = (await self.db.execute(select(ApiAccount))).scalars().all()
         self.assertTrue(all(item.priority_sync_status == "in_sync" for item in stored))
         listed = await self.accounts.list_accounts(self.db)
-        self.assertEqual([item.sub2api_account_id for item in listed], [8, 9, 7])
+        self.assertEqual([item.management_account_id for item in listed], [8, 9, 7])
 
     async def test_rebalance_reuses_supplied_snapshot_when_priorities_are_unchanged(self) -> None:
         interval = await self._interval()
@@ -600,8 +600,8 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sub2api.accounts[0]["priority"], 40)
         self.assertEqual(self.sub2api.accounts[1]["priority"], 88)
         configs = {
-            item.sub2api_account_id: item
-            for item in (await self.db.execute(select(UpstreamAccountConfig))).scalars().all()
+            item.management_account_id: item
+            for item in (await self.db.execute(select(ApiAccount))).scalars().all()
         }
         self.assertEqual(configs[8].priority_sync_status, "multiplier_unavailable")
         self.assertIsNone(configs[8].desired_priority)
@@ -619,7 +619,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(removed)
         self.assertEqual(self.sub2api.accounts[0]["priority"], 63)
         self.assertEqual(self.sub2api.priority_update_calls, [])
-        config = (await self.db.execute(select(UpstreamAccountConfig))).scalar_one()
+        config = (await self.db.execute(select(ApiAccount))).scalar_one()
         self.assertIsNone(config.priority_interval_id)
         self.assertEqual(config.priority_sync_status, "unassigned")
 
@@ -650,13 +650,13 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.sub2api.accounts.append(remote)
         config = self.accounts._new_config(remote, 7)
         config.remote_identity_fingerprint = None
-        config.effective_group_multiplier = 0.5
-        config.effective_recharge_multiplier = 1.0
+        config.upstream_group_multiplier = 0.5
+        config.upstream_recharge_multiplier = 1.0
         self.db.add(config)
         await self.db.commit()
         fingerprint = self.accounts._remote_identity_fingerprint(remote)
 
-        with self.assertRaises(UpstreamAccountServiceError) as unconfirmed:
+        with self.assertRaises(ApiAccountServiceError) as unconfirmed:
             await self.service.assign_interval(
                 self.db,
                 7,
@@ -687,8 +687,8 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         interval = await self._interval()
         original = remote_account(7, priority=90)
         config = self.accounts._new_config(original, 7)
-        config.effective_group_multiplier = 0.5
-        config.effective_recharge_multiplier = 1.0
+        config.upstream_group_multiplier = 0.5
+        config.upstream_recharge_multiplier = 1.0
         self.db.add(config)
         await self.db.commit()
         replacement = {**original, "name": "replacement-account"}
@@ -711,7 +711,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.identity_binding_status, "bound")
         self.assertEqual(account.priority, 40)
 
-    async def test_local_and_remote_deletion_rebalance_remaining_accounts(self) -> None:
+    async def test_local_and_remote_deletion_rewallet_balance_usd_accounts(self) -> None:
         interval = await self._interval()
         await self._add_config(7, interval.id, group=0.5, priority=90)
         await self._add_config(8, interval.id, group=1.0, priority=91)
@@ -724,12 +724,19 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         priorities = {int(item["id"]): item["priority"] for item in self.sub2api.accounts}
         self.assertEqual(priorities, {7: 40, 8: 40})
 
-        config = self.accounts._new_config(self.sub2api.accounts[0], 7)
-        config.priority_interval_id = interval.id
-        config.effective_group_multiplier = 0.5
-        config.effective_recharge_multiplier = 1.0
-        self.db.add(config)
-        await self.db.commit()
+        tombstone = await self.db.scalar(
+            select(ApiAccount).where(
+                ApiAccount.management_account_id == 7
+            )
+        )
+        self.assertIsNotNone(tombstone)
+        tombstone_id = tombstone.id
+        self.assertIsNotNone(tombstone.deleted_at)
+
+        await self.accounts.list_accounts(self.db)
+        await self.db.refresh(tombstone)
+        self.assertEqual(tombstone.id, tombstone_id)
+        self.assertIsNone(tombstone.deleted_at)
         await self.service.rebalance(self.db)
         first_fingerprint = self.accounts._remote_identity_fingerprint(self.sub2api.accounts[0])
 
@@ -753,8 +760,8 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.considered, result.failed), (1, 0))
         self.assertEqual(self.sub2api.accounts[0]["priority"], 40)
         configs = {
-            item.sub2api_account_id: item
-            for item in (await self.db.execute(select(UpstreamAccountConfig))).scalars().all()
+            item.management_account_id: item
+            for item in (await self.db.execute(select(ApiAccount))).scalars().all()
         }
         self.assertIsNone(configs[7].priority_interval_id)
         self.assertEqual(configs[7].priority_sync_status, "unassigned")
@@ -830,12 +837,12 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as concurrent_db:
             config = (
                 await concurrent_db.execute(
-                    select(UpstreamAccountConfig).where(
-                        UpstreamAccountConfig.sub2api_account_id == 7
+                    select(ApiAccount).where(
+                        ApiAccount.management_account_id == 7
                     )
                 )
             ).scalar_one()
-            config.effective_group_multiplier = 2.0
+            config.upstream_group_multiplier = 2.0
             await concurrent_db.commit()
         account_lock.release()
 
@@ -856,8 +863,8 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as concurrent_db:
             config = (
                 await concurrent_db.execute(
-                    select(UpstreamAccountConfig).where(
-                        UpstreamAccountConfig.sub2api_account_id == 7
+                    select(ApiAccount).where(
+                        ApiAccount.management_account_id == 7
                     )
                 )
             ).scalar_one()
@@ -887,7 +894,7 @@ class UpstreamPriorityServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((result.updated, result.failed), (0, 1))
         self.assertEqual(self.sub2api.priority_update_calls, [])
-        config = (await self.db.execute(select(UpstreamAccountConfig))).scalar_one()
+        config = (await self.db.execute(select(ApiAccount))).scalar_one()
         self.assertEqual(config.priority_sync_status, "apply_failed")
 
     async def test_bulk_write_preflight_is_bounded_and_concurrent(self) -> None:
@@ -929,12 +936,12 @@ class PriorityMigrationTests(unittest.IsolatedAsyncioTestCase):
                 await connection.execute(
                     text(
                         "CREATE TABLE upstream_account_configs ("
-                        "id INTEGER PRIMARY KEY, sub2api_account_id INTEGER NOT NULL UNIQUE)"
+                        "id INTEGER PRIMARY KEY, management_account_id INTEGER NOT NULL UNIQUE)"
                     )
                 )
                 await connection.execute(
                     text(
-                        "INSERT INTO upstream_account_configs (id, sub2api_account_id) "
+                        "INSERT INTO upstream_account_configs (id, management_account_id) "
                         "VALUES (1, 7)"
                     )
                 )
@@ -1041,8 +1048,8 @@ class PriorityMigrationTests(unittest.IsolatedAsyncioTestCase):
                 db.add(interval)
                 await db.flush()
                 db.add(
-                    UpstreamAccountConfig(
-                        sub2api_account_id=7,
+                    ApiAccount(
+                        management_account_id=7,
                         priority_interval_id=interval.id,
                         desired_priority=40,
                         priority_sync_status="in_sync",
@@ -1055,7 +1062,7 @@ class PriorityMigrationTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
                 db.expire_all()
                 config = (
-                    await db.execute(select(UpstreamAccountConfig))
+                    await db.execute(select(ApiAccount))
                 ).scalar_one()
 
                 self.assertEqual(

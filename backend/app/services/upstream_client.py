@@ -43,10 +43,10 @@ SUB2API_API_KEY_USAGE_BATCH_SIZE = 100
 SUB2API_API_KEY_PAGE_SIZE = 200
 SUB2API_API_KEY_PAGE_CONCURRENCY = 5
 MAX_SUB2API_API_KEY_PAGES = 25
-MAX_CHANNEL_MONITORS = 100
-CHANNEL_MONITOR_DETAIL_CONCURRENCY = 10
-MAX_CHANNEL_MONITOR_EXTRA_MODELS = 20
-MAX_CHANNEL_MONITOR_TIMELINE_POINTS = 60
+MAX_UPSTREAM_MONITORS = 100
+UPSTREAM_MONITOR_DETAIL_CONCURRENCY = 10
+MAX_UPSTREAM_MONITOR_EXTRA_MODELS = 20
+MAX_UPSTREAM_MONITOR_TIMELINE_POINTS = 60
 NEWAPI_BALANCE_ENDPOINT = "/api/user/self"
 NEWAPI_TODAY_USAGE_ENDPOINT = "/api/log/self/stat"
 NEWAPI_YESTERDAY_USAGE_RESPONSE_KEY = "newapi:yesterday-usage"
@@ -55,7 +55,8 @@ SUB2API_BALANCE_ENDPOINT = "/api/v1/auth/me"
 SUB2API_TODAY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/stats"
 SUB2API_USAGE_STATS_ENDPOINT = "/api/v1/usage/stats"
 SUB2API_API_KEY_USAGE_ENDPOINT = "/api/v1/usage/dashboard/api-keys-usage"
-SUB2API_CHANNEL_MONITORS_ENDPOINT = "/api/v1/channel-monitors"
+SUB2API_UPSTREAM_MONITORS_ENDPOINT = "/api/v1/channel-monitors"
+SUB2API_LOGIN_ENDPOINT = "/api/v1/auth/login"
 SUB2API_REFRESH_ENDPOINT = "/api/v1/auth/refresh"
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 DNS_OVER_HTTPS_URL = "https://cloudflare-dns.com/dns-query"
@@ -92,7 +93,7 @@ SUB2API_ENDPOINTS: tuple[str, ...] = (
     SUB2API_BALANCE_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
     SUB2API_USAGE_STATS_ENDPOINT,
-    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+    SUB2API_UPSTREAM_MONITORS_ENDPOINT,
 )
 
 NEWAPI_PRIMARY_ENDPOINTS: tuple[str, ...] = (
@@ -113,7 +114,7 @@ SUB2API_PRIMARY_ENDPOINTS: tuple[str, ...] = (
     SUB2API_BALANCE_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
     SUB2API_USAGE_STATS_ENDPOINT,
-    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+    SUB2API_UPSTREAM_MONITORS_ENDPOINT,
 )
 NEWAPI_MANAGEMENT_EVIDENCE_ENDPOINTS = frozenset(
     {
@@ -128,7 +129,7 @@ NEWAPI_MANAGEMENT_EVIDENCE_ENDPOINTS = frozenset(
 SUB2API_MANAGEMENT_EVIDENCE_ENDPOINTS = frozenset(
     endpoint
     for endpoint in SUB2API_ENDPOINTS
-    if endpoint != SUB2API_CHANNEL_MONITORS_ENDPOINT
+    if endpoint != SUB2API_UPSTREAM_MONITORS_ENDPOINT
 )
 
 
@@ -179,7 +180,7 @@ class AccountUpstreamState:
 class DiscoveryResult:
     """Safe, presentation-ready result of upstream multiplier discovery."""
 
-    upstream_type: str
+    platform_type: str
     source: str
     status: str
     groups: list[GroupOption] = field(default_factory=list)
@@ -187,29 +188,29 @@ class DiscoveryResult:
     account_group_matches: dict[int, AccountGroupMatch] = field(default_factory=dict)
     matched_account_state: AccountUpstreamState | None = None
     account_upstream_states: dict[int, AccountUpstreamState] = field(default_factory=dict)
-    discovered_group_multiplier: float | None = None
-    discovered_group_multiplier_source: str | None = None
-    discovered_recharge_multiplier: float | None = None
-    discovered_recharge_multiplier_source: str | None = None
+    discovered_upstream_group_multiplier: float | None = None
+    discovered_upstream_group_multiplier_source: str | None = None
+    discovered_upstream_recharge_multiplier: float | None = None
+    discovered_upstream_recharge_multiplier_source: str | None = None
     recharge_discovery_status: str = "unknown"
-    balance_remaining: float | None = None
-    balance_total: float | None = None
-    balance_used: float | None = None
+    wallet_balance_usd: float | None = None
+    wallet_total_usd: float | None = None
+    wallet_used_usd: float | None = None
     balance_unit: str | None = None
     balance_status: str = "unknown"
     balance_message: str = ""
-    today_balance_used: float | None = None
+    today_upstream_wallet_cost_usd: float | None = None
     today_balance_unit: str | None = None
     today_balance_status: str = "unknown"
     today_balance_error: str | None = None
-    yesterday_balance_used: float | None = None
+    yesterday_upstream_wallet_cost_usd: float | None = None
     yesterday_balance_unit: str | None = None
     yesterday_balance_status: str = "unknown"
     yesterday_balance_error: str | None = None
-    channel_monitors: list[dict[str, Any]] = field(default_factory=list)
-    channel_monitors_total: int = 0
-    channel_monitors_status: str = "unknown"
-    channel_monitors_message: str = ""
+    upstream_monitors: list[dict[str, Any]] = field(default_factory=list)
+    upstream_monitors_total: int = 0
+    upstream_monitors_status: str = "unknown"
+    upstream_monitors_message: str = ""
     sub2api_auth_rejected: bool = False
     message: str = ""
 
@@ -259,6 +260,13 @@ class _AvailableGroupRefs:
 class Sub2ApiTokenPair:
     access_token: str
     refresh_token: str
+    expires_in: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Sub2ApiLoginTokenPair:
+    access_token: str
+    refresh_token: str | None = None
     expires_in: int | None = None
 
 
@@ -349,9 +357,9 @@ class UpstreamClient:
         account_api_keys: Mapping[int | str, str] | None = None,
         account_api_key_record_ids: Mapping[int | str, int | str] | None = None,
         optimized_endpoint_fallbacks: bool = False,
-        include_channel_monitors: bool = True,
-        include_channel_monitor_details: bool = False,
-        channel_monitor_detail_ids: Iterable[int] | None = None,
+        include_upstream_monitors: bool = True,
+        include_upstream_monitor_details: bool = False,
+        upstream_monitor_detail_ids: Iterable[int] | None = None,
         monitor_only: bool = False,
         today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
         include_yesterday_usage: bool = True,
@@ -380,7 +388,7 @@ class UpstreamClient:
             if urlparse(normalized_url).scheme != "https":
                 return safe(
                     DiscoveryResult(
-                        upstream_type=requested_type,
+                        platform_type=requested_type,
                         source="configured",
                         status="insecure_url",
                         message="Upstream discovery requires HTTPS.",
@@ -403,9 +411,9 @@ class UpstreamClient:
         monitor_endpoints = (
             (NEWAPI_UPTIME_STATUS_ENDPOINT,)
             if requested_type == "newapi"
-            else (SUB2API_CHANNEL_MONITORS_ENDPOINT,)
+            else (SUB2API_UPSTREAM_MONITORS_ENDPOINT,)
             if requested_type == "sub2api"
-            else (NEWAPI_UPTIME_STATUS_ENDPOINT, SUB2API_CHANNEL_MONITORS_ENDPOINT)
+            else (NEWAPI_UPTIME_STATUS_ENDPOINT, SUB2API_UPSTREAM_MONITORS_ENDPOINT)
         )
         endpoints = (
             monitor_endpoints
@@ -422,13 +430,13 @@ class UpstreamClient:
                 else SUB2API_ENDPOINTS
             )
         )
-        if not monitor_only and not include_channel_monitors:
+        if not monitor_only and not include_upstream_monitors:
             endpoints = tuple(
                 endpoint
                 for endpoint in endpoints
                 if endpoint not in {
                     NEWAPI_UPTIME_STATUS_ENDPOINT,
-                    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+                    SUB2API_UPSTREAM_MONITORS_ENDPOINT,
                 }
             )
         if not monitor_only and not include_yesterday_usage:
@@ -450,7 +458,7 @@ class UpstreamClient:
         cached_api_key_records_by_account: dict[int, dict[str, Any]] = {}
         sub2api_api_key_usage_by_account: dict[int, float] = {}
         newapi_api_key_usage_by_account: dict[int, float] = {}
-        sub2api_channel_monitor_details: dict[int, _FetchResult] = {}
+        sub2api_upstream_monitor_details: dict[int, _FetchResult] = {}
         try:
             for address in pinned_addresses:
                 pinned_transport = _PinnedAsyncTransport(
@@ -520,13 +528,13 @@ class UpstreamClient:
                             requested_type,
                             primary_responses,
                         )
-                        if not include_channel_monitors:
+                        if not include_upstream_monitors:
                             compatibility_endpoints = tuple(
                                 endpoint
                                 for endpoint in compatibility_endpoints
                                 if endpoint not in {
                                     NEWAPI_UPTIME_STATUS_ENDPOINT,
-                                    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+                                    SUB2API_UPSTREAM_MONITORS_ENDPOINT,
                                 }
                             )
                         if not include_yesterday_usage:
@@ -548,17 +556,17 @@ class UpstreamClient:
                         else requested_type
                     )
                     async def fetch_monitor_details() -> dict[int, _FetchResult]:
-                        if candidate_type != "sub2api" or not include_channel_monitor_details:
+                        if candidate_type != "sub2api" or not include_upstream_monitor_details:
                             return {}
                         try:
-                            return await self._fetch_sub2api_channel_monitor_details(
+                            return await self._fetch_sub2api_upstream_monitor_details(
                                 client,
                                 normalized_url,
                                 list_result=candidate_responses.get(
-                                    SUB2API_CHANNEL_MONITORS_ENDPOINT
+                                    SUB2API_UPSTREAM_MONITORS_ENDPOINT
                                 ),
                                 access_token=access_token,
-                                channel_monitor_detail_ids=channel_monitor_detail_ids,
+                                upstream_monitor_detail_ids=upstream_monitor_detail_ids,
                             )
                         except Exception:
                             # List summaries remain useful when an older
@@ -796,7 +804,7 @@ class UpstreamClient:
                         )
 
                     (
-                        sub2api_channel_monitor_details,
+                        sub2api_upstream_monitor_details,
                         newapi_yesterday_usage_result,
                         api_key_context,
                     ) = await asyncio.gather(
@@ -837,7 +845,7 @@ class UpstreamClient:
             detected_type = _detect_upstream_type(responses)
             if detected_type is None:
                 newapi_monitor_result = responses.get(NEWAPI_UPTIME_STATUS_ENDPOINT)
-                sub2api_monitor_result = responses.get(SUB2API_CHANNEL_MONITORS_ENDPOINT)
+                sub2api_monitor_result = responses.get(SUB2API_UPSTREAM_MONITORS_ENDPOINT)
                 if (
                     monitor_only
                     and newapi_monitor_result is not None
@@ -874,16 +882,16 @@ class UpstreamClient:
         if monitor_only:
             try:
                 (
-                    channel_monitors,
-                    channel_monitors_total,
-                    channel_monitors_status,
-                    channel_monitors_message,
-                ) = _discover_channel_monitors(
+                    upstream_monitors,
+                    upstream_monitors_total,
+                    upstream_monitors_status,
+                    upstream_monitors_message,
+                ) = _discover_upstream_monitors(
                     active_type,
                     responses,
                     access_token=access_token,
                     secrets=secrets,
-                    detail_results=sub2api_channel_monitor_details,
+                    detail_results=sub2api_upstream_monitor_details,
                 )
             except Exception:
                 return safe(
@@ -893,21 +901,21 @@ class UpstreamClient:
                         "Could not parse a valid upstream monitor response.",
                     )
                 )
-            credentials_rejected = channel_monitors_status == "credentials_rejected"
-            monitor_error = channel_monitors_status == "error"
+            credentials_rejected = upstream_monitors_status == "credentials_rejected"
+            monitor_error = upstream_monitors_status == "error"
             return safe(
                 DiscoveryResult(
-                    upstream_type=active_type,
+                    platform_type=active_type,
                     source=source,
                     status="error" if credentials_rejected or monitor_error else "ok",
-                    channel_monitors=channel_monitors,
-                    channel_monitors_total=channel_monitors_total,
-                    channel_monitors_status=channel_monitors_status,
-                    channel_monitors_message=channel_monitors_message,
+                    upstream_monitors=upstream_monitors,
+                    upstream_monitors_total=upstream_monitors_total,
+                    upstream_monitors_status=upstream_monitors_status,
+                    upstream_monitors_message=upstream_monitors_message,
                     sub2api_auth_rejected=(
                         active_type == "sub2api" and credentials_rejected
                     ),
-                    message=channel_monitors_message,
+                    message=upstream_monitors_message,
                 )
             )
 
@@ -1026,7 +1034,7 @@ class UpstreamClient:
                 access_token=access_token,
                 new_api_user=new_api_user,
             )
-            today_balance_used, today_balance_unit, today_balance_status = (
+            today_upstream_wallet_cost_usd, today_balance_unit, today_balance_status = (
                 _discover_today_balance_usage(
                     active_type,
                     responses,
@@ -1034,7 +1042,7 @@ class UpstreamClient:
                     new_api_user=new_api_user,
                 )
             )
-            yesterday_balance_used, yesterday_balance_unit, yesterday_balance_status = (
+            yesterday_upstream_wallet_cost_usd, yesterday_balance_unit, yesterday_balance_status = (
                 _discover_yesterday_balance_usage(
                     active_type,
                     responses,
@@ -1043,17 +1051,17 @@ class UpstreamClient:
                 )
             )
             (
-                channel_monitors,
-                channel_monitors_total,
-                channel_monitors_status,
-                channel_monitors_message,
+                upstream_monitors,
+                upstream_monitors_total,
+                upstream_monitors_status,
+                upstream_monitors_message,
             ) = (
-                _discover_channel_monitors(
+                _discover_upstream_monitors(
                     active_type,
                     responses,
                     access_token=access_token,
                     secrets=secrets,
-                    detail_results=sub2api_channel_monitor_details,
+                    detail_results=sub2api_upstream_monitor_details,
                 )
             )
             today_balance_error = _daily_usage_error_detail(
@@ -1075,7 +1083,7 @@ class UpstreamClient:
         group_source = matched_group.source if group_multiplier is not None else None
         return safe(
             DiscoveryResult(
-                upstream_type=active_type,
+                platform_type=active_type,
                 source=source,
                 status="ok",
                 groups=groups,
@@ -1083,29 +1091,29 @@ class UpstreamClient:
                 account_group_matches=account_group_matches,
                 matched_account_state=matched_account_state,
                 account_upstream_states=account_upstream_states,
-                discovered_group_multiplier=group_multiplier,
-                discovered_group_multiplier_source=group_source,
-                discovered_recharge_multiplier=recharge_multiplier,
-                discovered_recharge_multiplier_source=recharge_source,
+                discovered_upstream_group_multiplier=group_multiplier,
+                discovered_upstream_group_multiplier_source=group_source,
+                discovered_upstream_recharge_multiplier=recharge_multiplier,
+                discovered_upstream_recharge_multiplier_source=recharge_source,
                 recharge_discovery_status=recharge_status,
-                balance_remaining=balance.remaining,
-                balance_total=balance.total,
-                balance_used=balance.used,
+                wallet_balance_usd=balance.remaining,
+                wallet_total_usd=balance.total,
+                wallet_used_usd=balance.used,
                 balance_unit=balance.unit,
                 balance_status=balance.status,
                 balance_message=balance.message,
-                today_balance_used=today_balance_used,
+                today_upstream_wallet_cost_usd=today_upstream_wallet_cost_usd,
                 today_balance_unit=today_balance_unit,
                 today_balance_status=today_balance_status,
                 today_balance_error=today_balance_error,
-                yesterday_balance_used=yesterday_balance_used,
+                yesterday_upstream_wallet_cost_usd=yesterday_upstream_wallet_cost_usd,
                 yesterday_balance_unit=yesterday_balance_unit,
                 yesterday_balance_status=yesterday_balance_status,
                 yesterday_balance_error=yesterday_balance_error,
-                channel_monitors=channel_monitors,
-                channel_monitors_total=channel_monitors_total,
-                channel_monitors_status=channel_monitors_status,
-                channel_monitors_message=channel_monitors_message,
+                upstream_monitors=upstream_monitors,
+                upstream_monitors_total=upstream_monitors_total,
+                upstream_monitors_status=upstream_monitors_status,
+                upstream_monitors_message=upstream_monitors_message,
                 sub2api_auth_rejected=sub2api_auth_rejected,
                 message=_success_message(group_multiplier, recharge_multiplier),
             )
@@ -1275,6 +1283,55 @@ class UpstreamClient:
             )
         return results
 
+    async def _fetch_sub2api_revealed_api_key_record(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        record_id: int,
+        listed_record: dict[str, Any],
+        headers: dict[str, str],
+    ) -> dict[str, Any] | None:
+        # Newer Sub2API deployments advertise the reveal capability on the
+        # list row. Keep the legacy detail request first for older providers
+        # and test doubles that do not expose that flag.
+        can_reveal = _first_value(listed_record, ("can_reveal", "canReveal")) is True
+        endpoints = (
+            (
+                (f"/api/v1/keys/{record_id}/reveal", True),
+                (f"/api/v1/keys/{record_id}", False),
+            )
+            if can_reveal
+            else ((f"/api/v1/keys/{record_id}", False),)
+        )
+        for endpoint, no_store in endpoints:
+            request_headers = (
+                {**headers, "Cache-Control": "no-store"}
+                if no_store
+                else headers
+            )
+            response = await self._request_json(
+                client,
+                base_url,
+                endpoint,
+                headers=request_headers,
+            )
+            if not response.ok or not _payload_succeeded(response.payload):
+                continue
+            data = _unwrap(response.payload)
+            if not isinstance(data, dict):
+                continue
+            returned_id = _api_key_record_id(data)
+            if returned_id is not None and returned_id != record_id:
+                continue
+            revealed_key = _clean_secret(
+                _first_value(data, ("key", "api_key", "apiKey", "token", "value"))
+            )
+            if revealed_key is None or "*" in revealed_key:
+                continue
+            return {**listed_record, **data, "id": record_id}
+        return None
+
     async def _reveal_api_key_records(
         self,
         client: httpx.AsyncClient,
@@ -1339,8 +1396,7 @@ class UpstreamClient:
                 matching_targets = [
                     target_key
                     for target_key in pending_keys
-                    if listed_key is not None
-                    and _masked_api_key_matches(listed_key, target_key)
+                    if _api_key_record_is_candidate(record, target_key)
                 ]
                 if matching_targets:
                     candidate_records_by_id.setdefault(record_id, record)
@@ -1394,30 +1450,39 @@ class UpstreamClient:
         semaphore = asyncio.Semaphore(KEY_REVEAL_CONCURRENCY)
 
         async def reveal(record_id: int, listed_record: dict[str, Any]):
-            endpoint = (
-                f"/api/token/{record_id}/key"
-                if upstream_type == "newapi"
-                else f"/api/v1/keys/{record_id}"
-            )
-            method = "POST" if upstream_type == "newapi" else "GET"
             async with semaphore:
-                response = await self._request_json(
-                    client,
-                    base_url,
-                    endpoint,
-                    method=method,
-                    headers=headers,
-                )
-            if not response.ok or not _payload_succeeded(response.payload):
-                return None
-            data = _unwrap(response.payload)
-            if not isinstance(data, dict):
-                return None
-            returned_id = _api_key_record_id(data)
-            if returned_id is not None and returned_id != record_id:
+                if upstream_type == "sub2api":
+                    matched_record = await self._fetch_sub2api_revealed_api_key_record(
+                        client,
+                        base_url,
+                        record_id=record_id,
+                        listed_record=listed_record,
+                        headers=headers,
+                    )
+                else:
+                    response = await self._request_json(
+                        client,
+                        base_url,
+                        f"/api/token/{record_id}/key",
+                        method="POST",
+                        headers=headers,
+                    )
+                    if not response.ok or not _payload_succeeded(response.payload):
+                        return None
+                    data = _unwrap(response.payload)
+                    if not isinstance(data, dict):
+                        return None
+                    returned_id = _api_key_record_id(data)
+                    if returned_id is not None and returned_id != record_id:
+                        return None
+                    matched_record = data
+            if matched_record is None:
                 return None
             revealed_key = _clean_secret(
-                _first_value(data, ("key", "api_key", "apiKey", "token", "value"))
+                _first_value(
+                    matched_record,
+                    ("key", "api_key", "apiKey", "token", "value"),
+                )
             )
             if revealed_key is None or "*" in revealed_key:
                 return None
@@ -1428,12 +1493,10 @@ class UpstreamClient:
             ]
             if len(matching_targets) != 1:
                 return None
-            matched_record = (
-                {**listed_record, **data}
-                if upstream_type == "sub2api"
-                else listed_record
+            return (
+                matching_targets[0],
+                matched_record if upstream_type == "sub2api" else listed_record,
             )
-            return matching_targets[0], matched_record
 
         revealed = await asyncio.gather(
             *(reveal(record_id, record) for record_id, record in records_by_id.items()),
@@ -1454,14 +1517,14 @@ class UpstreamClient:
             if len(records) == 1
         }
 
-    async def _fetch_sub2api_channel_monitor_details(
+    async def _fetch_sub2api_upstream_monitor_details(
         self,
         client: httpx.AsyncClient,
         base_url: str,
         *,
         list_result: _FetchResult | None,
         access_token: str | None,
-        channel_monitor_detail_ids: Iterable[int] | None = None,
+        upstream_monitor_detail_ids: Iterable[int] | None = None,
     ) -> dict[int, _FetchResult]:
         token = _clean_secret(access_token)
         if (
@@ -1477,10 +1540,10 @@ class UpstreamClient:
 
         requested_ids = (
             None
-            if channel_monitor_detail_ids is None
+            if upstream_monitor_detail_ids is None
             else {
                 monitor_id
-                for raw_monitor_id in channel_monitor_detail_ids
+                for raw_monitor_id in upstream_monitor_detail_ids
                 if (monitor_id := _positive_int64(raw_monitor_id)) is not None
             }
         )
@@ -1494,7 +1557,7 @@ class UpstreamClient:
                 continue
             monitor_ids.append(monitor_id)
             seen_ids.add(monitor_id)
-            if len(monitor_ids) >= MAX_CHANNEL_MONITORS:
+            if len(monitor_ids) >= MAX_UPSTREAM_MONITORS:
                 break
         if not monitor_ids:
             return {}
@@ -1504,12 +1567,12 @@ class UpstreamClient:
             api_key=None,
             new_api_user=None,
         )
-        semaphore = asyncio.Semaphore(CHANNEL_MONITOR_DETAIL_CONCURRENCY)
+        semaphore = asyncio.Semaphore(UPSTREAM_MONITOR_DETAIL_CONCURRENCY)
 
         async def fetch_detail(monitor_id: int) -> tuple[int, _FetchResult]:
             # The only interpolated value has passed strict positive-int64
             # validation, so the request remains on this fixed upstream path.
-            endpoint = f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/{monitor_id}/status"
+            endpoint = f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/{monitor_id}/status"
             async with semaphore:
                 result = await self._request_json(
                     client,
@@ -1591,27 +1654,31 @@ class UpstreamClient:
         semaphore = asyncio.Semaphore(KEY_REVEAL_CONCURRENCY)
 
         async def fetch_record(record_id: int) -> tuple[int, dict[str, Any]] | None:
-            endpoint = (
-                f"/api/token/{record_id}"
-                if upstream_type == "newapi"
-                else f"/api/v1/keys/{record_id}"
-            )
             async with semaphore:
+                if upstream_type == "sub2api":
+                    data = await self._fetch_sub2api_revealed_api_key_record(
+                        client,
+                        base_url,
+                        record_id=record_id,
+                        listed_record=listed_by_id.get(record_id, {"id": record_id}),
+                        headers=headers,
+                    )
+                    return (record_id, data) if data is not None else None
                 result = await self._request_json(
                     client,
                     base_url,
-                    endpoint,
+                    f"/api/token/{record_id}",
                     headers=headers,
                 )
-            if not result.ok or not _payload_succeeded(result.payload):
-                return None
-            data = _unwrap(result.payload)
-            if not isinstance(data, dict):
-                return None
-            returned_id = _api_key_record_id(data)
-            if returned_id is not None and returned_id != record_id:
-                return None
-            return record_id, {"id": record_id, **data}
+                if not result.ok or not _payload_succeeded(result.payload):
+                    return None
+                data = _unwrap(result.payload)
+                if not isinstance(data, dict):
+                    return None
+                returned_id = _api_key_record_id(data)
+                if returned_id is not None and returned_id != record_id:
+                    return None
+                return record_id, {"id": record_id, **data}
 
         fetched = await asyncio.gather(
             *(fetch_record(record_id) for record_id in missing_record_ids),
@@ -1911,6 +1978,103 @@ class UpstreamClient:
             )
         return usage_by_record_id
 
+    async def login_sub2api_tokens(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+    ) -> Sub2ApiLoginTokenPair | None:
+        """Log in with a browser TLS fingerprint and return a token-only result."""
+
+        login_username = _clean_text(username, 320)
+        login_password = password if isinstance(password, str) and password else None
+        if (
+            login_username is None
+            or login_password is None
+            or len(login_password) > MAX_UPSTREAM_TOKEN_LENGTH
+        ):
+            return None
+        try:
+            normalized_url, hostname = _normalize_base_url(base_url)
+            parsed_url = urlparse(normalized_url)
+            if parsed_url.scheme != "https":
+                return None
+            pinned_addresses = await self._resolve_public_addresses(hostname)
+            from curl_cffi import CurlOpt, requests
+        except Exception:
+            return None
+
+        address = pinned_addresses[0]
+        resolved_address = f"[{address}]" if ":" in address else address
+        port = parsed_url.port or 443
+        origin = urlunparse((parsed_url.scheme, parsed_url.netloc, "", "", "", ""))
+        try:
+            async with requests.AsyncSession(
+                impersonate="chrome",
+                timeout=max(self.timeout_seconds, 20.0),
+                trust_env=False,
+                allow_redirects=False,
+                curl_options={
+                    CurlOpt.RESOLVE: [f"{hostname}:{port}:{resolved_address}"],
+                },
+            ) as session:
+                response = await session.post(
+                    f"{normalized_url}{SUB2API_LOGIN_ENDPOINT}",
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Origin": origin,
+                        "Referer": f"{origin}/login",
+                    },
+                    json={"email": login_username, "password": login_password},
+                )
+        except Exception:
+            return None
+
+        content = getattr(response, "content", b"")
+        if (
+            int(getattr(response, "status_code", 0) or 0) != 200
+            or not isinstance(content, (bytes, bytearray))
+            or len(content) > self.max_response_bytes
+        ):
+            return None
+        try:
+            payload = response.json()
+        except Exception:
+            return None
+        if not _payload_succeeded(payload):
+            return None
+        data = _unwrap(payload)
+        if not isinstance(data, dict) or data.get("requires_2fa") is True:
+            return None
+        access_token = _clean_secret(data.get("access_token"))
+        refresh_token = _clean_secret(data.get("refresh_token"))
+        if (
+            access_token is None
+            or len(access_token) > MAX_UPSTREAM_TOKEN_LENGTH
+            or (
+                refresh_token is not None
+                and len(refresh_token) > MAX_UPSTREAM_TOKEN_LENGTH
+            )
+        ):
+            return None
+        try:
+            _validate_header_value(access_token)
+        except ValueError:
+            return None
+        expires_in = data.get("expires_in")
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, int)
+            or expires_in <= 0
+        ):
+            expires_in = None
+        return Sub2ApiLoginTokenPair(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=expires_in,
+        )
+
     async def refresh_sub2api_tokens(
         self,
         base_url: str,
@@ -2105,9 +2269,9 @@ async def discover_upstream(
     account_api_keys: Mapping[int | str, str] | None = None,
     account_api_key_record_ids: Mapping[int | str, int | str] | None = None,
     optimized_endpoint_fallbacks: bool = False,
-    include_channel_monitors: bool = True,
-    include_channel_monitor_details: bool = False,
-    channel_monitor_detail_ids: Iterable[int] | None = None,
+    include_upstream_monitors: bool = True,
+    include_upstream_monitor_details: bool = False,
+    upstream_monitor_detail_ids: Iterable[int] | None = None,
     monitor_only: bool = False,
     today_timezone: str = DEFAULT_TODAY_TIME_ZONE,
     include_yesterday_usage: bool = True,
@@ -2133,9 +2297,9 @@ async def discover_upstream(
         account_api_keys=account_api_keys,
         account_api_key_record_ids=account_api_key_record_ids,
         optimized_endpoint_fallbacks=optimized_endpoint_fallbacks,
-        include_channel_monitors=include_channel_monitors,
-        include_channel_monitor_details=include_channel_monitor_details,
-        channel_monitor_detail_ids=channel_monitor_detail_ids,
+        include_upstream_monitors=include_upstream_monitors,
+        include_upstream_monitor_details=include_upstream_monitor_details,
+        upstream_monitor_detail_ids=upstream_monitor_detail_ids,
         monitor_only=monitor_only,
         today_timezone=today_timezone,
         include_yesterday_usage=include_yesterday_usage,
@@ -2185,6 +2349,23 @@ async def refresh_sub2api_tokens(
         resolver=resolver,
     )
     return await client.refresh_sub2api_tokens(base_url, refresh_token)
+
+
+async def login_sub2api_tokens(
+    base_url: str,
+    username: str,
+    password: str,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    resolver: Resolver | None = None,
+) -> Sub2ApiLoginTokenPair | None:
+    """Acquire a Sub2API AT through a browser-fingerprint password login."""
+
+    client = UpstreamClient(
+        timeout_seconds=timeout_seconds,
+        resolver=resolver,
+    )
+    return await client.login_sub2api_tokens(base_url, username, password)
 
 
 def _normalize_base_url(value: str) -> tuple[str, str]:
@@ -2391,7 +2572,7 @@ def _headers_for_endpoint(
         SUB2API_TODAY_USAGE_ENDPOINT,
         SUB2API_USAGE_STATS_ENDPOINT,
         SUB2API_API_KEY_USAGE_ENDPOINT,
-        SUB2API_CHANNEL_MONITORS_ENDPOINT,
+        SUB2API_UPSTREAM_MONITORS_ENDPOINT,
     }:
         if _clean_secret(access_token) is None:
             return None
@@ -2503,11 +2684,11 @@ def _scrub_account_upstream_state(
     )
 
 
-def _scrub_channel_monitor(
+def _scrub_upstream_monitor(
     monitor: dict[str, Any],
     secret_variants: Sequence[str],
 ) -> dict[str, Any] | None:
-    return _sanitize_channel_monitor(
+    return _sanitize_upstream_monitor(
         monitor,
         secret_variants=secret_variants,
     )
@@ -2541,12 +2722,12 @@ def _scrub_discovery_result(
         account_id: _scrub_account_upstream_state(state, secret_values)
         for account_id, state in result.account_upstream_states.items()
     }
-    scrubbed_channel_monitors = [
+    scrubbed_upstream_monitors = [
         scrubbed_monitor
-        for monitor in result.channel_monitors
+        for monitor in result.upstream_monitors
         if isinstance(monitor, dict)
         if (
-            scrubbed_monitor := _scrub_channel_monitor(monitor, secret_variants)
+            scrubbed_monitor := _scrub_upstream_monitor(monitor, secret_variants)
         ) is not None
     ]
     return replace(
@@ -2556,17 +2737,17 @@ def _scrub_discovery_result(
         account_group_matches=scrubbed_account_matches,
         matched_account_state=scrubbed_account_state,
         account_upstream_states=scrubbed_account_states,
-        channel_monitors=scrubbed_channel_monitors,
-        channel_monitors_message=(
-            _scrub_text(result.channel_monitors_message, secret_values, 300) or ""
+        upstream_monitors=scrubbed_upstream_monitors,
+        upstream_monitors_message=(
+            _scrub_text(result.upstream_monitors_message, secret_values, 300) or ""
         ),
-        discovered_group_multiplier_source=_scrub_text(
-            result.discovered_group_multiplier_source,
+        discovered_upstream_group_multiplier_source=_scrub_text(
+            result.discovered_upstream_group_multiplier_source,
             secret_values,
             160,
         ),
-        discovered_recharge_multiplier_source=_scrub_text(
-            result.discovered_recharge_multiplier_source,
+        discovered_upstream_recharge_multiplier_source=_scrub_text(
+            result.discovered_upstream_recharge_multiplier_source,
             secret_values,
             160,
         ),
@@ -2713,7 +2894,7 @@ def _detect_upstream_type(responses: dict[str, _FetchResult]) -> str | None:
             "/api/v1/api-keys",
             SUB2API_BALANCE_ENDPOINT,
             SUB2API_USAGE_STATS_ENDPOINT,
-            SUB2API_CHANNEL_MONITORS_ENDPOINT,
+            SUB2API_UPSTREAM_MONITORS_ENDPOINT,
         }:
             sub2api_score += 4
 
@@ -3468,6 +3649,29 @@ def _masked_api_key_matches(mask: Any, api_key: str) -> bool:
     return any(re.fullmatch(pattern, candidate_key) is not None for candidate_key in candidate_keys)
 
 
+def _api_key_record_is_candidate(record: Mapping[str, Any], api_key: str) -> bool:
+    listed_key = _clean_secret(
+        _first_value(record, ("key", "api_key", "apiKey", "token", "value"))
+    )
+    if listed_key is not None:
+        return _masked_api_key_matches(listed_key, api_key)
+
+    prefix = _clean_secret(
+        _first_value(record, ("key_prefix", "keyPrefix", "prefix"))
+    )
+    suffix = _clean_secret(
+        _first_value(record, ("key_last4", "keyLast4", "last4"))
+    )
+    return bool(
+        prefix
+        and suffix
+        and len(prefix) >= 3
+        and len(suffix) >= 4
+        and api_key.startswith(prefix)
+        and api_key.endswith(suffix)
+    )
+
+
 def _unique_masked_api_key_records(
     upstream_type: str,
     payloads: dict[str, Any],
@@ -3928,7 +4132,7 @@ def _discover_sub2api_yesterday_usage(
     return amount, "USD", "ok"
 
 
-_CHANNEL_MONITOR_STATUSES = frozenset(
+_UPSTREAM_MONITOR_STATUSES = frozenset(
     {
         "available",
         "degraded",
@@ -3942,13 +4146,13 @@ _CHANNEL_MONITOR_STATUSES = frozenset(
         "unknown",
     }
 )
-_CHANNEL_MONITOR_STATUS_ALIASES = {
+_UPSTREAM_MONITOR_STATUS_ALIASES = {
     "active": "available",
     "enabled": "available",
     "ok": "available",
     "success": "available",
 }
-_CHANNEL_MONITOR_DETAIL_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+_UPSTREAM_MONITOR_DETAIL_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "primary_status": ("primary_status", "primaryStatus", "status"),
     "primary_latency_ms": ("primary_latency_ms", "primaryLatencyMs", "latency_ms"),
     "primary_ping_latency_ms": (
@@ -3960,16 +4164,16 @@ _CHANNEL_MONITOR_DETAIL_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "extra_models": ("extra_models", "extraModels"),
     "timeline": ("timeline",),
 }
-_CHANNEL_MONITOR_DETAIL_CONTAINERS = (
+_UPSTREAM_MONITOR_DETAIL_CONTAINERS = (
     "monitor",
-    "channel_monitor",
+    "upstream_monitor",
     "channelMonitor",
     "result",
     "status",
 )
 
 
-def _discover_channel_monitors(
+def _discover_upstream_monitors(
     upstream_type: str,
     responses: dict[str, _FetchResult],
     *,
@@ -3983,23 +4187,23 @@ def _discover_channel_monitors(
             secrets=secrets,
         )
     if upstream_type != "sub2api":
-        return [], 0, "unsupported", "The upstream type does not expose channel monitors."
+        return [], 0, "unsupported", "The upstream type does not expose upstream monitors."
     if _clean_secret(access_token) is None:
-        return [], 0, "credentials_missing", "An upstream access token is required to read channel monitors."
+        return [], 0, "credentials_missing", "An upstream access token is required to read upstream monitors."
 
-    result = responses.get(SUB2API_CHANNEL_MONITORS_ENDPOINT)
+    result = responses.get(SUB2API_UPSTREAM_MONITORS_ENDPOINT)
     if result is not None and result.status_code in {404, 405}:
-        return [], 0, "unsupported", "The upstream does not expose channel monitors."
+        return [], 0, "unsupported", "The upstream does not expose upstream monitors."
     if result is not None and result.status_code in {401, 403}:
-        return [], 0, "credentials_rejected", "The upstream rejected channel monitor credentials."
+        return [], 0, "credentials_rejected", "The upstream rejected upstream monitor credentials."
     if result is None or not result.ok:
-        return [], 0, "error", "Could not read upstream channel monitors."
+        return [], 0, "error", "Could not read upstream upstream monitors."
     if not _payload_succeeded(result.payload):
-        return [], 0, "error", "The upstream channel monitor response indicated failure."
+        return [], 0, "error", "The upstream upstream monitor response indicated failure."
 
     data = _unwrap(result.payload)
     if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-        return [], 0, "error", "The upstream returned invalid channel monitor data."
+        return [], 0, "error", "The upstream returned invalid upstream monitor data."
 
     secret_variants = _secret_variants((*tuple(secrets), access_token))
     monitors: list[dict[str, Any]] = []
@@ -4014,20 +4218,20 @@ def _discover_channel_monitors(
         if monitor_id is None:
             continue
         valid_monitor_count += 1
-        if len(monitors) >= MAX_CHANNEL_MONITORS:
+        if len(monitors) >= MAX_UPSTREAM_MONITORS:
             continue
 
         merged = dict(raw)
         detail_result = details_by_id.get(monitor_id)
         if detail_result is not None:
             attempted_detail_ids.add(monitor_id)
-            detail_patch = _channel_monitor_detail_patch(detail_result)
+            detail_patch = _upstream_monitor_detail_patch(detail_result)
             if detail_patch:
                 merged.update(detail_patch)
                 successful_detail_ids.add(monitor_id)
         # Never allow a detail response to replace the validated list ID.
         merged["id"] = monitor_id
-        monitor = _sanitize_channel_monitor(
+        monitor = _sanitize_upstream_monitor(
             merged,
             secret_variants=secret_variants,
         )
@@ -4036,12 +4240,12 @@ def _discover_channel_monitors(
     if valid_monitor_count > len(monitors):
         message = (
             f"Read the first {len(monitors)} of {valid_monitor_count} "
-            "upstream channel monitors."
+            "upstream upstream monitors."
         )
     elif monitors:
-        message = f"Read {len(monitors)} upstream channel monitor(s)."
+        message = f"Read {len(monitors)} upstream upstream monitor(s)."
     else:
-        message = "No upstream channel monitors are available."
+        message = "No upstream upstream monitors are available."
     detail_failure_count = len(attempted_detail_ids - successful_detail_ids)
     if detail_failure_count:
         message += (
@@ -4132,12 +4336,12 @@ def _discover_newapi_uptime_monitors(
 
             seen_descriptors.add(descriptor)
             valid_monitor_count += 1
-            if len(monitors) >= MAX_CHANNEL_MONITORS:
+            if len(monitors) >= MAX_UPSTREAM_MONITORS:
                 continue
             # Preserve the original first-occurrence ID while collapsing
             # indistinguishable duplicates into one conservative status.
             monitor_id = _stable_monitor_id(f"{descriptor}\x1f0")
-            monitor = _sanitize_channel_monitor(
+            monitor = _sanitize_upstream_monitor(
                 {
                     "id": monitor_id,
                     "name": name,
@@ -4200,7 +4404,7 @@ def _stable_monitor_id(value: str) -> int:
     return (int.from_bytes(digest[:8], "big") & ((1 << 53) - 1)) or 1
 
 
-def _channel_monitor_detail_patch(result: _FetchResult) -> dict[str, Any]:
+def _upstream_monitor_detail_patch(result: _FetchResult) -> dict[str, Any]:
     if not result.ok or not _payload_succeeded(result.payload):
         return {}
     data = _unwrap(result.payload)
@@ -4216,11 +4420,11 @@ def _channel_monitor_detail_patch(result: _FetchResult) -> dict[str, Any]:
             return
         seen.add(candidate_identity)
 
-        for field, aliases in _CHANNEL_MONITOR_DETAIL_FIELD_ALIASES.items():
+        for field, aliases in _UPSTREAM_MONITOR_DETAIL_FIELD_ALIASES.items():
             for alias in aliases:
                 if alias not in candidate:
                     continue
-                normalized = _normalize_channel_monitor_detail_field(
+                normalized = _normalize_upstream_monitor_detail_field(
                     field,
                     candidate.get(alias),
                 )
@@ -4228,7 +4432,7 @@ def _channel_monitor_detail_patch(result: _FetchResult) -> dict[str, Any]:
                     patch[field] = normalized
                 break
 
-        for container in _CHANNEL_MONITOR_DETAIL_CONTAINERS:
+        for container in _UPSTREAM_MONITOR_DETAIL_CONTAINERS:
             nested = candidate.get(container)
             if isinstance(nested, dict):
                 merge_candidate(nested, depth + 1)
@@ -4237,9 +4441,9 @@ def _channel_monitor_detail_patch(result: _FetchResult) -> dict[str, Any]:
     return patch
 
 
-def _normalize_channel_monitor_detail_field(field: str, value: Any) -> Any | None:
+def _normalize_upstream_monitor_detail_field(field: str, value: Any) -> Any | None:
     if field == "primary_status":
-        status = _normalize_channel_monitor_status(value)
+        status = _normalize_upstream_monitor_status(value)
         raw_status = _clean_text(value, 32)
         return (
             status
@@ -4256,7 +4460,7 @@ def _normalize_channel_monitor_detail_field(field: str, value: Any) -> Any | Non
     return None
 
 
-def _sanitize_channel_monitor(
+def _sanitize_upstream_monitor(
     raw: Any,
     *,
     secret_variants: Sequence[str] = (),
@@ -4271,7 +4475,7 @@ def _sanitize_channel_monitor(
     raw_extra_models = raw.get("extra_models")
     if isinstance(raw_extra_models, list):
         for extra in raw_extra_models:
-            if len(extra_models) >= MAX_CHANNEL_MONITOR_EXTRA_MODELS:
+            if len(extra_models) >= MAX_UPSTREAM_MONITOR_EXTRA_MODELS:
                 break
             if not isinstance(extra, dict):
                 continue
@@ -4285,7 +4489,7 @@ def _sanitize_channel_monitor(
             extra_models.append(
                 {
                     "model": model,
-                    "status": _normalize_channel_monitor_status(
+                    "status": _normalize_upstream_monitor_status(
                         _scrub_text_with_variants(
                             extra.get("status"),
                             secret_variants,
@@ -4321,7 +4525,7 @@ def _sanitize_channel_monitor(
                 (
                     parsed_checked_at,
                     {
-                    "status": _normalize_channel_monitor_status(
+                    "status": _normalize_upstream_monitor_status(
                         _scrub_text_with_variants(
                             point.get("status"),
                             secret_variants,
@@ -4344,7 +4548,7 @@ def _sanitize_channel_monitor(
     timeline = [
         point
         for _, point in sorted(timeline_candidates, key=lambda item: item[0])[
-            -MAX_CHANNEL_MONITOR_TIMELINE_POINTS:
+            -MAX_UPSTREAM_MONITOR_TIMELINE_POINTS:
         ]
     ]
 
@@ -4356,7 +4560,7 @@ def _sanitize_channel_monitor(
             160,
         )
         or f"Monitor #{monitor_id}",
-        "provider": _normalize_channel_monitor_provider(
+        "provider": _normalize_upstream_monitor_provider(
             _scrub_text_with_variants(
                 raw.get("provider"),
                 secret_variants,
@@ -4375,7 +4579,7 @@ def _sanitize_channel_monitor(
             160,
         )
         or "",
-        "primary_status": _normalize_channel_monitor_status(
+        "primary_status": _normalize_upstream_monitor_status(
             _scrub_text_with_variants(
                 raw.get("primary_status"),
                 secret_variants,
@@ -4404,14 +4608,14 @@ def _sanitize_channel_monitor(
     }
 
 
-def _normalize_channel_monitor_status(value: Any) -> str:
+def _normalize_upstream_monitor_status(value: Any) -> str:
     status = _clean_text(value, 32)
     normalized = status.casefold() if status is not None else ""
-    normalized = _CHANNEL_MONITOR_STATUS_ALIASES.get(normalized, normalized)
-    return normalized if normalized in _CHANNEL_MONITOR_STATUSES else "unknown"
+    normalized = _UPSTREAM_MONITOR_STATUS_ALIASES.get(normalized, normalized)
+    return normalized if normalized in _UPSTREAM_MONITOR_STATUSES else "unknown"
 
 
-def _normalize_channel_monitor_provider(value: Any) -> str:
+def _normalize_upstream_monitor_provider(value: Any) -> str:
     provider = _clean_text(value, 64)
     if provider is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", provider) is None:
         return "unknown"
@@ -4822,7 +5026,7 @@ def _discovery_failure(
 
 def _error_result(upstream_type: str, source: str, message: str) -> DiscoveryResult:
     return DiscoveryResult(
-        upstream_type=upstream_type,
+        platform_type=upstream_type,
         source=source,
         status="error",
         message=message,
@@ -4843,17 +5047,20 @@ __all__ = [
     "NEWAPI_TODAY_USAGE_ENDPOINT",
     "NEWAPI_UPTIME_STATUS_ENDPOINT",
     "SUB2API_API_KEY_USAGE_ENDPOINT",
-    "SUB2API_CHANNEL_MONITORS_ENDPOINT",
+    "SUB2API_LOGIN_ENDPOINT",
+    "SUB2API_UPSTREAM_MONITORS_ENDPOINT",
     "SUB2API_ENDPOINTS",
     "SUB2API_REFRESH_ENDPOINT",
     "SUB2API_TODAY_USAGE_ENDPOINT",
     "SUB2API_USAGE_STATS_ENDPOINT",
     "UPSTREAM_USAGE_TIMEOUT_SECONDS",
     "UPSTREAM_HISTORY_FETCH_CONCURRENCY",
+    "Sub2ApiLoginTokenPair",
     "Sub2ApiTokenPair",
     "UpstreamClient",
     "UpstreamDiscoveryClient",
     "discover_upstream",
     "fetch_upstream_daily_usages",
+    "login_sub2api_tokens",
     "refresh_sub2api_tokens",
 ]

@@ -153,29 +153,29 @@ async def _editor_out(
     )
 
 
-@router.get("/editor/{sub2api_account_id}", response_model=AccountEditorOut)
+@router.get("/editor/{management_account_id}", response_model=AccountEditorOut)
 async def get_account_editor(
-    sub2api_account_id: int = Path(ge=1),
+    management_account_id: int = Path(ge=1),
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> AccountEditorOut:
-    sub2api, resources = await _load_resources(sub2api_account_id)
+    sub2api, resources = await _load_resources(management_account_id)
     return await _editor_out(db, sub2api, resources)
 
 
-@router.put("/editor/{sub2api_account_id}", response_model=AccountEditResult)
+@router.put("/editor/{management_account_id}", response_model=AccountEditResult)
 async def update_account_editor(
     payload: AccountEditUpdate,
-    sub2api_account_id: int = Path(ge=1),
+    management_account_id: int = Path(ge=1),
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> AccountEditResult:
-    sub2api, resources = await _load_resources(sub2api_account_id)
+    sub2api, resources = await _load_resources(management_account_id)
     try:
         assert_account_identity(sub2api, resources.account, payload.expected_identity_fingerprint)
         validate_account_edit_configuration(payload, resources)
         updated = await sub2api.update_account_configuration(
-            sub2api_account_id,
+            management_account_id,
             name=payload.name,
             concurrency=payload.concurrency,
             priority=payload.priority,
@@ -200,9 +200,9 @@ async def update_account_editor(
     await record_event(
         db,
         "account_configuration_updated",
-        f"已更新 sub2api 账号 {payload.name} 的调度配置。",
+        f"已更新管理站点 API 账号 {payload.name} 的调度配置。",
         details={
-            "sub2api_account_id": sub2api_account_id,
+            "management_account_id": management_account_id,
             "concurrency": payload.concurrency,
             "priority": payload.priority,
             "proxy_id": payload.proxy_id,
@@ -230,32 +230,32 @@ def _account_notes_out(sub2api: Sub2ApiClient, account: dict[str, Any]) -> Accou
     )
 
 
-@router.get("/{sub2api_account_id}/notes", response_model=AccountNotesOut)
+@router.get("/{management_account_id}/notes", response_model=AccountNotesOut)
 async def get_account_notes(
-    sub2api_account_id: int = Path(ge=1),
+    management_account_id: int = Path(ge=1),
     _: dict = Depends(require_admin),
 ) -> AccountNotesOut:
     sub2api = Sub2ApiClient()
     try:
-        account = await sub2api.get_account_by_id(sub2api_account_id)
+        account = await sub2api.get_account_by_id(management_account_id)
     except Sub2ApiRequestError as exc:
         raise _sub2api_http_error(exc) from exc
     if account is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sub2api 账号不存在。")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="管理站点 API 账号不存在。")
     return _account_notes_out(sub2api, account)
 
 
-@router.put("/{sub2api_account_id}/notes", response_model=AccountNotesOut)
+@router.put("/{management_account_id}/notes", response_model=AccountNotesOut)
 async def update_account_notes(
     payload: AccountNotesUpdate,
-    sub2api_account_id: int = Path(ge=1),
+    management_account_id: int = Path(ge=1),
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> AccountNotesOut:
     sub2api = Sub2ApiClient()
     try:
         updated = await sub2api.update_account_notes(
-            sub2api_account_id,
+            management_account_id,
             payload.notes,
             validate_current=lambda current: assert_account_identity(
                 sub2api,
@@ -270,8 +270,8 @@ async def update_account_notes(
     await record_event(
         db,
         "account_notes_updated",
-        f"已更新 sub2api 账号 #{sub2api_account_id} 的备注。",
-        details={"sub2api_account_id": sub2api_account_id, "notes_length": len(payload.notes)},
+        f"已更新管理站点 API 账号 #{management_account_id} 的备注。",
+        details={"management_account_id": management_account_id, "notes_length": len(payload.notes)},
     )
     return _account_notes_out(sub2api, updated)
 
@@ -343,13 +343,13 @@ async def delete_account_edit_preset(
 
 
 @router.post(
-    "/edit-presets/{preset_id}/apply/{sub2api_account_id}",
+    "/edit-presets/{preset_id}/apply/{management_account_id}",
     response_model=AccountEditResult,
 )
 async def apply_account_edit_preset(
     payload: AccountEditPresetApply,
     preset_id: int = Path(ge=1),
-    sub2api_account_id: int = Path(ge=1),
+    management_account_id: int = Path(ge=1),
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> AccountEditResult:
@@ -357,7 +357,7 @@ async def apply_account_edit_preset(
     if preset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模板不存在。")
     preset_out = AccountEditPresetOut.model_validate(preset)
-    sub2api, resources = await _load_resources(sub2api_account_id)
+    sub2api, resources = await _load_resources(management_account_id)
     platform = sub2api.account_platform(resources.account)
     if platform != preset.platform:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="模板平台与当前账号不匹配。")
@@ -369,8 +369,8 @@ async def apply_account_edit_preset(
         assert_account_identity(sub2api, resources.account, payload.expected_identity_fingerprint)
         validate_account_edit_configuration(configuration, resources, preset_name=preset.name)
         updated = await sub2api.update_account_configuration(
-            sub2api_account_id,
-            name=sub2api.account_name(resources.account) or f"account-{sub2api_account_id}",
+            management_account_id,
+            name=sub2api.account_name(resources.account) or f"account-{management_account_id}",
             concurrency=configuration.concurrency,
             priority=configuration.priority,
             rate_multiplier=configuration.rate_multiplier,
@@ -394,8 +394,8 @@ async def apply_account_edit_preset(
     await record_event(
         db,
         "account_edit_preset_applied",
-        f"已将模板 {preset.name} 应用到 sub2api 账号 #{sub2api_account_id}。",
-        details={"preset_id": preset.id, "sub2api_account_id": sub2api_account_id},
+        f"已将模板 {preset.name} 应用到管理站点 API 账号 #{management_account_id}。",
+        details={"preset_id": preset.id, "management_account_id": management_account_id},
     )
     editor = await _editor_out(db, sub2api, replace(resources, account=updated, checked_at=utcnow()))
     return AccountEditResult(message=f"模板“{preset.name}”已通过有效性检查并应用。", editor=editor)

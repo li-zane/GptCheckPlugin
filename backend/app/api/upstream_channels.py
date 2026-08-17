@@ -5,26 +5,27 @@ from time import perf_counter
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import require_admin
-from app.models import UpstreamChannel
+from app.models import Upstream
 from app.schemas import (
     MessageResponse,
-    UpstreamChannelDiscoverAllRequest,
-    UpstreamChannelDiscoverAllOut,
-    UpstreamChannelMonitorsOut,
-    UpstreamChannelOut,
-    UpstreamChannelUpdate,
+    UpstreamDiscoverAllRequest,
+    UpstreamDiscoverAllOut,
+    UpstreamMonitorsOut,
+    UpstreamOut,
+    UpstreamUpdate,
     UpstreamOverviewOut,
     UpstreamUsageHistoryOut,
 )
-from app.services.upstream_accounts import UpstreamAccountServiceError
+from app.services.upstream_accounts import ApiAccountServiceError
 from app.services.upstream_channels import (
-    UpstreamChannelService,
+    UpstreamService,
     UpstreamDiscoveryOptions,
-    get_upstream_channel_service,
+    get_upstream_service,
 )
 from app.services.events import elapsed_ms, record_event
 from app.services.runtime_config import get_runtime_config_service
@@ -37,7 +38,10 @@ from app.services.upstream_usage_history import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-ChannelId = Annotated[int, Path(ge=1, le=9_007_199_254_740_991)]
+UpstreamId = Annotated[
+    str,
+    Path(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+]
 MANUAL_UPSTREAM_SYNC_TIMEOUT_SECONDS = 300.0
 
 
@@ -48,8 +52,8 @@ def _manual_discovery_options(settings: dict[str, object]) -> UpstreamDiscoveryO
         evaluate_upstream_health=bool(
             settings.get("manual_upstream_sync_upstream_health_enabled", True)
         ),
-        refresh_channel_monitors=bool(
-            settings.get("manual_upstream_sync_channel_monitors_enabled", True)
+        refresh_upstream_monitors=bool(
+            settings.get("manual_upstream_sync_upstream_monitors_enabled", True)
         ),
         evaluate_account_availability=bool(
             settings.get("manual_upstream_sync_account_availability_enabled", False)
@@ -63,35 +67,53 @@ def _manual_discovery_options(settings: dict[str, object]) -> UpstreamDiscoveryO
     )
 
 
-def _http_error(exc: UpstreamAccountServiceError) -> HTTPException:
+def _http_error(exc: ApiAccountServiceError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=exc.public_message)
+
+
+async def _load_upstream(
+    db: AsyncSession,
+    upstream_id: str,
+    *,
+    include_deleted: bool = False,
+) -> Upstream:
+    statement = select(Upstream).where(
+        Upstream.id == upstream_id.lower()
+    )
+    if not include_deleted:
+        statement = statement.where(Upstream.deleted_at.is_(None))
+    result = await db.execute(statement)
+    upstream = result.scalar_one_or_none()
+    if upstream is None:
+        raise HTTPException(status_code=404, detail="Upstream not found.")
+    return upstream
 
 
 @router.get("", response_model=UpstreamOverviewOut)
 async def upstream_channel_overview(
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+    service: UpstreamService = Depends(get_upstream_service),
 ) -> UpstreamOverviewOut:
     try:
         return await service.overview(db, sync_inventory=False)
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.get("/{channel_id}/usage-history", response_model=UpstreamUsageHistoryOut)
+@router.get("/{upstream_id}/usage-history", response_model=UpstreamUsageHistoryOut)
 async def upstream_channel_usage_history(
-    channel_id: ChannelId,
+    upstream_id: UpstreamId,
     start_date: Annotated[date | None, Query()] = None,
     end_date: Annotated[date | None, Query()] = None,
-    api_key_account_id: Annotated[
+    management_account_id: Annotated[
         int | None,
         Query(ge=1, le=9_007_199_254_740_991),
     ] = None,
     time_zone: Annotated[str | None, Query(max_length=80)] = None,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+    service: UpstreamService = Depends(get_upstream_service),
 ) -> UpstreamUsageHistoryOut:
     try:
         normalized_time_zone = normalize_history_time_zone(time_zone)
@@ -105,16 +127,14 @@ async def upstream_channel_usage_history(
             status_code=422,
             detail="The end date must not be earlier than the start date.",
         )
-    channel = await db.get(UpstreamChannel, channel_id)
-    if channel is None:
-        raise HTTPException(status_code=404, detail="Upstream channel not found.")
+    upstream = await _load_upstream(db, upstream_id, include_deleted=True)
     try:
         history = await usage_history(
             db,
-            channel=channel,
+            upstream=upstream,
             start_date=effective_start,
             end_date=effective_end,
-            api_key_account_id=api_key_account_id,
+            management_account_id=management_account_id,
             time_zone=normalized_time_zone,
         )
     except ValueError as exc:
@@ -126,16 +146,16 @@ async def upstream_channel_usage_history(
 async def sync_upstream_channel_inventory(
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+    service: UpstreamService = Depends(get_upstream_service),
 ) -> UpstreamOverviewOut:
     started_at = perf_counter()
     try:
         result = await service.overview(db)
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
-    channel_count = sum(item.account_count > 0 for item in result.channels)
-    account_count = sum(item.account_count for item in result.channels) + len(
+    upstream_count = sum(item.account_count > 0 for item in result.upstreams)
+    account_count = sum(item.account_count for item in result.upstreams) + len(
         result.unassigned_accounts
     )
     try:
@@ -144,12 +164,12 @@ async def sync_upstream_channel_inventory(
             "manual_api_key_inventory_sync",
             (
                 f"Synchronized {account_count} API key account(s) across "
-                f"{channel_count} upstream channel(s)."
+                f"{upstream_count} upstream(s)."
             ),
             details={
                 "reason": "manual",
                 "accounts": account_count,
-                "channels": channel_count,
+                "upstreams": upstream_count,
                 "unassigned_accounts": len(result.unassigned_accounts),
                 "duration_ms": elapsed_ms(started_at),
             },
@@ -163,19 +183,19 @@ async def sync_upstream_channel_inventory(
     return result
 
 
-@router.post("/discover-all", response_model=UpstreamChannelDiscoverAllOut)
+@router.post("/discover-all", response_model=UpstreamDiscoverAllOut)
 async def discover_all_upstream_channels(
-    payload: UpstreamChannelDiscoverAllRequest | None = None,
+    payload: UpstreamDiscoverAllRequest | None = None,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
-) -> UpstreamChannelDiscoverAllOut:
+    service: UpstreamService = Depends(get_upstream_service),
+) -> UpstreamDiscoverAllOut:
     started_at = perf_counter()
     try:
         legacy_bindings = None
         if payload is not None and payload.confirm_legacy_bindings:
             legacy_bindings = {
-                item.sub2api_account_id: item.expected_identity_fingerprint
+                item.management_account_id: item.expected_identity_fingerprint
                 for item in payload.account_bindings
             }
         runtime = get_runtime_config_service()
@@ -193,8 +213,16 @@ async def discover_all_upstream_channels(
         }
         if legacy_bindings is not None:
             discover_kwargs["legacy_bindings"] = legacy_bindings
-        if payload is not None and payload.skip_channel_ids:
-            discover_kwargs["skip_channel_ids"] = set(payload.skip_channel_ids)
+        if payload is not None and payload.skip_upstream_ids:
+            rows = (
+                await db.execute(
+                    select(Upstream.id).where(
+                        Upstream.id.in_(payload.skip_upstream_ids),
+                        Upstream.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+            discover_kwargs["skip_upstream_ids"] = set(rows)
         if options is not None:
             discover_kwargs["options"] = options
         result = await asyncio.wait_for(
@@ -206,7 +234,7 @@ async def discover_all_upstream_channels(
             status_code=504,
             detail="Manual API key account synchronization timed out.",
         ) from None
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
     try:
         details = {
@@ -221,14 +249,14 @@ async def discover_all_upstream_channels(
             "probe_globally_enabled": result.probe_globally_enabled,
             "duration_ms": elapsed_ms(started_at),
         }
-        if payload is not None and payload.skip_channel_ids:
-            details["skip_channel_ids"] = payload.skip_channel_ids
+        if payload is not None and payload.skip_upstream_ids:
+            details["skip_upstream_ids"] = payload.skip_upstream_ids
         if manual_settings_available and options is not None:
             details["manual_tasks"] = {
                 "rates": options.sync_rates,
                 "priorities": options.sync_priorities,
                 "upstream_health": options.evaluate_upstream_health,
-                "channel_monitors": options.refresh_channel_monitors,
+                "upstream_monitors": options.refresh_upstream_monitors,
                 "account_availability": options.evaluate_account_availability,
                 "balance_guard": options.evaluate_balance_guard,
                 "rate_pause": options.evaluate_rate_pause,
@@ -245,7 +273,7 @@ async def discover_all_upstream_channels(
             db,
             "manual_upstream_sync",
             (
-                f"Synchronized {result.total} API key channel(s); "
+                f"Synchronized {result.total} upstream(s); "
                 f"{result.succeeded} probed successfully, {result.cached} reused cached state, "
                 f"{result.failed} failed, and {result.skipped} skipped."
             ),
@@ -257,63 +285,67 @@ async def discover_all_upstream_channels(
     return result
 
 
-@router.put("/{channel_id}", response_model=UpstreamChannelOut)
+@router.put("/{upstream_id}", response_model=UpstreamOut)
 async def update_upstream_channel(
-    channel_id: ChannelId,
-    payload: UpstreamChannelUpdate,
+    upstream_id: UpstreamId,
+    payload: UpstreamUpdate,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
-) -> UpstreamChannelOut:
+    service: UpstreamService = Depends(get_upstream_service),
+) -> UpstreamOut:
     try:
-        return await service.update_channel(db, channel_id, payload)
-    except UpstreamAccountServiceError as exc:
+        upstream = await _load_upstream(db, upstream_id)
+        return await service.update_channel(db, upstream.id, payload)
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.delete("/{channel_id}", response_model=MessageResponse)
+@router.delete("/{upstream_id}", response_model=MessageResponse)
 async def delete_upstream_channel(
-    channel_id: ChannelId,
+    upstream_id: UpstreamId,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
+    service: UpstreamService = Depends(get_upstream_service),
 ) -> MessageResponse:
     try:
-        await service.delete_channel(db, channel_id)
-    except UpstreamAccountServiceError as exc:
+        upstream = await _load_upstream(db, upstream_id)
+        await service.delete_channel(db, upstream.id)
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
-    return MessageResponse(message="空渠道已删除。")
+    return MessageResponse(message="空上游已归档。")
 
 
-@router.post("/{channel_id}/discover", response_model=UpstreamChannelOut)
+@router.post("/{upstream_id}/discover", response_model=UpstreamOut)
 async def discover_upstream_channel(
-    channel_id: ChannelId,
+    upstream_id: UpstreamId,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
-) -> UpstreamChannelOut:
+    service: UpstreamService = Depends(get_upstream_service),
+) -> UpstreamOut:
     try:
+        upstream = await _load_upstream(db, upstream_id)
         settings = await get_runtime_config_service().get_public_settings()
         return await service.discover_channel(
             db,
-            channel_id,
+            upstream.id,
             options=_manual_discovery_options(settings),
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
 @router.post(
-    "/{channel_id}/channel-monitors/refresh",
-    response_model=UpstreamChannelMonitorsOut,
+    "/{upstream_id}/upstream-monitors/refresh",
+    response_model=UpstreamMonitorsOut,
 )
-async def refresh_upstream_channel_monitors(
-    channel_id: ChannelId,
+async def refresh_upstream_monitors(
+    upstream_id: UpstreamId,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
-) -> UpstreamChannelMonitorsOut:
+    service: UpstreamService = Depends(get_upstream_service),
+) -> UpstreamMonitorsOut:
     try:
-        return await service.refresh_channel_monitors(db, channel_id)
-    except UpstreamAccountServiceError as exc:
+        upstream = await _load_upstream(db, upstream_id)
+        return await service.refresh_upstream_monitors(db, upstream.id)
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None

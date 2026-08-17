@@ -1,5 +1,5 @@
 import type { ApiKeySubview } from "./viewRouting";
-import type { ChangeLogUnreadCounts } from "./types";
+import type { ChangeLogUnreadCounts } from "./domain";
 
 export type ChangeLogSubview = Extract<
   ApiKeySubview,

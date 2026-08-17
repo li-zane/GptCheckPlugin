@@ -2,15 +2,15 @@ export function upstreamChangeReasonLabel(reason?: string | null) {
   const value = normalizedStatus(reason);
   return ({
     automatic_sync: "自动同步",
-    channel_discovery: "渠道同步",
+    upstream_discovery: "上游同步",
     group_changed: "上游分组变化",
     upstream_group_change: "上游分组变化",
-    upstream_recharge_change: "上游充值成本变化",
-    local_recharge_change: "本地充值成本变化",
+    upstream_recharge_change: "上游充值倍率变化",
+    management_recharge_change: "管理站点充值倍率变化",
     manual_fallback: "手动倍率回退",
     rate_changed: "计费倍率变化",
-    target_recalculated: "目标倍率重算",
-    rate_drift: "账号倍率偏离目标",
+    expected_billing_multiplier_recalculated: "预期账号计费倍率重算",
+    rate_drift: "账号计费倍率不一致",
     upstream_key_status_change: "上游 Key 状态变化",
     upstream_key_status_changed: "上游 Key 状态变化",
     upstream_key_change: "上游 Key 状态变化",
@@ -28,8 +28,8 @@ export function upstreamChangeReasonLabel(reason?: string | null) {
     auto_disable: "账号已自动禁用",
     upstream_auto_disable: "上游失效后自动禁用",
     upstream_balance_negative: "上游余额低于阈值",
-    channel_monitor_unavailable: "渠道监控与回退测试不可用",
-    upstream_rate_increase: "综合上游倍率上涨",
+    upstream_monitor_unavailable: "上游监控与回退测试不可用",
+    upstream_rate_increase: "上游实际倍率上涨",
     upstream_key_recovered: "上游 Key 恢复可用",
     upstream_group_recovered: "上游分组恢复可用",
     remote_schedulable_change: "账号调度状态变化",
@@ -42,9 +42,6 @@ export function upstreamChangeReasonLabel(reason?: string | null) {
     skipped: "已跳过应用",
   } as Record<string, string>)[value] || reason || "上游同步";
 }
-
-/** Compatibility alias retained for callers using the earlier rate-only name. */
-export const rateChangeReasonLabel = upstreamChangeReasonLabel;
 
 export type UpstreamHealthKind = "key" | "group" | "account";
 

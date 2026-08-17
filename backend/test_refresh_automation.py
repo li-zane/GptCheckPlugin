@@ -186,7 +186,7 @@ class ManualRefreshRouteTests(unittest.TestCase):
         job = SimpleNamespace(
             id=11,
             email="manual@example.com",
-            sub2api_account_id="7",
+            management_account_id="7",
             status="queued",
             reason="manual",
             access_token_tail=None,

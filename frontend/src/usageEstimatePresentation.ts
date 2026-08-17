@@ -3,7 +3,7 @@ import type {
   UsageEstimate,
   UsageWindowAggregate,
   UsageWindowEstimate,
-} from "./types";
+} from "./domain";
 
 export type UsageDetailAccountFilter = "normal" | "rate-limited";
 

@@ -18,7 +18,7 @@ from app.services.discord_commands import get_discord_command_service
 from app.services.refresh import get_refresh_service
 from app.services.runtime_config import get_runtime_config_service
 from app.services.upstream_rate_sync import get_upstream_rate_sync_service
-from app.services.upstream_channels import get_upstream_channel_service
+from app.services.upstream_channels import get_upstream_service
 from app.services.usage_refresh import get_usage_refresh_service
 
 
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     await usage_refresh.stop()
     await notification_dispatcher.stop()
     await discord_commands.stop()
-    await get_upstream_channel_service().stop_background_tasks()
+    await get_upstream_service().stop_background_tasks()
 
 
 settings = get_settings()

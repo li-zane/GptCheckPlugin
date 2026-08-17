@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import require_admin
-from app.models import AccountSnapshot, MailboxCredential, RefreshJob, UpstreamChannel
+from app.models import AccountSnapshot, MailboxCredential, RefreshJob, Upstream
 from app.schemas import DashboardSummary
 from app.services.runtime_config import get_runtime_config_service
 from app.services.sub2api import HEALTHY_ACCOUNT_STATUSES
@@ -81,73 +81,73 @@ async def dashboard_summary(
     threshold_getter = getattr(runtime_config, "get_upstream_balance_pause_threshold", None)
     balance_basis = str(await basis_getter()) if basis_getter else "wallet"
     balance_threshold = float(await threshold_getter()) if threshold_getter else 0.0
-    historical_balance = UpstreamChannel.balance_remaining
-    historical_balance_ready = UpstreamChannel.balance_remaining.is_not(None)
+    historical_balance = Upstream.wallet_balance_usd
+    historical_balance_ready = Upstream.wallet_balance_usd.is_not(None)
     if balance_basis == "recharge_adjusted":
         historical_balance = (
-            UpstreamChannel.balance_remaining
-            * UpstreamChannel.effective_recharge_multiplier
+            Upstream.wallet_balance_usd
+            * Upstream.upstream_recharge_multiplier
         )
         historical_balance_ready = and_(
             historical_balance_ready,
-            UpstreamChannel.effective_recharge_multiplier.is_not(None),
+            Upstream.upstream_recharge_multiplier.is_not(None),
         )
-    low_balance_filter = UpstreamChannel.balance_guard_state == "insufficient"
+    low_balance_filter = Upstream.balance_guard_state == "insufficient"
     if show_stale:
         low_balance_filter = or_(
             low_balance_filter,
             and_(
                 historical_balance_ready,
                 historical_balance < balance_threshold,
-                UpstreamChannel.balance_checked_at.is_not(None),
-                UpstreamChannel.balance_source == "upstream_wallet",
+                Upstream.balance_checked_at.is_not(None),
+                Upstream.balance_source == "upstream_wallet",
             ),
         )
     low_balance_result = await db.execute(
-        select(UpstreamChannel)
+        select(Upstream)
         .where(low_balance_filter)
-        .order_by(UpstreamChannel.display_name, UpstreamChannel.id)
+        .order_by(Upstream.display_name, Upstream.id)
     )
-    low_balance_channels = []
-    for channel in low_balance_result.scalars().all():
+    low_balance_upstreams = []
+    for upstream in low_balance_result.scalars().all():
         guard_balance_available = (
-            channel.balance_guard_state == "insufficient"
-            and channel.balance_guard_value is not None
+            upstream.balance_guard_state == "insufficient"
+            and upstream.balance_guard_value is not None
         )
-        historical_value = channel.balance_remaining
+        historical_value = upstream.wallet_balance_usd
         if (
             not guard_balance_available
             and balance_basis == "recharge_adjusted"
             and historical_value is not None
-            and channel.effective_recharge_multiplier is not None
+            and upstream.upstream_recharge_multiplier is not None
         ):
-            historical_value *= channel.effective_recharge_multiplier
+            historical_value *= upstream.upstream_recharge_multiplier
         output_basis = (
-            channel.balance_guard_basis
+            upstream.balance_guard_basis
             if guard_balance_available
             else balance_basis
         )
-        low_balance_channels.append(
+        low_balance_upstreams.append(
             {
-                "id": channel.id,
-                "name": channel.display_name,
+                "id": upstream.id,
+                "name": upstream.display_name,
                 "balance": (
-                    channel.balance_guard_value
+                    upstream.balance_guard_value
                     if guard_balance_available
                     else historical_value
                 ),
                 "unit": (
                     "CNY"
                     if output_basis == "recharge_adjusted"
-                    else channel.balance_unit
+                    else upstream.balance_unit
                 ),
                 "basis": output_basis,
                 "threshold": balance_threshold,
-                "paused_accounts": channel.balance_guard_paused_count,
+                "paused_accounts": upstream.balance_guard_paused_count,
                 "checked_at": (
-                    channel.balance_guard_checked_at
+                    upstream.balance_guard_checked_at
                     if guard_balance_available
-                    else channel.balance_checked_at
+                    else upstream.balance_checked_at
                 ),
             }
         )
@@ -161,6 +161,6 @@ async def dashboard_summary(
         mailbox_count=mailbox_count,
         recent_success=recent_success,
         recent_failed=recent_failed,
-        low_balance_channel_count=len(low_balance_channels),
-        low_balance_channels=low_balance_channels,
+        low_balance_upstream_count=len(low_balance_upstreams),
+        low_balance_upstreams=low_balance_upstreams,
     )

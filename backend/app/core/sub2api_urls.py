@@ -9,8 +9,8 @@ SUB2API_API_PREFIX = "/api/v1"
 _DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 
-def normalize_sub2api_base_url(value: str) -> str:
-    """Validate and canonicalize the runtime sub2api API base URL."""
+def normalize_management_site_base_url(value: str) -> str:
+    """Validate and canonicalize the management site's Sub2API base URL."""
 
     if not isinstance(value, str):
         raise TypeError("sub2api base URL must be a string")
@@ -66,7 +66,7 @@ def normalize_sub2api_base_url(value: str) -> str:
 def replace_sub2api_port(base_url: str, port: int) -> str:
     if not 1 <= int(port) <= 65535:
         raise ValueError("sub2api port must be between 1 and 65535")
-    parsed = urlsplit(normalize_sub2api_base_url(base_url))
+    parsed = urlsplit(normalize_management_site_base_url(base_url))
     hostname = parsed.hostname
     if hostname is None:  # pragma: no cover - guarded by normalization
         raise ValueError("sub2api base URL host is required")
@@ -74,7 +74,7 @@ def replace_sub2api_port(base_url: str, port: int) -> str:
     updated = urlunsplit(
         (parsed.scheme, f"{host_for_url}:{int(port)}", parsed.path, "", "")
     )
-    return normalize_sub2api_base_url(updated)
+    return normalize_management_site_base_url(updated)
 
 
 def is_strict_loopback_hostname(hostname: str) -> bool:
@@ -89,7 +89,7 @@ def is_strict_loopback_hostname(hostname: str) -> bool:
 
 def is_loopback_sub2api_url(value: str) -> bool:
     try:
-        hostname = urlsplit(normalize_sub2api_base_url(value)).hostname
+        hostname = urlsplit(normalize_management_site_base_url(value)).hostname
     except (TypeError, ValueError):
         return False
     return bool(hostname and is_strict_loopback_hostname(hostname))
@@ -131,6 +131,6 @@ __all__ = [
     "SUB2API_API_PREFIX",
     "is_loopback_sub2api_url",
     "is_strict_loopback_hostname",
-    "normalize_sub2api_base_url",
+    "normalize_management_site_base_url",
     "replace_sub2api_port",
 ]

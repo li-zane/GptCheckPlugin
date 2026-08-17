@@ -57,8 +57,8 @@ async def list_upstream_rate_change_logs(
     changed_fields = (
         (UpstreamRateChangeLog.old_group_multiplier, UpstreamRateChangeLog.new_group_multiplier),
         (UpstreamRateChangeLog.old_upstream_multiplier, UpstreamRateChangeLog.new_upstream_multiplier),
-        (UpstreamRateChangeLog.old_target_rate, UpstreamRateChangeLog.new_target_rate),
-        (UpstreamRateChangeLog.old_current_rate, UpstreamRateChangeLog.new_current_rate),
+        (UpstreamRateChangeLog.old_expected_management_billing_multiplier, UpstreamRateChangeLog.new_expected_management_billing_multiplier),
+        (UpstreamRateChangeLog.old_management_billing_multiplier, UpstreamRateChangeLog.new_management_billing_multiplier),
         (UpstreamRateChangeLog.old_upstream_key_status, UpstreamRateChangeLog.new_upstream_key_status),
         (UpstreamRateChangeLog.old_upstream_group_status, UpstreamRateChangeLog.new_upstream_group_status),
         (UpstreamRateChangeLog.old_remote_schedulable, UpstreamRateChangeLog.new_remote_schedulable),

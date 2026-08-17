@@ -1,4 +1,4 @@
-import type { UsageLimitSample } from "./types";
+import type { UsageLimitSample } from "./domain";
 
 export type UsageSampleSortField = "quota" | "recorded_at";
 export type UsageSampleSortDirection = "asc" | "desc";

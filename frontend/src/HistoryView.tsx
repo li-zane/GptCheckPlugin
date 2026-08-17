@@ -7,7 +7,7 @@ import {
   formatElapsedDuration,
   timestampDurationMs,
 } from "./durationPresentation";
-import type { AccountExceptionRecord, AppEvent, RefreshJob } from "./types";
+import type { AccountExceptionRecord, AppEvent, RefreshJob } from "./domain";
 
 type HistoryViewProps = {
   jobs: RefreshJob[];
@@ -80,12 +80,12 @@ export function HistoryView({
                       <Badge tone={exceptionStatusTone(record.status)}>{exceptionStatusLabel(record.status)}</Badge>
                       <Badge tone="ink">{exceptionSourceLabel(record.source)}</Badge>
                       <strong className="mono history-email">{record.email || "unknown"}</strong>
-                      {record.sub2api_account_id ? <span className="memory-pill mono">{record.sub2api_account_id}</span> : null}
+                      {record.management_account_id ? <span className="memory-pill mono">{record.management_account_id}</span> : null}
                       {relatedJobDurationMs !== null ? <span className="memory-pill">耗时 {formatElapsedDuration(relatedJobDurationMs)}</span> : null}
                     </div>
                     <div className="history-record-actions">
                       <time>{formatDate(displayTime, timeZone)}</time>
-                      <button aria-label="在账号界面定位此账号" className="icon-button" disabled={busy || (!record.email && !record.sub2api_account_id)} onClick={() => onLocateAccount(record)} title="在账号界面定位此账号" type="button">
+                      <button aria-label="在账号界面定位此账号" className="icon-button" disabled={busy || (!record.email && !record.management_account_id)} onClick={() => onLocateAccount(record)} title="在账号界面定位此账号" type="button">
                         <ExternalLink size={16} />
                       </button>
                       <button aria-label="删除异常账号记录" className="icon-button history-dismiss-button" disabled={busy} onClick={() => onDeleteExceptionRecord(record.id)} title="删除这条异常账号记录" type="button">
@@ -188,10 +188,10 @@ function statusLabel(status: string) {
 }
 
 function latestErrorRefreshJobForRecord(record: AccountExceptionRecord, jobs: RefreshJob[]) {
-  const accountId = normalizeHistoryAccountId(record.sub2api_account_id);
+  const accountId = normalizeHistoryAccountId(record.management_account_id);
   if (accountId) {
     for (const job of jobs) {
-      if (refreshJobHasErrorReason(job) && normalizeHistoryAccountId(job.sub2api_account_id) === accountId) return job;
+      if (refreshJobHasErrorReason(job) && normalizeHistoryAccountId(job.management_account_id) === accountId) return job;
     }
   }
   const email = normalizeHistoryEmail(record.email);
@@ -274,7 +274,7 @@ function eventModeLabel(event: AppEvent) {
 
 function eventKindLabel(kind: string) {
   return ({
-    sub2api_protocol_refresh_failed: "sub2api /refresh", sub2api_check_status_unavailable: "sub2api /check-status", runtime_access_token_missing: "运行态 AT", access_token_status_check_failed: "AT 状态检查", chatgpt_protocol_refresh_failed: "ChatGPT 协议", openai_oauth_refresh_token_failed: "OpenAI OAuth", refresh_failed: "刷新失败", refresh_started: "刷新开始", refresh_succeeded: "刷新成功", refresh_deactive: "刷新封禁", refresh_skipped_missing_mailbox: "缺少邮箱", manual_sync: "OAuth 账号同步", monitor_sync: "OAuth 账号清单同步", monitor_failed: "OAuth 账号清单同步失败", usage_refresh: "OAuth 用量窗口", usage_refresh_failed: "OAuth 用量窗口失败", usage_statistics_refresh: "用量窗口手动刷新", subscription_refresh: "订阅信息刷新", manual_upstream_sync: "API 账号同步", manual_api_key_inventory_sync: "API Key 账号清单同步", api_key_inventory_sync: "API Key 账号清单自动同步", api_key_inventory_sync_failed: "API Key 账号清单自动同步失败", upstream_sync: "上游自动探测", upstream_rate_sync_failed: "上游自动探测失败",
+    sub2api_protocol_refresh_failed: "sub2api /refresh", sub2api_check_status_unavailable: "sub2api /check-status", runtime_access_token_missing: "运行态 AT", access_token_status_check_failed: "AT 状态检查", chatgpt_protocol_refresh_failed: "ChatGPT 协议", openai_oauth_refresh_token_failed: "OpenAI OAuth", refresh_failed: "刷新失败", refresh_started: "刷新开始", refresh_succeeded: "刷新成功", refresh_deactive: "刷新封禁", refresh_skipped_missing_mailbox: "缺少邮箱", manual_sync: "OAuth 账号同步", monitor_sync: "OAuth 账号清单同步", monitor_failed: "OAuth 账号清单同步失败", usage_refresh: "OAuth 用量窗口", usage_refresh_failed: "OAuth 用量窗口失败", usage_statistics_refresh: "用量窗口手动刷新", subscription_refresh: "订阅信息刷新", manual_upstream_sync: "API 账号同步", manual_api_key_inventory_sync: "API 账号清单同步", api_key_inventory_sync: "API 账号清单自动同步", api_key_inventory_sync_failed: "API 账号清单自动同步失败", upstream_sync: "上游自动探测", upstream_rate_sync_failed: "上游自动探测失败",
   }[kind] || kind);
 }
 

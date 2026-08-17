@@ -6,6 +6,7 @@ from time import perf_counter
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from pydantic import ValidationError
 from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,6 +83,7 @@ from app.services.usage_estimate import (
     _usage_limit_sample_allowed,
     account_rate_limited_windows,
     build_usage_estimate,
+    delete_cached_usage_estimate,
     get_cached_usage_estimate,
 )
 from app.services.usage_refresh import get_usage_refresh_service
@@ -168,8 +170,8 @@ def _manual_error_delete_unlockable(
     return remote_error and not effective_deactive and not is_duplicate
 
 
-def _account_delete_unlock_key(sub2api_account_id: str) -> str:
-    return f"{_ACCOUNT_DELETE_UNLOCK_PREFIX}{sub2api_account_id}"
+def _account_delete_unlock_key(management_account_id: str) -> str:
+    return f"{_ACCOUNT_DELETE_UNLOCK_PREFIX}{management_account_id}"
 
 
 async def _load_delete_unlocked_ids(db: AsyncSession) -> set[str]:
@@ -181,8 +183,8 @@ async def _load_delete_unlocked_ids(db: AsyncSession) -> set[str]:
     }
 
 
-async def _set_delete_unlocked(db: AsyncSession, sub2api_account_id: str, unlocked: bool) -> None:
-    setting_key = _account_delete_unlock_key(sub2api_account_id)
+async def _set_delete_unlocked(db: AsyncSession, management_account_id: str, unlocked: bool) -> None:
+    setting_key = _account_delete_unlock_key(management_account_id)
     setting = await db.get(AppSetting, setting_key)
     if unlocked:
         if setting is None:
@@ -379,7 +381,7 @@ def _snapshot_subscription_metadata(snapshot: AccountSnapshot | None) -> dict[st
     }
 
 
-def _sub2api_imported_at(account: dict[str, Any] | None, snapshot: AccountSnapshot | None = None) -> str | None:
+def _management_site_imported_at(account: dict[str, Any] | None, snapshot: AccountSnapshot | None = None) -> str | None:
     paths = (
         ("created_at",),
         ("createdAt",),
@@ -621,8 +623,8 @@ async def list_accounts(
         effective_deactive = _effective_deactive(sub2api, account, snapshot)
         remote_deactive = sub2api.is_deactive_account(account)
         remote_error = sub2api.is_error_account(account) or effective_deactive
-        sub2api_error_code = sub2api.account_error_status_code(account) if remote_error else None
-        sub2api_error_message = sub2api.account_error_message(account) if remote_error else None
+        management_site_error_code = sub2api.account_error_status_code(account) if remote_error else None
+        management_site_error_message = sub2api.account_error_message(account) if remote_error else None
         mailbox_bound = normalized in bound_emails
         phone_data = phone_by_email.get(normalized) or {}
         delete_unlockable = _manual_error_delete_unlockable(
@@ -648,8 +650,8 @@ async def list_accounts(
                 account_name=sub2api.account_name(account)
                 or sub2api.account_name(snapshot.raw if snapshot and isinstance(snapshot.raw, dict) else {})
                 or normalized,
-                sub2api_account_id=account_id,
-                sub2api_imported_at=_sub2api_imported_at(account, snapshot),
+                management_account_id=account_id,
+                management_site_imported_at=_management_site_imported_at(account, snapshot),
                 platform=sub2api.account_platform(account) or (snapshot.platform if snapshot else None),
                 account_type=sub2api.account_type(account) or (snapshot.account_type if snapshot else None),
                 status=sub2api.account_status(account) or (snapshot.status if snapshot else None),
@@ -660,8 +662,8 @@ async def list_accounts(
                 refreshing=snapshot.refreshing if snapshot else False,
                 auto_refresh_locked=snapshot.auto_refresh_locked if snapshot else False,
                 last_error=last_error,
-                sub2api_error_code=sub2api_error_code,
-                sub2api_error_message=sub2api_error_message,
+                management_site_error_code=management_site_error_code,
+                management_site_error_message=management_site_error_message,
                 last_seen_at=snapshot.last_seen_at if snapshot else now,
                 updated_at=snapshot.updated_at if snapshot else now,
                 is_duplicate=is_duplicate,
@@ -692,7 +694,7 @@ async def list_accounts(
         if normalized in seen_remote_emails:
             continue
         rate_limited_windows = account_rate_limited_windows(snapshot.raw or {}, sample_thresholds=sample_thresholds)
-        account_id = snapshot.sub2api_account_id
+        account_id = snapshot.management_account_id
         mailbox_bound = normalized in bound_emails
         phone_data = phone_by_email.get(normalized) or {}
         snapshot_raw = snapshot.raw if isinstance(snapshot.raw, dict) else {}
@@ -718,8 +720,8 @@ async def list_accounts(
                 id=snapshot.id,
                 email=normalized,
                 account_name=sub2api.account_name(snapshot.raw if isinstance(snapshot.raw, dict) else {}) or normalized,
-                sub2api_account_id=snapshot.sub2api_account_id,
-                sub2api_imported_at=_sub2api_imported_at(None, snapshot),
+                management_account_id=snapshot.management_account_id,
+                management_site_imported_at=_management_site_imported_at(None, snapshot),
                 platform=snapshot.platform,
                 account_type=snapshot.account_type,
                 status=snapshot.status,
@@ -730,12 +732,12 @@ async def list_accounts(
                 refreshing=snapshot.refreshing,
                 auto_refresh_locked=snapshot.auto_refresh_locked,
                 last_error=sub2api.redact_error_text(snapshot.last_error) or None,
-                sub2api_error_code=(
+                management_site_error_code=(
                     sub2api.account_error_status_code(snapshot_remote)
                     if snapshot_has_remote_error
                     else None
                 ),
-                sub2api_error_message=(
+                management_site_error_message=(
                     sub2api.account_error_message(snapshot_remote)
                     if snapshot_has_remote_error
                     else None
@@ -759,7 +761,7 @@ async def list_accounts(
             )
         )
 
-    return sorted(rows, key=lambda item: (item.email, item.duplicate_rank, item.sub2api_account_id or ""))
+    return sorted(rows, key=lambda item: (item.email, item.duplicate_rank, item.management_account_id or ""))
 
 
 @router.get("/usage-estimate", response_model=UsageEstimateOut)
@@ -772,12 +774,18 @@ async def usage_estimate(
         if not refresh:
             cached = await get_cached_usage_estimate()
             if cached is not None:
-                return UsageEstimateOut.model_validate(cached)
+                try:
+                    return UsageEstimateOut.model_validate(cached)
+                except ValidationError:
+                    await delete_cached_usage_estimate()
         if refresh:
             await usage_service.refresh_all(reason="usage_estimate")
             cached = await get_cached_usage_estimate()
             if cached is not None:
-                return UsageEstimateOut.model_validate(cached)
+                try:
+                    return UsageEstimateOut.model_validate(cached)
+                except ValidationError:
+                    await delete_cached_usage_estimate()
         cached_usage = usage_service.latest_usage_snapshot() or None
         return await build_usage_estimate(
             refresh=False,
@@ -845,7 +853,7 @@ async def usage_limit_samples(
                             id=row.id,
                             account_key=row.account_key,
                             email=row.email,
-                            sub2api_account_id=row.sub2api_account_id,
+                            management_account_id=row.management_account_id,
                             plan_cohort=_normalize_plan_cohort(row.plan_cohort),
                             subscription_type=_normalize_plan_cohort(row.plan_cohort),
                             subscription_label=_plan_cohort_label(row.plan_cohort),
@@ -1188,9 +1196,9 @@ async def sync_accounts(
     return result
 
 
-@router.delete("/remote/{sub2api_account_id}", response_model=MessageResponse)
+@router.delete("/remote/{management_account_id}", response_model=MessageResponse)
 async def delete_remote_account(
-    sub2api_account_id: str,
+    management_account_id: str,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MessageResponse:
@@ -1203,7 +1211,7 @@ async def delete_remote_account(
     target_index = None
     target_account = None
     for index, account in enumerate(accounts):
-        if sub2api.account_id(account) == sub2api_account_id:
+        if sub2api.account_id(account) == management_account_id:
             target_index = index
             target_account = account
             break
@@ -1253,7 +1261,7 @@ async def delete_remote_account(
         "Requested deletion of one sub2api account.",
         email.lower() if email else None,
         {
-            "sub2api_account_id": sub2api_account_id,
+            "management_account_id": management_account_id,
             "is_duplicate": is_duplicate,
             "duplicate_primary": duplicate_primary,
             "remote_error": is_remote_error,
@@ -1262,24 +1270,24 @@ async def delete_remote_account(
     )
 
     try:
-        deleted = await sub2api.delete_account(sub2api_account_id)
+        deleted = await sub2api.delete_account(management_account_id)
     except Sub2ApiRequestError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sub2api account not found.")
 
-    await _set_delete_unlocked(db, sub2api_account_id, False)
+    await _set_delete_unlocked(db, management_account_id, False)
 
     if email:
         remaining_same_email = [
             account
             for account in accounts
-            if sub2api.account_id(account) != sub2api_account_id and sub2api.account_email(account) == email
+            if sub2api.account_id(account) != management_account_id and sub2api.account_email(account) == email
         ]
         if snapshot and remaining_same_email:
             deduped, _ = sub2api.dedupe_accounts_by_email(remaining_same_email)
             replacement = deduped[0] if deduped else remaining_same_email[0]
-            snapshot.sub2api_account_id = sub2api.account_id(replacement)
+            snapshot.management_account_id = sub2api.account_id(replacement)
             snapshot.platform = sub2api.account_platform(replacement)
             snapshot.account_type = sub2api.account_type(replacement)
             snapshot.status = sub2api.account_status(replacement)
@@ -1295,7 +1303,7 @@ async def delete_remote_account(
             db,
             source=source,
             email=normalized_email,
-            sub2api_account_id=sub2api_account_id,
+            management_account_id=management_account_id,
             commit=False,
         )
 
@@ -1305,19 +1313,19 @@ async def delete_remote_account(
         "Deleted one sub2api account from the account table.",
         email.lower() if email else None,
         {
-            "sub2api_account_id": sub2api_account_id,
+            "management_account_id": management_account_id,
             "is_duplicate": is_duplicate,
             "duplicate_primary": duplicate_primary,
             "remote_error": is_remote_error,
             "delete_mode": "session_unlock" if delete_unlockable else "direct",
         },
     )
-    return MessageResponse(message=f"Deleted sub2api account {sub2api_account_id}.")
+    return MessageResponse(message=f"Deleted sub2api account {management_account_id}.")
 
 
-@router.put("/remote/{sub2api_account_id}/delete-lock", response_model=MessageResponse)
+@router.put("/remote/{management_account_id}/delete-lock", response_model=MessageResponse)
 async def update_remote_account_delete_lock(
-    sub2api_account_id: str,
+    management_account_id: str,
     payload: AccountDeleteUnlockUpdate,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
@@ -1331,7 +1339,7 @@ async def update_remote_account_delete_lock(
     target_index = None
     target_account = None
     for index, account in enumerate(accounts):
-        if sub2api.account_id(account) == sub2api_account_id:
+        if sub2api.account_id(account) == management_account_id:
             target_index = index
             target_account = account
             break
@@ -1363,14 +1371,14 @@ async def update_remote_account_delete_lock(
     if payload.unlocked and not delete_unlockable:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This account does not support manual delete unlock.")
 
-    await _set_delete_unlocked(db, sub2api_account_id, payload.unlocked)
+    await _set_delete_unlocked(db, management_account_id, payload.unlocked)
     message = "Manual delete unlock enabled for this account." if payload.unlocked else "Delete lock restored for this account."
     await record_event(
         db,
         "account_delete_lock_updated",
         message,
         email.lower() if email else None,
-        {"sub2api_account_id": sub2api_account_id, "unlocked": payload.unlocked},
+        {"management_account_id": management_account_id, "unlocked": payload.unlocked},
     )
     return MessageResponse(message=message)
 
@@ -1553,9 +1561,9 @@ async def delete_deactivated_accounts(
             message="No deactivated or duplicate accounts to delete.",
             deleted_accounts=0,
             deleted_mailboxes=0,
-            deleted_sub2api_accounts=0,
-            deleted_no_email_sub2api_accounts=0,
-            failed_sub2api_accounts=[],
+            deleted_management_site_api_accounts=0,
+            deleted_management_site_accounts_without_email=0,
+            failed_management_site_api_accounts=[],
         )
 
     failed_remote: list[str] = []
@@ -1594,7 +1602,7 @@ async def delete_deactivated_accounts(
             if snapshot:
                 deduped, _ = sub2api.dedupe_accounts_by_email(remaining)
                 replacement = deduped[0] if deduped else remaining[0]
-                snapshot.sub2api_account_id = sub2api.account_id(replacement)
+                snapshot.management_account_id = sub2api.account_id(replacement)
                 snapshot.platform = sub2api.account_platform(replacement)
                 snapshot.account_type = sub2api.account_type(replacement)
                 snapshot.status = sub2api.account_status(replacement)
@@ -1615,7 +1623,7 @@ async def delete_deactivated_accounts(
         for email in affected_emails:
             await clear_account_exception(db, source=source, email=email, commit=False)
         for account_id in deleted_remote_ids:
-            await clear_account_exception(db, source=source, sub2api_account_id=account_id, commit=False)
+            await clear_account_exception(db, source=source, management_account_id=account_id, commit=False)
 
     await record_event(
         db,
@@ -1624,9 +1632,9 @@ async def delete_deactivated_accounts(
         details={
             "deleted_accounts": deleted_accounts,
             "deleted_mailboxes": deleted_mailboxes,
-            "deleted_sub2api_accounts": deleted_remote,
-            "deleted_no_email_sub2api_accounts": deleted_no_email_remote,
-            "failed_sub2api_accounts": failed_remote,
+            "deleted_management_site_api_accounts": deleted_remote,
+            "deleted_management_site_accounts_without_email": deleted_no_email_remote,
+            "failed_management_site_api_accounts": failed_remote,
         },
     )
     remote_summary = f"and {deleted_remote} sub2api account(s)"
@@ -1642,9 +1650,9 @@ async def delete_deactivated_accounts(
         message=message,
         deleted_accounts=deleted_accounts,
         deleted_mailboxes=deleted_mailboxes,
-        deleted_sub2api_accounts=deleted_remote,
-        deleted_no_email_sub2api_accounts=deleted_no_email_remote,
-        failed_sub2api_accounts=failed_remote,
+        deleted_management_site_api_accounts=deleted_remote,
+        deleted_management_site_accounts_without_email=deleted_no_email_remote,
+        failed_management_site_api_accounts=failed_remote,
     )
 
 
@@ -1655,9 +1663,9 @@ async def delete_selected_accounts(
     db: AsyncSession = Depends(get_db),
 ) -> DeactivatedCleanupResult:
     selected_remote_ids = {
-        str(item.sub2api_account_id).strip()
+        str(item.management_account_id).strip()
         for item in payload.accounts
-        if item.sub2api_account_id and str(item.sub2api_account_id).strip()
+        if item.management_account_id and str(item.management_account_id).strip()
     }
     selected_snapshot_ids = {int(item.snapshot_id) for item in payload.accounts if item.snapshot_id}
     if not selected_remote_ids and not selected_snapshot_ids:
@@ -1679,9 +1687,9 @@ async def delete_selected_accounts(
     snapshots_by_email = {snapshot.email.lower(): snapshot for snapshot in snapshots}
     selected_snapshots = [snapshot for snapshot in snapshots if snapshot.id in selected_snapshot_ids]
     selected_snapshot_account_ids = {
-        str(snapshot.sub2api_account_id).strip()
+        str(snapshot.management_account_id).strip()
         for snapshot in selected_snapshots
-        if snapshot.sub2api_account_id and str(snapshot.sub2api_account_id).strip()
+        if snapshot.management_account_id and str(snapshot.management_account_id).strip()
     }
 
     failed_remote: list[str] = []
@@ -1725,7 +1733,7 @@ async def delete_selected_accounts(
             if snapshot:
                 deduped, _ = sub2api.dedupe_accounts_by_email(remaining)
                 replacement = deduped[0] if deduped else remaining[0]
-                snapshot.sub2api_account_id = sub2api.account_id(replacement)
+                snapshot.management_account_id = sub2api.account_id(replacement)
                 snapshot.platform = sub2api.account_platform(replacement)
                 snapshot.account_type = sub2api.account_type(replacement)
                 snapshot.status = sub2api.account_status(replacement)
@@ -1746,7 +1754,7 @@ async def delete_selected_accounts(
         for email in affected_emails:
             await clear_account_exception(db, source=source, email=email, commit=False)
         for account_id in deleted_remote_ids:
-            await clear_account_exception(db, source=source, sub2api_account_id=account_id, commit=False)
+            await clear_account_exception(db, source=source, management_account_id=account_id, commit=False)
 
     await record_event(
         db,
@@ -1754,13 +1762,13 @@ async def delete_selected_accounts(
         f"Deleted {deleted_accounts} selected account(s), {deleted_mailboxes} mailbox credential(s), and {deleted_remote} sub2api account(s).",
         details={
             "selected_count": len(payload.accounts),
-            "selected_sub2api_account_ids": sorted(selected_remote_ids),
+            "selected_management_account_ids": sorted(selected_remote_ids),
             "selected_snapshot_ids": sorted(selected_snapshot_ids),
             "deleted_accounts": deleted_accounts,
             "deleted_mailboxes": deleted_mailboxes,
-            "deleted_sub2api_accounts": deleted_remote,
-            "deleted_no_email_sub2api_accounts": deleted_no_email_remote,
-            "failed_sub2api_accounts": failed_remote,
+            "deleted_management_site_api_accounts": deleted_remote,
+            "deleted_management_site_accounts_without_email": deleted_no_email_remote,
+            "failed_management_site_api_accounts": failed_remote,
         },
     )
     message = (
@@ -1773,9 +1781,9 @@ async def delete_selected_accounts(
         message=message,
         deleted_accounts=deleted_accounts,
         deleted_mailboxes=deleted_mailboxes,
-        deleted_sub2api_accounts=deleted_remote,
-        deleted_no_email_sub2api_accounts=deleted_no_email_remote,
-        failed_sub2api_accounts=failed_remote,
+        deleted_management_site_api_accounts=deleted_remote,
+        deleted_management_site_accounts_without_email=deleted_no_email_remote,
+        failed_management_site_api_accounts=failed_remote,
     )
 
 

@@ -11,8 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import (
     AccountSchedulingChangeLog,
     AppSetting,
-    UpstreamAccountDataArchive,
-    UpstreamChannelChangeEvent,
+    ApiAccountDataArchive,
+    UpstreamChangeEvent,
     utcnow,
 )
 
@@ -109,7 +109,7 @@ async def mark_upstream_changes_read(
     )
     return await _mark_read(
         db,
-        UpstreamChannelChangeEvent,
+        UpstreamChangeEvent,
         cursor_key,
         through_id,
     )
@@ -140,17 +140,17 @@ async def delete_expired_change_logs(
     *,
     retention_days: int,
 ) -> None:
-    await _prune(db, UpstreamChannelChangeEvent, retention_days)
+    await _prune(db, UpstreamChangeEvent, retention_days)
     await _prune(db, AccountSchedulingChangeLog, retention_days)
-    await _prune(db, UpstreamAccountDataArchive, retention_days)
+    await _prune(db, ApiAccountDataArchive, retention_days)
     await _effective_cursor(
         db,
-        UpstreamChannelChangeEvent,
+        UpstreamChangeEvent,
         UPSTREAM_CHANGE_READ_CURSOR,
     )
     await _effective_cursor(
         db,
-        UpstreamChannelChangeEvent,
+        UpstreamChangeEvent,
         ACCOUNT_RATE_CHANGE_READ_CURSOR,
     )
     await _effective_cursor(
@@ -231,9 +231,9 @@ async def _list_page(
     unread_statement = select(func.count()).select_from(model).where(model.id > cursor)
     if where_clause is not None:
         unread_statement = unread_statement.where(where_clause)
-    if model is UpstreamChannelChangeEvent:
+    if model is UpstreamChangeEvent:
         unread_statement = unread_statement.where(
-            UpstreamChannelChangeEvent.legacy_imported.is_(False)
+            UpstreamChangeEvent.legacy_imported.is_(False)
         )
     unread_count = int(await db.scalar(unread_statement) or 0)
     return rows, cursor, unread_count, total_count
@@ -249,19 +249,19 @@ async def list_upstream_channel_changes(
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     category: str = "all",
-) -> tuple[list[UpstreamChannelChangeEvent], int, int, int]:
+) -> tuple[list[UpstreamChangeEvent], int, int, int]:
     if category not in {"all", "upstream", "account_rate"}:
         raise ValueError("Unsupported upstream change category.")
     where_clause = (
-        UpstreamChannelChangeEvent.event_type == ACCOUNT_RATE_EVENT_TYPE
+        UpstreamChangeEvent.event_type == ACCOUNT_RATE_EVENT_TYPE
         if category == "account_rate"
-        else UpstreamChannelChangeEvent.event_type != ACCOUNT_RATE_EVENT_TYPE
+        else UpstreamChangeEvent.event_type != ACCOUNT_RATE_EVENT_TYPE
         if category == "upstream"
         else None
     )
     return await _list_page(
         db,
-        UpstreamChannelChangeEvent,
+        UpstreamChangeEvent,
         (
             ACCOUNT_RATE_CHANGE_READ_CURSOR
             if category == "account_rate"
@@ -309,7 +309,7 @@ async def change_log_unread_counts(
         raise ValueError("retention_days must be between 1 and 3650.")
     upstream_cursor = await _effective_cursor(
         db,
-        UpstreamChannelChangeEvent,
+        UpstreamChangeEvent,
         UPSTREAM_CHANGE_READ_CURSOR,
         repair=False,
     )
@@ -321,18 +321,18 @@ async def change_log_unread_counts(
     )
     account_rate_cursor = await _effective_cursor(
         db,
-        UpstreamChannelChangeEvent,
+        UpstreamChangeEvent,
         ACCOUNT_RATE_CHANGE_READ_CURSOR,
         repair=False,
     )
     upstream = int(
         await db.scalar(
             select(func.count())
-            .select_from(UpstreamChannelChangeEvent)
+            .select_from(UpstreamChangeEvent)
             .where(
-                UpstreamChannelChangeEvent.id > upstream_cursor,
-                UpstreamChannelChangeEvent.legacy_imported.is_(False),
-                UpstreamChannelChangeEvent.event_type != ACCOUNT_RATE_EVENT_TYPE,
+                UpstreamChangeEvent.id > upstream_cursor,
+                UpstreamChangeEvent.legacy_imported.is_(False),
+                UpstreamChangeEvent.event_type != ACCOUNT_RATE_EVENT_TYPE,
             )
         )
         or 0
@@ -340,11 +340,11 @@ async def change_log_unread_counts(
     account_rate = int(
         await db.scalar(
             select(func.count())
-            .select_from(UpstreamChannelChangeEvent)
+            .select_from(UpstreamChangeEvent)
             .where(
-                UpstreamChannelChangeEvent.id > account_rate_cursor,
-                UpstreamChannelChangeEvent.legacy_imported.is_(False),
-                UpstreamChannelChangeEvent.event_type == ACCOUNT_RATE_EVENT_TYPE,
+                UpstreamChangeEvent.id > account_rate_cursor,
+                UpstreamChangeEvent.legacy_imported.is_(False),
+                UpstreamChangeEvent.event_type == ACCOUNT_RATE_EVENT_TYPE,
             )
         )
         or 0
@@ -400,8 +400,8 @@ def _recharge_multiplier_details(
 def record_upstream_channel_changes(
     db: AsyncSession,
     *,
-    channel_id: int,
-    channel_name: str | None,
+    upstream_id: str,
+    upstream_name: str | None,
     previous_recharge_multiplier: Any,
     current_recharge_multiplier: Any,
     previous_groups: list[dict[str, Any]] | None,
@@ -412,17 +412,17 @@ def record_upstream_channel_changes(
     old_recharge = _finite_number(previous_recharge_multiplier)
     new_recharge = _finite_number(current_recharge_multiplier)
     # An unavailable probe is not evidence of a billing change. Both sides
-    # must be known before emitting a channel recharge multiplier event.
+    # must be known before emitting an upstream recharge multiplier event.
     if (
         old_recharge is not None
         and new_recharge is not None
         and _numbers_differ(old_recharge, new_recharge)
     ):
         db.add(
-            UpstreamChannelChangeEvent(
-                channel_id=channel_id,
-                channel_name=(channel_name or "")[:200] or None,
-                event_type="channel_multiplier_changed",
+            UpstreamChangeEvent(
+                upstream_id=upstream_id,
+                upstream_name=(upstream_name or "")[:200] or None,
+                event_type="upstream_recharge_multiplier_changed",
                 old_value=old_recharge,
                 new_value=new_recharge,
                 created_at=observed_at,
@@ -449,9 +449,9 @@ def record_upstream_channel_changes(
             }
             group_changes.append(change)
             db.add(
-                UpstreamChannelChangeEvent(
-                    channel_id=channel_id,
-                    channel_name=(channel_name or "")[:200] or None,
+                UpstreamChangeEvent(
+                    upstream_id=upstream_id,
+                    upstream_name=(upstream_name or "")[:200] or None,
                     event_type="group_added",
                     group_id=group_id[:128],
                     group_name=group_name,
@@ -475,9 +475,9 @@ def record_upstream_channel_changes(
             }
             group_changes.append(change)
             db.add(
-                UpstreamChannelChangeEvent(
-                    channel_id=channel_id,
-                    channel_name=(channel_name or "")[:200] or None,
+                UpstreamChangeEvent(
+                    upstream_id=upstream_id,
+                    upstream_name=(upstream_name or "")[:200] or None,
                     event_type="group_removed",
                     group_id=group_id[:128],
                     group_name=group_name,
@@ -509,9 +509,9 @@ def record_upstream_channel_changes(
                 "details": name_change_details,
             })
             db.add(
-                UpstreamChannelChangeEvent(
-                    channel_id=channel_id,
-                    channel_name=(channel_name or "")[:200] or None,
+                UpstreamChangeEvent(
+                    upstream_id=upstream_id,
+                    upstream_name=(upstream_name or "")[:200] or None,
                     event_type="group_name_changed",
                     group_id=group_id[:128],
                     group_name=new_name or old_name,
@@ -532,9 +532,9 @@ def record_upstream_channel_changes(
                 "new_multiplier": new_value,
             })
             db.add(
-                UpstreamChannelChangeEvent(
-                    channel_id=channel_id,
-                    channel_name=(channel_name or "")[:200] or None,
+                UpstreamChangeEvent(
+                    upstream_id=upstream_id,
+                    upstream_name=(upstream_name or "")[:200] or None,
                     event_type="group_multiplier_changed",
                     group_id=group_id[:128],
                     group_name=group_name,

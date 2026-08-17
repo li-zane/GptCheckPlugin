@@ -61,7 +61,7 @@ class ValidationRedactionTests(unittest.TestCase):
         with TestClient(app) as client:
             response = client.put(
                 "/api/settings",
-                json={"sub2api_base_url": f"https://user:{secret}@example.com"},
+                json={"management_site_base_url": f"https://user:{secret}@example.com"},
             )
 
         self.assertEqual(response.status_code, 422)

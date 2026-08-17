@@ -7,12 +7,12 @@ from time import perf_counter
 from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
-from app.models import AccountSnapshot, UpstreamAccountConfig, utcnow
+from app.models import AccountSnapshot, ApiAccount, utcnow
 from app.services.change_logs import prune_change_logs
 from app.services.events import elapsed_ms, record_event
 from app.services.runtime_config import RuntimeConfigService, get_runtime_config_service
 from app.services.sub2api import Sub2ApiClient
-from app.services.upstream_channels import UpstreamChannelService, get_upstream_channel_service
+from app.services.upstream_channels import UpstreamService, get_upstream_service
 from app.services.upstream_rate_logs import prune_upstream_rate_change_logs
 from app.services.upstream_usage_history import DEFAULT_TIME_ZONE, prune_upstream_usage_history
 
@@ -24,11 +24,11 @@ class UpstreamRateSyncService:
     def __init__(
         self,
         runtime_config: RuntimeConfigService | None = None,
-        channel_service: UpstreamChannelService | None = None,
+        channel_service: UpstreamService | None = None,
         sub2api: Sub2ApiClient | None = None,
     ) -> None:
         self.runtime_config = runtime_config or get_runtime_config_service()
-        self.channel_service = channel_service or get_upstream_channel_service()
+        self.channel_service = channel_service or get_upstream_service()
         self.sub2api = sub2api or Sub2ApiClient()
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -243,7 +243,7 @@ class UpstreamRateSyncService:
                 (
                     await read_db.execute(
                         select(AccountSnapshot).where(
-                            AccountSnapshot.sub2api_account_id.is_not(None)
+                            AccountSnapshot.management_account_id.is_not(None)
                         )
                     )
                 ).scalars()
@@ -251,7 +251,7 @@ class UpstreamRateSyncService:
             api_key_rows = list(
                 (
                     await read_db.execute(
-                        select(UpstreamAccountConfig)
+                        select(ApiAccount)
                     )
                 ).scalars()
             )
@@ -262,7 +262,11 @@ class UpstreamRateSyncService:
             }
             account_ids: set[str] = set()
             for row in (*oauth_rows, *api_key_rows):
-                account_id = str(row.sub2api_account_id or "").strip()
+                account_id = str(
+                    row.management_account_id
+                    if isinstance(row, ApiAccount)
+                    else row.management_account_id or ""
+                ).strip()
                 if account_id:
                     account_ids.add(account_id)
 
@@ -285,21 +289,21 @@ class UpstreamRateSyncService:
 
         if results:
             oauth_account_ids = {
-                str(row.sub2api_account_id)
+                str(row.management_account_id)
                 for row in oauth_rows
-                if row.sub2api_account_id is not None
+                if row.management_account_id is not None
             }
             api_key_account_ids = {
-                int(row.sub2api_account_id)
+                int(row.management_account_id)
                 for row in api_key_rows
-                if row.sub2api_account_id is not None
+                if row.management_account_id is not None
             }
             async with AsyncSessionLocal() as write_db:
                 current_oauth_rows = list(
                     (
                         await write_db.execute(
                             select(AccountSnapshot).where(
-                                AccountSnapshot.sub2api_account_id.in_(oauth_account_ids)
+                                AccountSnapshot.management_account_id.in_(oauth_account_ids)
                             )
                         )
                     ).scalars()
@@ -307,8 +311,8 @@ class UpstreamRateSyncService:
                 current_api_key_rows = list(
                     (
                         await write_db.execute(
-                            select(UpstreamAccountConfig).where(
-                                UpstreamAccountConfig.sub2api_account_id.in_(api_key_account_ids)
+                            select(ApiAccount).where(
+                                ApiAccount.management_account_id.in_(api_key_account_ids)
                             )
                         )
                     ).scalars()
@@ -320,7 +324,11 @@ class UpstreamRateSyncService:
                         or row.available_models_checked_at != row_versions[row_key]
                     ):
                         continue
-                    account_id = str(row.sub2api_account_id or "").strip()
+                    account_id = str(
+                        row.management_account_id
+                        if isinstance(row, ApiAccount)
+                        else row.management_account_id or ""
+                    ).strip()
                     result = results_by_account_id.get(account_id)
                     if result is None:
                         continue

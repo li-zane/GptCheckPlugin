@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api import settings as settings_api
 from app.core.database import Base
 from app.main import app, lifespan
-from app.models import AccountSnapshot, UpstreamAccountConfig
+from app.models import AccountSnapshot, ApiAccount
 from app.schemas import AppSettingsUpdate
 from app.services.upstream_rate_sync import UpstreamRateSyncService
 
@@ -105,11 +105,11 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
                     [
                         AccountSnapshot(
                             email="oauth@example.com",
-                            sub2api_account_id="1",
+                            management_account_id="1",
                             available_models=None,
                         ),
-                        UpstreamAccountConfig(
-                            sub2api_account_id=2,
+                        ApiAccount(
+                            management_account_id=2,
                             available_models=[{"id": "old", "display_name": "Old"}],
                         ),
                     ]
@@ -125,11 +125,11 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sub2api.get_account_models.await_count, 2)
             async with session_factory() as db:
                 oauth = await db.scalar(
-                    select(AccountSnapshot).where(AccountSnapshot.sub2api_account_id == "1")
+                    select(AccountSnapshot).where(AccountSnapshot.management_account_id == "1")
                 )
                 api_key = await db.scalar(
-                    select(UpstreamAccountConfig).where(
-                        UpstreamAccountConfig.sub2api_account_id == 2
+                    select(ApiAccount).where(
+                        ApiAccount.management_account_id == 2
                     )
                 )
                 self.assertEqual(
@@ -170,7 +170,7 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
                 db.add(
                     AccountSnapshot(
                         email="oauth@example.com",
-                        sub2api_account_id="1",
+                        management_account_id="1",
                         available_models=[{"id": "old", "display_name": "Old"}],
                         available_models_status="ok",
                     )
@@ -185,7 +185,7 @@ class UpstreamRateSyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
             async with session_factory() as db:
                 row = await db.scalar(
-                    select(AccountSnapshot).where(AccountSnapshot.sub2api_account_id == "1")
+                    select(AccountSnapshot).where(AccountSnapshot.management_account_id == "1")
                 )
                 self.assertEqual(row.available_models, [{"id": "old", "display_name": "Old"}])
                 self.assertEqual(row.available_models_status, "error")
@@ -406,7 +406,7 @@ class UpstreamRateSyncWiringTests(unittest.IsolatedAsyncioTestCase):
             update_public_settings=AsyncMock(
                 side_effect=[upstream_settings, liveness_settings]
             ),
-            scan_sub2api_ports=AsyncMock(return_value={}),
+            scan_management_site=AsyncMock(return_value={}),
         )
         monitor = SimpleNamespace(wake=Mock())
         rate_sync = SimpleNamespace(
@@ -427,7 +427,7 @@ class UpstreamRateSyncWiringTests(unittest.IsolatedAsyncioTestCase):
             patch.object(settings_api, "get_account_liveness_limiter", return_value=liveness),
             patch.object(settings_api, "_available_test_models", new=AsyncMock(return_value=[])),
             patch.object(settings_api, "AppSettingsOut", side_effect=lambda **values: values),
-            patch.object(settings_api, "Sub2ApiPortScanResult", side_effect=lambda **values: values),
+            patch.object(settings_api, "ManagementSiteScanResult", side_effect=lambda **values: values),
         ):
             await settings_api.update_settings(
                 AppSettingsUpdate(upstream_sync_enabled=True),
@@ -446,7 +446,7 @@ class UpstreamRateSyncWiringTests(unittest.IsolatedAsyncioTestCase):
                 {},
             )
             liveness.wake.assert_awaited_once_with()
-            await settings_api.scan_sub2api({})
+            await settings_api.scan_management_site({})
 
         rate_sync.wake.assert_called_once_with()
         rate_sync.wake_upstream.assert_called_once_with()

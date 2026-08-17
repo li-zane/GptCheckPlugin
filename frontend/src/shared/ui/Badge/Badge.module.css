@@ -1,0 +1,6 @@
+.badge { border-radius: 999px; display: inline-flex; font-size: 12px; font-weight: 650; line-height: 1; padding: 5px 8px; }
+.neutral { background: var(--ink-bg); color: var(--ink-badge); }
+.success { background: var(--ok-bg); color: var(--ok-ink); }
+.warning { background: var(--warn-bg); color: var(--warn-ink); }
+.danger { background: var(--danger-bg); color: var(--danger-ink); }
+.info { background: var(--info-bg); color: var(--info-ink); }

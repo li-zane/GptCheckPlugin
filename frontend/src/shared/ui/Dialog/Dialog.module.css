@@ -1,0 +1,7 @@
+.backdrop { align-items: center; background: var(--modal-backdrop); display: flex; inset: 0; justify-content: center; padding: 24px; position: fixed; z-index: 1000; }
+.dialog { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); box-shadow: var(--modal-shadow); display: flex; flex-direction: column; max-height: calc(100vh - 48px); max-width: 720px; outline: none; width: 100%; }
+.header { align-items: center; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; padding: 16px 18px; }
+.header h2 { font-size: 17px; margin: 0; }
+.body { overflow: auto; padding: 18px; }
+.footer { border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; padding: 14px 18px; }
+@media (max-width: 520px) { .backdrop { align-items: flex-end; padding: 0; } .dialog { border-bottom: 0; border-left: 0; border-radius: var(--radius-sm) var(--radius-sm) 0 0; border-right: 0; max-height: 92vh; } }

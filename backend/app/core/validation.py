@@ -9,7 +9,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 
-_SENSITIVE_FIELD_NAMES = {"apikey", "baseurl", "managementbaseurl"}
+_SENSITIVE_FIELD_NAMES = {
+    "apiendpointurl",
+    "apikey",
+    "baseurl",
+    "managementbaseurl",
+    "managementurl",
+}
 _SENSITIVE_FIELD_MARKERS = (
     "adminkey",
     "apikey",

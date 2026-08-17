@@ -1,0 +1,4 @@
+.page { display: contents; }
+.page {
+  min-width: 0;
+}

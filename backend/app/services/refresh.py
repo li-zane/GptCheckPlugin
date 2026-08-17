@@ -147,7 +147,7 @@ class RefreshService:
                 return None
             job = RefreshJob(
                 email=normalized,
-                sub2api_account_id=self.sub2api.account_id(account),
+                management_account_id=self.sub2api.account_id(account),
                 status="queued",
                 reason=reason,
             )
@@ -1343,7 +1343,7 @@ class RefreshService:
                     snapshot.auto_refresh_locked = False
                 if status == "succeeded":
                     if remote_account is not None:
-                        snapshot.sub2api_account_id = self.sub2api.account_id(remote_account)
+                        snapshot.management_account_id = self.sub2api.account_id(remote_account)
                         snapshot.platform = self.sub2api.account_platform(remote_account)
                         snapshot.account_type = self.sub2api.account_type(remote_account)
                         snapshot.status = self.sub2api.account_status(remote_account) or "recovered"
@@ -1354,7 +1354,7 @@ class RefreshService:
                         snapshot.deactive = False
                         snapshot.status = snapshot.status or "recovered"
                 elif remote_account is not None:
-                    snapshot.sub2api_account_id = self.sub2api.account_id(remote_account)
+                    snapshot.management_account_id = self.sub2api.account_id(remote_account)
                     snapshot.platform = self.sub2api.account_platform(remote_account)
                     snapshot.account_type = self.sub2api.account_type(remote_account)
                     snapshot.status = self.sub2api.account_status(remote_account)
@@ -1366,13 +1366,13 @@ class RefreshService:
                         db,
                         email,
                         reason or "OAuth account refresh restored the account.",
-                        account_id=snapshot.sub2api_account_id,
+                        account_id=snapshot.management_account_id,
                     )
             account_id = self.sub2api.account_id(remote_account) if remote_account is not None else None
             if account_id is None and job is not None:
-                account_id = job.sub2api_account_id
+                account_id = job.management_account_id
             if status == "succeeded":
-                await clear_account_exception(db, source="sync", email=email, sub2api_account_id=account_id, commit=False)
+                await clear_account_exception(db, source="sync", email=email, management_account_id=account_id, commit=False)
             await db.commit()
         await self._record_event_safely(f"refresh_{status}", reason, email, {"job_id": job_id})
 

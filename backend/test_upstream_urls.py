@@ -1,7 +1,7 @@
 import unittest
 
 from app.core.upstream_urls import canonicalize_upstream_url
-from app.schemas import UpstreamAccountUpdate, UpstreamChannelUpdate
+from app.schemas import ApiAccountUpdate, UpstreamUpdate
 
 
 class UpstreamURLTests(unittest.TestCase):
@@ -36,14 +36,16 @@ class UpstreamURLTests(unittest.TestCase):
     def test_account_and_channel_inputs_share_canonicalization(self) -> None:
         expected = "https://example.com/prefix"
         self.assertEqual(
-            UpstreamAccountUpdate(
+            ApiAccountUpdate(
                 expected_identity_fingerprint="0" * 64,
-                base_url="https://EXAMPLE.com:443/prefix/v1/",
-            ).base_url,
+                api_endpoint_url="https://EXAMPLE.com:443/prefix/v1/",
+            ).api_endpoint_url,
             expected,
         )
         self.assertEqual(
-            UpstreamChannelUpdate(base_url="https://EXAMPLE.com:443/prefix/api/v1/").base_url,
+            UpstreamUpdate(
+                api_endpoint_url="https://EXAMPLE.com:443/prefix/api/v1/"
+            ).api_endpoint_url,
             expected,
         )
 

@@ -10,5 +10,5 @@ api_router.include_router(account_editor.router, prefix="/accounts", tags=["acco
 api_router.include_router(mailboxes.router, prefix="/mailboxes", tags=["mailboxes"])
 api_router.include_router(phones.router, prefix="/phones", tags=["phones"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
-api_router.include_router(upstream_accounts.router, prefix="/upstream-accounts", tags=["upstream-accounts"])
-api_router.include_router(upstream_channels.router, prefix="/upstream-channels", tags=["upstream-channels"])
+api_router.include_router(upstream_accounts.router, prefix="/api-accounts", tags=["api-accounts"])
+api_router.include_router(upstream_channels.router, prefix="/upstreams", tags=["upstreams"])

@@ -1,20 +1,20 @@
-import type { UpstreamAccount, UpstreamChannel, UpstreamChannelsResponse } from "./types";
+import type { ApiAccount, Upstream, UpstreamOverviewResponse } from "./domain";
 
-export type UpstreamAccountEntry = {
-  account: UpstreamAccount;
-  channel: UpstreamChannel | null;
+export type ApiAccountEntry = {
+  account: ApiAccount;
+  upstream: Upstream | null;
 };
 
-export type UpstreamAccountTieSort = "name" | "priority";
+export type ApiAccountTieSort = "name" | "priority";
 
-export type UpstreamAccountFilters = {
-  channel: "all" | "__unassigned__" | string;
+export type ApiAccountFilters = {
+  upstream: "all" | "__unassigned__" | string;
   interval: "all" | "unassigned" | string;
   platform: "all" | "__unknown__" | string;
   query: string;
 };
 
-export type UpstreamAccountStatusFilter = "all" | "enabled" | "disabled" | "pending" | "attention" | "undiscovered";
+export type ApiAccountStatusFilter = "all" | "enabled" | "disabled" | "pending" | "attention" | "undiscovered";
 
 export type PriorityTieMoveState = {
   canMoveDown: boolean;
@@ -24,41 +24,41 @@ export type PriorityTieMoveState = {
 
 const PRIORITY_TIE_DECIMAL_PLACES = 13;
 
-export function accountCompositeMultiplier(account: UpstreamAccount) {
-  const persisted = finiteNumber(account.composite_multiplier);
+export function accountCompositeMultiplier(account: ApiAccount) {
+  const persisted = finiteNumber(account.upstream_actual_multiplier);
   if (persisted !== null) return persisted;
-  const group = finiteNumber(account.effective_group_multiplier);
-  const recharge = finiteNumber(account.effective_recharge_multiplier);
+  const group = finiteNumber(account.upstream_group_multiplier);
+  const recharge = finiteNumber(account.upstream_recharge_multiplier);
   return group === null || recharge === null ? null : group * recharge;
 }
 
-export function priorityIntervalAssignmentNeedsConfirmation(account: UpstreamAccount) {
+export function priorityIntervalAssignmentNeedsConfirmation(account: ApiAccount) {
   return account.identity_binding_status === "unbound";
 }
 
-export function priorityIntervalAssignmentBlocked(account: UpstreamAccount) {
+export function priorityIntervalAssignmentBlocked(account: ApiAccount) {
   return Boolean(account.identity_rebind_required)
     && !priorityIntervalAssignmentNeedsConfirmation(account);
 }
 
-export function flattenUpstreamAccounts(data: UpstreamChannelsResponse): UpstreamAccountEntry[] {
-  const entries = new Map<string, UpstreamAccountEntry>();
-  for (const channel of data.channels) {
-    for (const account of channel.accounts || []) {
-      const key = String(account.sub2api_account_id);
-      if (!entries.has(key)) entries.set(key, { account, channel });
+export function flattenApiAccounts(data: UpstreamOverviewResponse): ApiAccountEntry[] {
+  const entries = new Map<string, ApiAccountEntry>();
+  for (const upstream of data.upstreams) {
+    for (const account of upstream.accounts || []) {
+      const key = String(account.management_account_id);
+      if (!entries.has(key)) entries.set(key, { account, upstream });
     }
   }
   for (const account of data.unassigned_accounts) {
-    const key = String(account.sub2api_account_id);
-    if (!entries.has(key)) entries.set(key, { account, channel: null });
+    const key = String(account.management_account_id);
+    if (!entries.has(key)) entries.set(key, { account, upstream: null });
   }
   return [...entries.values()];
 }
 
-export function sortUpstreamAccountEntries(
-  entries: UpstreamAccountEntry[],
-  tieSort: UpstreamAccountTieSort = "name",
+export function sortApiAccountEntries(
+  entries: ApiAccountEntry[],
+  tieSort: ApiAccountTieSort = "name",
 ) {
   return [...entries].sort((left, right) => {
     const leftMultiplier = accountCompositeMultiplier(left.account);
@@ -74,12 +74,12 @@ export function sortUpstreamAccountEntries(
   });
 }
 
-export function sortUpstreamAccountEntriesByName(entries: UpstreamAccountEntry[]) {
+export function sortApiAccountEntriesByName(entries: ApiAccountEntry[]) {
   return [...entries].sort((left, right) => compareAccountNames(left.account, right.account));
 }
 
-export function priorityTieMoveOptions(accounts: UpstreamAccount[]) {
-  const groups = new Map<string, UpstreamAccount[]>();
+export function priorityTieMoveOptions(accounts: ApiAccount[]) {
+  const groups = new Map<string, ApiAccount[]>();
   for (const account of accounts) {
     const intervalId = account.priority_interval_id;
     const multiplier = accountCompositeMultiplier(account);
@@ -100,7 +100,7 @@ export function priorityTieMoveOptions(accounts: UpstreamAccount[]) {
     if (group.length < 2) continue;
     const ordered = [...group].sort(comparePriorityTieOrder);
     ordered.forEach((account, index) => {
-      options.set(String(account.sub2api_account_id), {
+      options.set(String(account.management_account_id), {
         canMoveDown: index > 0,
         canMoveUp: index < ordered.length - 1,
         peerCount: ordered.length,
@@ -110,16 +110,16 @@ export function priorityTieMoveOptions(accounts: UpstreamAccount[]) {
   return options;
 }
 
-export function filterUpstreamAccountEntries(
-  entries: UpstreamAccountEntry[],
-  filters: UpstreamAccountFilters,
+export function filterApiAccountEntries(
+  entries: ApiAccountEntry[],
+  filters: ApiAccountFilters,
 ) {
   const query = filters.query.trim().toLowerCase();
   const platform = filters.platform.toLowerCase();
-  return entries.filter(({ account, channel }) => {
-    if (filters.channel === "__unassigned__") {
-      if (channel !== null) return false;
-    } else if (filters.channel !== "all" && String(channel?.id ?? "") !== filters.channel) {
+  return entries.filter(({ account, upstream }) => {
+    if (filters.upstream === "__unassigned__") {
+      if (upstream !== null) return false;
+    } else if (filters.upstream !== "all" && String(upstream?.upstream_id ?? "") !== filters.upstream) {
       return false;
     }
 
@@ -142,48 +142,48 @@ export function filterUpstreamAccountEntries(
       account.remote_name,
       account.remote_platform,
       account.remote_status,
-      account.sub2api_account_id,
+      account.management_account_id,
       account.selected_group_id,
       account.selected_group_name,
       account.priority,
       account.desired_priority,
       account.priority_interval_name,
-      channel?.display_name,
-      channel?.base_url,
-      channel?.canonical_base_url,
+      upstream?.display_name,
+      upstream?.api_endpoint_url,
+      upstream?.api_endpoint_url,
     ].some((value) => String(value ?? "").toLowerCase().includes(query));
   });
 }
 
-export function upstreamAccountChannels(entries: UpstreamAccountEntry[]) {
+export function upstreamAccountUpstreams(entries: ApiAccountEntry[]) {
   const values = new Map<string, string>();
   let hasUnassigned = false;
-  for (const { channel } of entries) {
-    if (channel === null) {
+  for (const { upstream } of entries) {
+    if (upstream === null) {
       hasUnassigned = true;
       continue;
     }
-    const value = String(channel.id);
+    const value = String(upstream.upstream_id);
     if (values.has(value)) continue;
     values.set(
       value,
       String(
-        channel.display_name
-        || channel.base_url
-        || channel.canonical_base_url
+        upstream.display_name
+        || upstream.api_endpoint_url
+        || upstream.api_endpoint_url
         || `上游 #${value}`,
       ).trim(),
     );
   }
   return {
     hasUnassigned,
-    channels: [...values.entries()]
+    upstreams: [...values.entries()]
       .sort(([, left], [, right]) => left.localeCompare(right, "zh-CN"))
       .map(([value, label]) => ({ value, label })),
   };
 }
 
-export function upstreamAccountPlatforms(entries: UpstreamAccountEntry[]) {
+export function upstreamAccountPlatforms(entries: ApiAccountEntry[]) {
   const values = new Map<string, string>();
   let hasUnknown = false;
   for (const { account } of entries) {
@@ -204,8 +204,8 @@ export function upstreamAccountPlatforms(entries: UpstreamAccountEntry[]) {
 }
 
 export function upstreamAccountMatchesStatus(
-  account: UpstreamAccount,
-  filter: UpstreamAccountStatusFilter,
+  account: ApiAccount,
+  filter: ApiAccountStatusFilter,
 ) {
   if (filter === "all") return true;
   if (filter === "enabled") return account.remote_schedulable === true;
@@ -215,7 +215,7 @@ export function upstreamAccountMatchesStatus(
   return accountNeedsAttention(account);
 }
 
-function accountNeedsAttention(account: UpstreamAccount) {
+function accountNeedsAttention(account: ApiAccount) {
   if (
     !account.managed
     || account.identity_rebind_required
@@ -233,7 +233,7 @@ function accountNeedsAttention(account: UpstreamAccount) {
     .some((status) => isFailureStatus(status));
 }
 
-function comparePriorityTieOrder(left: UpstreamAccount, right: UpstreamAccount) {
+function comparePriorityTieOrder(left: ApiAccount, right: ApiAccount) {
   const multiplier = accountCompositeMultiplier(left);
   const leftOrder = activePriorityTieOrder(left, multiplier);
   const rightOrder = activePriorityTieOrder(right, multiplier);
@@ -245,7 +245,7 @@ function comparePriorityTieOrder(left: UpstreamAccount, right: UpstreamAccount) 
   return compareAccountNames(left, right);
 }
 
-function compareAccountSchedulingPriority(left: UpstreamAccount, right: UpstreamAccount) {
+function compareAccountSchedulingPriority(left: ApiAccount, right: ApiAccount) {
   const leftPriority = finiteNumber(left.priority) ?? finiteNumber(left.desired_priority);
   const rightPriority = finiteNumber(right.priority) ?? finiteNumber(right.desired_priority);
   if (leftPriority !== null && rightPriority !== null && leftPriority !== rightPriority) {
@@ -256,7 +256,7 @@ function compareAccountSchedulingPriority(left: UpstreamAccount, right: Upstream
   return compareAccountNames(left, right);
 }
 
-function activePriorityTieOrder(account: UpstreamAccount, multiplier: number | null) {
+function activePriorityTieOrder(account: ApiAccount, multiplier: number | null) {
   const order = finiteNumber(account.priority_tiebreak_order);
   const storedMultiplier = finiteNumber(account.priority_tiebreak_multiplier);
   if (
@@ -293,14 +293,14 @@ export function priorityTieMultiplierKey(value: number) {
   return `${negative ? "-" : ""}${normalizedInteger}.${normalizedFraction}`;
 }
 
-function compareAccountNames(left: UpstreamAccount, right: UpstreamAccount) {
+function compareAccountNames(left: ApiAccount, right: ApiAccount) {
   const leftName = String(left.remote_name || "").trim();
   const rightName = String(right.remote_name || "").trim();
   const compared = leftName.localeCompare(rightName, "zh-CN", {
     numeric: true,
     sensitivity: "base",
   });
-  return compared || compareAccountIds(left.sub2api_account_id, right.sub2api_account_id);
+  return compared || compareAccountIds(left.management_account_id, right.management_account_id);
 }
 
 function isFailureStatus(status?: string | null) {

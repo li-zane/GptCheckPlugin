@@ -10,19 +10,19 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app.services.upstream_client import (
-    CHANNEL_MONITOR_DETAIL_CONCURRENCY,
+    UPSTREAM_MONITOR_DETAIL_CONCURRENCY,
     DiscoveryResult,
     MAX_DOH_RESPONSE_BYTES,
-    MAX_CHANNEL_MONITORS,
-    MAX_CHANNEL_MONITOR_EXTRA_MODELS,
-    MAX_CHANNEL_MONITOR_TIMELINE_POINTS,
+    MAX_UPSTREAM_MONITORS,
+    MAX_UPSTREAM_MONITOR_EXTRA_MODELS,
+    MAX_UPSTREAM_MONITOR_TIMELINE_POINTS,
     MAX_RESPONSE_BYTES,
     MAX_UPSTREAM_TOKEN_LENGTH,
     NEWAPI_ENDPOINTS,
     NEWAPI_TODAY_USAGE_ENDPOINT,
     NEWAPI_UPTIME_STATUS_ENDPOINT,
     SUB2API_API_KEY_USAGE_ENDPOINT,
-    SUB2API_CHANNEL_MONITORS_ENDPOINT,
+    SUB2API_UPSTREAM_MONITORS_ENDPOINT,
     SUB2API_REFRESH_ENDPOINT,
     SUB2API_TODAY_USAGE_ENDPOINT,
     SUB2API_USAGE_STATS_ENDPOINT,
@@ -169,6 +169,108 @@ class UpstreamClientTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(calls, 0)
+
+    def test_sub2api_login_uses_browser_fingerprint_and_pinned_dns(self) -> None:
+        from curl_cffi import CurlOpt
+
+        class FakeResponse:
+            status_code = 200
+            content = b'{"code":0,"data":{"access_token":"at-login","refresh_token":"rt-login"}}'
+
+            @staticmethod
+            def json() -> dict:
+                return {
+                    "code": 0,
+                    "data": {
+                        "access_token": "at-login",
+                        "refresh_token": "rt-login",
+                    },
+                }
+
+        class FakeSession:
+            init_kwargs: dict = {}
+            post_args: tuple = ()
+
+            def __init__(self, **kwargs) -> None:
+                self.__class__.init_kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+            async def post(self, *args, **kwargs):
+                self.__class__.post_args = (args, kwargs)
+                return FakeResponse()
+
+        client = UpstreamClient(resolver=public_resolver)
+        with patch("curl_cffi.requests.AsyncSession", FakeSession):
+            pair = asyncio.run(
+                client.login_sub2api_tokens(
+                    "https://upstream.example",
+                    "xingchen@example.com",
+                    "login-password",
+                )
+            )
+
+        self.assertIsNotNone(pair)
+        assert pair is not None
+        self.assertEqual((pair.access_token, pair.refresh_token), ("at-login", "rt-login"))
+        self.assertEqual(FakeSession.init_kwargs["impersonate"], "chrome")
+        self.assertFalse(FakeSession.init_kwargs["trust_env"])
+        self.assertFalse(FakeSession.init_kwargs["allow_redirects"])
+        self.assertEqual(
+            FakeSession.init_kwargs["curl_options"][CurlOpt.RESOLVE],
+            [f"upstream.example:443:{PUBLIC_ADDRESS}"],
+        )
+        args, kwargs = FakeSession.post_args
+        self.assertEqual(args[0], "https://upstream.example/api/v1/auth/login")
+        self.assertEqual(
+            kwargs["json"],
+            {"email": "xingchen@example.com", "password": "login-password"},
+        )
+
+    def test_sub2api_can_reveal_record_uses_reveal_endpoint_first(self) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            target = request_target(request)
+            seen.append(target)
+            if target == "/api/v1/keys/3051/reveal":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {"id": 3051, "key": "sk-xingchen-full-key"},
+                    },
+                )
+            return httpx.Response(404, json={"code": 404})
+
+        async def scenario() -> dict | None:
+            client = UpstreamClient(resolver=public_resolver)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                return await client._fetch_sub2api_revealed_api_key_record(
+                    http,
+                    "https://upstream.example",
+                    record_id=3051,
+                    listed_record={
+                        "id": 3051,
+                        "key_prefix": "sk-xing",
+                        "key_last4": "-key",
+                        "can_reveal": True,
+                        "group_id": 44,
+                    },
+                    headers={"Authorization": "Bearer at-private"},
+                )
+
+        record = asyncio.run(scenario())
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["key"], "sk-xingchen-full-key")
+        self.assertEqual(record["group_id"], 44)
+        self.assertEqual(seen, ["/api/v1/keys/3051/reveal"])
 
     def test_sub2api_refresh_rejects_failures_and_incomplete_token_pairs(self) -> None:
         complete_pair = {
@@ -359,17 +461,17 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.upstream_type, "newapi")
+        self.assertEqual(result.platform_type, "newapi")
         self.assertEqual(result.source, "configured")
         self.assertEqual([group.name for group in result.groups], ["default", "vip"])
         self.assertIsNotNone(result.matched_group)
         self.assertEqual(result.matched_group.name, "vip")
-        self.assertAlmostEqual(result.discovered_group_multiplier or 0, 1.8)
-        self.assertEqual(result.discovered_group_multiplier_source, "self.groups.ratio")
+        self.assertAlmostEqual(result.discovered_upstream_group_multiplier or 0, 1.8)
+        self.assertEqual(result.discovered_upstream_group_multiplier_source, "self.groups.ratio")
         # ¥1 / $10 is stored as a normalized CNY/USD cost of 0.1.
-        self.assertEqual(result.discovered_recharge_multiplier, 0.1)
-        self.assertEqual(result.discovered_recharge_multiplier_source, "status.price")
-        self.assertEqual(result.balance_remaining, 2.0)
+        self.assertEqual(result.discovered_upstream_recharge_multiplier, 0.1)
+        self.assertEqual(result.discovered_upstream_recharge_multiplier_source, "status.price")
+        self.assertEqual(result.wallet_balance_usd, 2.0)
         self.assertEqual(result.balance_status, "ok")
         self.assertTrue(seen_headers)
         status_headers = next(headers for headers in seen_headers if headers[0] == "/api/status")
@@ -786,9 +888,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.balance_remaining, 12.5)
-        self.assertEqual(result.balance_used, 2.5)
-        self.assertEqual(result.balance_total, 20.0)
+        self.assertEqual(result.wallet_balance_usd, 12.5)
+        self.assertEqual(result.wallet_used_usd, 2.5)
+        self.assertEqual(result.wallet_total_usd, 20.0)
         self.assertEqual(result.balance_unit, "USD")
         self.assertEqual(result.balance_status, "ok")
         self.assertEqual(seen_headers["/api/status"], (None, None))
@@ -838,11 +940,11 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.today_balance_used, 2.5)
+        self.assertEqual(result.today_upstream_wallet_cost_usd, 2.5)
         self.assertEqual(result.today_balance_unit, "USD")
         self.assertEqual(result.today_balance_status, "ok")
         self.assertIsNone(result.today_balance_error)
-        self.assertEqual(result.yesterday_balance_used, 1.25)
+        self.assertEqual(result.yesterday_upstream_wallet_cost_usd, 1.25)
         self.assertEqual(result.yesterday_balance_unit, "USD")
         self.assertEqual(result.yesterday_balance_status, "ok")
         self.assertIsNone(result.yesterday_balance_error)
@@ -906,10 +1008,10 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertIsNone(result.today_balance_used)
+        self.assertIsNone(result.today_upstream_wallet_cost_usd)
         self.assertIsNone(result.today_balance_unit)
         self.assertEqual(result.today_balance_status, "unsupported")
-        self.assertIsNone(result.yesterday_balance_used)
+        self.assertIsNone(result.yesterday_upstream_wallet_cost_usd)
         self.assertIsNone(result.yesterday_balance_unit)
         self.assertEqual(result.yesterday_balance_status, "unsupported")
 
@@ -952,7 +1054,7 @@ class UpstreamClientTests(unittest.TestCase):
                 )
 
                 self.assertEqual(attempts, 1)
-                self.assertIsNone(result.today_balance_used)
+                self.assertIsNone(result.today_upstream_wallet_cost_usd)
                 self.assertEqual(result.today_balance_status, "error")
                 self.assertEqual(result.today_balance_error, expected_error)
 
@@ -1184,9 +1286,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.balance_remaining, 1476.34)
-        self.assertEqual(result.balance_used, 123.66)
-        self.assertIsNone(result.balance_total)
+        self.assertEqual(result.wallet_balance_usd, 1476.34)
+        self.assertEqual(result.wallet_used_usd, 123.66)
+        self.assertIsNone(result.wallet_total_usd)
         self.assertEqual(result.balance_status, "ok")
 
     def test_newapi_balance_never_uses_model_api_key_as_console_access_token(self) -> None:
@@ -1217,9 +1319,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.discovered_group_multiplier, 1.0)
+        self.assertEqual(result.discovered_upstream_group_multiplier, 1.0)
         self.assertEqual(result.balance_status, "credentials_missing")
-        self.assertIsNone(result.balance_remaining)
+        self.assertIsNone(result.wallet_balance_usd)
         self.assertNotIn("/api/user/self", seen)
 
     def test_newapi_balance_requires_numeric_user_id_without_blocking_groups(self) -> None:
@@ -1246,9 +1348,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.discovered_group_multiplier, 2.0)
+        self.assertEqual(result.discovered_upstream_group_multiplier, 2.0)
         self.assertEqual(result.balance_status, "credentials_missing")
-        self.assertIsNone(result.balance_remaining)
+        self.assertIsNone(result.wallet_balance_usd)
         self.assertNotIn("/api/user/self", seen)
 
     def test_newapi_balance_rejects_unsuccessful_and_invalid_payloads(self) -> None:
@@ -1284,7 +1386,7 @@ class UpstreamClientTests(unittest.TestCase):
 
                 self.assertTrue(result.ok)
                 self.assertEqual(result.balance_status, "error")
-                self.assertIsNone(result.balance_remaining)
+                self.assertIsNone(result.wallet_balance_usd)
 
     def test_sub2api_balance_uses_login_access_token_without_newapi_header(self) -> None:
         seen_headers: dict[str, tuple[str | None, str | None]] = {}
@@ -1320,10 +1422,10 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.discovered_group_multiplier, 1.0)
-        self.assertEqual(result.balance_remaining, 42.75)
-        self.assertIsNone(result.balance_total)
-        self.assertIsNone(result.balance_used)
+        self.assertEqual(result.discovered_upstream_group_multiplier, 1.0)
+        self.assertEqual(result.wallet_balance_usd, 42.75)
+        self.assertIsNone(result.wallet_total_usd)
+        self.assertIsNone(result.wallet_used_usd)
         self.assertEqual(result.balance_unit, "USD")
         self.assertEqual(result.balance_status, "ok")
         self.assertEqual(
@@ -1354,7 +1456,7 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.discovered_group_multiplier, 1.0)
+        self.assertEqual(result.discovered_upstream_group_multiplier, 1.0)
         self.assertEqual(result.balance_status, "credentials_missing")
         self.assertNotIn("/api/v1/auth/me", seen)
 
@@ -1449,7 +1551,7 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIsNotNone(result.matched_group)
         self.assertEqual(result.matched_group.name, "default")
-        self.assertEqual(result.discovered_group_multiplier, 1.0)
+        self.assertEqual(result.discovered_upstream_group_multiplier, 1.0)
 
     def test_newapi_explicit_payment_multiplier_precedes_status_price_fallback(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1478,9 +1580,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.discovered_recharge_multiplier, 0.4)
+        self.assertEqual(result.discovered_upstream_recharge_multiplier, 0.4)
         self.assertEqual(
-            result.discovered_recharge_multiplier_source,
+            result.discovered_upstream_recharge_multiplier_source,
             "payment.config.balance_recharge_multiplier",
         )
 
@@ -1509,9 +1611,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.discovered_recharge_multiplier, 0.4)
+        self.assertEqual(result.discovered_upstream_recharge_multiplier, 0.4)
         self.assertEqual(
-            result.discovered_recharge_multiplier_source,
+            result.discovered_upstream_recharge_multiplier_source,
             "status.balance_recharge_multiplier",
         )
 
@@ -1536,7 +1638,7 @@ class UpstreamClientTests(unittest.TestCase):
         result = self.run_discovery(handler, upstream_type="newapi")
 
         self.assertEqual(result.status, "error")
-        self.assertIsNone(result.discovered_recharge_multiplier)
+        self.assertIsNone(result.discovered_upstream_recharge_multiplier)
 
     def test_sub2api_rates_override_available_group_and_checkout_precedes_config(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1582,12 +1684,12 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertIsNotNone(result.matched_group)
         self.assertEqual(result.matched_group.id, "2")
         self.assertEqual(result.matched_group.name, "premium")
-        self.assertAlmostEqual(result.discovered_group_multiplier or 0, 2.75)
-        self.assertEqual(result.discovered_group_multiplier_source, "groups.rates")
+        self.assertAlmostEqual(result.discovered_upstream_group_multiplier or 0, 2.75)
+        self.assertEqual(result.discovered_upstream_group_multiplier_source, "groups.rates")
         # Sub2API exposes USD credited per CNY. 1 CNY = 10 USD costs 0.1 CNY/USD.
-        self.assertAlmostEqual(result.discovered_recharge_multiplier or 0, 0.1)
+        self.assertAlmostEqual(result.discovered_upstream_recharge_multiplier or 0, 0.1)
         self.assertEqual(
-            result.discovered_recharge_multiplier_source,
+            result.discovered_upstream_recharge_multiplier_source,
             "payment.checkout-info.balance_recharge_multiplier",
         )
 
@@ -1844,9 +1946,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.upstream_type, "sub2api")
+        self.assertEqual(result.platform_type, "sub2api")
         self.assertEqual(result.source, "auto")
-        self.assertEqual(result.discovered_group_multiplier, 3.5)
+        self.assertEqual(result.discovered_upstream_group_multiplier, 3.5)
 
     def test_missing_optional_values_remain_none(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1864,10 +1966,10 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.groups, [])
         self.assertIsNone(result.matched_group)
-        self.assertIsNone(result.discovered_group_multiplier)
-        self.assertIsNone(result.discovered_group_multiplier_source)
-        self.assertIsNone(result.discovered_recharge_multiplier)
-        self.assertIsNone(result.discovered_recharge_multiplier_source)
+        self.assertIsNone(result.discovered_upstream_group_multiplier)
+        self.assertIsNone(result.discovered_upstream_group_multiplier_source)
+        self.assertIsNone(result.discovered_upstream_recharge_multiplier)
+        self.assertIsNone(result.discovered_upstream_recharge_multiplier_source)
         self.assertEqual(result.recharge_discovery_status, "missing")
 
     def test_successful_groups_with_no_successful_recharge_endpoint_is_not_missing(self) -> None:
@@ -1886,8 +1988,8 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.discovered_group_multiplier, 2.0)
-        self.assertIsNone(result.discovered_recharge_multiplier)
+        self.assertEqual(result.discovered_upstream_group_multiplier, 2.0)
+        self.assertIsNone(result.discovered_upstream_recharge_multiplier)
         self.assertEqual(result.recharge_discovery_status, "error")
 
     def test_present_but_invalid_recharge_multiplier_fails_discovery(self) -> None:
@@ -1912,7 +2014,7 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "error")
-        self.assertIsNone(result.discovered_recharge_multiplier)
+        self.assertIsNone(result.discovered_upstream_recharge_multiplier)
         self.assertNotIn("0", result.message)
 
     def test_transport_connects_to_pinned_ip_and_preserves_host_and_tls_sni(self) -> None:
@@ -2420,10 +2522,10 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(state.group_id, "2")
         self.assertEqual(state.usage_amount, 12.375)
         self.assertEqual(state.usage_unit, "USD")
-        self.assertEqual(result.today_balance_used, 3.25)
+        self.assertEqual(result.today_upstream_wallet_cost_usd, 3.25)
         self.assertEqual(result.today_balance_unit, "USD")
         self.assertEqual(result.today_balance_status, "ok")
-        self.assertEqual(result.yesterday_balance_used, 2.75)
+        self.assertEqual(result.yesterday_upstream_wallet_cost_usd, 2.75)
         self.assertEqual(result.yesterday_balance_unit, "USD")
         self.assertEqual(result.yesterday_balance_status, "ok")
         self.assertEqual(seen_today_headers, [("Bearer sub2api-login-token", None)])
@@ -2558,7 +2660,7 @@ class UpstreamClientTests(unittest.TestCase):
             today_timezone="America/New_York",
         )
 
-        self.assertEqual(result.yesterday_balance_used, 0)
+        self.assertEqual(result.yesterday_upstream_wallet_cost_usd, 0)
         self.assertEqual(result.yesterday_balance_status, "ok")
         self.assertEqual(len(seen), 1)
         request = seen[0]
@@ -2582,11 +2684,11 @@ class UpstreamClientTests(unittest.TestCase):
                     upstream_type="sub2api",
                     access_token="sub2api-login-token",
                 )
-                self.assertIsNone(result.yesterday_balance_used)
+                self.assertIsNone(result.yesterday_upstream_wallet_cost_usd)
                 self.assertIsNone(result.yesterday_balance_unit)
                 self.assertEqual(result.yesterday_balance_status, expected_status)
 
-    def test_finalized_yesterday_can_skip_the_upstream_usage_stats_request(self) -> None:
+    def test_finalized_yesterday_can_skip_the_upstream_wallet_cost_usd_stats_request(self) -> None:
         seen: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3292,12 +3394,12 @@ class UpstreamClientTests(unittest.TestCase):
                             },
                         },
                     )
-                if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                     return httpx.Response(
                         200,
                         json={"code": 0, "data": {"items": [{"id": 9, "name": "Primary"}]}},
                     )
-                if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/9/status":
+                if request.url.path == f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/9/status":
                     await asyncio.wait_for(usage_started.wait(), timeout=0.5)
                     monitor_observed_usage.append(usage_started.is_set())
                     return httpx.Response(
@@ -3341,7 +3443,7 @@ class UpstreamClientTests(unittest.TestCase):
                 upstream_type="sub2api",
                 access_token="sub2api-login-token",
                 account_api_keys={1: direct_key, 2: unresolved_key},
-                include_channel_monitor_details=True,
+                include_upstream_monitor_details=True,
             )
             return result, reveal_observed_usage, monitor_observed_usage, usage_batches
 
@@ -3354,7 +3456,7 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertIn([2], usage_batches)
         self.assertEqual(result.account_upstream_states[1].usage_amount, 1.0)
         self.assertEqual(result.account_upstream_states[2].usage_amount, 2.0)
-        self.assertEqual(result.channel_monitors[0]["primary_status"], "operational")
+        self.assertEqual(result.upstream_monitors[0]["primary_status"], "operational")
 
     def test_sub2api_today_key_usage_reads_later_key_pages(self) -> None:
         target_key = "sk-page-two-target"
@@ -3607,13 +3709,13 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertNotIn(1, result.account_upstream_states)
         self.assertEqual(result.account_upstream_states[2].usage_amount, 7.75)
 
-    def test_sub2api_channel_monitor_details_are_opt_in(self) -> None:
+    def test_sub2api_upstream_monitor_details_are_opt_in(self) -> None:
         detail_requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request_target(request) == "/api/v1/groups/available":
                 return httpx.Response(200, json={"code": 0, "data": []})
-            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+            if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                 return httpx.Response(
                     200,
                     json={
@@ -3629,7 +3731,7 @@ class UpstreamClientTests(unittest.TestCase):
                         },
                     },
                 )
-            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status":
+            if request.url.path == f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/17/status":
                 detail_requests.append(request)
                 return httpx.Response(
                     200,
@@ -3644,9 +3746,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertEqual(detail_requests, [])
-        self.assertEqual(result.channel_monitors[0]["primary_status"], "degraded")
+        self.assertEqual(result.upstream_monitors[0]["primary_status"], "degraded")
 
-    def test_sub2api_channel_monitor_list_can_be_skipped(self) -> None:
+    def test_sub2api_upstream_monitor_list_can_be_skipped(self) -> None:
         requested_paths: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3660,17 +3762,17 @@ class UpstreamClientTests(unittest.TestCase):
             upstream_type="sub2api",
             access_token="sub2api-login-token",
             optimized_endpoint_fallbacks=True,
-            include_channel_monitors=False,
+            include_upstream_monitors=False,
         )
 
-        self.assertNotIn(SUB2API_CHANNEL_MONITORS_ENDPOINT, requested_paths)
+        self.assertNotIn(SUB2API_UPSTREAM_MONITORS_ENDPOINT, requested_paths)
 
     def test_sub2api_monitor_only_discovery_skips_balance_usage_and_key_endpoints(self) -> None:
         requested_paths: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requested_paths.append(request.url.path)
-            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+            if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                 return httpx.Response(
                     200,
                     json={
@@ -3686,7 +3788,7 @@ class UpstreamClientTests(unittest.TestCase):
                         },
                     },
                 )
-            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status":
+            if request.url.path == f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/17/status":
                 return httpx.Response(
                     200,
                     json={"code": 0, "data": {"primary_status": "success"}},
@@ -3697,20 +3799,20 @@ class UpstreamClientTests(unittest.TestCase):
             handler,
             upstream_type="sub2api",
             access_token="sub2api-login-token",
-            include_channel_monitor_details=True,
+            include_upstream_monitor_details=True,
             monitor_only=True,
         )
 
         self.assertEqual(
             requested_paths,
             [
-                SUB2API_CHANNEL_MONITORS_ENDPOINT,
-                f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status",
+                SUB2API_UPSTREAM_MONITORS_ENDPOINT,
+                f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/17/status",
             ],
         )
         self.assertTrue(result.ok)
-        self.assertEqual(result.channel_monitors_status, "ok")
-        self.assertEqual(result.channel_monitors[0]["primary_status"], "available")
+        self.assertEqual(result.upstream_monitors_status, "ok")
+        self.assertEqual(result.upstream_monitors[0]["primary_status"], "available")
 
     def test_newapi_monitor_only_reads_public_uptime_panel_without_credentials(self) -> None:
         requested_paths: list[str] = []
@@ -3757,17 +3859,17 @@ class UpstreamClientTests(unittest.TestCase):
 
         self.assertEqual(requested_paths, [NEWAPI_UPTIME_STATUS_ENDPOINT])
         self.assertTrue(result.ok)
-        self.assertEqual(result.channel_monitors_status, "ok")
-        self.assertEqual(result.channel_monitors_total, 2)
+        self.assertEqual(result.upstream_monitors_status, "ok")
+        self.assertEqual(result.upstream_monitors_total, 2)
         self.assertEqual(
-            [item["primary_status"] for item in result.channel_monitors],
+            [item["primary_status"] for item in result.upstream_monitors],
             ["available", "unavailable"],
         )
-        self.assertEqual(result.channel_monitors[0]["provider"], "uptime-kuma")
-        self.assertEqual(result.channel_monitors[0]["group_name"], "Models · Primary")
-        self.assertEqual(result.channel_monitors[0]["availability_7d"], 0.9985)
-        self.assertEqual(result.channel_monitors[0]["availability_window"], "24h")
-        self.assertLessEqual(result.channel_monitors[0]["id"], (1 << 53) - 1)
+        self.assertEqual(result.upstream_monitors[0]["provider"], "uptime-kuma")
+        self.assertEqual(result.upstream_monitors[0]["group_name"], "Models · Primary")
+        self.assertEqual(result.upstream_monitors[0]["availability_7d"], 0.9985)
+        self.assertEqual(result.upstream_monitors[0]["availability_window"], "24h")
+        self.assertLessEqual(result.upstream_monitors[0]["id"], (1 << 53) - 1)
 
     def test_public_uptime_alone_does_not_make_regular_newapi_discovery_succeed(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3803,7 +3905,7 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.channel_monitors_status, "unknown")
+        self.assertEqual(result.upstream_monitors_status, "unknown")
 
     def test_auto_monitor_only_prefers_successful_newapi_uptime_over_sub2api_401(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3822,7 +3924,7 @@ class UpstreamClientTests(unittest.TestCase):
                         ],
                     },
                 )
-            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+            if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                 return httpx.Response(401)
             self.fail(f"monitor-only discovery requested unrelated endpoint {request.url.path}")
 
@@ -3834,8 +3936,8 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.upstream_type, "newapi")
-        self.assertEqual(result.channel_monitors_status, "ok")
+        self.assertEqual(result.platform_type, "newapi")
+        self.assertEqual(result.upstream_monitors_status, "ok")
         self.assertFalse(result.sub2api_auth_rejected)
 
     def test_auto_monitor_only_preserves_unresolved_sub2api_credential_rejection(self) -> None:
@@ -3844,7 +3946,7 @@ class UpstreamClientTests(unittest.TestCase):
                 def handler(request: httpx.Request) -> httpx.Response:
                     if request.url.path == NEWAPI_UPTIME_STATUS_ENDPOINT:
                         return httpx.Response(404)
-                    if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                    if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                         return httpx.Response(rejected_status)
                     self.fail(
                         f"monitor-only discovery requested unrelated endpoint {request.url.path}"
@@ -3858,10 +3960,10 @@ class UpstreamClientTests(unittest.TestCase):
                 )
 
                 self.assertFalse(result.ok)
-                self.assertEqual(result.upstream_type, "sub2api")
+                self.assertEqual(result.platform_type, "sub2api")
                 self.assertTrue(result.sub2api_auth_rejected)
                 self.assertEqual(
-                    result.channel_monitors_status,
+                    result.upstream_monitors_status,
                     "credentials_rejected",
                 )
 
@@ -3872,7 +3974,7 @@ class UpstreamClientTests(unittest.TestCase):
             monitor_only=True,
         )
         self.assertTrue(newapi_result.ok)
-        self.assertEqual(newapi_result.channel_monitors_status, "unsupported")
+        self.assertEqual(newapi_result.upstream_monitors_status, "unsupported")
 
         sub2api_result = self.run_discovery(
             lambda _request: httpx.Response(403),
@@ -3883,7 +3985,7 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertFalse(sub2api_result.ok)
         self.assertTrue(sub2api_result.sub2api_auth_rejected)
         self.assertEqual(
-            sub2api_result.channel_monitors_status,
+            sub2api_result.upstream_monitors_status,
             "credentials_rejected",
         )
 
@@ -3899,9 +4001,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.channel_monitors, [])
-        self.assertEqual(result.channel_monitors_status, "not_configured")
-        self.assertIn("no public uptime monitors", result.channel_monitors_message)
+        self.assertEqual(result.upstream_monitors, [])
+        self.assertEqual(result.upstream_monitors_status, "not_configured")
+        self.assertIn("no public uptime monitors", result.upstream_monitors_message)
 
     def test_newapi_configured_empty_uptime_group_is_an_error(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3921,9 +4023,9 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.channel_monitors, [])
-        self.assertEqual(result.channel_monitors_status, "error")
-        self.assertIn("configured", result.channel_monitors_message)
+        self.assertEqual(result.upstream_monitors, [])
+        self.assertEqual(result.upstream_monitors_status, "error")
+        self.assertIn("configured", result.upstream_monitors_message)
 
     def test_newapi_partial_empty_uptime_group_preserves_error_state(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3951,11 +4053,11 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.channel_monitors_status, "error")
-        self.assertEqual(len(result.channel_monitors), 1)
-        self.assertIn("incomplete data", result.channel_monitors_message)
+        self.assertEqual(result.upstream_monitors_status, "error")
+        self.assertEqual(len(result.upstream_monitors), 1)
+        self.assertIn("incomplete data", result.upstream_monitors_message)
 
-    def test_newapi_duplicate_uptime_monitors_merge_with_stable_id(self) -> None:
+    def test_newapi_duplicate_uptime_monitors_merge_with_id(self) -> None:
         duplicate_monitors = [
             {"name": "OpenAI", "group": "Primary", "status": 1, "uptime": 0.99},
             {"name": "OpenAI", "group": "Primary", "status": 0, "uptime": 0.75},
@@ -3978,22 +4080,22 @@ class UpstreamClientTests(unittest.TestCase):
         reversed_result = discover(list(reversed(duplicate_monitors)))
 
         self.assertTrue(forward.ok)
-        self.assertEqual(forward.channel_monitors_total, 1)
-        self.assertEqual(len(forward.channel_monitors), 1)
+        self.assertEqual(forward.upstream_monitors_total, 1)
+        self.assertEqual(len(forward.upstream_monitors), 1)
         self.assertEqual(
-            forward.channel_monitors[0]["id"],
-            reversed_result.channel_monitors[0]["id"],
+            forward.upstream_monitors[0]["id"],
+            reversed_result.upstream_monitors[0]["id"],
         )
-        self.assertEqual(forward.channel_monitors[0]["primary_status"], "unavailable")
-        self.assertEqual(reversed_result.channel_monitors[0]["primary_status"], "unavailable")
-        self.assertEqual(forward.channel_monitors[0]["availability_7d"], 0.75)
-        self.assertEqual(reversed_result.channel_monitors[0]["availability_7d"], 0.75)
+        self.assertEqual(forward.upstream_monitors[0]["primary_status"], "unavailable")
+        self.assertEqual(reversed_result.upstream_monitors[0]["primary_status"], "unavailable")
+        self.assertEqual(forward.upstream_monitors[0]["availability_7d"], 0.75)
+        self.assertEqual(reversed_result.upstream_monitors[0]["availability_7d"], 0.75)
 
-    def test_channel_monitor_available_status_aliases_are_normalized(self) -> None:
+    def test_upstream_monitor_available_status_aliases_are_normalized(self) -> None:
         for status in ("ok", "success", "active", "enabled"):
             with self.subTest(status=status):
                 def handler(request: httpx.Request) -> httpx.Response:
-                    if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                    if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                         return httpx.Response(
                             200,
                             json={
@@ -4018,35 +4120,35 @@ class UpstreamClientTests(unittest.TestCase):
                     monitor_only=True,
                 )
                 self.assertEqual(
-                    result.channel_monitors[0]["primary_status"],
+                    result.upstream_monitors[0]["primary_status"],
                     "available",
                 )
 
     def test_monitor_only_401_marks_sub2api_auth_rejected(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            self.assertEqual(request.url.path, SUB2API_CHANNEL_MONITORS_ENDPOINT)
+            self.assertEqual(request.url.path, SUB2API_UPSTREAM_MONITORS_ENDPOINT)
             return httpx.Response(401)
 
         result = self.run_discovery(
             handler,
             upstream_type="sub2api",
             access_token="expired-access-token",
-            include_channel_monitor_details=True,
+            include_upstream_monitor_details=True,
             monitor_only=True,
         )
 
         self.assertEqual(result.status, "error")
         self.assertTrue(result.sub2api_auth_rejected)
-        self.assertEqual(result.channel_monitors_status, "credentials_rejected")
+        self.assertEqual(result.upstream_monitors_status, "credentials_rejected")
 
-    def test_sub2api_channel_monitors_merge_summary_and_status_details(self) -> None:
+    def test_sub2api_upstream_monitors_merge_summary_and_status_details(self) -> None:
         secret = "monitor-detail-secret"
         detail_requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request_target(request) == "/api/v1/groups/available":
                 return httpx.Response(200, json={"code": 0, "data": []})
-            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+            if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                 return httpx.Response(
                     200,
                     json={
@@ -4075,7 +4177,7 @@ class UpstreamClientTests(unittest.TestCase):
                         },
                     },
                 )
-            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status":
+            if request.url.path == f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/17/status":
                 detail_requests.append(request)
                 return httpx.Response(
                     200,
@@ -4111,7 +4213,7 @@ class UpstreamClientTests(unittest.TestCase):
                         },
                     },
                 )
-            if request.url.path == f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/18/status":
+            if request.url.path == f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/18/status":
                 detail_requests.append(request)
                 return httpx.Response(503)
             return httpx.Response(404)
@@ -4120,17 +4222,17 @@ class UpstreamClientTests(unittest.TestCase):
             handler,
             upstream_type="sub2api",
             access_token=secret,
-            include_channel_monitor_details=True,
+            include_upstream_monitor_details=True,
         )
 
-        self.assertEqual(result.channel_monitors_status, "ok")
-        self.assertEqual(result.channel_monitors_total, 2)
+        self.assertEqual(result.upstream_monitors_status, "ok")
+        self.assertEqual(result.upstream_monitors_total, 2)
         self.assertEqual(len(detail_requests), 2)
         self.assertEqual(
             {request.url.path for request in detail_requests},
             {
-                f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/17/status",
-                f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/18/status",
+                f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/17/status",
+                f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/18/status",
             },
         )
         self.assertTrue(all(request.method == "GET" for request in detail_requests))
@@ -4141,7 +4243,7 @@ class UpstreamClientTests(unittest.TestCase):
             )
         )
 
-        detailed, fallback = result.channel_monitors
+        detailed, fallback = result.upstream_monitors
         self.assertEqual(detailed["name"], "Summary name")
         self.assertEqual(detailed["provider"], "openai")
         self.assertEqual(detailed["group_name"], "Primary")
@@ -4155,14 +4257,14 @@ class UpstreamClientTests(unittest.TestCase):
         self.assertEqual(fallback["name"], "Fallback summary")
         self.assertEqual(fallback["primary_status"], "operational")
         self.assertEqual(fallback["primary_latency_ms"], 88)
-        self.assertIn("Used list summaries for 1 monitor(s)", result.channel_monitors_message)
+        self.assertIn("Used list summaries for 1 monitor(s)", result.upstream_monitors_message)
         self.assertNotIn(secret, json.dumps(result.as_dict()))
 
-    def test_sub2api_channel_monitor_details_can_target_one_monitor(self) -> None:
+    def test_sub2api_upstream_monitor_details_can_target_one_monitor(self) -> None:
         detail_ids: list[int] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+            if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                 return httpx.Response(
                     200,
                     json={
@@ -4176,7 +4278,7 @@ class UpstreamClientTests(unittest.TestCase):
                     },
                 )
             if (
-                request.url.path.startswith(f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/")
+                request.url.path.startswith(f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/")
                 and request.url.path.endswith("/status")
             ):
                 monitor_id = int(request.url.path.rsplit("/", 2)[-2])
@@ -4191,27 +4293,27 @@ class UpstreamClientTests(unittest.TestCase):
             handler,
             upstream_type="sub2api",
             access_token="sub2api-login-token",
-            include_channel_monitor_details=True,
-            channel_monitor_detail_ids={18},
+            include_upstream_monitor_details=True,
+            upstream_monitor_detail_ids={18},
             monitor_only=True,
         )
 
         self.assertEqual(detail_ids, [18])
         self.assertEqual(
-            [monitor["primary_status"] for monitor in result.channel_monitors],
+            [monitor["primary_status"] for monitor in result.upstream_monitors],
             ["degraded", "operational"],
         )
 
-    def test_sub2api_channel_monitor_detail_concurrency_is_bounded(self) -> None:
+    def test_sub2api_upstream_monitor_detail_concurrency_is_bounded(self) -> None:
         active_details = 0
         max_active_details = 0
-        detail_count = CHANNEL_MONITOR_DETAIL_CONCURRENCY + 5
+        detail_count = UPSTREAM_MONITOR_DETAIL_CONCURRENCY + 5
 
         async def handler(request: httpx.Request) -> httpx.Response:
             nonlocal active_details, max_active_details
             if request_target(request) == "/api/v1/groups/available":
                 return httpx.Response(200, json={"code": 0, "data": []})
-            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+            if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                 return httpx.Response(
                     200,
                     json={
@@ -4225,7 +4327,7 @@ class UpstreamClientTests(unittest.TestCase):
                     },
                 )
             if (
-                request.url.path.startswith(f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/")
+                request.url.path.startswith(f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/")
                 and request.url.path.endswith("/status")
             ):
                 active_details += 1
@@ -4242,14 +4344,14 @@ class UpstreamClientTests(unittest.TestCase):
             handler,
             upstream_type="sub2api",
             access_token="sub2api-login-token",
-            include_channel_monitor_details=True,
+            include_upstream_monitor_details=True,
         )
 
-        self.assertEqual(len(result.channel_monitors), detail_count)
+        self.assertEqual(len(result.upstream_monitors), detail_count)
         self.assertGreater(max_active_details, 1)
-        self.assertLessEqual(max_active_details, CHANNEL_MONITOR_DETAIL_CONCURRENCY)
+        self.assertLessEqual(max_active_details, UPSTREAM_MONITOR_DETAIL_CONCURRENCY)
 
-    def test_sub2api_channel_monitors_are_bounded_cleaned_and_scrubbed(self) -> None:
+    def test_sub2api_upstream_monitors_are_bounded_cleaned_and_scrubbed(self) -> None:
         secret = "monitor-secret-token-" + ("S" * 220)
         detail_ids: list[int] = []
         extras = [
@@ -4260,7 +4362,7 @@ class UpstreamClientTests(unittest.TestCase):
                     "status": "operational",
                     "latency_ms": index,
                 }
-                for index in range(MAX_CHANNEL_MONITOR_EXTRA_MODELS + 5)
+                for index in range(MAX_UPSTREAM_MONITOR_EXTRA_MODELS + 5)
             ),
         ]
         timeline = [
@@ -4272,7 +4374,7 @@ class UpstreamClientTests(unittest.TestCase):
                     "ping_latency_ms": index + 1,
                     "checked_at": f"2026-07-18T00:{index % 60:02d}:00Z",
                 }
-                for index in range(MAX_CHANNEL_MONITOR_TIMELINE_POINTS + 5)
+                for index in range(MAX_UPSTREAM_MONITOR_TIMELINE_POINTS + 5)
             ),
         ]
         monitors = [
@@ -4300,20 +4402,20 @@ class UpstreamClientTests(unittest.TestCase):
                     "primary_status": "operational",
                     "availability_7d": 99.5,
                 }
-                for index in range(2, MAX_CHANNEL_MONITORS + 6)
+                for index in range(2, MAX_UPSTREAM_MONITORS + 6)
             ),
         ]
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request_target(request) == "/api/v1/groups/available":
                 return httpx.Response(200, json={"code": 0, "data": []})
-            if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+            if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                 return httpx.Response(
                     200,
                     json={"code": 0, "data": {"items": monitors}},
                 )
             if (
-                request.url.path.startswith(f"{SUB2API_CHANNEL_MONITORS_ENDPOINT}/")
+                request.url.path.startswith(f"{SUB2API_UPSTREAM_MONITORS_ENDPOINT}/")
                 and request.url.path.endswith("/status")
             ):
                 monitor_id = int(request.url.path.rsplit("/", 2)[-2])
@@ -4325,29 +4427,29 @@ class UpstreamClientTests(unittest.TestCase):
             handler,
             upstream_type="sub2api",
             access_token=secret,
-            include_channel_monitor_details=True,
+            include_upstream_monitor_details=True,
         )
 
-        self.assertEqual(result.channel_monitors_status, "ok")
-        self.assertEqual(len(result.channel_monitors), MAX_CHANNEL_MONITORS)
-        self.assertEqual(result.channel_monitors_total, MAX_CHANNEL_MONITORS + 5)
-        self.assertEqual(len(detail_ids), MAX_CHANNEL_MONITORS)
-        self.assertEqual(set(detail_ids), set(range(1, MAX_CHANNEL_MONITORS + 1)))
-        first = result.channel_monitors[0]
+        self.assertEqual(result.upstream_monitors_status, "ok")
+        self.assertEqual(len(result.upstream_monitors), MAX_UPSTREAM_MONITORS)
+        self.assertEqual(result.upstream_monitors_total, MAX_UPSTREAM_MONITORS + 5)
+        self.assertEqual(len(detail_ids), MAX_UPSTREAM_MONITORS)
+        self.assertEqual(set(detail_ids), set(range(1, MAX_UPSTREAM_MONITORS + 1)))
+        first = result.upstream_monitors[0]
         self.assertEqual(first["name"], "Status [redacted]")
         self.assertEqual(first["provider"], "unknown")
         self.assertEqual(first["primary_status"], "unknown")
         self.assertIsNone(first["primary_latency_ms"])
         self.assertEqual(first["primary_ping_latency_ms"], 12.5)
         self.assertIsNone(first["availability_7d"])
-        self.assertEqual(len(first["extra_models"]), MAX_CHANNEL_MONITOR_EXTRA_MODELS)
-        self.assertEqual(len(first["timeline"]), MAX_CHANNEL_MONITOR_TIMELINE_POINTS)
+        self.assertEqual(len(first["extra_models"]), MAX_UPSTREAM_MONITOR_EXTRA_MODELS)
+        self.assertEqual(len(first["timeline"]), MAX_UPSTREAM_MONITOR_TIMELINE_POINTS)
         serialized = json.dumps(result.as_dict())
         self.assertNotIn(secret, serialized)
         self.assertNotIn(secret[:160], serialized)
         self.assertNotIn('"api_key"', serialized)
 
-    def test_sub2api_channel_monitor_failures_are_explicit(self) -> None:
+    def test_sub2api_upstream_monitor_failures_are_explicit(self) -> None:
         for status_code, expected_status in (
             (401, "credentials_rejected"),
             (404, "unsupported"),
@@ -4358,7 +4460,7 @@ class UpstreamClientTests(unittest.TestCase):
                 def handler(request: httpx.Request) -> httpx.Response:
                     if request_target(request) == "/api/v1/groups/available":
                         return httpx.Response(200, json={"code": 0, "data": []})
-                    if request.url.path == SUB2API_CHANNEL_MONITORS_ENDPOINT:
+                    if request.url.path == SUB2API_UPSTREAM_MONITORS_ENDPOINT:
                         return httpx.Response(status_code)
                     return httpx.Response(404)
 
@@ -4367,16 +4469,16 @@ class UpstreamClientTests(unittest.TestCase):
                     upstream_type="sub2api",
                     access_token="sub2api-login-token",
                 )
-                self.assertEqual(result.channel_monitors, [])
-                self.assertEqual(result.channel_monitors_status, expected_status)
+                self.assertEqual(result.upstream_monitors, [])
+                self.assertEqual(result.upstream_monitors_status, expected_status)
 
-    def test_channel_monitor_scrubbing_tolerates_non_list_collections(self) -> None:
+    def test_upstream_monitor_scrubbing_tolerates_non_list_collections(self) -> None:
         result = _scrub_discovery_result(
             DiscoveryResult(
-                upstream_type="sub2api",
+                platform_type="sub2api",
                 source="https://upstream.example",
                 status="ok",
-                channel_monitors=[
+                upstream_monitors=[
                     {
                         "id": 1,
                         "name": "Monitor",
@@ -4388,17 +4490,17 @@ class UpstreamClientTests(unittest.TestCase):
             ("secret",),
         )
 
-        self.assertEqual(result.channel_monitors[0]["extra_models"], [])
-        self.assertEqual(result.channel_monitors[0]["timeline"], [])
+        self.assertEqual(result.upstream_monitors[0]["extra_models"], [])
+        self.assertEqual(result.upstream_monitors[0]["timeline"], [])
 
-    def test_channel_monitor_scrubbing_reapplies_a_strict_field_allowlist(self) -> None:
+    def test_upstream_monitor_scrubbing_reapplies_a_strict_field_allowlist(self) -> None:
         secret = "manually-constructed-monitor-secret"
         result = _scrub_discovery_result(
             DiscoveryResult(
-                upstream_type="sub2api",
+                platform_type="sub2api",
                 source="https://upstream.example",
                 status="ok",
-                channel_monitors=[
+                upstream_monitors=[
                     {
                         "id": 1,
                         "name": "Monitor",
@@ -4426,7 +4528,7 @@ class UpstreamClientTests(unittest.TestCase):
             (secret,),
         )
 
-        monitor = result.channel_monitors[0]
+        monitor = result.upstream_monitors[0]
         self.assertNotIn("raw_secret", monitor)
         self.assertNotIn("api_key", monitor["extra_models"][0])
         self.assertNotIn("raw_secret", monitor["timeline"][0])

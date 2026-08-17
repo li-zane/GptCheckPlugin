@@ -13,7 +13,7 @@ import websockets
 from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
-from app.models import UpstreamAccountConfig, UpstreamChannel
+from app.models import ApiAccount, Upstream
 from app.services.runtime_config import RuntimeConfigService, get_runtime_config_service
 from app.services.usage_estimate import get_cached_usage_estimate
 
@@ -345,22 +345,22 @@ class DiscordCommandService:
 async def build_balance_command_embed() -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         channels = list(
-            (await db.scalars(select(UpstreamChannel).order_by(UpstreamChannel.display_name, UpstreamChannel.id))).all()
+            (await db.scalars(select(Upstream).order_by(Upstream.display_name, Upstream.id))).all()
         )
         configs = list(
             (
                 await db.scalars(
-                    select(UpstreamAccountConfig).where(
-                        UpstreamAccountConfig.channel_id.is_not(None),
-                        UpstreamAccountConfig.remote_present.is_(True),
+                    select(ApiAccount).where(
+                        ApiAccount.upstream_id.is_not(None),
+                        ApiAccount.remote_present.is_(True),
                     )
                 )
             ).all()
         )
-    by_channel: dict[int, list[UpstreamAccountConfig]] = {}
+    by_channel: dict[str, list[ApiAccount]] = {}
     for config in configs:
-        if config.channel_id is not None:
-            by_channel.setdefault(int(config.channel_id), []).append(config)
+        if config.upstream_id is not None:
+            by_channel.setdefault(config.upstream_id, []).append(config)
     categories: dict[str, list[str]] = {"有账号": [], "无启用": [], "无账号": []}
     checked_times: list[datetime] = []
     low_balance = False
@@ -372,13 +372,15 @@ async def build_balance_command_embed() -> dict[str, Any]:
             category = "无启用"
         else:
             category = "有账号"
-        wallet = _money(channel.balance_remaining, channel.balance_unit or "USD")
+        wallet = _money(channel.wallet_balance_usd, channel.balance_unit or "USD")
         adjusted = (
-            channel.balance_remaining * channel.effective_recharge_multiplier
-            if channel.balance_remaining is not None and channel.effective_recharge_multiplier is not None
+            channel.wallet_balance_usd * channel.upstream_recharge_multiplier
+            if channel.wallet_balance_usd is not None and channel.upstream_recharge_multiplier is not None
             else None
         )
-        categories[category].append(f"• {channel.display_name} · 原 {wallet} · 综 {_money(adjusted, 'CNY')}")
+        categories[category].append(
+            f"• {channel.display_name} · 钱包 {wallet} · 实际 {_money(adjusted, 'CNY')}"
+        )
         if channel.balance_guard_state == "insufficient":
             low_balance = True
         if channel.balance_checked_at is not None:
@@ -590,7 +592,7 @@ def _valid_snowflake(value: str) -> bool:
     return value.isascii() and value.isdigit() and 1 <= len(value) <= 32
 
 
-def _account_is_enabled(account: UpstreamAccountConfig) -> bool:
+def _account_is_enabled(account: ApiAccount) -> bool:
     if account.remote_schedulable is False:
         return False
     status = str(account.remote_status or "").strip().lower()

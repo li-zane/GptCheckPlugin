@@ -1,0 +1,6 @@
+/*
+ * Legacy visual boundary.
+ * Existing feature views still use stable string class names while they are
+ * being migrated to co-located CSS Modules. New components must use a module.
+ */
+@import "../../features/legacy/legacy.css";

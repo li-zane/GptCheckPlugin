@@ -1,12 +1,12 @@
-import type { UpstreamChannel } from "./types";
+import type { Upstream } from "./domain";
 
-export function channelCredentialBindingChanged(
-  channel: UpstreamChannel,
+export function upstreamCredentialBindingChanged(
+  upstream: Upstream,
   nextCanonicalUrl: string,
   nextManagementUrl: string,
 ) {
-  const previousCanonicalUrl = channel.canonical_base_url?.trim() || channel.base_url?.trim() || "";
-  const previousManagementUrl = channel.management_base_url?.trim() || previousCanonicalUrl;
+  const previousCanonicalUrl = upstream.api_endpoint_url?.trim() || "";
+  const previousManagementUrl = upstream.management_url?.trim() || previousCanonicalUrl;
   const effectiveNextManagementUrl = nextManagementUrl.trim() || nextCanonicalUrl;
   return (
     credentialOrigin(previousCanonicalUrl) !== credentialOrigin(nextCanonicalUrl) ||

@@ -22,7 +22,7 @@ EVENT_SWITCHES = {
     "upstream_group_changed": "upstream_group_changed_enabled",
     "upstream_group_multiplier_changed": "api_key_rate_changed_enabled",
     "upstream_balance_low": "upstream_balance_low_enabled",
-    "upstream_channel_token_invalid": "upstream_channel_token_invalid_enabled",
+    "upstream_token_invalid": "upstream_token_invalid_enabled",
 }
 
 
@@ -231,8 +231,8 @@ async def enqueue_api_key_account_state_changed(
     account_id: int,
     account_name: str | None,
     reason: str,
-    channel_id: int | None = None,
-    channel_name: str | None = None,
+    upstream_id: str | None = None,
+    upstream_name: str | None = None,
     reason_details: dict[str, Any] | None = None,
     observed_at: datetime | None = None,
     runtime_config: Any | None = None,
@@ -244,8 +244,8 @@ async def enqueue_api_key_account_state_changed(
         account_id=account_id,
         account_name=account_name,
         reason=reason,
-        channel_id=channel_id,
-        channel_name=channel_name,
+        upstream_id=upstream_id,
+        upstream_name=upstream_name,
         reason_details=reason_details,
         observed_at=observed_at,
         runtime_config=runtime_config,
@@ -261,8 +261,8 @@ async def enqueue_account_state_changed(
     account_id: int | str | None = None,
     account_name: str | None = None,
     email: str | None = None,
-    channel_id: int | None = None,
-    channel_name: str | None = None,
+    upstream_id: str | None = None,
+    upstream_name: str | None = None,
     reason_details: dict[str, Any] | None = None,
     observed_at: datetime | None = None,
     runtime_config: Any | None = None,
@@ -285,8 +285,8 @@ async def enqueue_account_state_changed(
         "account_id": account_id,
         "account_name": normalized_name,
         "email": normalized_email,
-        "channel_id": channel_id,
-        "channel_name": str(channel_name or "").strip() or None,
+        "upstream_id": upstream_id,
+        "upstream_name": str(upstream_name or "").strip() or None,
         "enabled": enabled,
         "reason": str(reason or "")[:500],
         "observed_at": observed.isoformat(),
@@ -324,8 +324,8 @@ async def enqueue_api_key_rate_changed(
     new_rate: float,
     observed_at: datetime,
     reason: str,
-    channel_id: int | None = None,
-    channel_name: str | None = None,
+    upstream_id: str | None = None,
+    upstream_name: str | None = None,
     runtime_config: Any | None = None,
 ) -> NotificationOutbox | None:
     display_name = (account_name or "").strip() or f"Account #{account_id}"
@@ -340,8 +340,8 @@ async def enqueue_api_key_rate_changed(
         {
             "account_id": account_id,
             "account_name": account_name,
-            "channel_id": channel_id,
-            "channel_name": channel_name,
+            "upstream_id": upstream_id,
+            "upstream_name": upstream_name,
             "old_rate": old_rate,
             "new_rate": new_rate,
             "reason": reason,
@@ -353,8 +353,8 @@ async def enqueue_api_key_rate_changed(
 async def enqueue_upstream_group_multiplier_changed(
     db: AsyncSession,
     *,
-    channel_id: int,
-    channel_name: str | None,
+    upstream_id: str,
+    upstream_name: str | None,
     group_id: str | None,
     group_name: str | None,
     old_multiplier: float,
@@ -364,8 +364,8 @@ async def enqueue_upstream_group_multiplier_changed(
 ) -> NotificationOutbox | None:
     return await enqueue_upstream_group_changed(
         db,
-        channel_id=channel_id,
-        channel_name=channel_name,
+        upstream_id=upstream_id,
+        upstream_name=upstream_name,
         group_id=group_id,
         group_name=group_name,
         change_type="multiplier",
@@ -380,8 +380,8 @@ async def enqueue_upstream_group_multiplier_changed(
 async def enqueue_upstream_group_changed(
     db: AsyncSession,
     *,
-    channel_id: int,
-    channel_name: str | None,
+    upstream_id: str,
+    upstream_name: str | None,
     group_id: str | None,
     group_name: str | None,
     change_type: str,
@@ -394,17 +394,17 @@ async def enqueue_upstream_group_changed(
     observed_at: datetime,
     runtime_config: Any | None = None,
 ) -> NotificationOutbox | None:
-    display_channel = str(channel_name or "").strip() or f"Channel #{channel_id}"
+    display_channel = str(upstream_name or "").strip() or f"Upstream #{upstream_id}"
     display_group = str(group_name or "").strip() or str(group_id or "").strip() or "Unknown group"
     normalized_change_type = str(change_type or "changed").strip().lower() or "changed"
     identity = (
-        f"{channel_id}:{group_id}:{display_group}:{normalized_change_type}:"
+        f"{upstream_id}:{group_id}:{display_group}:{normalized_change_type}:"
         f"{old_multiplier!r}:{new_multiplier!r}:{old_status}:{new_status}"
     )
     identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
     notification_details: dict[str, Any] = {
-        "channel_id": channel_id,
-        "channel_name": channel_name,
+        "upstream_id": upstream_id,
+        "upstream_name": upstream_name,
         "group_id": group_id,
         "group_name": group_name,
         "change_type": normalized_change_type,
@@ -425,28 +425,28 @@ async def enqueue_upstream_group_changed(
     )
 
 
-async def enqueue_upstream_channel_token_invalid(
+async def enqueue_upstream_token_invalid(
     db: AsyncSession,
     *,
-    channel_id: int,
-    channel_name: str | None,
+    upstream_id: str,
+    upstream_name: str | None,
     credential_fingerprint: str,
     observed_at: datetime,
     runtime_config: Any | None = None,
 ) -> NotificationOutbox | None:
-    display_channel = str(channel_name or "").strip() or f"Channel #{channel_id}"
+    display_channel = str(upstream_name or "").strip() or f"Upstream #{upstream_id}"
     fingerprint = hashlib.sha256(
-        f"{channel_id}:{credential_fingerprint}".encode("utf-8")
+        f"{upstream_id}:{credential_fingerprint}".encode("utf-8")
     ).hexdigest()[:24]
     return await NotificationService(db, runtime_config).enqueue_if_enabled(
-        "upstream_channel_token_invalid",
+        "upstream_token_invalid",
         f"upstream-token-invalid:{fingerprint}",
         "Upstream channel token invalid",
         f"{display_channel}: the saved login token was rejected and could not be refreshed.",
         {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "reason": "upstream_channel_token_invalid",
+            "upstream_id": upstream_id,
+            "upstream_name": upstream_name,
+            "reason": "upstream_token_invalid",
             "observed_at": observed_at.isoformat(),
         },
     )

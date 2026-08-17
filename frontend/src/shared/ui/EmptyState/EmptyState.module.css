@@ -1,0 +1,3 @@
+.empty { align-items: center; color: var(--muted); display: flex; flex-direction: column; gap: 8px; justify-content: center; min-height: 180px; padding: 28px; text-align: center; }
+.empty strong { color: var(--ink); }
+.empty p { margin: 0; max-width: 48ch; }

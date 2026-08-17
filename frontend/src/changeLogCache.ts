@@ -1,7 +1,7 @@
 import type {
   AccountSchedulingChangeEvent,
-  UpstreamChannelChangeEvent,
-} from "./types";
+  UpstreamChangeEvent,
+} from "./domain";
 
 export const changeLogCacheVersion = 3;
 const cacheKeyPrefix = "sub2api-at-change-log:";
@@ -10,7 +10,7 @@ const categoryReadCursorMaxAgeMs = 60_000;
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 type EnumerableStorageLike = Pick<Storage, "key" | "length" | "removeItem">;
-type ChangeLogItem = UpstreamChannelChangeEvent | AccountSchedulingChangeEvent;
+type ChangeLogItem = UpstreamChangeEvent | AccountSchedulingChangeEvent;
 
 export type ChangeLogCacheCategory = "upstream" | "account_rate" | "scheduling";
 

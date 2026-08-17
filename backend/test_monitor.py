@@ -163,7 +163,7 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
                 db.add(
                     AccountSnapshot(
                         email="oauth@example.com",
-                        sub2api_account_id="1",
+                        management_account_id="1",
                         available_models=None,
                     )
                 )
@@ -242,7 +242,7 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
                 db.add(
                     AccountSnapshot(
                         email="oauth@example.com",
-                        sub2api_account_id="1",
+                        management_account_id="1",
                         available_models=[{"id": "model-a", "display_name": "Model A"}],
                     )
                 )
@@ -295,7 +295,7 @@ class MonitorServiceTests(unittest.IsolatedAsyncioTestCase):
                 db.add(
                     AccountSnapshot(
                         email="oauth@example.com",
-                        sub2api_account_id="1",
+                        management_account_id="1",
                         available_models=None,
                     )
                 )

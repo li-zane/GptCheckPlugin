@@ -9,10 +9,10 @@ from app.models import AccountExceptionRecord, AccountSnapshot, AppSetting, utcn
 _BACKFILL_KEY = "migration.account_exception_records.current_only_backfilled"
 
 
-def account_exception_fingerprint(source: str, email: str | None = None, sub2api_account_id: str | None = None) -> str:
+def account_exception_fingerprint(source: str, email: str | None = None, management_account_id: str | None = None) -> str:
     source_key = str(source or "account").strip().lower() or "account"
     email_key = str(email or "").strip().lower()
-    account_key = str(sub2api_account_id or "").strip().lower()
+    account_key = str(management_account_id or "").strip().lower()
     if email_key:
         return f"{source_key}:email:{email_key}"
     if account_key:
@@ -27,12 +27,12 @@ async def upsert_account_exception(
     status: str,
     message: str,
     email: str | None = None,
-    sub2api_account_id: str | None = None,
+    management_account_id: str | None = None,
     details: dict[str, Any] | None = None,
     commit: bool = True,
 ) -> AccountExceptionRecord:
     normalized_email = str(email or "").strip().lower() or None
-    account_id = str(sub2api_account_id or "").strip() or None
+    account_id = str(management_account_id or "").strip() or None
     fingerprint = account_exception_fingerprint(source, normalized_email, account_id)
     now = utcnow()
     record = await db.scalar(select(AccountExceptionRecord).where(AccountExceptionRecord.fingerprint == fingerprint))
@@ -40,7 +40,7 @@ async def upsert_account_exception(
         record = AccountExceptionRecord(
             fingerprint=fingerprint,
             email=normalized_email,
-            sub2api_account_id=account_id,
+            management_account_id=account_id,
             source=source,
             status=status,
             message=message,
@@ -51,7 +51,7 @@ async def upsert_account_exception(
         db.add(record)
     else:
         record.email = normalized_email
-        record.sub2api_account_id = account_id
+        record.management_account_id = account_id
         record.source = source
         record.status = status
         record.message = message
@@ -68,10 +68,10 @@ async def clear_account_exception(
     *,
     source: str,
     email: str | None = None,
-    sub2api_account_id: str | None = None,
+    management_account_id: str | None = None,
     commit: bool = True,
 ) -> int:
-    fingerprint = account_exception_fingerprint(source, email, sub2api_account_id)
+    fingerprint = account_exception_fingerprint(source, email, management_account_id)
     result = await db.execute(delete(AccountExceptionRecord).where(AccountExceptionRecord.fingerprint == fingerprint))
     if commit:
         await db.commit()
@@ -96,7 +96,7 @@ async def backfill_account_exception_records(db: AsyncSession) -> None:
             status=status,
             message=snapshot.last_error or "Account snapshot is in an exception state.",
             email=snapshot.email,
-            sub2api_account_id=snapshot.sub2api_account_id,
+            management_account_id=snapshot.management_account_id,
             details={"snapshot_id": snapshot.id, "backfilled": True},
             commit=False,
         )

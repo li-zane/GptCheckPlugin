@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.upstream_accounts import router
 from app.core.database import Base, get_db
 from app.core.security import require_admin
-from app.models import UpstreamChannelChangeEvent, UpstreamRateChangeLog, utcnow
+from app.models import UpstreamChangeEvent, UpstreamRateChangeLog, utcnow
 from app.schemas import UpstreamRateChangeLogOut
 from app.services.upstream_rate_logs import (
     list_upstream_rate_change_logs,
@@ -23,10 +23,10 @@ from app.services.upstream_rate_logs import (
 
 def _log(*, account_id: int, status: str, created_at=None) -> UpstreamRateChangeLog:
     return UpstreamRateChangeLog(
-        sub2api_account_id=account_id,
+        management_account_id=account_id,
         account_name=f"Account {account_id}",
-        channel_id=3,
-        channel_name="Example upstream",
+        upstream_id="00000000-0000-4000-8000-000000000003",
+        upstream_name="Example upstream",
         group_id="default",
         group_name="Default",
         old_group_multiplier=1.0,
@@ -36,11 +36,11 @@ def _log(*, account_id: int, status: str, created_at=None) -> UpstreamRateChange
         old_upstream_recharge_multiplier=0.1,
         new_upstream_recharge_multiplier=0.1,
         upstream_recharge_multiplier=0.1,
-        local_recharge_multiplier=0.1,
-        old_target_rate=1.0,
-        new_target_rate=1.25,
-        old_current_rate=1.0,
-        new_current_rate=1.25,
+        management_recharge_multiplier=0.1,
+        old_expected_management_billing_multiplier=1.0,
+        new_expected_management_billing_multiplier=1.25,
+        old_management_billing_multiplier=1.0,
+        new_management_billing_multiplier=1.25,
         reason="scheduled_sync",
         status=status,
         safe_error=None,
@@ -114,13 +114,13 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
         initial = _log(account_id=3, status="observed", created_at=now - timedelta(hours=12))
         initial.old_group_multiplier = None
         initial.old_upstream_multiplier = None
-        initial.old_target_rate = None
-        initial.old_current_rate = initial.new_current_rate
+        initial.old_expected_management_billing_multiplier = None
+        initial.old_management_billing_multiplier = initial.new_management_billing_multiplier
         unchanged = _log(account_id=4, status="observed", created_at=now - timedelta(hours=6))
         unchanged.new_group_multiplier = unchanged.old_group_multiplier
         unchanged.new_upstream_multiplier = unchanged.old_upstream_multiplier
-        unchanged.new_target_rate = unchanged.old_target_rate
-        unchanged.new_current_rate = unchanged.old_current_rate
+        unchanged.new_expected_management_billing_multiplier = unchanged.old_expected_management_billing_multiplier
+        unchanged.new_management_billing_multiplier = unchanged.old_management_billing_multiplier
         self.db.add_all([outside, inside, initial, unchanged])
         await self.db.commit()
 
@@ -131,20 +131,20 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
             end_at=now,
         )
 
-        self.assertEqual([row.sub2api_account_id for row in rows], [2])
+        self.assertEqual([row.management_account_id for row in rows], [2])
 
     async def test_list_keeps_apply_failure_when_only_rate_drift_was_observed(self) -> None:
         failure = _log(account_id=5, status="apply_failed")
         failure.new_group_multiplier = failure.old_group_multiplier
         failure.new_upstream_multiplier = failure.old_upstream_multiplier
-        failure.new_target_rate = failure.old_target_rate
-        failure.new_current_rate = failure.old_current_rate
+        failure.new_expected_management_billing_multiplier = failure.old_expected_management_billing_multiplier
+        failure.new_management_billing_multiplier = failure.old_management_billing_multiplier
         failure.safe_error = "Unable to update and verify the sub2api account rate."
         unchanged = _log(account_id=6, status="observed")
         unchanged.new_group_multiplier = unchanged.old_group_multiplier
         unchanged.new_upstream_multiplier = unchanged.old_upstream_multiplier
-        unchanged.new_target_rate = unchanged.old_target_rate
-        unchanged.new_current_rate = unchanged.old_current_rate
+        unchanged.new_expected_management_billing_multiplier = unchanged.old_expected_management_billing_multiplier
+        unchanged.new_management_billing_multiplier = unchanged.old_management_billing_multiplier
         self.db.add_all([failure, unchanged])
         await self.db.commit()
 
@@ -153,15 +153,15 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
             retention_days=30,
         )
 
-        self.assertEqual([row.sub2api_account_id for row in rows], [5])
+        self.assertEqual([row.management_account_id for row in rows], [5])
         self.assertEqual(rows[0].safe_error, failure.safe_error)
 
     async def test_list_returns_health_only_changes_and_disable_failures(self) -> None:
         health_change = _log(account_id=7, status="observed")
         health_change.new_group_multiplier = health_change.old_group_multiplier
         health_change.new_upstream_multiplier = health_change.old_upstream_multiplier
-        health_change.new_target_rate = health_change.old_target_rate
-        health_change.new_current_rate = health_change.old_current_rate
+        health_change.new_expected_management_billing_multiplier = health_change.old_expected_management_billing_multiplier
+        health_change.new_management_billing_multiplier = health_change.old_management_billing_multiplier
         health_change.old_upstream_key_status = "active"
         health_change.new_upstream_key_status = "disabled"
         health_change.old_upstream_group_status = "available"
@@ -171,8 +171,8 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
         disable_failure = _log(account_id=8, status="disable_failed")
         disable_failure.new_group_multiplier = disable_failure.old_group_multiplier
         disable_failure.new_upstream_multiplier = disable_failure.old_upstream_multiplier
-        disable_failure.new_target_rate = disable_failure.old_target_rate
-        disable_failure.new_current_rate = disable_failure.old_current_rate
+        disable_failure.new_expected_management_billing_multiplier = disable_failure.old_expected_management_billing_multiplier
+        disable_failure.new_management_billing_multiplier = disable_failure.old_management_billing_multiplier
         disable_failure.safe_error = "Unable to disable and verify the sub2api account."
         self.db.add_all([health_change, disable_failure])
         await self.db.commit()
@@ -183,7 +183,7 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            [row.sub2api_account_id for row in rows],
+            [row.management_account_id for row in rows],
             [8, 7],
         )
 
@@ -225,7 +225,7 @@ class UpstreamRateChangeLogServiceTests(unittest.IsolatedAsyncioTestCase):
 class UpstreamRateChangeLogApiTests(unittest.TestCase):
     def test_channel_change_route_returns_numbered_page_metadata(self) -> None:
         app = FastAPI()
-        app.include_router(router, prefix="/api/upstream-accounts")
+        app.include_router(router, prefix="/api/api-accounts")
         fake_db = AsyncMock()
 
         async def db_override():
@@ -233,9 +233,9 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
 
         app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
         app.dependency_overrides[get_db] = db_override
-        row = UpstreamChannelChangeEvent(
-            channel_id=3,
-            channel_name="Example upstream",
+        row = UpstreamChangeEvent(
+            upstream_id="00000000-0000-4000-8000-000000000003",
+            upstream_name="Example upstream",
             event_type="account_rate_changed",
             old_value=1.0,
             new_value=1.2,
@@ -260,7 +260,7 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
             TestClient(app) as client,
         ):
             response = client.get(
-                "/api/upstream-accounts/channel-change-events"
+                "/api/api-accounts/upstream-change-events"
                 "?limit=20&page=2&category=account_rate"
             )
 
@@ -286,7 +286,7 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
 
     def test_route_uses_retention_setting_and_cursor(self) -> None:
         app = FastAPI()
-        app.include_router(router, prefix="/api/upstream-accounts")
+        app.include_router(router, prefix="/api/api-accounts")
         fake_db = AsyncMock()
 
         async def db_override():
@@ -313,7 +313,7 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
             TestClient(app) as client,
         ):
             response = client.get(
-                "/api/upstream-accounts/rate-change-logs?limit=25&before_id=20"
+                "/api/api-accounts/upstream-change-logs?limit=25&before_id=20"
             )
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -332,7 +332,7 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
 
     def test_route_rejects_limit_above_200(self) -> None:
         app = FastAPI()
-        app.include_router(router, prefix="/api/upstream-accounts")
+        app.include_router(router, prefix="/api/api-accounts")
 
         async def db_override():
             yield ANY
@@ -340,43 +340,13 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
         app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
         app.dependency_overrides[get_db] = db_override
         with TestClient(app) as client:
-            response = client.get("/api/upstream-accounts/rate-change-logs?limit=201")
+            response = client.get("/api/api-accounts/upstream-change-logs?limit=201")
 
         self.assertEqual(response.status_code, 422)
 
-    def test_upstream_change_log_alias_preserves_the_old_contract(self) -> None:
-        app = FastAPI()
-        app.include_router(router, prefix="/api/upstream-accounts")
-        fake_db = AsyncMock()
-
-        async def db_override():
-            yield fake_db
-
-        app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
-        app.dependency_overrides[get_db] = db_override
-        runtime = SimpleNamespace(
-            get_upstream_rate_log_retention_days=AsyncMock(return_value=30)
-        )
-        list_logs = AsyncMock(return_value=[])
-        with (
-            patch(
-                "app.api.upstream_accounts.get_runtime_config_service",
-                return_value=runtime,
-            ),
-            patch(
-                "app.api.upstream_accounts.list_upstream_rate_change_logs",
-                new=list_logs,
-            ),
-            TestClient(app) as client,
-        ):
-            response = client.get("/api/upstream-accounts/upstream-change-logs")
-
-        self.assertEqual(response.status_code, 200, response.text)
-        list_logs.assert_awaited_once()
-
     def test_route_converts_inclusive_local_dates_to_utc_bounds(self) -> None:
         app = FastAPI()
-        app.include_router(router, prefix="/api/upstream-accounts")
+        app.include_router(router, prefix="/api/api-accounts")
         fake_db = AsyncMock()
 
         async def db_override():
@@ -401,7 +371,7 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
             TestClient(app) as client,
         ):
             response = client.get(
-                "/api/upstream-accounts/rate-change-logs"
+                "/api/api-accounts/upstream-change-logs"
                 "?start_date=2026-07-14&end_date=2026-07-14&time_zone=Asia%2FShanghai"
             )
 
@@ -417,16 +387,16 @@ class UpstreamRateChangeLogApiTests(unittest.TestCase):
 
     def test_route_rejects_invalid_date_range_and_time_zone(self) -> None:
         app = FastAPI()
-        app.include_router(router, prefix="/api/upstream-accounts")
+        app.include_router(router, prefix="/api/api-accounts")
         app.dependency_overrides[require_admin] = lambda: {"sub": "admin"}
         app.dependency_overrides[get_db] = lambda: ANY
         with TestClient(app) as client:
             reversed_range = client.get(
-                "/api/upstream-accounts/rate-change-logs"
+                "/api/api-accounts/upstream-change-logs"
                 "?start_date=2026-07-15&end_date=2026-07-14"
             )
             invalid_zone = client.get(
-                "/api/upstream-accounts/rate-change-logs?time_zone=Not%2FAZone"
+                "/api/api-accounts/upstream-change-logs?time_zone=Not%2FAZone"
             )
 
         self.assertEqual(reversed_range.status_code, 422)

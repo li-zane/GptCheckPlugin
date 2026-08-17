@@ -20,7 +20,7 @@ from app.services.notification_transports import (
 from app.services.notifications import (
     NotificationService,
     enqueue_account_state_changed,
-    enqueue_upstream_channel_token_invalid,
+    enqueue_upstream_token_invalid,
     enqueue_upstream_group_changed,
     enqueue_upstream_group_multiplier_changed,
 )
@@ -35,7 +35,7 @@ def _notification_config(**overrides):
         "account_enabled_enabled": True,
         "api_key_rate_changed_enabled": True,
         "upstream_balance_low_enabled": True,
-        "upstream_channel_token_invalid_enabled": False,
+        "upstream_token_invalid_enabled": False,
         "discord_bot_token": "bot-secret",
         "discord_channel_id": "123456",
     }
@@ -129,8 +129,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
                 account_type="api_key",
                 account_id=7,
                 account_name="Upstream Seven",
-                channel_id=3,
-                channel_name="奶酪",
+                upstream_id=3,
+                upstream_name="奶酪",
                 reason="upstream_balance_negative",
                 reason_details={
                     "balance": 4.99,
@@ -152,7 +152,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
                 reason_details={
                     "previous_pause_reasons": [
                         "upstream_balance_negative",
-                        "channel_monitor_unavailable",
+                        "upstream_monitor_unavailable",
                         "upstream_balance_negative",
                         "",
                     ],
@@ -166,7 +166,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disabled.event_type, "account_disabled")
         self.assertEqual(disabled.details["account_type"], "api_key")
         self.assertEqual(disabled.details["account_id"], 7)
-        self.assertEqual(disabled.details["channel_name"], "奶酪")
+        self.assertEqual(disabled.details["upstream_name"], "奶酪")
         self.assertEqual(disabled.details["balance"], 4.99)
         self.assertEqual(disabled.details["threshold"], 5.0)
         self.assertEqual(disabled.details["basis"], "wallet")
@@ -175,7 +175,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(enabled.event_type, "account_enabled")
         self.assertEqual(
             enabled.details["previous_pause_reasons"],
-            ["upstream_balance_negative", "channel_monitor_unavailable"],
+            ["upstream_balance_negative", "upstream_monitor_unavailable"],
         )
         self.assertNotIn("ignored", enabled.details)
         self.assertTrue(enabled.details["enabled"])
@@ -185,8 +185,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             first = await enqueue_upstream_group_multiplier_changed(
                 db,
-                channel_id=3,
-                channel_name="Upstream",
+                upstream_id=3,
+                upstream_name="Upstream",
                 group_id="vip",
                 group_name="VIP",
                 old_multiplier=1.0,
@@ -196,8 +196,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
             )
             second = await enqueue_upstream_group_multiplier_changed(
                 db,
-                channel_id=3,
-                channel_name="Upstream",
+                upstream_id=3,
+                upstream_name="Upstream",
                 group_id="vip",
                 group_name="VIP",
                 old_multiplier=1.0,
@@ -217,8 +217,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             disabled = await enqueue_upstream_group_changed(
                 db,
-                channel_id=3,
-                channel_name="Upstream",
+                upstream_id=3,
+                upstream_name="Upstream",
                 group_id="vip",
                 group_name="VIP",
                 change_type="added",
@@ -233,8 +233,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
             )
             enabled = await enqueue_upstream_group_changed(
                 db,
-                channel_id=3,
-                channel_name="Upstream",
+                upstream_id=3,
+                upstream_name="Upstream",
                 group_id="vip",
                 group_name="VIP",
                 change_type="added",
@@ -258,8 +258,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             disabled = await enqueue_upstream_group_multiplier_changed(
                 db,
-                channel_id=3,
-                channel_name="Upstream",
+                upstream_id=3,
+                upstream_name="Upstream",
                 group_id="vip",
                 group_name="VIP",
                 old_multiplier=1.0,
@@ -274,8 +274,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
             )
             enabled = await enqueue_upstream_group_multiplier_changed(
                 db,
-                channel_id=3,
-                channel_name="Upstream",
+                upstream_id=3,
+                upstream_name="Upstream",
                 group_id="vip",
                 group_name="VIP",
                 old_multiplier=1.0,
@@ -313,21 +313,21 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
 
         runtime._load_values = load_notification_values
         config = await runtime.get_notification_config()
-        self.assertTrue(config["upstream_channel_token_invalid_enabled"])
+        self.assertTrue(config["upstream_token_invalid_enabled"])
 
         async with self.sessions() as db:
-            first = await enqueue_upstream_channel_token_invalid(
+            first = await enqueue_upstream_token_invalid(
                 db,
-                channel_id=7,
-                channel_name="哈基米",
+                upstream_id=7,
+                upstream_name="哈基米",
                 credential_fingerprint="credential-a",
                 observed_at=observed_at,
                 runtime_config=runtime,
             )
-            second = await enqueue_upstream_channel_token_invalid(
+            second = await enqueue_upstream_token_invalid(
                 db,
-                channel_id=7,
-                channel_name="哈基米",
+                upstream_id=7,
+                upstream_name="哈基米",
                 credential_fingerprint="credential-a",
                 observed_at=observed_at + timedelta(minutes=5),
                 runtime_config=runtime,
@@ -335,8 +335,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
 
         self.assertEqual(first.id, second.id)
-        self.assertEqual(first.event_type, "upstream_channel_token_invalid")
-        self.assertEqual(first.details["channel_id"], 7)
+        self.assertEqual(first.event_type, "upstream_token_invalid")
+        self.assertEqual(first.details["upstream_id"], 7)
 
     async def test_direct_test_notification_uses_configured_transport(self) -> None:
         transport = _RecordingTransport()
@@ -698,7 +698,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("content", payload)
         self.assertEqual(payload["embeds"][0]["title"], "Title")
         self.assertEqual(payload["embeds"][0]["description"], "Hello @everyone")
-        self.assertEqual(payload["embeds"][0]["footer"]["text"], "sub2api · 自动通知")
+        self.assertEqual(payload["embeds"][0]["footer"]["text"], "管理站点 · 自动通知")
 
     async def test_discord_uses_localized_event_embed_with_structured_fields(self) -> None:
         requests: list[httpx.Request] = []
@@ -718,8 +718,8 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                 "Upstream group multiplier changed",
                 "Cheese / VIP: 1 -> 1.5.",
                 {
-                    "channel_id": 3,
-                    "channel_name": "奶酪",
+                    "upstream_id": 3,
+                    "upstream_name": "奶酪",
                     "group_id": "vip",
                     "group_name": "Codex Plus 稳定版",
                     "old_multiplier": 1,
@@ -735,7 +735,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embed["color"], 0xE67E22)
         self.assertEqual(embed["timestamp"], "2026-07-21T09:00:00+00:00")
         fields = {field["name"]: field["value"] for field in embed["fields"]}
-        self.assertEqual(fields["上游渠道"], "奶酪")
+        self.assertEqual(fields["上游"], "奶酪")
         self.assertEqual(fields["上游分组"], "Codex Plus 稳定版")
         self.assertEqual(fields["原倍率"], "1×")
         self.assertEqual(fields["新倍率"], "1.5×")
@@ -759,7 +759,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                 "Group multiplier changed",
                 "VIP changed.",
                 {
-                    "channel_name": "哈基米",
+                    "upstream_name": "哈基米",
                     "group_id": "codex-pro",
                     "group_name": "codex pro",
                     "old_multiplier": 1.0,
@@ -826,8 +826,8 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                         "Upstream group changed",
                         f"VIP: {change_type}",
                         {
-                            "channel_id": 3,
-                            "channel_name": "奶酪",
+                            "upstream_id": 3,
+                            "upstream_name": "奶酪",
                             "group_id": "vip",
                             "group_name": "VIP",
                             "change_type": change_type,
@@ -839,7 +839,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                 embed = json.loads(requests[-1].content)["embeds"][0]
                 fields = {field["name"]: field["value"] for field in embed["fields"]}
                 self.assertEqual(embed["title"], "上游分组变化")
-                self.assertEqual(fields["上游渠道"], "奶酪")
+                self.assertEqual(fields["上游"], "奶酪")
                 self.assertEqual(fields["上游分组"], "VIP")
                 self.assertEqual(fields["变化类型"], expected_label)
 
@@ -859,12 +859,12 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
         await transport.send(
             NotificationEnvelope(
                 2,
-                "upstream_channel_token_invalid",
+                "upstream_token_invalid",
                 "Upstream channel token invalid",
                 "哈基米 token invalid.",
                 {
-                    "channel_id": 7,
-                    "channel_name": "哈基米",
+                    "upstream_id": 7,
+                    "upstream_name": "哈基米",
                     "observed_at": "2026-07-21T09:30:00+00:00",
                 },
             )
@@ -874,7 +874,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embed["title"], "Token 失效")
         self.assertEqual(embed["color"], 0xED4245)
         fields = {field["name"]: field["value"] for field in embed["fields"]}
-        self.assertEqual(fields["上游渠道"], "哈基米")
+        self.assertEqual(fields["上游"], "哈基米")
         self.assertEqual(fields["当前状态"], "🔴 Token 失效")
 
     async def test_discord_account_embed_includes_state_and_reason(self) -> None:
@@ -898,7 +898,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                     "account_type": "api_key",
                     "account_id": 7,
                     "account_name": "Upstream Seven",
-                    "channel_id": 3,
+                    "upstream_id": 3,
                     "reason": "Account state changed manually.",
                 },
             )
@@ -911,13 +911,13 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields["账号"], "Upstream Seven")
         self.assertEqual(fields["类型"], "API Key")
         self.assertEqual(fields["当前状态"], "🔴 已停用")
-        self.assertEqual(fields["关联渠道"], "渠道 #3")
+        self.assertEqual(fields["关联上游"], "上游 #3")
         self.assertEqual(fields["触发原因"], "手动修改账号状态")
 
     async def test_discord_account_pause_embed_labels_every_automatic_pause_reason(self) -> None:
         expected_labels = {
-            "upstream_balance_negative": "上游渠道余额低于配置阈值",
-            "channel_monitor_unavailable": "上游渠道监控异常",
+            "upstream_balance_negative": "上游余额低于配置阈值",
+            "upstream_monitor_unavailable": "上游监控异常",
             "upstream_rate_increase": "上游倍率涨幅超过停用阈值",
             "upstream_key_unavailable": "上游 API Key 不可用",
             "upstream_group_unavailable": "上游分组不可用",
@@ -976,11 +976,11 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                     "account_type": "api_key",
                     "account_id": 7,
                     "account_name": "Upstream Seven",
-                    "channel_name": "奶酪",
+                    "upstream_name": "奶酪",
                     "reason": "All automatic pause conditions cleared.",
                     "previous_pause_reasons": [
                         "upstream_balance_negative",
-                        "channel_monitor_unavailable",
+                        "upstream_monitor_unavailable",
                     ],
                 },
             )
@@ -992,7 +992,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields["恢复说明"], "所有自动暂停条件均已解除")
         self.assertEqual(
             fields["原暂停原因"],
-            "• 上游渠道余额低于配置阈值\n• 上游渠道监控异常",
+            "• 上游余额低于配置阈值\n• 上游监控异常",
         )
 
     async def test_discord_balance_alert_uses_configured_threshold(self) -> None:
@@ -1013,8 +1013,8 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                 "Upstream channel balance is below the configured threshold",
                 "奶酪 balance is 4.99 USD; threshold is 5.00.",
                 {
-                    "channel_id": 6,
-                    "channel_name": "奶酪",
+                    "upstream_id": 6,
+                    "upstream_name": "奶酪",
                     "balance": 4.99,
                     "threshold": 5.0,
                     "basis": "wallet",
@@ -1050,7 +1050,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
                     "account_type": "api_key",
                     "account_id": 7,
                     "account_name": "Upstream Seven",
-                    "channel_name": "奶酪",
+                    "upstream_name": "奶酪",
                     "reason": "upstream_balance_negative",
                     "balance": 2.0,
                     "threshold": 3.0,
@@ -1064,7 +1064,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
             field["name"]: field["value"]
             for field in json.loads(requests[0].content)["embeds"][0]["fields"]
         }
-        self.assertEqual(fields["触发原因"], "上游渠道余额低于配置阈值")
+        self.assertEqual(fields["触发原因"], "上游余额低于配置阈值")
         self.assertEqual(fields["配置阈值"], "3.00 CNY")
         self.assertNotIn("低于 0", " ".join(fields.values()))
 
@@ -1116,7 +1116,7 @@ class DiscordTransportTests(unittest.IsolatedAsyncioTestCase):
         fallback = json.loads(requests[1].content)
         self.assertIn("**调度变化**", fallback["content"])
         self.assertIn("账号已启用", fallback["content"])
-        self.assertIn("上游渠道余额低于配置阈值", fallback["content"])
+        self.assertIn("上游余额低于配置阈值", fallback["content"])
         self.assertIn("上游倍率涨幅超过停用阈值", fallback["content"])
         self.assertEqual(fallback["allowed_mentions"], {"parse": []})
 

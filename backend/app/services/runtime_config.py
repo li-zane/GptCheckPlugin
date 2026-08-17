@@ -26,7 +26,7 @@ from app.models import AppSetting, utcnow
 from app.core.subscription_types import normalize_usage_limit_ranges
 from app.core.sub2api_urls import (
     is_loopback_sub2api_url,
-    normalize_sub2api_base_url,
+    normalize_management_site_base_url,
     replace_sub2api_port,
 )
 from app.services.upstream_rate_logs import delete_expired_upstream_rate_change_logs
@@ -34,10 +34,10 @@ from app.services.change_logs import delete_expired_change_logs
 from app.services.upstream_usage_history import prune_upstream_usage_history
 
 
-KEY_SUB2API_BASE_URL = "sub2api_base_url"
-KEY_SUB2API_BASE_URL_SOURCE = "sub2api_base_url_source"
-KEY_SUB2API_X_API_KEY = "sub2api_x_api_key"
-KEY_SUB2API_AUTO_RECOVER_STATE = "sub2api_auto_recover_state"
+KEY_MANAGEMENT_SITE_BASE_URL = "management_site_base_url"
+KEY_MANAGEMENT_SITE_BASE_URL_SOURCE = "management_site_base_url_source"
+KEY_MANAGEMENT_SITE_X_API_KEY = "management_site_x_api_key"
+KEY_MANAGEMENT_SITE_AUTO_RECOVER_STATE = "management_site_auto_recover_state"
 KEY_OAUTH_ACCOUNT_SYNC_ENABLED = "oauth_account_sync_enabled"
 KEY_MONITOR_INTERVAL_SECONDS = "monitor_interval_seconds"
 KEY_USAGE_REFRESH_ENABLED = "usage_refresh_enabled"
@@ -55,8 +55,8 @@ KEY_MANUAL_UPSTREAM_SYNC_PRIORITY_ENABLED = "manual_upstream_sync_priority_enabl
 KEY_MANUAL_UPSTREAM_SYNC_UPSTREAM_HEALTH_ENABLED = (
     "manual_upstream_sync_upstream_health_enabled"
 )
-KEY_MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED = (
-    "manual_upstream_sync_channel_monitors_enabled"
+KEY_MANUAL_UPSTREAM_MONITOR_SYNC_ENABLED = (
+    "manual_upstream_monitor_sync_enabled"
 )
 KEY_MANUAL_UPSTREAM_SYNC_ACCOUNT_AVAILABILITY_ENABLED = (
     "manual_upstream_sync_account_availability_enabled"
@@ -70,31 +70,31 @@ KEY_MANUAL_UPSTREAM_SYNC_RATE_PAUSE_ENABLED = (
 KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE = (
     "api_key_auto_disable_on_upstream_unavailable"
 )
-KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED = (
-    "api_key_auto_pause_on_channel_monitor_unavailable_enabled"
+KEY_API_ACCOUNT_AUTO_PAUSE_ON_UPSTREAM_MONITOR_UNAVAILABLE_ENABLED = (
+    "api_account_auto_pause_on_upstream_monitor_unavailable_enabled"
 )
 KEY_API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED = (
     "api_key_availability_all_tests_must_succeed"
 )
-KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED = "channel_monitor_auto_probe_enabled"
+KEY_UPSTREAM_MONITOR_AUTO_PROBE_ENABLED = "upstream_monitor_auto_probe_enabled"
 KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED = "account_model_whitelist_sync_enabled"
 KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS = "account_model_whitelist_sync_interval_seconds"
 KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME = "account_model_whitelist_sync_each_time"
-KEY_CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD = (
-    "channel_monitor_unavailable_consecutive_threshold"
+KEY_UPSTREAM_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD = (
+    "upstream_monitor_unavailable_consecutive_threshold"
 )
-KEY_CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD = (
-    "channel_monitor_recovery_consecutive_threshold"
+KEY_UPSTREAM_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD = (
+    "upstream_monitor_recovery_consecutive_threshold"
 )
-KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED = (
-    "channel_monitor_fallback_without_monitor_enabled"
+KEY_UPSTREAM_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED = (
+    "upstream_monitor_fallback_without_monitor_enabled"
 )
-KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS = "channel_monitor_fallback_test_models"
-KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL = "channel_monitor_fallback_test_model"
-KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS = "channel_monitor_fallback_test_attempts"
-KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS = "channel_monitor_recovery_test_attempts"
-KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS = (
-    "channel_monitor_test_attempt_interval_seconds"
+KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODELS = "upstream_monitor_fallback_test_models"
+KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODEL = "upstream_monitor_fallback_test_model"
+KEY_UPSTREAM_MONITOR_FALLBACK_TEST_ATTEMPTS = "upstream_monitor_fallback_test_attempts"
+KEY_UPSTREAM_MONITOR_RECOVERY_TEST_ATTEMPTS = "upstream_monitor_recovery_test_attempts"
+KEY_UPSTREAM_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS = (
+    "upstream_monitor_test_attempt_interval_seconds"
 )
 KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED = (
     "api_key_auto_pause_on_negative_balance_enabled"
@@ -105,8 +105,8 @@ KEY_SHOW_STALE_NEGATIVE_BALANCE_ALERT = "show_stale_negative_balance_alert"
 KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS = (
     "priority_assign_disabled_api_key_accounts"
 )
-KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER = (
-    "priority_share_same_composite_multiplier"
+KEY_PRIORITY_SHARE_SAME_UPSTREAM_ACTUAL_MULTIPLIER = (
+    "priority_share_same_upstream_actual_multiplier"
 )
 KEY_DISCORD_BOT_NOTIFICATIONS_ENABLED = "discord_bot_notifications_enabled"
 KEY_DISCORD_BOT_TOKEN = "discord_bot_token"
@@ -134,9 +134,9 @@ KEY_BROWSER_MIN_AVAILABLE_MEMORY_MB = "browser_min_available_memory_mb"
 KEY_SUBSCRIPTION_REFRESH_BATCH_SIZE = "subscription_refresh_batch_size"
 KEY_SUBSCRIPTION_REFRESH_MAX_CONCURRENCY = "subscription_refresh_max_concurrency"
 KEY_ACCOUNT_LIVENESS_MAX_CONCURRENCY = "account_liveness_max_concurrency"
-KEY_LAST_SCAN_AT = "sub2api_last_scan_at"
-KEY_LAST_SCAN_STATUS = "sub2api_last_scan_status"
-KEY_LAST_SCAN_MESSAGE = "sub2api_last_scan_message"
+KEY_LAST_SCAN_AT = "management_site_last_scan_at"
+KEY_LAST_SCAN_STATUS = "management_site_last_scan_status"
+KEY_LAST_SCAN_MESSAGE = "management_site_last_scan_message"
 KEY_DISPLAY_TIMEZONE = "display_timezone"
 KEY_SITE_NAME = "site_name"
 KEY_SITE_LOGO_DATA = "site_logo_data"
@@ -188,27 +188,27 @@ class RuntimeConfigService:
 
     async def get_sub2api_config(self) -> EffectiveSub2ApiConfig:
         values = await self._load_values()
-        runtime_key = decrypt_text(values.get(KEY_SUB2API_X_API_KEY))
-        if KEY_SUB2API_X_API_KEY in values:
-            auth_token = runtime_key or ""
-            auth_header = "x-api-key"
-            auth_scheme = ""
-        else:
-            auth_token = self.settings.sub2api_auth_token
-            auth_header = self.settings.sub2api_auth_header
-            auth_scheme = self.settings.sub2api_auth_scheme
+        runtime_key = decrypt_text(values.get(KEY_MANAGEMENT_SITE_X_API_KEY))
+        auth_token = (
+            runtime_key or ""
+            if KEY_MANAGEMENT_SITE_X_API_KEY in values
+            else self.settings.management_site_x_api_key
+        )
 
         return EffectiveSub2ApiConfig(
-            base_url=_normalize_base_url(values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url),
+            base_url=_normalize_base_url(
+                values.get(KEY_MANAGEMENT_SITE_BASE_URL)
+                or self.settings.management_site_base_url
+            ),
             auth_token=auth_token,
-            auth_header=auth_header,
-            auth_scheme=auth_scheme,
+            auth_header="x-api-key",
+            auth_scheme="",
             accounts_path=self.settings.sub2api_accounts_path,
             access_token_path=self.settings.sub2api_access_token_path,
             auto_clear_error=self.settings.sub2api_auto_clear_error,
             auto_recover_state=_bool_or_default(
-                values.get(KEY_SUB2API_AUTO_RECOVER_STATE),
-                self.settings.sub2api_auto_recover_state,
+                values.get(KEY_MANAGEMENT_SITE_AUTO_RECOVER_STATE),
+                self.settings.management_site_auto_recover_state,
             ),
         )
 
@@ -330,14 +330,14 @@ class RuntimeConfigService:
             self.settings.api_key_auto_disable_on_upstream_unavailable,
         )
 
-    async def get_api_key_auto_pause_on_channel_monitor_unavailable_enabled(self) -> bool:
+    async def get_api_account_auto_pause_on_upstream_monitor_unavailable_enabled(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(
-            values.get(KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED),
+            values.get(KEY_API_ACCOUNT_AUTO_PAUSE_ON_UPSTREAM_MONITOR_UNAVAILABLE_ENABLED),
             bool(
                 getattr(
                     self.settings,
-                    "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                    "api_account_auto_pause_on_upstream_monitor_unavailable_enabled",
                     False,
                 )
             ),
@@ -356,11 +356,11 @@ class RuntimeConfigService:
             ),
         )
 
-    async def get_channel_monitor_auto_probe_enabled(self) -> bool:
+    async def get_upstream_monitor_auto_probe_enabled(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(
-            values.get(KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED),
-            bool(getattr(self.settings, "channel_monitor_auto_probe_enabled", True)),
+            values.get(KEY_UPSTREAM_MONITOR_AUTO_PROBE_ENABLED),
+            bool(getattr(self.settings, "upstream_monitor_auto_probe_enabled", True)),
         )
 
     async def get_account_model_whitelist_sync_enabled(self) -> bool:
@@ -395,14 +395,14 @@ class RuntimeConfigService:
             bool(getattr(self.settings, "account_model_whitelist_sync_each_time", False)),
         )
 
-    async def get_channel_monitor_unavailable_consecutive_threshold(self) -> int:
+    async def get_upstream_monitor_unavailable_consecutive_threshold(self) -> int:
         values = await self._load_values()
         return _bounded_int_or_default(
-            values.get(KEY_CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD),
+            values.get(KEY_UPSTREAM_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD),
             int(
                 getattr(
                     self.settings,
-                    "channel_monitor_unavailable_consecutive_threshold",
+                    "upstream_monitor_unavailable_consecutive_threshold",
                     2,
                 )
             ),
@@ -410,14 +410,14 @@ class RuntimeConfigService:
             100,
         )
 
-    async def get_channel_monitor_recovery_consecutive_threshold(self) -> int:
+    async def get_upstream_monitor_recovery_consecutive_threshold(self) -> int:
         values = await self._load_values()
         return _bounded_int_or_default(
-            values.get(KEY_CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD),
+            values.get(KEY_UPSTREAM_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD),
             int(
                 getattr(
                     self.settings,
-                    "channel_monitor_recovery_consecutive_threshold",
+                    "upstream_monitor_recovery_consecutive_threshold",
                     2,
                 )
             ),
@@ -425,63 +425,63 @@ class RuntimeConfigService:
             100,
         )
 
-    async def get_channel_monitor_fallback_test_model(self) -> str:
-        models = await self.get_channel_monitor_fallback_test_models()
+    async def get_upstream_monitor_fallback_test_model(self) -> str:
+        models = await self.get_upstream_monitor_fallback_test_models()
         return models[0] if models else ""
 
-    async def get_channel_monitor_fallback_without_monitor_enabled(self) -> bool:
+    async def get_upstream_monitor_fallback_without_monitor_enabled(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(
-            values.get(KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED),
+            values.get(KEY_UPSTREAM_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED),
             bool(
                 getattr(
                     self.settings,
-                    "channel_monitor_fallback_without_monitor_enabled",
+                    "upstream_monitor_fallback_without_monitor_enabled",
                     False,
                 )
             ),
         )
 
-    async def get_channel_monitor_fallback_test_models(self) -> list[str]:
+    async def get_upstream_monitor_fallback_test_models(self) -> list[str]:
         values = await self._load_values()
-        stored = values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS)
-        configured = getattr(self.settings, "channel_monitor_fallback_test_models", [])
+        stored = values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODELS)
+        configured = getattr(self.settings, "upstream_monitor_fallback_test_models", [])
         models = _normalize_model_chain(stored if stored is not None else configured)
         if models:
             return models
         legacy = (
-            values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL)
-            or getattr(self.settings, "channel_monitor_fallback_test_model", "")
+            values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODEL)
+            or getattr(self.settings, "upstream_monitor_fallback_test_model", "")
             or ""
         )
         return _normalize_model_chain(legacy)
 
-    async def get_channel_monitor_fallback_test_attempts(self) -> int:
+    async def get_upstream_monitor_fallback_test_attempts(self) -> int:
         values = await self._load_values()
         return _bounded_int_or_default(
-            values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS),
-            int(getattr(self.settings, "channel_monitor_fallback_test_attempts", 1)),
+            values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_ATTEMPTS),
+            int(getattr(self.settings, "upstream_monitor_fallback_test_attempts", 1)),
             1,
             5,
         )
 
-    async def get_channel_monitor_recovery_test_attempts(self) -> int:
+    async def get_upstream_monitor_recovery_test_attempts(self) -> int:
         values = await self._load_values()
         return _bounded_int_or_default(
-            values.get(KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS),
-            int(getattr(self.settings, "channel_monitor_recovery_test_attempts", 1)),
+            values.get(KEY_UPSTREAM_MONITOR_RECOVERY_TEST_ATTEMPTS),
+            int(getattr(self.settings, "upstream_monitor_recovery_test_attempts", 1)),
             1,
             5,
         )
 
-    async def get_channel_monitor_test_attempt_interval_seconds(self) -> int:
+    async def get_upstream_monitor_test_attempt_interval_seconds(self) -> int:
         values = await self._load_values()
         return _bounded_int_or_default(
-            values.get(KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS),
+            values.get(KEY_UPSTREAM_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS),
             int(
                 getattr(
                     self.settings,
-                    "channel_monitor_test_attempt_interval_seconds",
+                    "upstream_monitor_test_attempt_interval_seconds",
                     0,
                 )
             ),
@@ -527,14 +527,14 @@ class RuntimeConfigService:
             bool(getattr(self.settings, "priority_assign_disabled_api_key_accounts", False)),
         )
 
-    async def get_priority_share_same_composite_multiplier(self) -> bool:
+    async def get_priority_share_same_upstream_actual_multiplier(self) -> bool:
         values = await self._load_values()
         return _bool_or_default(
-            values.get(KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER),
+            values.get(KEY_PRIORITY_SHARE_SAME_UPSTREAM_ACTUAL_MULTIPLIER),
             bool(
                 getattr(
                     self.settings,
-                    "priority_share_same_composite_multiplier",
+                    "priority_share_same_upstream_actual_multiplier",
                     False,
                 )
             ),
@@ -576,7 +576,7 @@ class RuntimeConfigService:
                 values.get(KEY_NOTIFY_UPSTREAM_BALANCE_LOW),
                 bool(getattr(self.settings, "notify_upstream_balance_low", False)),
             ),
-            "upstream_channel_token_invalid_enabled": _bool_or_default(
+            "upstream_token_invalid_enabled": _bool_or_default(
                 values.get(KEY_NOTIFY_UPSTREAM_TOKEN_INVALID),
                 bool(getattr(self.settings, "notify_upstream_token_invalid", False)),
             ),
@@ -739,10 +739,15 @@ class RuntimeConfigService:
 
     async def get_public_settings(self) -> dict:
         values = await self._load_values()
-        base_url = _normalize_base_url(values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url)
-        runtime_key = decrypt_text(values.get(KEY_SUB2API_X_API_KEY))
+        base_url = _normalize_base_url(
+            values.get(KEY_MANAGEMENT_SITE_BASE_URL)
+            or self.settings.management_site_base_url
+        )
+        runtime_key = decrypt_text(values.get(KEY_MANAGEMENT_SITE_X_API_KEY))
         env_x_api_key = self._env_x_api_key()
-        effective_x_api_key = runtime_key if KEY_SUB2API_X_API_KEY in values else env_x_api_key
+        effective_x_api_key = (
+            runtime_key if KEY_MANAGEMENT_SITE_X_API_KEY in values else env_x_api_key
+        )
         notification = await self.get_notification_config()
         logo_data = values.get(KEY_SITE_LOGO_DATA)
         logo_version = hashlib.sha256(logo_data.encode("ascii")).hexdigest()[:12] if logo_data else None
@@ -756,14 +761,18 @@ class RuntimeConfigService:
             int(getattr(self.settings, "change_log_page_size", 50)),
         )
         return {
-            "sub2api_base_url": base_url,
-            "sub2api_port": _port_from_url(base_url),
-            "sub2api_base_url_source": values.get(KEY_SUB2API_BASE_URL_SOURCE) or "env",
-            "sub2api_x_api_key_set": bool(effective_x_api_key),
-            "sub2api_x_api_key_hint": redact(effective_x_api_key) if effective_x_api_key else None,
-            "sub2api_auto_recover_state": _bool_or_default(
-                values.get(KEY_SUB2API_AUTO_RECOVER_STATE),
-                self.settings.sub2api_auto_recover_state,
+            "management_site_base_url": base_url,
+            "management_site_port": _port_from_url(base_url),
+            "management_site_base_url_source": (
+                values.get(KEY_MANAGEMENT_SITE_BASE_URL_SOURCE) or "env"
+            ),
+            "management_site_x_api_key_set": bool(effective_x_api_key),
+            "management_site_x_api_key_hint": (
+                redact(effective_x_api_key) if effective_x_api_key else None
+            ),
+            "management_site_auto_recover_state": _bool_or_default(
+                values.get(KEY_MANAGEMENT_SITE_AUTO_RECOVER_STATE),
+                self.settings.management_site_auto_recover_state,
             ),
             "automation_paused": _bool_or_default(
                 values.get(KEY_AUTOMATION_PAUSED),
@@ -860,12 +869,12 @@ class RuntimeConfigService:
                     )
                 ),
             ),
-            "manual_upstream_sync_channel_monitors_enabled": _bool_or_default(
-                values.get(KEY_MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED),
+            "manual_upstream_monitor_sync_enabled": _bool_or_default(
+                values.get(KEY_MANUAL_UPSTREAM_MONITOR_SYNC_ENABLED),
                 bool(
                     getattr(
                         self.settings,
-                        "manual_upstream_sync_channel_monitors_enabled",
+                        "manual_upstream_monitor_sync_enabled",
                         True,
                     )
                 ),
@@ -904,12 +913,12 @@ class RuntimeConfigService:
                 values.get(KEY_API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE),
                 self.settings.api_key_auto_disable_on_upstream_unavailable,
             ),
-            "api_key_auto_pause_on_channel_monitor_unavailable_enabled": _bool_or_default(
-                values.get(KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED),
+            "api_account_auto_pause_on_upstream_monitor_unavailable_enabled": _bool_or_default(
+                values.get(KEY_API_ACCOUNT_AUTO_PAUSE_ON_UPSTREAM_MONITOR_UNAVAILABLE_ENABLED),
                 bool(
                     getattr(
                         self.settings,
-                        "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+                        "api_account_auto_pause_on_upstream_monitor_unavailable_enabled",
                         False,
                     )
                 ),
@@ -924,9 +933,9 @@ class RuntimeConfigService:
                     )
                 ),
             ),
-            "channel_monitor_auto_probe_enabled": _bool_or_default(
-                values.get(KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED),
-                bool(getattr(self.settings, "channel_monitor_auto_probe_enabled", True)),
+            "upstream_monitor_auto_probe_enabled": _bool_or_default(
+                values.get(KEY_UPSTREAM_MONITOR_AUTO_PROBE_ENABLED),
+                bool(getattr(self.settings, "upstream_monitor_auto_probe_enabled", True)),
             ),
             "account_model_whitelist_sync_enabled": _bool_or_default(
                 values.get(KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED),
@@ -955,72 +964,72 @@ class RuntimeConfigService:
                     )
                 ),
             ),
-            "channel_monitor_unavailable_consecutive_threshold": _bounded_int_or_default(
-                values.get(KEY_CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD),
+            "upstream_monitor_unavailable_consecutive_threshold": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD),
                 int(
                     getattr(
                         self.settings,
-                        "channel_monitor_unavailable_consecutive_threshold",
+                        "upstream_monitor_unavailable_consecutive_threshold",
                         2,
                     )
                 ),
                 1,
                 100,
             ),
-            "channel_monitor_recovery_consecutive_threshold": _bounded_int_or_default(
-                values.get(KEY_CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD),
+            "upstream_monitor_recovery_consecutive_threshold": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD),
                 int(
                     getattr(
                         self.settings,
-                        "channel_monitor_recovery_consecutive_threshold",
+                        "upstream_monitor_recovery_consecutive_threshold",
                         2,
                     )
                 ),
                 1,
                 100,
             ),
-            "channel_monitor_fallback_without_monitor_enabled": _bool_or_default(
-                values.get(KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED),
+            "upstream_monitor_fallback_without_monitor_enabled": _bool_or_default(
+                values.get(KEY_UPSTREAM_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED),
                 bool(
                     getattr(
                         self.settings,
-                        "channel_monitor_fallback_without_monitor_enabled",
+                        "upstream_monitor_fallback_without_monitor_enabled",
                         False,
                     )
                 ),
             ),
-            "channel_monitor_fallback_test_models": _normalize_model_chain(
-                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS)
-                if values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS) is not None
-                else getattr(self.settings, "channel_monitor_fallback_test_models", [])
+            "upstream_monitor_fallback_test_models": _normalize_model_chain(
+                values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODELS)
+                if values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODELS) is not None
+                else getattr(self.settings, "upstream_monitor_fallback_test_models", [])
             ) or _normalize_model_chain(
-                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL)
-                or getattr(self.settings, "channel_monitor_fallback_test_model", "")
+                values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODEL)
+                or getattr(self.settings, "upstream_monitor_fallback_test_model", "")
                 or ""
             ),
-            "channel_monitor_fallback_test_model": str(
-                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL)
-                or getattr(self.settings, "channel_monitor_fallback_test_model", "")
+            "upstream_monitor_fallback_test_model": str(
+                values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODEL)
+                or getattr(self.settings, "upstream_monitor_fallback_test_model", "")
                 or ""
             ).strip()[:160],
-            "channel_monitor_fallback_test_attempts": _bounded_int_or_default(
-                values.get(KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS),
-                int(getattr(self.settings, "channel_monitor_fallback_test_attempts", 1)),
+            "upstream_monitor_fallback_test_attempts": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_MONITOR_FALLBACK_TEST_ATTEMPTS),
+                int(getattr(self.settings, "upstream_monitor_fallback_test_attempts", 1)),
                 1,
                 5,
             ),
-            "channel_monitor_recovery_test_attempts": _bounded_int_or_default(
-                values.get(KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS),
-                int(getattr(self.settings, "channel_monitor_recovery_test_attempts", 1)),
+            "upstream_monitor_recovery_test_attempts": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_MONITOR_RECOVERY_TEST_ATTEMPTS),
+                int(getattr(self.settings, "upstream_monitor_recovery_test_attempts", 1)),
                 1,
                 5,
             ),
-            "channel_monitor_test_attempt_interval_seconds": _bounded_int_or_default(
-                values.get(KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS),
+            "upstream_monitor_test_attempt_interval_seconds": _bounded_int_or_default(
+                values.get(KEY_UPSTREAM_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS),
                 int(
                     getattr(
                         self.settings,
-                        "channel_monitor_test_attempt_interval_seconds",
+                        "upstream_monitor_test_attempt_interval_seconds",
                         0,
                     )
                 ),
@@ -1050,12 +1059,12 @@ class RuntimeConfigService:
                 values.get(KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS),
                 bool(getattr(self.settings, "priority_assign_disabled_api_key_accounts", False)),
             ),
-            "priority_share_same_composite_multiplier": _bool_or_default(
-                values.get(KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER),
+            "priority_share_same_upstream_actual_multiplier": _bool_or_default(
+                values.get(KEY_PRIORITY_SHARE_SAME_UPSTREAM_ACTUAL_MULTIPLIER),
                 bool(
                     getattr(
                         self.settings,
-                        "priority_share_same_composite_multiplier",
+                        "priority_share_same_upstream_actual_multiplier",
                         False,
                     )
                 ),
@@ -1074,7 +1083,7 @@ class RuntimeConfigService:
             "notify_upstream_group_changed": notification["upstream_group_changed_enabled"],
             "notify_upstream_balance_low": notification["upstream_balance_low_enabled"],
             "notify_upstream_token_invalid": notification[
-                "upstream_channel_token_invalid_enabled"
+                "upstream_token_invalid_enabled"
             ],
             "upstream_rate_log_retention_days": _bounded_int_or_default(
                 values.get(KEY_UPSTREAM_RATE_LOG_RETENTION_DAYS),
@@ -1202,43 +1211,56 @@ class RuntimeConfigService:
             )
         )
         current_base_url = _normalize_base_url(
-            current_values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url
+            current_values.get(KEY_MANAGEMENT_SITE_BASE_URL)
+            or self.settings.management_site_base_url
         )
         next_base_url = current_base_url
-        if payload.get("sub2api_base_url") is not None or payload.get("sub2api_port") is not None:
-            next_base_url = _normalize_base_url(payload.get("sub2api_base_url") or current_base_url)
-            if payload.get("sub2api_port") is not None:
-                next_base_url = _replace_port(next_base_url, int(payload["sub2api_port"]))
+        if (
+            payload.get("management_site_base_url") is not None
+            or payload.get("management_site_port") is not None
+        ):
+            next_base_url = _normalize_base_url(
+                payload.get("management_site_base_url") or current_base_url
+            )
+            if payload.get("management_site_port") is not None:
+                next_base_url = _replace_port(
+                    next_base_url, int(payload["management_site_port"])
+                )
 
-        current_runtime_key = decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY))
+        current_runtime_key = decrypt_text(
+            current_values.get(KEY_MANAGEMENT_SITE_X_API_KEY)
+        )
         current_auth_token = (
             current_runtime_key or ""
-            if KEY_SUB2API_X_API_KEY in current_values
-            else self.settings.sub2api_auth_token.strip()
+            if KEY_MANAGEMENT_SITE_X_API_KEY in current_values
+            else self.settings.management_site_x_api_key.strip()
         )
         replacing_key = bool(
-            isinstance(payload.get("sub2api_x_api_key"), str)
-            and payload["sub2api_x_api_key"].strip()
+            isinstance(payload.get("management_site_x_api_key"), str)
+            and payload["management_site_x_api_key"].strip()
         )
-        clearing_key = bool(payload.get("clear_sub2api_x_api_key"))
+        clearing_key = bool(payload.get("clear_management_site_x_api_key"))
         if (
             _sub2api_origin(next_base_url) != _sub2api_origin(current_base_url)
             and current_auth_token
             and not replacing_key
             and not clearing_key
-            and not payload.get("confirm_sub2api_credential_rebind")
+            and not payload.get("confirm_management_site_credential_rebind")
         ):
             raise RuntimeConfigServiceError(
-                "Changing the sub2api origin while retaining its credential requires explicit confirmation.",
+                "Changing the management-site origin while retaining its credential requires explicit confirmation.",
                 status_code=409,
             )
         x_api_key_for_file = self._x_api_key_for_file(payload, current_values)
         explicit_runtime_key_change = clearing_key or replacing_key
 
         async with AsyncSessionLocal() as db:
-            if payload.get("sub2api_base_url") is not None or payload.get("sub2api_port") is not None:
-                await self._put(db, KEY_SUB2API_BASE_URL, next_base_url)
-                await self._put(db, KEY_SUB2API_BASE_URL_SOURCE, "manual")
+            if (
+                payload.get("management_site_base_url") is not None
+                or payload.get("management_site_port") is not None
+            ):
+                await self._put(db, KEY_MANAGEMENT_SITE_BASE_URL, next_base_url)
+                await self._put(db, KEY_MANAGEMENT_SITE_BASE_URL_SOURCE, "manual")
 
             if payload.get("monitor_interval_seconds") is not None:
                 await self._put(db, KEY_MONITOR_INTERVAL_SECONDS, str(int(payload["monitor_interval_seconds"])))
@@ -1348,20 +1370,20 @@ class RuntimeConfigService:
                 "manual_upstream_sync_rate_enabled": KEY_MANUAL_UPSTREAM_SYNC_RATE_ENABLED,
                 "manual_upstream_sync_priority_enabled": KEY_MANUAL_UPSTREAM_SYNC_PRIORITY_ENABLED,
                 "manual_upstream_sync_upstream_health_enabled": KEY_MANUAL_UPSTREAM_SYNC_UPSTREAM_HEALTH_ENABLED,
-                "manual_upstream_sync_channel_monitors_enabled": KEY_MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED,
+                "manual_upstream_monitor_sync_enabled": KEY_MANUAL_UPSTREAM_MONITOR_SYNC_ENABLED,
                 "manual_upstream_sync_account_availability_enabled": KEY_MANUAL_UPSTREAM_SYNC_ACCOUNT_AVAILABILITY_ENABLED,
                 "manual_upstream_sync_balance_guard_enabled": KEY_MANUAL_UPSTREAM_SYNC_BALANCE_GUARD_ENABLED,
                 "manual_upstream_sync_rate_pause_enabled": KEY_MANUAL_UPSTREAM_SYNC_RATE_PAUSE_ENABLED,
-                "api_key_auto_pause_on_channel_monitor_unavailable_enabled": KEY_API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED,
+                "api_account_auto_pause_on_upstream_monitor_unavailable_enabled": KEY_API_ACCOUNT_AUTO_PAUSE_ON_UPSTREAM_MONITOR_UNAVAILABLE_ENABLED,
                 "api_key_availability_all_tests_must_succeed": KEY_API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED,
-                "channel_monitor_auto_probe_enabled": KEY_CHANNEL_MONITOR_AUTO_PROBE_ENABLED,
+                "upstream_monitor_auto_probe_enabled": KEY_UPSTREAM_MONITOR_AUTO_PROBE_ENABLED,
                 "account_model_whitelist_sync_enabled": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED,
                 "account_model_whitelist_sync_each_time": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_EACH_TIME,
-                "channel_monitor_fallback_without_monitor_enabled": KEY_CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED,
+                "upstream_monitor_fallback_without_monitor_enabled": KEY_UPSTREAM_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED,
                 "api_key_auto_pause_on_negative_balance_enabled": KEY_API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED,
                 "show_stale_negative_balance_alert": KEY_SHOW_STALE_NEGATIVE_BALANCE_ALERT,
                 "priority_assign_disabled_api_key_accounts": KEY_PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS,
-                "priority_share_same_composite_multiplier": KEY_PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER,
+                "priority_share_same_upstream_actual_multiplier": KEY_PRIORITY_SHARE_SAME_UPSTREAM_ACTUAL_MULTIPLIER,
                 "discord_bot_notifications_enabled": KEY_DISCORD_BOT_NOTIFICATIONS_ENABLED,
                 "notify_oauth_account_disabled": KEY_NOTIFY_OAUTH_ACCOUNT_DISABLED,
                 "notify_account_enabled": KEY_NOTIFY_ACCOUNT_ENABLED,
@@ -1380,26 +1402,26 @@ class RuntimeConfigService:
 
             int_setting_keys = {
                 "account_model_whitelist_sync_interval_seconds": KEY_ACCOUNT_MODEL_WHITELIST_SYNC_INTERVAL_SECONDS,
-                "channel_monitor_fallback_test_attempts": KEY_CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS,
-                "channel_monitor_recovery_test_attempts": KEY_CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS,
-                "channel_monitor_test_attempt_interval_seconds": KEY_CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS,
+                "upstream_monitor_fallback_test_attempts": KEY_UPSTREAM_MONITOR_FALLBACK_TEST_ATTEMPTS,
+                "upstream_monitor_recovery_test_attempts": KEY_UPSTREAM_MONITOR_RECOVERY_TEST_ATTEMPTS,
+                "upstream_monitor_test_attempt_interval_seconds": KEY_UPSTREAM_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS,
             }
             for payload_key, setting_key in int_setting_keys.items():
                 if payload.get(payload_key) is not None:
                     await self._put(db, setting_key, str(int(payload[payload_key])))
 
-            if payload.get("channel_monitor_fallback_test_model") is not None:
+            if payload.get("upstream_monitor_fallback_test_model") is not None:
                 await self._put(
                     db,
-                    KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODEL,
-                    str(payload["channel_monitor_fallback_test_model"]).strip()[:160],
+                    KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODEL,
+                    str(payload["upstream_monitor_fallback_test_model"]).strip()[:160],
                 )
 
-            if payload.get("channel_monitor_fallback_test_models") is not None:
-                models = _normalize_model_chain(payload["channel_monitor_fallback_test_models"])
+            if payload.get("upstream_monitor_fallback_test_models") is not None:
+                models = _normalize_model_chain(payload["upstream_monitor_fallback_test_models"])
                 await self._put(
                     db,
-                    KEY_CHANNEL_MONITOR_FALLBACK_TEST_MODELS,
+                    KEY_UPSTREAM_MONITOR_FALLBACK_TEST_MODELS,
                     json.dumps(models, ensure_ascii=False),
                 )
 
@@ -1495,11 +1517,11 @@ class RuntimeConfigService:
                     json.dumps(normalized_ranges, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
                 )
 
-            if payload.get("sub2api_auto_recover_state") is not None:
+            if payload.get("management_site_auto_recover_state") is not None:
                 await self._put(
                     db,
-                    KEY_SUB2API_AUTO_RECOVER_STATE,
-                    "true" if payload["sub2api_auto_recover_state"] else "false",
+                    KEY_MANAGEMENT_SITE_AUTO_RECOVER_STATE,
+                    "true" if payload["management_site_auto_recover_state"] else "false",
                 )
 
             protocol_concurrency = payload.get("protocol_refresh_max_concurrency")
@@ -1561,14 +1583,18 @@ class RuntimeConfigService:
                 await self._put(db, KEY_SITE_LOGO_MIME, mime)
                 await self._put(db, KEY_SITE_LOGO_UPDATED_AT, utcnow().isoformat())
 
-            if payload.get("clear_sub2api_x_api_key"):
+            if payload.get("clear_management_site_x_api_key"):
                 # An explicit empty marker prevents the in-memory environment
                 # credential from becoming active again before restart.
-                await self._put(db, KEY_SUB2API_X_API_KEY, "")
+                await self._put(db, KEY_MANAGEMENT_SITE_X_API_KEY, "")
             else:
-                raw_key = payload.get("sub2api_x_api_key")
+                raw_key = payload.get("management_site_x_api_key")
                 if isinstance(raw_key, str) and raw_key.strip():
-                    await self._put(db, KEY_SUB2API_X_API_KEY, encrypt_text(raw_key.strip()))
+                    await self._put(
+                        db,
+                        KEY_MANAGEMENT_SITE_X_API_KEY,
+                        encrypt_text(raw_key.strip()),
+                    )
 
             await db.commit()
 
@@ -1580,7 +1606,7 @@ class RuntimeConfigService:
         )
         return settings
 
-    async def scan_sub2api_ports(self, apply: bool = False) -> dict:
+    async def scan_management_site(self, apply: bool = False) -> dict:
         config = await self.get_sub2api_config()
         checked_ports = self._candidate_ports(config.base_url)
         configured_hit = await self._probe_configured_sub2api(config)
@@ -1605,17 +1631,17 @@ class RuntimeConfigService:
         else:
             status = "not_found"
             message = (
-                "当前配置地址和受限本地候选端口均未发现 sub2api；"
-                "请手动设置地址/端口，或调整 SUB2API_SCAN_PORTS。"
+                "当前配置地址和受限本地候选端口均未发现管理站点；"
+                "请手动设置地址/端口，或调整 MANAGEMENT_SITE_SCAN_PORTS。"
             )
             base_url = None
             port = None
 
         async with AsyncSessionLocal() as db:
             if should_apply:
-                await self._put(db, KEY_SUB2API_BASE_URL, hit.base_url)
+                await self._put(db, KEY_MANAGEMENT_SITE_BASE_URL, hit.base_url)
                 if configured_hit is None:
-                    await self._put(db, KEY_SUB2API_BASE_URL_SOURCE, "auto")
+                    await self._put(db, KEY_MANAGEMENT_SITE_BASE_URL_SOURCE, "auto")
             await self._put(db, KEY_LAST_SCAN_AT, utcnow().isoformat())
             await self._put(db, KEY_LAST_SCAN_STATUS, status)
             await self._put(db, KEY_LAST_SCAN_MESSAGE, message)
@@ -1680,19 +1706,22 @@ class RuntimeConfigService:
 
     async def auto_detect_sub2api(self) -> None:
         values = await self._load_values()
-        if values.get(KEY_SUB2API_BASE_URL_SOURCE) == "manual":
+        if values.get(KEY_MANAGEMENT_SITE_BASE_URL_SOURCE) == "manual":
             return
-        base_url = _normalize_base_url(values.get(KEY_SUB2API_BASE_URL) or self.settings.sub2api_base_url)
+        base_url = _normalize_base_url(
+            values.get(KEY_MANAGEMENT_SITE_BASE_URL)
+            or self.settings.management_site_base_url
+        )
         if not _is_local_url(base_url):
             return
-        await self.scan_sub2api_ports(apply=True)
+        await self.scan_management_site(apply=True)
 
     def _candidate_ports(self, current_base_url: str) -> list[int]:
         ports: list[int] = []
         current_port = _port_from_url(current_base_url)
         if current_port:
             ports.append(current_port)
-        ports.extend(self.settings.sub2api_scan_ports)
+        ports.extend(self.settings.management_site_scan_ports)
         ports.extend(COMMON_SUB2API_PORTS)
         return list(dict.fromkeys(port for port in ports if 0 < int(port) <= 65535))
 
@@ -1781,7 +1810,7 @@ class RuntimeConfigService:
 
     def _probe_operation_timeout(self) -> float:
         return _bounded_float_or_default(
-            self.settings.sub2api_scan_timeout_seconds,
+            self.settings.management_site_scan_timeout_seconds,
             0.8,
             0.1,
             10.0,
@@ -1796,14 +1825,18 @@ class RuntimeConfigService:
             return {item.key: item.value for item in result.scalars().all()}
 
     def _x_api_key_for_file(self, payload: dict, current_values: dict[str, str | None]) -> str | None:
-        if payload.get("clear_sub2api_x_api_key"):
+        if payload.get("clear_management_site_x_api_key"):
             return ""
-        raw_key = payload.get("sub2api_x_api_key")
+        raw_key = payload.get("management_site_x_api_key")
         if isinstance(raw_key, str) and raw_key.strip():
             return raw_key.strip()
-        if KEY_SUB2API_X_API_KEY in current_values:
-            return decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY)) or ""
-        return decrypt_text(current_values.get(KEY_SUB2API_X_API_KEY)) or self._env_x_api_key() or None
+        if KEY_MANAGEMENT_SITE_X_API_KEY in current_values:
+            return decrypt_text(current_values.get(KEY_MANAGEMENT_SITE_X_API_KEY)) or ""
+        return (
+            decrypt_text(current_values.get(KEY_MANAGEMENT_SITE_X_API_KEY))
+            or self._env_x_api_key()
+            or None
+        )
 
     def _persist_settings_file(
         self,
@@ -1817,8 +1850,10 @@ class RuntimeConfigService:
         path = self.settings.project_root / ".env"
         values: dict[str, str | None] = {
             "APP_NAME": str(settings["site_name"]),
-            "SUB2API_BASE_URL": str(settings["sub2api_base_url"]),
-            "SUB2API_AUTO_RECOVER_STATE": _env_bool(bool(settings["sub2api_auto_recover_state"])),
+            "MANAGEMENT_SITE_BASE_URL": str(settings["management_site_base_url"]),
+            "MANAGEMENT_SITE_AUTO_RECOVER_STATE": _env_bool(
+                bool(settings["management_site_auto_recover_state"])
+            ),
             "AUTOMATION_PAUSED": _env_bool(bool(settings["automation_paused"])),
             "OAUTH_ACCOUNT_SYNC_ENABLED": _env_bool(bool(settings["oauth_account_sync_enabled"])),
             "RECOVERY_ENABLED": _env_bool(bool(settings["recovery_enabled"])),
@@ -1850,8 +1885,8 @@ class RuntimeConfigService:
             "MANUAL_UPSTREAM_SYNC_UPSTREAM_HEALTH_ENABLED": _env_bool(
                 bool(settings.get("manual_upstream_sync_upstream_health_enabled", True))
             ),
-            "MANUAL_UPSTREAM_SYNC_CHANNEL_MONITORS_ENABLED": _env_bool(
-                bool(settings.get("manual_upstream_sync_channel_monitors_enabled", True))
+            "MANUAL_UPSTREAM_MONITOR_SYNC_ENABLED": _env_bool(
+                bool(settings.get("manual_upstream_monitor_sync_enabled", True))
             ),
             "MANUAL_UPSTREAM_SYNC_ACCOUNT_AVAILABILITY_ENABLED": _env_bool(
                 bool(settings.get("manual_upstream_sync_account_availability_enabled", False))
@@ -1865,14 +1900,14 @@ class RuntimeConfigService:
             "API_KEY_AUTO_DISABLE_ON_UPSTREAM_UNAVAILABLE": _env_bool(
                 bool(settings["api_key_auto_disable_on_upstream_unavailable"])
             ),
-            "API_KEY_AUTO_PAUSE_ON_CHANNEL_MONITOR_UNAVAILABLE_ENABLED": _env_bool(
-                bool(settings["api_key_auto_pause_on_channel_monitor_unavailable_enabled"])
+            "API_ACCOUNT_AUTO_PAUSE_ON_UPSTREAM_MONITOR_UNAVAILABLE_ENABLED": _env_bool(
+                bool(settings["api_account_auto_pause_on_upstream_monitor_unavailable_enabled"])
             ),
             "API_KEY_AVAILABILITY_ALL_TESTS_MUST_SUCCEED": _env_bool(
                 bool(settings.get("api_key_availability_all_tests_must_succeed", False))
             ),
-            "CHANNEL_MONITOR_AUTO_PROBE_ENABLED": _env_bool(
-                bool(settings.get("channel_monitor_auto_probe_enabled", True))
+            "UPSTREAM_MONITOR_AUTO_PROBE_ENABLED": _env_bool(
+                bool(settings.get("upstream_monitor_auto_probe_enabled", True))
             ),
             "ACCOUNT_MODEL_WHITELIST_SYNC_ENABLED": _env_bool(
                 bool(settings.get("account_model_whitelist_sync_enabled", False))
@@ -1885,26 +1920,26 @@ class RuntimeConfigService:
             ),
             # Legacy confirmation thresholds are read for migration only. The
             # current policy uses per-round pause and recovery test counts.
-            "CHANNEL_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD": None,
-            "CHANNEL_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD": None,
-            "CHANNEL_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED": _env_bool(
-                bool(settings.get("channel_monitor_fallback_without_monitor_enabled", False))
+            "UPSTREAM_MONITOR_UNAVAILABLE_CONSECUTIVE_THRESHOLD": None,
+            "UPSTREAM_MONITOR_RECOVERY_CONSECUTIVE_THRESHOLD": None,
+            "UPSTREAM_MONITOR_FALLBACK_WITHOUT_MONITOR_ENABLED": _env_bool(
+                bool(settings.get("upstream_monitor_fallback_without_monitor_enabled", False))
             ),
-            "CHANNEL_MONITOR_FALLBACK_TEST_MODELS": json.dumps(
-                settings.get("channel_monitor_fallback_test_models", []),
+            "UPSTREAM_MONITOR_FALLBACK_TEST_MODELS": json.dumps(
+                settings.get("upstream_monitor_fallback_test_models", []),
                 ensure_ascii=False,
             ),
-            "CHANNEL_MONITOR_FALLBACK_TEST_MODEL": str(
-                settings.get("channel_monitor_fallback_test_model", "")
+            "UPSTREAM_MONITOR_FALLBACK_TEST_MODEL": str(
+                settings.get("upstream_monitor_fallback_test_model", "")
             ),
-            "CHANNEL_MONITOR_FALLBACK_TEST_ATTEMPTS": str(
-                int(settings.get("channel_monitor_fallback_test_attempts", 1))
+            "UPSTREAM_MONITOR_FALLBACK_TEST_ATTEMPTS": str(
+                int(settings.get("upstream_monitor_fallback_test_attempts", 1))
             ),
-            "CHANNEL_MONITOR_RECOVERY_TEST_ATTEMPTS": str(
-                int(settings.get("channel_monitor_recovery_test_attempts", 1))
+            "UPSTREAM_MONITOR_RECOVERY_TEST_ATTEMPTS": str(
+                int(settings.get("upstream_monitor_recovery_test_attempts", 1))
             ),
-            "CHANNEL_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS": str(
-                int(settings.get("channel_monitor_test_attempt_interval_seconds", 0))
+            "UPSTREAM_MONITOR_TEST_ATTEMPT_INTERVAL_SECONDS": str(
+                int(settings.get("upstream_monitor_test_attempt_interval_seconds", 0))
             ),
             "API_KEY_AUTO_PAUSE_ON_NEGATIVE_BALANCE_ENABLED": _env_bool(
                 bool(settings.get("api_key_auto_pause_on_negative_balance_enabled", False))
@@ -1919,8 +1954,8 @@ class RuntimeConfigService:
             "PRIORITY_ASSIGN_DISABLED_API_KEY_ACCOUNTS": _env_bool(
                 bool(settings.get("priority_assign_disabled_api_key_accounts", False))
             ),
-            "PRIORITY_SHARE_SAME_COMPOSITE_MULTIPLIER": _env_bool(
-                bool(settings.get("priority_share_same_composite_multiplier", False))
+            "PRIORITY_SHARE_SAME_UPSTREAM_ACTUAL_MULTIPLIER": _env_bool(
+                bool(settings.get("priority_share_same_upstream_actual_multiplier", False))
             ),
             "DISCORD_BOT_NOTIFICATIONS_ENABLED": _env_bool(
                 bool(settings.get("discord_bot_notifications_enabled", False))
@@ -1994,10 +2029,7 @@ class RuntimeConfigService:
         setting.value = value
 
     def _env_x_api_key(self) -> str:
-        header = self.settings.sub2api_auth_header.strip().lower()
-        if header in {"x-api-key", "x-api", "x-api_key"}:
-            return self.settings.sub2api_auth_token.strip()
-        return ""
+        return self.settings.management_site_x_api_key.strip()
 
     def _default_protocol_refresh_max_concurrency(self) -> int:
         if self.settings.protocol_refresh_max_concurrency is not None:
@@ -2016,7 +2048,7 @@ def _headers_for_probe(config: EffectiveSub2ApiConfig) -> dict[str, str]:
 
 
 def _normalize_base_url(value: str) -> str:
-    return normalize_sub2api_base_url(value)
+    return normalize_management_site_base_url(value)
 
 
 def _sub2api_origin(value: str) -> tuple[str, str]:

@@ -1,4 +1,4 @@
-import type { Account } from "./types";
+import type { Account } from "./domain";
 
 export const MAX_LIVENESS_ACCOUNTS = 200;
 
@@ -18,9 +18,9 @@ function isPositiveSafeAccountId(value: string | null | undefined) {
 }
 
 export function accountCanBeLivenessTested(
-  account: Pick<Account, "account_type" | "platform" | "sub2api_account_id">,
+  account: Pick<Account, "account_type" | "platform" | "management_account_id">,
 ) {
-  if (!isPositiveSafeAccountId(account.sub2api_account_id)) return false;
+  if (!isPositiveSafeAccountId(account.management_account_id)) return false;
   const accountType = normalizedAccountType(account);
   // /api/accounts is already restricted to GPT accounts by the backend. The
   // browser can reliably distinguish only the OAuth half of that same rule.
@@ -28,13 +28,13 @@ export function accountCanBeLivenessTested(
 }
 
 export function livenessAccountIds(
-  accounts: Array<Pick<Account, "account_type" | "platform" | "sub2api_account_id">>,
+  accounts: Array<Pick<Account, "account_type" | "platform" | "management_account_id">>,
 ) {
   const result: string[] = [];
   const seen = new Set<string>();
   for (const account of accounts) {
     if (!accountCanBeLivenessTested(account)) continue;
-    const accountId = String(account.sub2api_account_id).trim();
+    const accountId = String(account.management_account_id).trim();
     if (seen.has(accountId)) continue;
     seen.add(accountId);
     result.push(accountId);

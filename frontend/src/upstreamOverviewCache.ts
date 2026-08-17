@@ -1,16 +1,16 @@
 import type {
-  UpstreamAccount,
-  UpstreamChannel,
-  UpstreamChannelsResponse,
-  UpstreamChannelMonitor,
-  UpstreamAccountPauseHold,
+  ApiAccount,
+  Upstream,
+  UpstreamOverviewResponse,
+  UpstreamMonitor,
+  ApiAccountPauseHold,
   UpstreamGroupOption,
   UpstreamType,
   PriorityInterval,
   PriorityAllocationStrategy,
-} from "./types";
+} from "./domain";
 
-export const upstreamOverviewCacheVersion = 8;
+export const upstreamOverviewCacheVersion = 9;
 const cacheKeyPrefix = "sub2api-at-upstream-overview:";
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem" | "key" | "length">;
@@ -59,7 +59,7 @@ export function readUpstreamOverviewCache(storage: StorageLike | null, baseUrl: 
 export function writeUpstreamOverviewCache(
   storage: StorageLike | null,
   baseUrl: string,
-  response: UpstreamChannelsResponse,
+  response: UpstreamOverviewResponse,
 ) {
   const safeResponse = sanitizeUpstreamOverview(response);
   if (!safeResponse) return null;
@@ -99,65 +99,65 @@ export function clearUpstreamOverviewCache(storage: StorageLike | null, baseUrl?
  * Persist only display state. Credential values and hints are intentionally
  * absent from this allowlist even if a future API response includes them.
  */
-export function sanitizeUpstreamOverview(value: unknown): UpstreamChannelsResponse | null {
+export function sanitizeUpstreamOverview(value: unknown): UpstreamOverviewResponse | null {
   const source = asRecord(value);
-  if (!source || !Array.isArray(source.channels) || !Array.isArray(source.unassigned_accounts)) return null;
+  if (!source || !Array.isArray(source.upstreams) || !Array.isArray(source.unassigned_accounts)) return null;
   return {
-    local_recharge_multiplier: nullableNumber(source.local_recharge_multiplier),
-    local_recharge_source: nullableString(source.local_recharge_source),
-    local_recharge_status: nullableString(source.local_recharge_status),
+    management_recharge_multiplier: nullableNumber(source.management_recharge_multiplier),
+    management_recharge_source: nullableString(source.management_recharge_source),
+    management_recharge_status: nullableString(source.management_recharge_status),
     priority_intervals: sanitizePriorityIntervals(source.priority_intervals),
-    channels: source.channels.map(sanitizeChannel).filter(isPresent),
+    upstreams: source.upstreams.map(sanitizeUpstream).filter(isPresent),
     unassigned_accounts: source.unassigned_accounts.map(sanitizeAccount).filter(isPresent),
   };
 }
 
-export function upstreamOverviewHasLiveMutationData(value: UpstreamChannelsResponse | null | undefined) {
+export function upstreamOverviewHasLiveMutationData(value: UpstreamOverviewResponse | null | undefined) {
   if (!value) return false;
   const accounts = [
-    ...value.channels.flatMap((channel) => channel.accounts || []),
+    ...value.upstreams.flatMap((upstream) => upstream.accounts || []),
     ...value.unassigned_accounts,
   ];
-  return value.channels.every((channel) => typeof channel.probe_enabled === "boolean")
+  return value.upstreams.every((upstream) => typeof upstream.probe_enabled === "boolean")
     && accounts.every((account) => /^[a-f0-9]{64}$/.test(String(account.identity_fingerprint || "")));
 }
 
-function sanitizeChannel(value: unknown): UpstreamChannel | null {
+function sanitizeUpstream(value: unknown): Upstream | null {
   const source = asRecord(value);
-  const id = source ? nullableId(source.id) : undefined;
+  const id = source ? nullableUuid(source.upstream_id) : undefined;
   if (!source || id === undefined || id === null) return null;
   return {
-    id,
+    upstream_id: id,
     display_name: nullableString(source.display_name),
-    base_url: nullableString(source.base_url),
-    canonical_base_url: nullableString(source.canonical_base_url),
-    management_base_url: nullableString(source.management_base_url),
-    upstream_type: upstreamType(source.upstream_type),
+    api_endpoint_url: nullableString(source.api_endpoint_url),
+    management_url: nullableString(source.management_url),
+    platform_type: upstreamType(source.platform_type),
     probe_enabled: optionalBoolean(source.probe_enabled),
-    resolved_upstream_type: resolvedUpstreamType(source.resolved_upstream_type),
+    resolved_platform_type: resolvedUpstreamType(source.resolved_platform_type),
     upstream_user_id: nullableString(source.upstream_user_id),
     access_token_set: optionalBoolean(source.access_token_set),
     refresh_token_set: optionalBoolean(source.refresh_token_set),
-    manual_recharge_multiplier: nullableNumber(source.manual_recharge_multiplier),
-    discovered_recharge_multiplier: nullableNumber(source.discovered_recharge_multiplier),
-    effective_recharge_multiplier: nullableNumber(source.effective_recharge_multiplier),
+    login_credentials_set: optionalBoolean(source.login_credentials_set),
+    upstream_recharge_multiplier_override: nullableNumber(source.upstream_recharge_multiplier_override),
+    discovered_upstream_recharge_multiplier: nullableNumber(source.discovered_upstream_recharge_multiplier),
+    upstream_recharge_multiplier: nullableNumber(source.upstream_recharge_multiplier),
     recharge_multiplier_source: nullableString(source.recharge_multiplier_source),
     recharge_multiplier_status: nullableString(source.recharge_multiplier_status),
     group_options: sanitizeGroupOptions(source.group_options),
-    balance_remaining: nullableNumber(source.balance_remaining),
-    balance_total: nullableNumber(source.balance_total),
-    balance_used: nullableNumber(source.balance_used),
+    wallet_balance_usd: nullableNumber(source.wallet_balance_usd),
+    wallet_total_usd: nullableNumber(source.wallet_total_usd),
+    wallet_used_usd: nullableNumber(source.wallet_used_usd),
     balance_unit: nullableString(source.balance_unit),
     balance_status: nullableString(source.balance_status),
     balance_source: nullableString(source.balance_source),
     balance_message: nullableString(source.balance_message),
     balance_checked_at: nullableString(source.balance_checked_at),
-    recharge_adjusted_balance: nullableNumber(source.recharge_adjusted_balance),
-    today_balance_used: nullableNumber(source.today_balance_used),
+    actual_balance_cny: nullableNumber(source.actual_balance_cny),
+    today_upstream_wallet_cost_usd: nullableNumber(source.today_upstream_wallet_cost_usd),
     today_balance_unit: nullableString(source.today_balance_unit),
     today_balance_status: nullableString(source.today_balance_status),
     today_balance_checked_at: nullableString(source.today_balance_checked_at),
-    yesterday_balance_used: nullableNumber(source.yesterday_balance_used),
+    yesterday_upstream_wallet_cost_usd: nullableNumber(source.yesterday_upstream_wallet_cost_usd),
     yesterday_balance_unit: nullableString(source.yesterday_balance_unit),
     yesterday_balance_status: nullableString(source.yesterday_balance_status),
     yesterday_balance_checked_at: nullableString(source.yesterday_balance_checked_at),
@@ -166,15 +166,15 @@ function sanitizeChannel(value: unknown): UpstreamChannel | null {
     balance_guard_value: nullableNumber(source.balance_guard_value),
     balance_guard_checked_at: nullableString(source.balance_guard_checked_at),
     balance_guard_paused_count: nullableNumber(source.balance_guard_paused_count) ?? undefined,
-    channel_monitors: sanitizeChannelMonitors(source.channel_monitors),
-    channel_monitor_count: nullableNumber(source.channel_monitor_count) ?? undefined,
-    channel_monitor_status: nullableString(source.channel_monitor_status),
-    channel_monitor_message: nullableString(source.channel_monitor_message),
-    channel_monitor_checked_at: nullableString(source.channel_monitor_checked_at),
-    channel_monitor_guard_state: nullableString(source.channel_monitor_guard_state),
-    channel_monitor_unavailable_count: nullableNumber(source.channel_monitor_unavailable_count) ?? undefined,
-    channel_monitor_recovery_count: nullableNumber(source.channel_monitor_recovery_count) ?? undefined,
-    channel_monitor_guard_checked_at: nullableString(source.channel_monitor_guard_checked_at),
+    upstream_monitors: sanitizeUpstreamMonitors(source.upstream_monitors),
+    upstream_monitor_count: nullableNumber(source.upstream_monitor_count) ?? undefined,
+    upstream_monitor_status: nullableString(source.upstream_monitor_status),
+    upstream_monitor_message: nullableString(source.upstream_monitor_message),
+    upstream_monitor_checked_at: nullableString(source.upstream_monitor_checked_at),
+    upstream_monitor_guard_state: nullableString(source.upstream_monitor_guard_state),
+    upstream_monitor_unavailable_count: nullableNumber(source.upstream_monitor_unavailable_count) ?? undefined,
+    upstream_monitor_recovery_count: nullableNumber(source.upstream_monitor_recovery_count) ?? undefined,
+    upstream_monitor_guard_checked_at: nullableString(source.upstream_monitor_guard_checked_at),
     status: nullableString(source.status),
     message: nullableString(source.message),
     checked_at: nullableString(source.checked_at),
@@ -187,14 +187,15 @@ function sanitizeChannel(value: unknown): UpstreamChannel | null {
   };
 }
 
-function sanitizeAccount(value: unknown): UpstreamAccount | null {
+function sanitizeAccount(value: unknown): ApiAccount | null {
   const source = asRecord(value);
-  const accountId = source ? nullableId(source.sub2api_account_id) : undefined;
+  const accountId = source ? nullableId(source.management_account_id) : undefined;
   if (!source || accountId === undefined || accountId === null) return null;
   return {
-    sub2api_account_id: accountId,
-    upstream_api_key_record_id: nullableId(source.upstream_api_key_record_id),
-    channel_id: nullableId(source.channel_id),
+    management_account_id: accountId,
+    remote_key_id: nullableId(source.remote_key_id),
+    upstream_api_key_id: nullableId(source.upstream_api_key_id),
+    upstream_id: nullableUuid(source.upstream_id),
     remote_name: nullableString(source.remote_name),
     remote_platform: nullableString(source.remote_platform),
     remote_account_type: nullableString(source.remote_account_type),
@@ -222,22 +223,22 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
       ? source.rate_pause_effective_source
       : undefined,
     rate_absolute_threshold: nullableNumber(source.rate_absolute_threshold),
-    composite_multiplier: nullableNumber(source.composite_multiplier),
+    upstream_actual_multiplier: nullableNumber(source.upstream_actual_multiplier),
     managed: optionalBoolean(source.managed),
-    base_url: nullableString(source.base_url),
-    upstream_type: upstreamType(source.upstream_type),
-    resolved_upstream_type: resolvedUpstreamType(source.resolved_upstream_type),
-    detected_upstream_type: resolvedUpstreamType(source.detected_upstream_type),
+    api_endpoint_url: nullableString(source.api_endpoint_url),
+    platform_type: upstreamType(source.platform_type),
+    resolved_platform_type: resolvedUpstreamType(source.resolved_platform_type),
+    detected_platform_type: resolvedUpstreamType(source.detected_platform_type),
     upstream_user_id: nullableString(source.upstream_user_id),
     selected_group_id: nullableString(source.selected_group_id),
     selected_group_name: nullableString(source.selected_group_name),
     api_key_set: optionalBoolean(source.api_key_set),
     access_token_set: optionalBoolean(source.access_token_set),
-    manual_group_multiplier: nullableNumber(source.manual_group_multiplier),
-    manual_recharge_multiplier: nullableNumber(source.manual_recharge_multiplier),
+    upstream_group_multiplier_override: nullableNumber(source.upstream_group_multiplier_override),
+    upstream_recharge_multiplier_override: nullableNumber(source.upstream_recharge_multiplier_override),
     group_options: sanitizeGroupOptions(source.group_options),
-    discovered_group_multiplier: nullableNumber(source.discovered_group_multiplier),
-    effective_group_multiplier: nullableNumber(source.effective_group_multiplier),
+    discovered_upstream_group_multiplier: nullableNumber(source.discovered_upstream_group_multiplier),
+    upstream_group_multiplier: nullableNumber(source.upstream_group_multiplier),
     group_multiplier_source: nullableString(source.group_multiplier_source),
     group_multiplier_status: nullableString(source.group_multiplier_status),
     upstream_key_status: nullableString(source.upstream_key_status),
@@ -264,44 +265,44 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
     pause_owned_by_plugin: optionalBoolean(source.pause_owned_by_plugin),
     auto_restore_eligible: optionalBoolean(source.auto_restore_eligible),
     auto_pause_episode_id: nullableString(source.auto_pause_episode_id),
-    auto_pause_channel_id: nullableId(source.auto_pause_channel_id),
+    auto_pause_upstream_id: nullableString(source.auto_pause_upstream_id),
     auto_paused_at: nullableString(source.auto_paused_at),
     balance_guard_restore_eligible: optionalBoolean(source.balance_guard_restore_eligible),
-    balance_guard_channel_id: nullableId(source.balance_guard_channel_id),
+    balance_guard_upstream_id: nullableString(source.balance_guard_upstream_id),
     balance_guard_paused_at: nullableString(source.balance_guard_paused_at),
-    discovered_recharge_multiplier: nullableNumber(source.discovered_recharge_multiplier),
-    effective_recharge_multiplier: nullableNumber(source.effective_recharge_multiplier),
+    discovered_upstream_recharge_multiplier: nullableNumber(source.discovered_upstream_recharge_multiplier),
+    upstream_recharge_multiplier: nullableNumber(source.upstream_recharge_multiplier),
     recharge_multiplier_source: nullableString(source.recharge_multiplier_source),
     recharge_multiplier_status: nullableString(source.recharge_multiplier_status),
-    local_recharge_multiplier: nullableNumber(source.local_recharge_multiplier),
-    local_recharge_source: nullableString(source.local_recharge_source),
-    local_recharge_status: nullableString(source.local_recharge_status),
-    current_rate: nullableNumber(source.current_rate),
-    target_rate: nullableNumber(source.target_rate),
+    management_recharge_multiplier: nullableNumber(source.management_recharge_multiplier),
+    management_recharge_source: nullableString(source.management_recharge_source),
+    management_recharge_status: nullableString(source.management_recharge_status),
+    management_billing_multiplier: nullableNumber(source.management_billing_multiplier),
+    expected_management_billing_multiplier: nullableNumber(source.expected_management_billing_multiplier),
     would_change: optionalBoolean(source.would_change),
-    balance_remaining: nullableNumber(source.balance_remaining),
-    balance_total: nullableNumber(source.balance_total),
-    balance_used: nullableNumber(source.balance_used),
+    wallet_balance_usd: nullableNumber(source.wallet_balance_usd),
+    wallet_total_usd: nullableNumber(source.wallet_total_usd),
+    wallet_used_usd: nullableNumber(source.wallet_used_usd),
     balance_unit: nullableString(source.balance_unit),
     balance_status: nullableString(source.balance_status),
     balance_source: nullableString(source.balance_source),
     balance_message: nullableString(source.balance_message),
     balance_checked_at: nullableString(source.balance_checked_at),
-    upstream_usage_amount: nullableNumber(source.upstream_usage_amount),
+    upstream_wallet_cost_usd: nullableNumber(source.upstream_wallet_cost_usd),
     upstream_usage_unit: nullableString(source.upstream_usage_unit),
     upstream_usage_checked_at: nullableString(source.upstream_usage_checked_at),
-    today_upstream_usage_amount: nullableNumber(source.today_upstream_usage_amount),
+    today_upstream_wallet_cost_usd: nullableNumber(source.today_upstream_wallet_cost_usd),
     today_upstream_usage_unit: nullableString(source.today_upstream_usage_unit),
     today_upstream_usage_status: nullableString(source.today_upstream_usage_status),
     today_upstream_usage_source: nullableString(source.today_upstream_usage_source),
     today_upstream_usage_checked_at: nullableString(source.today_upstream_usage_checked_at),
-    today_upstream_cost_cny: nullableNumber(source.today_upstream_cost_cny),
-    today_sub2api_cost_cny: nullableNumber(source.today_sub2api_cost_cny),
-    today_income_cny: nullableNumber(source.today_income_cny),
+    today_upstream_actual_cost_cny: nullableNumber(source.today_upstream_actual_cost_cny),
+    today_management_account_cost_cny: nullableNumber(source.today_management_account_cost_cny),
+    today_actual_income_cny: nullableNumber(source.today_actual_income_cny),
     today_consumption_cny: nullableNumber(source.today_consumption_cny),
     today_profit_cny: nullableNumber(source.today_profit_cny),
-    today_sub2api_stats_status: nullableString(source.today_sub2api_stats_status),
-    today_sub2api_stats_checked_at: nullableString(source.today_sub2api_stats_checked_at),
+    today_management_site_stats_status: nullableString(source.today_management_site_stats_status),
+    today_management_site_stats_checked_at: nullableString(source.today_management_site_stats_checked_at),
     last_used_at: nullableString(source.last_used_at),
     last_error: nullableString(source.last_error),
     last_discovered_at: nullableString(source.last_discovered_at),
@@ -311,7 +312,7 @@ function sanitizeAccount(value: unknown): UpstreamAccount | null {
   };
 }
 
-function sanitizePauseHolds(value: unknown): UpstreamAccountPauseHold[] | undefined {
+function sanitizePauseHolds(value: unknown): ApiAccountPauseHold[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.map((entry) => {
     const source = asRecord(entry);
@@ -322,13 +323,13 @@ function sanitizePauseHolds(value: unknown): UpstreamAccountPauseHold[] | undefi
       reason,
       triggered_at: nullableString(source.triggered_at),
       recovery_mode: nullableString(source.recovery_mode),
-      scope_channel_id: nullableId(source.scope_channel_id),
+      scope_upstream_id: nullableString(source.scope_upstream_id),
       ...(evidence ? { evidence } : {}),
     };
   }).filter(isPresent);
 }
 
-function sanitizePauseEvidence(value: unknown): UpstreamAccountPauseHold["evidence"] {
+function sanitizePauseEvidence(value: unknown): ApiAccountPauseHold["evidence"] {
   const source = asRecord(value);
   if (!source) return undefined;
   return {
@@ -400,7 +401,7 @@ function sanitizeGroupOptions(value: unknown): UpstreamGroupOption[] {
   }).filter(isPresent);
 }
 
-function sanitizeChannelMonitors(value: unknown): UpstreamChannelMonitor[] {
+function sanitizeUpstreamMonitors(value: unknown): UpstreamMonitor[] {
   if (!Array.isArray(value)) return [];
   return value.map((entry) => {
     const source = asRecord(entry);
@@ -471,6 +472,14 @@ function nullableString(value: unknown): string | null | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function nullableUuid(value: unknown): string | null | undefined {
+  const normalized = nullableString(value);
+  if (normalized === undefined || normalized === null) return normalized;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
+    ? normalized.toLowerCase()
+    : null;
+}
+
 function nullableNumber(value: unknown): number | null | undefined {
   if (value === null) return null;
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
@@ -505,8 +514,8 @@ function resolvedUpstreamType(value: unknown): "newapi" | "sub2api" | null | und
   return value === "newapi" || value === "sub2api" ? value : undefined;
 }
 
-function availabilityCheckMode(value: unknown): "channel_monitor" | "independent_model" | undefined {
-  return value === "channel_monitor" || value === "independent_model" ? value : undefined;
+function availabilityCheckMode(value: unknown): "upstream_monitor" | "independent_model" | undefined {
+  return value === "upstream_monitor" || value === "independent_model" ? value : undefined;
 }
 
 function isPresent<T>(value: T | null): value is T {

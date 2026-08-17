@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.dashboard import dashboard_summary
 from app.core.database import Base
-from app.models import UpstreamChannel, utcnow
+from app.models import Upstream, utcnow
 
 
 class DashboardBalanceWarningTests(unittest.IsolatedAsyncioTestCase):
@@ -23,29 +23,29 @@ class DashboardBalanceWarningTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             db.add_all(
                 [
-                    UpstreamChannel(
+                    Upstream(
                         display_name="Low wallet",
-                        canonical_base_url="https://negative.example/api/v1",
-                        balance_remaining=4.75,
+                        api_endpoint_url="https://negative.example/api/v1",
+                        wallet_balance_usd=4.75,
                         balance_unit="USD",
                         balance_status="ok",
                         balance_source="upstream_wallet",
                         balance_checked_at=utcnow(),
                         balance_guard_state="disabled",
                     ),
-                    UpstreamChannel(
+                    Upstream(
                         display_name="Local fallback",
-                        canonical_base_url="https://fallback.example/api/v1",
-                        balance_remaining=4.0,
+                        api_endpoint_url="https://fallback.example/api/v1",
+                        wallet_balance_usd=4.0,
                         balance_unit="USD",
                         balance_status="ok",
                         balance_source="local_api_key",
                         balance_guard_state="disabled",
                     ),
-                    UpstreamChannel(
+                    Upstream(
                         display_name="Failed stale probe",
-                        canonical_base_url="https://stale.example/api/v1",
-                        balance_remaining=3.0,
+                        api_endpoint_url="https://stale.example/api/v1",
+                        wallet_balance_usd=3.0,
                         balance_unit="USD",
                         balance_status="error",
                         balance_source=None,
@@ -67,8 +67,8 @@ class DashboardBalanceWarningTests(unittest.IsolatedAsyncioTestCase):
             ):
                 summary = await dashboard_summary({}, db)
 
-        self.assertEqual(summary.low_balance_channel_count, 1)
-        warnings = {item["name"]: item for item in summary.low_balance_channels}
+        self.assertEqual(summary.low_balance_upstream_count, 1)
+        warnings = {item["name"]: item for item in summary.low_balance_upstreams}
         self.assertEqual(warnings["Low wallet"]["balance"], 4.75)
         self.assertEqual(warnings["Low wallet"]["basis"], "wallet")
         self.assertEqual(warnings["Low wallet"]["threshold"], 5.0)
@@ -78,19 +78,19 @@ class DashboardBalanceWarningTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             db.add_all(
                 [
-                    UpstreamChannel(
+                    Upstream(
                         display_name="Historical negative",
-                        canonical_base_url="https://historical.example/api/v1",
-                        balance_remaining=-11,
+                        api_endpoint_url="https://historical.example/api/v1",
+                        wallet_balance_usd=-11,
                         balance_unit="USD",
                         balance_status="error",
                         balance_checked_at=utcnow(),
                         balance_guard_state="unavailable",
                     ),
-                    UpstreamChannel(
+                    Upstream(
                         display_name="Active balance guard",
-                        canonical_base_url="https://active.example/api/v1",
-                        balance_remaining=-7,
+                        api_endpoint_url="https://active.example/api/v1",
+                        wallet_balance_usd=-7,
                         balance_unit="USD",
                         balance_status="ok",
                         balance_source="upstream_wallet",
@@ -116,33 +116,33 @@ class DashboardBalanceWarningTests(unittest.IsolatedAsyncioTestCase):
             ):
                 summary = await dashboard_summary({}, db)
 
-        self.assertEqual(summary.low_balance_channel_count, 1)
-        self.assertEqual(summary.low_balance_channels[0]["name"], "Active balance guard")
-        self.assertEqual(summary.low_balance_channels[0]["balance"], -3.5)
-        self.assertEqual(summary.low_balance_channels[0]["basis"], "recharge_adjusted")
-        self.assertEqual(summary.low_balance_channels[0]["unit"], "CNY")
-        self.assertEqual(summary.low_balance_channels[0]["paused_accounts"], 2)
+        self.assertEqual(summary.low_balance_upstream_count, 1)
+        self.assertEqual(summary.low_balance_upstreams[0]["name"], "Active balance guard")
+        self.assertEqual(summary.low_balance_upstreams[0]["balance"], -3.5)
+        self.assertEqual(summary.low_balance_upstreams[0]["basis"], "recharge_adjusted")
+        self.assertEqual(summary.low_balance_upstreams[0]["unit"], "CNY")
+        self.assertEqual(summary.low_balance_upstreams[0]["paused_accounts"], 2)
 
     async def test_stale_recharge_adjusted_warning_uses_adjusted_value_and_threshold(self) -> None:
         async with self.sessions() as db:
             db.add_all(
                 [
-                    UpstreamChannel(
+                    Upstream(
                         display_name="Adjusted low",
-                        canonical_base_url="https://adjusted-low.example/api/v1",
-                        balance_remaining=4.0,
-                        effective_recharge_multiplier=0.5,
+                        api_endpoint_url="https://adjusted-low.example/api/v1",
+                        wallet_balance_usd=4.0,
+                        upstream_recharge_multiplier=0.5,
                         balance_unit="USD",
                         balance_status="ok",
                         balance_source="upstream_wallet",
                         balance_checked_at=utcnow(),
                         balance_guard_state="disabled",
                     ),
-                    UpstreamChannel(
+                    Upstream(
                         display_name="Adjusted healthy",
-                        canonical_base_url="https://adjusted-healthy.example/api/v1",
-                        balance_remaining=4.0,
-                        effective_recharge_multiplier=1.0,
+                        api_endpoint_url="https://adjusted-healthy.example/api/v1",
+                        wallet_balance_usd=4.0,
+                        upstream_recharge_multiplier=1.0,
                         balance_unit="USD",
                         balance_status="ok",
                         balance_source="upstream_wallet",
@@ -166,8 +166,8 @@ class DashboardBalanceWarningTests(unittest.IsolatedAsyncioTestCase):
             ):
                 summary = await dashboard_summary({}, db)
 
-        self.assertEqual(summary.low_balance_channel_count, 1)
-        warning = summary.low_balance_channels[0]
+        self.assertEqual(summary.low_balance_upstream_count, 1)
+        warning = summary.low_balance_upstreams[0]
         self.assertEqual(warning["name"], "Adjusted low")
         self.assertEqual(warning["balance"], 2.0)
         self.assertEqual(warning["basis"], "recharge_adjusted")

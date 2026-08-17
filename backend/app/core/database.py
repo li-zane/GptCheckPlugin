@@ -1,7 +1,9 @@
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import UUID, uuid4, uuid5
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
@@ -140,6 +142,166 @@ async def _ensure_upstream_channel_reference_guards(conn: AsyncConnection) -> No
     )
 
 
+async def _backfill_normalized_upstream_entities(conn: AsyncConnection) -> None:
+    """Create durable remote group/key rows without inferring identity from names."""
+
+    required_tables = {"upstream_channels", "upstream_account_configs", "upstream_groups", "upstream_api_keys"}
+    existing_tables = {
+        str(row[0])
+        for row in (
+            await conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type = 'table'")
+            )
+        ).fetchall()
+    }
+    if not required_tables.issubset(existing_tables):
+        return
+
+    channels = (
+        await conn.execute(
+            text(
+                "SELECT id, group_options, last_discovered_at "
+                "FROM upstream_channels ORDER BY id"
+            )
+        )
+    ).mappings().all()
+    for channel in channels:
+        raw_options = channel["group_options"]
+        if isinstance(raw_options, str):
+            try:
+                raw_options = json.loads(raw_options)
+            except (TypeError, ValueError):
+                raw_options = []
+        if not isinstance(raw_options, list):
+            continue
+        for option in raw_options:
+            if not isinstance(option, dict):
+                continue
+            remote_group_id = str(option.get("id") or "").strip()
+            name = str(option.get("name") or "").strip()
+            if not remote_group_id or not name:
+                continue
+            multiplier = option.get("multiplier")
+            if isinstance(multiplier, bool) or not isinstance(multiplier, (int, float)):
+                multiplier = None
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_groups ("
+                    "channel_id, remote_group_id, name, multiplier, available, "
+                    "last_seen_at, deleted_at, created_at, updated_at) "
+                    "VALUES (:channel_id, :remote_group_id, :name, :multiplier, 1, "
+                    ":last_seen_at, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(channel_id, remote_group_id) DO UPDATE SET "
+                    "name = excluded.name, multiplier = excluded.multiplier, available = 1, "
+                    "last_seen_at = COALESCE(excluded.last_seen_at, upstream_groups.last_seen_at), "
+                    "deleted_at = NULL, updated_at = CURRENT_TIMESTAMP"
+                ),
+                {
+                    "channel_id": int(channel["id"]),
+                    "remote_group_id": remote_group_id,
+                    "name": name[:200],
+                    "multiplier": multiplier,
+                    "last_seen_at": channel["last_discovered_at"],
+                },
+            )
+
+    accounts = (
+        await conn.execute(
+            text(
+                "SELECT id, channel_id, upstream_api_key_record_id, remote_name, "
+                "selected_group_id, selected_group_name, effective_group_multiplier, "
+                "upstream_key_status, last_discovered_at "
+                "FROM upstream_account_configs "
+                "WHERE channel_id IS NOT NULL AND upstream_api_key_record_id IS NOT NULL "
+                "ORDER BY id"
+            )
+        )
+    ).mappings().all()
+    for account in accounts:
+        channel_id = int(account["channel_id"])
+        group_row_id = None
+        remote_group_id = str(account["selected_group_id"] or "").strip()
+        if remote_group_id:
+            group_name = str(account["selected_group_name"] or remote_group_id).strip()[:200]
+            await conn.execute(
+                text(
+                    "INSERT INTO upstream_groups ("
+                    "channel_id, remote_group_id, name, multiplier, available, "
+                    "last_seen_at, deleted_at, created_at, updated_at) "
+                    "VALUES (:channel_id, :remote_group_id, :name, :multiplier, 1, "
+                    ":last_seen_at, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(channel_id, remote_group_id) DO UPDATE SET "
+                    "name = excluded.name, multiplier = COALESCE(excluded.multiplier, upstream_groups.multiplier), "
+                    "available = 1, last_seen_at = COALESCE(excluded.last_seen_at, upstream_groups.last_seen_at), "
+                    "deleted_at = NULL, updated_at = CURRENT_TIMESTAMP"
+                ),
+                {
+                    "channel_id": channel_id,
+                    "remote_group_id": remote_group_id,
+                    "name": group_name,
+                    "multiplier": account["effective_group_multiplier"],
+                    "last_seen_at": account["last_discovered_at"],
+                },
+            )
+            group_row_id = (
+                await conn.execute(
+                    text(
+                        "SELECT id FROM upstream_groups "
+                        "WHERE channel_id = :channel_id AND remote_group_id = :remote_group_id"
+                    ),
+                    {"channel_id": channel_id, "remote_group_id": remote_group_id},
+                )
+            ).scalar_one()
+        await conn.execute(
+            text(
+                "INSERT INTO upstream_api_keys ("
+                "channel_id, remote_key_id, remote_name, group_id, status, "
+                "last_seen_at, deleted_at, created_at, updated_at) "
+                "VALUES (:channel_id, :remote_key_id, :remote_name, :group_id, :status, "
+                ":last_seen_at, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(channel_id, remote_key_id) DO UPDATE SET "
+                "remote_name = excluded.remote_name, group_id = excluded.group_id, "
+                "status = excluded.status, last_seen_at = COALESCE(excluded.last_seen_at, upstream_api_keys.last_seen_at), "
+                "deleted_at = NULL, updated_at = CURRENT_TIMESTAMP"
+            ),
+            {
+                "channel_id": channel_id,
+                "remote_key_id": int(account["upstream_api_key_record_id"]),
+                "remote_name": account["remote_name"],
+                "group_id": group_row_id,
+                "status": account["upstream_key_status"] or "not_checked",
+                "last_seen_at": account["last_discovered_at"],
+            },
+        )
+        key_row_id = (
+            await conn.execute(
+                text(
+                    "SELECT id FROM upstream_api_keys "
+                    "WHERE channel_id = :channel_id AND remote_key_id = :remote_key_id"
+                ),
+                {
+                    "channel_id": channel_id,
+                    "remote_key_id": int(account["upstream_api_key_record_id"]),
+                },
+            )
+        ).scalar_one()
+        await conn.execute(
+            text(
+                "UPDATE upstream_account_configs SET upstream_api_key_id = :key_row_id "
+                "WHERE id = :account_id"
+            ),
+            {"key_row_id": int(key_row_id), "account_id": int(account["id"])},
+        )
+
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_upstream_account_configs_api_key_id "
+            "ON upstream_account_configs (upstream_api_key_id) "
+            "WHERE upstream_api_key_id IS NOT NULL"
+        )
+    )
+
+
 async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
     result = await conn.execute(text("PRAGMA table_info(upstream_priority_intervals)"))
     priority_interval_columns = {str(row[1]) for row in result.fetchall()}
@@ -196,6 +358,9 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
             text("ALTER TABLE upstream_channels ADD COLUMN encrypted_refresh_token TEXT")
         )
     optional_channel_columns = {
+        "stable_id": "VARCHAR(36)",
+        "deleted_at": "DATETIME",
+        "archived_canonical_base_url": "VARCHAR(500)",
         "last_known_recharge_multiplier": "FLOAT",
         "today_balance_used": "FLOAT",
         "today_balance_unit": "VARCHAR(32)",
@@ -225,6 +390,8 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "pending_group_options": "JSON",
         "pending_group_removal_count": "INTEGER NOT NULL DEFAULT 0",
         "pending_group_removal_checked_at": "DATETIME",
+        "encrypted_login_username": "TEXT",
+        "encrypted_login_password": "TEXT",
     }
     for column, column_type in optional_channel_columns.items():
         if channel_columns and column not in channel_columns:
@@ -232,6 +399,36 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
                 text(f"ALTER TABLE upstream_channels ADD COLUMN {column} {column_type}")
             )
             channel_columns.add(column)
+
+    if channel_columns and "stable_id" in channel_columns:
+        rows = (
+            await conn.execute(
+                text("SELECT id, stable_id FROM upstream_channels ORDER BY id")
+            )
+        ).mappings().all()
+        seen: set[str] = set()
+        for row in rows:
+            raw_value = str(row["stable_id"] or "").strip().lower()
+            try:
+                stable_id = str(UUID(raw_value))
+            except (ValueError, AttributeError):
+                stable_id = ""
+            if not stable_id or stable_id in seen:
+                stable_id = str(uuid4())
+                await conn.execute(
+                    text(
+                        "UPDATE upstream_channels SET stable_id = :stable_id "
+                        "WHERE id = :channel_id"
+                    ),
+                    {"stable_id": stable_id, "channel_id": int(row["id"])},
+                )
+            seen.add(stable_id)
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_upstream_channels_stable_id ON upstream_channels (stable_id)"
+            )
+        )
 
     recharge_multiplier_columns = [
         column
@@ -282,6 +479,7 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
         "rate_absolute_threshold": "FLOAT",
         "remote_identity_fingerprint": "VARCHAR(64)",
         "upstream_api_key_record_id": "BIGINT",
+        "upstream_api_key_id": "INTEGER",
         "upstream_identity_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "api_key_origin_rebind_required": "BOOLEAN NOT NULL DEFAULT 0",
         "remote_name": "VARCHAR(200)",
@@ -294,6 +492,8 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
           "remote_snapshot_updated_at": "DATETIME",
           "remote_present": "BOOLEAN NOT NULL DEFAULT 1",
           "remote_missing_at": "DATETIME",
+        "last_seen_at": "DATETIME",
+        "deleted_at": "DATETIME",
         "base_url": "VARCHAR(500)",
         "encrypted_api_key": "TEXT",
         "encrypted_access_token": "TEXT",
@@ -373,9 +573,13 @@ async def _migrate_upstream_channels(conn: AsyncConnection) -> None:
     for column, column_type in optional_account_columns.items():
         if column not in columns:
             await conn.execute(
-                text(f"ALTER TABLE upstream_account_configs ADD COLUMN {column} {column_type}")
+                text(
+                    f"ALTER TABLE upstream_account_configs ADD COLUMN {column} {column_type}"
+                )
             )
             columns.add(column)
+
+    await _backfill_normalized_upstream_entities(conn)
 
     # Relative-increase policies cannot be converted to one absolute threshold
     # without an account-specific baseline. Disable them once during upgrade so
@@ -915,6 +1119,12 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             await conn.execute(text("PRAGMA table_info(upstream_account_daily_usages)"))
         ).fetchall()
     }
+    account_config_columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
+        ).fetchall()
+    }
     if account_columns and "channel_identity" not in account_columns:
         await conn.execute(
             text(
@@ -923,6 +1133,15 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             )
         )
         account_columns.add("channel_identity")
+    for column_name in ("api_account_id", "upstream_api_key_id"):
+        if account_columns and column_name not in account_columns:
+            await conn.execute(
+                text(
+                    "ALTER TABLE upstream_account_daily_usages "
+                    f"ADD COLUMN {column_name} INTEGER"
+                )
+            )
+            account_columns.add(column_name)
     for column_name in (
         "upstream_recharge_multiplier",
         "sub2api_cost",
@@ -939,6 +1158,33 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             )
             account_columns.add(column_name)
     if account_columns:
+        if (
+            {"id", "sub2api_account_id"}.issubset(account_config_columns)
+            and "api_account_id" in account_columns
+        ):
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_daily_usages SET api_account_id = "
+                    "COALESCE(api_account_id, (SELECT id FROM upstream_account_configs "
+                    "WHERE upstream_account_configs.sub2api_account_id = "
+                    "upstream_account_daily_usages.sub2api_account_id LIMIT 1))"
+                )
+            )
+        if (
+            {"sub2api_account_id", "upstream_api_key_id"}.issubset(
+                account_config_columns
+            )
+            and "upstream_api_key_id" in account_columns
+        ):
+            await conn.execute(
+                text(
+                    "UPDATE upstream_account_daily_usages SET upstream_api_key_id = "
+                    "COALESCE(upstream_api_key_id, (SELECT upstream_api_key_id "
+                    "FROM upstream_account_configs WHERE "
+                    "upstream_account_configs.sub2api_account_id = "
+                    "upstream_account_daily_usages.sub2api_account_id LIMIT 1))"
+                )
+            )
         await conn.execute(
             text(
                 "UPDATE upstream_account_daily_usages SET "
@@ -978,6 +1224,18 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_upstream_account_daily_usages_channel_identity "
                 "ON upstream_account_daily_usages (channel_identity)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_upstream_account_daily_usages_api_account_id "
+                "ON upstream_account_daily_usages (api_account_id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_upstream_account_daily_usages_upstream_api_key_id "
+                "ON upstream_account_daily_usages (upstream_api_key_id)"
             )
         )
 
@@ -1127,6 +1385,130 @@ async def _migrate_upstream_usage_history(conn: AsyncConnection) -> None:
             )
         )
 
+    upstream_columns = {
+        str(row[1])
+        for row in (
+            await conn.execute(text("PRAGMA table_info(upstream_channels)"))
+        ).fetchall()
+    }
+
+    if "stable_id" in upstream_columns:
+        archived_candidates: dict[int, str | None] = {}
+        for table_name, columns in (
+            ("upstream_channel_daily_usages", channel_columns),
+            ("upstream_account_daily_usages", account_columns),
+            ("upstream_channel_usage_totals", total_columns),
+        ):
+            if "channel_id" not in columns:
+                continue
+            name_expression = "MAX(channel_name)" if "channel_name" in columns else "NULL"
+            rows = (
+                await conn.execute(
+                    text(
+                        f"SELECT channel_id, {name_expression} AS channel_name "
+                        f"FROM {table_name} GROUP BY channel_id"
+                    )
+                )
+            ).mappings().all()
+            for row in rows:
+                if row["channel_id"] is None:
+                    continue
+                archived_candidates.setdefault(
+                    int(row["channel_id"]),
+                    str(row["channel_name"] or "").strip() or None,
+                )
+
+        existing_ids = {
+            int(value)
+            for value in (
+                await conn.execute(text("SELECT id FROM upstream_channels"))
+            ).scalars()
+        }
+        for orphan_id, archived_name in sorted(archived_candidates.items()):
+            if orphan_id in existing_ids:
+                continue
+            archived_uuid = str(uuid4())
+            archived_values = {
+                "id": orphan_id,
+                "stable_id": archived_uuid,
+                "display_name": (archived_name or f"Archived upstream #{orphan_id}")[:200],
+                "canonical_base_url": (
+                    f"archived://legacy-upstream/{orphan_id}/{archived_uuid}"
+                ),
+                "upstream_type": "auto",
+                "probe_enabled": 0,
+                "deleted_at": "CURRENT_TIMESTAMP",
+                "created_at": "CURRENT_TIMESTAMP",
+                "updated_at": "CURRENT_TIMESTAMP",
+            }
+            insert_columns = [
+                column for column in archived_values if column in upstream_columns
+            ]
+            value_expressions = [
+                archived_values[column]
+                if archived_values[column] == "CURRENT_TIMESTAMP"
+                else f":{column}"
+                for column in insert_columns
+            ]
+            await conn.execute(
+                text(
+                    f"INSERT INTO upstream_channels ({', '.join(insert_columns)}) "
+                    f"VALUES ({', '.join(value_expressions)})"
+                ),
+                {
+                    column: value
+                    for column, value in archived_values.items()
+                    if column in insert_columns and value != "CURRENT_TIMESTAMP"
+                },
+            )
+            existing_ids.add(orphan_id)
+
+    # Move every non-conflicting history key from a mutable URL to the
+    # immutable upstream UUID. Conflicting same-day legacy segments remain
+    # addressable through channel_id and are included by the history service.
+    if "stable_id" in upstream_columns and channel_columns and "channel_identity" in channel_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_daily_usages AS history "
+                "SET channel_identity = (SELECT stable_id FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id) "
+                "WHERE EXISTS (SELECT 1 FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id "
+                "AND stable_id IS NOT NULL) "
+                "AND NOT EXISTS (SELECT 1 FROM upstream_channel_daily_usages AS current "
+                "WHERE current.id <> history.id "
+                "AND current.channel_identity = (SELECT stable_id FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id) "
+                "AND current.usage_date = history.usage_date)"
+            )
+        )
+    if "stable_id" in upstream_columns and account_columns and "channel_identity" in account_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_account_daily_usages AS history "
+                "SET channel_identity = (SELECT stable_id FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id) "
+                "WHERE EXISTS (SELECT 1 FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id "
+                "AND stable_id IS NOT NULL)"
+            )
+        )
+    if "stable_id" in upstream_columns and total_columns and "channel_identity" in total_columns:
+        await conn.execute(
+            text(
+                "UPDATE upstream_channel_usage_totals AS history "
+                "SET channel_identity = (SELECT stable_id FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id) "
+                "WHERE EXISTS (SELECT 1 FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id "
+                "AND stable_id IS NOT NULL) "
+                "AND NOT EXISTS (SELECT 1 FROM upstream_channel_usage_totals AS current "
+                "WHERE current.channel_identity = (SELECT stable_id FROM upstream_channels "
+                "WHERE upstream_channels.id = history.channel_id) "
+                "AND current.channel_identity <> history.channel_identity)"
+            )
+        )
+
 
 async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
     await conn.execute(
@@ -1161,7 +1543,11 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
         text("DROP TRIGGER IF EXISTS trg_upstream_priority_interval_no_overlap_update")
     )
 
-    result = await conn.execute(text("PRAGMA table_info(upstream_account_configs)"))
+    tables = await _sqlite_table_names(conn)
+    account_table = (
+        "api_accounts" if "api_accounts" in tables else "upstream_account_configs"
+    )
+    result = await conn.execute(text(f'PRAGMA table_info("{account_table}")'))
     columns = {str(row[1]) for row in result.fetchall()}
     if not columns:
         return
@@ -1177,23 +1563,23 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
     for column, column_type in priority_columns.items():
         if column not in columns:
             await conn.execute(
-                text(f"ALTER TABLE upstream_account_configs ADD COLUMN {column} {column_type}")
+                text(f'ALTER TABLE "{account_table}" ADD COLUMN {column} {column_type}')
             )
             columns.add(column)
     await conn.execute(
         text(
-            "UPDATE upstream_account_configs SET priority_sync_status = 'unassigned' "
+            f'UPDATE "{account_table}" SET priority_sync_status = \'unassigned\' '
             "WHERE priority_sync_status IS NULL OR TRIM(priority_sync_status) = ''"
         )
     )
     await conn.execute(
         text(
-            "CREATE INDEX IF NOT EXISTS ix_upstream_account_configs_priority_interval_id "
-            "ON upstream_account_configs (priority_interval_id)"
+            f'CREATE INDEX IF NOT EXISTS ix_{account_table}_priority_interval_id '
+            f'ON "{account_table}" (priority_interval_id)'
         )
     )
 
-    result = await conn.execute(text("PRAGMA foreign_key_list(upstream_account_configs)"))
+    result = await conn.execute(text(f'PRAGMA foreign_key_list("{account_table}")'))
     has_interval_foreign_key = any(
         str(row[2]) == "upstream_priority_intervals"
         and str(row[3]) == "priority_interval_id"
@@ -1208,7 +1594,7 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
         text(
             "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_cleanup_delete "
             "BEFORE DELETE ON upstream_priority_intervals "
-            "BEGIN UPDATE upstream_account_configs SET priority_interval_id = NULL, "
+            f'BEGIN UPDATE "{account_table}" SET priority_interval_id = NULL, '
             "desired_priority = NULL, priority_tiebreak_order = NULL, "
             "priority_tiebreak_multiplier = NULL, priority_sync_status = 'unassigned', "
             "priority_sync_error = NULL WHERE priority_interval_id = OLD.id; END"
@@ -1218,7 +1604,7 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
         return
     await conn.execute(
         text(
-            "UPDATE upstream_account_configs SET priority_interval_id = NULL, "
+            f'UPDATE "{account_table}" SET priority_interval_id = NULL, '
             "desired_priority = NULL, priority_tiebreak_order = NULL, "
             "priority_tiebreak_multiplier = NULL, priority_sync_status = 'unassigned', "
             "priority_sync_error = NULL WHERE priority_interval_id IS NOT NULL "
@@ -1229,7 +1615,7 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
     await conn.execute(
         text(
             "CREATE TRIGGER IF NOT EXISTS trg_upstream_account_priority_interval_insert "
-            "BEFORE INSERT ON upstream_account_configs "
+            f'BEFORE INSERT ON "{account_table}" '
             "WHEN NEW.priority_interval_id IS NOT NULL AND NOT EXISTS "
             "(SELECT 1 FROM upstream_priority_intervals WHERE id = NEW.priority_interval_id) "
             "BEGIN SELECT RAISE(ABORT, 'invalid upstream priority interval reference'); END"
@@ -1238,7 +1624,7 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
     await conn.execute(
         text(
             "CREATE TRIGGER IF NOT EXISTS trg_upstream_account_priority_interval_update "
-            "BEFORE UPDATE OF priority_interval_id ON upstream_account_configs "
+            f'BEFORE UPDATE OF priority_interval_id ON "{account_table}" '
             "WHEN NEW.priority_interval_id IS NOT NULL AND NOT EXISTS "
             "(SELECT 1 FROM upstream_priority_intervals WHERE id = NEW.priority_interval_id) "
             "BEGIN SELECT RAISE(ABORT, 'invalid upstream priority interval reference'); END"
@@ -1248,7 +1634,7 @@ async def _migrate_upstream_priority_intervals(conn: AsyncConnection) -> None:
         text(
             "CREATE TRIGGER IF NOT EXISTS trg_upstream_priority_interval_delete "
             "AFTER DELETE ON upstream_priority_intervals "
-            "BEGIN UPDATE upstream_account_configs SET priority_interval_id = NULL, "
+            f'BEGIN UPDATE "{account_table}" SET priority_interval_id = NULL, '
             "desired_priority = NULL, priority_tiebreak_order = NULL, "
             "priority_tiebreak_multiplier = NULL, priority_sync_status = 'unassigned', "
             "priority_sync_error = NULL WHERE priority_interval_id = OLD.id; END"
@@ -1594,23 +1980,699 @@ async def _migrate_duplicate_group_deletion_events(conn: AsyncConnection) -> Non
     )
 
 
+_LEGACY_UPSTREAM_COLLISIONS = {
+    "upstream_groups": "legacy_upstream_groups_v1",
+    "upstream_api_keys": "legacy_upstream_api_keys_v1",
+    "upstream_rate_change_logs": "legacy_upstream_rate_change_logs_v1",
+    "account_scheduling_change_logs": "legacy_account_scheduling_change_logs_v1",
+}
+
+
+async def _sqlite_table_names(conn: AsyncConnection) -> set[str]:
+    rows = await conn.execute(text("SELECT name FROM sqlite_master WHERE type = 'table'"))
+    return {str(row[0]) for row in rows.fetchall()}
+
+
+async def _prepare_upstream_domain_v2(conn: AsyncConnection) -> bool:
+    """Move colliding v1 tables aside before SQLAlchemy creates the v2 schema."""
+
+    tables = await _sqlite_table_names(conn)
+    legacy_present = "upstream_channels" in tables
+    if not legacy_present:
+        return False
+    for source, archived in _LEGACY_UPSTREAM_COLLISIONS.items():
+        if source in tables and archived not in tables:
+            indexes = await conn.execute(text(f'PRAGMA index_list("{source}")'))
+            for index in indexes.fetchall():
+                index_name = str(index[1])
+                index_origin = str(index[3]) if len(index) > 3 else ""
+                if index_origin == "c" and not index_name.startswith("sqlite_autoindex_"):
+                    escaped_name = index_name.replace('"', '""')
+                    await conn.execute(text(f'DROP INDEX "{escaped_name}"'))
+            await conn.execute(text(f'ALTER TABLE "{source}" RENAME TO "{archived}"'))
+    return True
+
+
+async def _rename_upstream_domain_v2_columns(conn: AsyncConnection) -> None:
+    """Finish v2 naming for databases created during the domain upgrade."""
+
+    tables = await _sqlite_table_names(conn)
+    mappings = {
+        "upstreams": {
+            "canonical_base_url": "api_endpoint_url",
+            "archived_canonical_base_url": "archived_api_endpoint_url",
+            "management_base_url": "management_url",
+            "upstream_type": "platform_type",
+            "resolved_upstream_type": "resolved_platform_type",
+            "manual_recharge_multiplier": "upstream_recharge_multiplier_override",
+            "discovered_recharge_multiplier": "discovered_upstream_recharge_multiplier",
+        },
+        "api_accounts": {
+            "upstream_api_key_record_id": "remote_upstream_api_key_id",
+            "base_url": "api_endpoint_url",
+            "upstream_type": "platform_type",
+            "resolved_upstream_type": "resolved_platform_type",
+            "manual_group_multiplier": "upstream_group_multiplier_override",
+            "manual_recharge_multiplier": "upstream_recharge_multiplier_override",
+            "discovered_group_multiplier": "discovered_upstream_group_multiplier",
+            "discovered_recharge_multiplier": "discovered_upstream_recharge_multiplier",
+            "today_management_stats_status": "today_management_site_stats_status",
+            "today_management_stats_checked_at": "today_management_site_stats_checked_at",
+        },
+        "api_account_daily_usages": {
+            "upstream_api_key_record_id": "remote_upstream_api_key_id",
+        },
+    }
+    for table_name, column_mapping in mappings.items():
+        if table_name not in tables:
+            continue
+        columns = await _table_columns(conn, table_name)
+        for old_name, new_name in column_mapping.items():
+            if old_name not in columns or new_name in columns:
+                continue
+            await conn.execute(
+                text(
+                    f'ALTER TABLE "{table_name}" RENAME COLUMN '
+                    f'"{old_name}" TO "{new_name}"'
+                )
+            )
+            columns.remove(old_name)
+            columns.add(new_name)
+
+    if "upstreams" in tables:
+        await conn.execute(text("DROP INDEX IF EXISTS uq_upstreams_active_canonical_base_url"))
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_upstreams_active_api_endpoint_url "
+                "ON upstreams (api_endpoint_url) WHERE deleted_at IS NULL"
+            )
+        )
+    if "api_accounts" in tables:
+        await conn.execute(text("DROP INDEX IF EXISTS uq_api_accounts_upstream_record_id"))
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_api_accounts_upstream_remote_key_id "
+                "ON api_accounts (upstream_id, remote_upstream_api_key_id)"
+            )
+        )
+    if "upstream_change_events" in tables:
+        await conn.execute(
+            text(
+                "UPDATE upstream_change_events "
+                "SET event_type = 'upstream_recharge_multiplier_changed' "
+                "WHERE event_type IN ('channel_multiplier_changed', "
+                "'upstream_multiplier_changed')"
+            )
+            )
+
+
+async def _rename_management_account_columns(conn: AsyncConnection) -> None:
+    """Rename management-site account identifiers outside the upstream domain."""
+
+    tables = await _sqlite_table_names(conn)
+    table_names = (
+        "account_snapshots",
+        "refresh_jobs",
+        "account_exception_records",
+        "usage_window_states",
+        "usage_limit_samples",
+        "usage_token_windows",
+    )
+    for table_name in table_names:
+        if table_name not in tables:
+            continue
+        columns = await _table_columns(conn, table_name)
+        if "sub2api_account_id" in columns and "management_account_id" not in columns:
+            await conn.execute(
+                text(
+                    f'ALTER TABLE "{table_name}" RENAME COLUMN '
+                    '"sub2api_account_id" TO "management_account_id"'
+                )
+            )
+
+    for table_name in table_names:
+        await conn.execute(
+            text(f"DROP INDEX IF EXISTS ix_{table_name}_sub2api_account_id")
+        )
+        if table_name in tables:
+            await conn.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS ix_{table_name}_management_account_id "
+                    f'ON "{table_name}" (management_account_id)'
+                )
+            )
+
+
+async def _migrate_persisted_domain_values(conn: AsyncConnection) -> None:
+    """Normalize renamed enum values and invalidate stale JSON contracts."""
+
+    tables = await _sqlite_table_names(conn)
+    if "api_account_pause_holds" in tables:
+        await conn.execute(
+            text(
+                "UPDATE api_account_pause_holds AS current SET "
+                "active = MAX(current.active, COALESCE((SELECT legacy.active "
+                "FROM api_account_pause_holds AS legacy "
+                "WHERE legacy.api_account_id = current.api_account_id "
+                "AND legacy.reason = 'channel_monitor_unavailable' LIMIT 1), 0)), "
+                "resolved_at = CASE WHEN current.active = 1 OR EXISTS ("
+                "SELECT 1 FROM api_account_pause_holds AS legacy "
+                "WHERE legacy.api_account_id = current.api_account_id "
+                "AND legacy.reason = 'channel_monitor_unavailable' "
+                "AND legacy.active = 1) THEN NULL ELSE current.resolved_at END "
+                "WHERE current.reason = 'upstream_monitor_unavailable'"
+            )
+        )
+        await conn.execute(
+            text(
+                "DELETE FROM api_account_pause_holds AS legacy "
+                "WHERE legacy.reason = 'channel_monitor_unavailable' AND EXISTS ("
+                "SELECT 1 FROM api_account_pause_holds AS current "
+                "WHERE current.api_account_id = legacy.api_account_id "
+                "AND current.reason = 'upstream_monitor_unavailable')"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE api_account_pause_holds "
+                "SET reason = 'upstream_monitor_unavailable' "
+                "WHERE reason = 'channel_monitor_unavailable'"
+            )
+        )
+    if "usage_estimate_cache" in tables:
+        await conn.execute(
+            text(
+                "DELETE FROM usage_estimate_cache "
+                "WHERE CAST(payload AS TEXT) LIKE '%\"sub2api_account_id\"%'"
+            )
+        )
+
+
+async def _table_columns(conn: AsyncConnection, table_name: str) -> set[str]:
+    rows = await conn.execute(text(f'PRAGMA table_info("{table_name}")'))
+    return {str(row[1]) for row in rows.fetchall()}
+
+
+async def _insert_dict(conn: AsyncConnection, table_name: str, values: dict) -> None:
+    columns = await _table_columns(conn, table_name)
+    payload = {key: value for key, value in values.items() if key in columns}
+    names = list(payload)
+    if not names:
+        return
+    quoted = ", ".join(f'"{name}"' for name in names)
+    parameters = ", ".join(f":{name}" for name in names)
+    await conn.execute(
+        text(f'INSERT INTO "{table_name}" ({quoted}) VALUES ({parameters})'),
+        payload,
+    )
+
+
+def _valid_uuid(value: object) -> str | None:
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _renamed_row(row: dict, mapping: dict[str, str]) -> dict:
+    values = dict(row)
+    for old_name, new_name in mapping.items():
+        if old_name in row:
+            values[new_name] = row[old_name]
+        values.pop(old_name, None)
+    return values
+
+
+async def _migrate_upstream_domain_v2(conn: AsyncConnection) -> None:
+    """Replace URL/int-based upstream storage with the final UUID domain schema."""
+
+    tables = await _sqlite_table_names(conn)
+    if "upstream_channels" not in tables:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    upstream_rows = (
+        await conn.execute(text("SELECT * FROM upstream_channels ORDER BY id"))
+    ).mappings().all()
+    upstream_ids: dict[int, str] = {}
+    identity_ids: dict[str, str] = {}
+    upstream_mapping = {
+        "canonical_base_url": "api_endpoint_url",
+        "archived_canonical_base_url": "archived_api_endpoint_url",
+        "management_base_url": "management_url",
+        "upstream_type": "platform_type",
+        "resolved_upstream_type": "resolved_platform_type",
+        "manual_recharge_multiplier": "upstream_recharge_multiplier_override",
+        "discovered_recharge_multiplier": "discovered_upstream_recharge_multiplier",
+        "effective_recharge_multiplier": "upstream_recharge_multiplier",
+        "balance_remaining": "wallet_balance_usd",
+        "balance_total": "wallet_total_usd",
+        "balance_used": "wallet_used_usd",
+        "today_balance_used": "today_upstream_wallet_cost_usd",
+        "yesterday_balance_used": "yesterday_upstream_wallet_cost_usd",
+        "channel_monitors": "upstream_monitors",
+        "channel_monitor_test_models": "upstream_monitor_test_models",
+        "channel_monitor_count": "upstream_monitor_count",
+        "channel_monitor_status": "upstream_monitor_status",
+        "channel_monitor_message": "upstream_monitor_message",
+        "channel_monitor_checked_at": "upstream_monitor_checked_at",
+        "channel_monitor_guard_state": "upstream_monitor_guard_state",
+        "channel_monitor_unavailable_count": "upstream_monitor_unavailable_count",
+        "channel_monitor_recovery_count": "upstream_monitor_recovery_count",
+        "channel_monitor_guard_checked_at": "upstream_monitor_guard_checked_at",
+    }
+    for row_view in upstream_rows:
+        row = dict(row_view)
+        upstream_id = _valid_uuid(row.get("stable_id")) or str(uuid4())
+        old_id = int(row["id"])
+        upstream_ids[old_id] = upstream_id
+        for identity in (row.get("stable_id"), row.get("canonical_base_url")):
+            normalized = str(identity or "").strip()
+            if normalized:
+                identity_ids[normalized] = upstream_id
+        values = _renamed_row(row, upstream_mapping)
+        values["id"] = upstream_id
+        values.pop("stable_id", None)
+        await _insert_dict(conn, "upstreams", values)
+
+    async def archived_upstream(
+        old_id: object,
+        identity: object,
+        display_name: object = None,
+    ) -> str:
+        try:
+            numeric_id = int(old_id) if old_id is not None else None
+        except (TypeError, ValueError):
+            numeric_id = None
+        if numeric_id is not None and numeric_id in upstream_ids:
+            return upstream_ids[numeric_id]
+        normalized_identity = str(identity or "").strip()
+        if normalized_identity and normalized_identity in identity_ids:
+            return identity_ids[normalized_identity]
+        archive_key = normalized_identity or f"legacy-channel:{numeric_id or 'unknown'}"
+        archive_id = str(uuid5(UUID("87bc812a-2a1e-4b0d-aa80-791c8b2ac88e"), archive_key))
+        identity_ids[archive_key] = archive_id
+        if numeric_id is not None:
+            upstream_ids[numeric_id] = archive_id
+        existing = await conn.scalar(
+            text("SELECT id FROM upstreams WHERE id = :id"), {"id": archive_id}
+        )
+        if existing is None:
+            await _insert_dict(
+                conn,
+                "upstreams",
+                {
+                    "id": archive_id,
+                    "display_name": str(display_name or "归档上游")[:200],
+                    "api_endpoint_url": f"archived://{archive_id}",
+                    "platform_type": "auto",
+                    "probe_enabled": 0,
+                    "deleted_at": now,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        return archive_id
+
+    for source, target, id_column in (
+        ("legacy_upstream_groups_v1", "upstream_groups", "channel_id"),
+        ("legacy_upstream_api_keys_v1", "upstream_api_keys", "channel_id"),
+    ):
+        if source not in tables:
+            continue
+        rows = (await conn.execute(text(f'SELECT * FROM "{source}" ORDER BY id'))).mappings()
+        for row_view in rows:
+            row = dict(row_view)
+            values = dict(row)
+            values["upstream_id"] = await archived_upstream(
+                row.get(id_column), None, row.get("name") or row.get("remote_name")
+            )
+            values.pop(id_column, None)
+            await _insert_dict(conn, target, values)
+
+    account_rows = (
+        await conn.execute(text("SELECT * FROM upstream_account_configs ORDER BY id"))
+    ).mappings().all()
+    account_mapping = {
+        "sub2api_account_id": "management_account_id",
+        "channel_auto_assign_disabled": "upstream_auto_assign_disabled",
+        "upstream_api_key_record_id": "remote_upstream_api_key_id",
+        "base_url": "api_endpoint_url",
+        "upstream_type": "platform_type",
+        "resolved_upstream_type": "resolved_platform_type",
+        "manual_group_multiplier": "upstream_group_multiplier_override",
+        "manual_recharge_multiplier": "upstream_recharge_multiplier_override",
+        "discovered_group_multiplier": "discovered_upstream_group_multiplier",
+        "discovered_recharge_multiplier": "discovered_upstream_recharge_multiplier",
+        "effective_group_multiplier": "upstream_group_multiplier",
+        "effective_recharge_multiplier": "upstream_recharge_multiplier",
+        "local_recharge_multiplier": "management_recharge_multiplier",
+        "local_recharge_source": "management_recharge_source",
+        "local_recharge_status": "management_recharge_status",
+        "target_rate": "expected_management_billing_multiplier",
+        "current_rate": "management_billing_multiplier",
+        "balance_remaining": "wallet_balance_usd",
+        "balance_total": "wallet_total_usd",
+        "balance_used": "wallet_used_usd",
+        "upstream_usage_amount": "upstream_wallet_cost_usd",
+        "today_upstream_usage_amount": "today_upstream_wallet_cost_usd",
+        "today_sub2api_cost_amount": "today_management_account_cost_usd",
+        "today_sub2api_user_cost_amount": "today_management_user_charge_usd",
+        "today_sub2api_stats_status": "today_management_site_stats_status",
+        "today_sub2api_stats_checked_at": "today_management_site_stats_checked_at",
+        "balance_guard_channel_id": "balance_guard_upstream_id",
+        "auto_pause_channel_id": "auto_pause_upstream_id",
+    }
+    for row_view in account_rows:
+        row = dict(row_view)
+        values = _renamed_row(row, account_mapping)
+        values["upstream_id"] = (
+            await archived_upstream(row.get("channel_id"), None, row.get("remote_name"))
+            if row.get("channel_id") is not None
+            else None
+        )
+        if values.get("balance_guard_upstream_id") is not None:
+            values["balance_guard_upstream_id"] = await archived_upstream(
+                row.get("balance_guard_channel_id"), None
+            )
+        if values.get("auto_pause_upstream_id") is not None:
+            values["auto_pause_upstream_id"] = await archived_upstream(
+                row.get("auto_pause_channel_id"), None
+            )
+        if values.get("availability_check_mode") == "channel_monitor":
+            values["availability_check_mode"] = "upstream_monitor"
+        values.pop("channel_id", None)
+        await _insert_dict(conn, "api_accounts", values)
+
+    api_account_ids = {int(row["id"]) for row in account_rows}
+    upstream_api_key_ids = {
+        int(row[0])
+        for row in (
+            await conn.execute(text("SELECT id FROM upstream_api_keys"))
+        ).fetchall()
+    }
+
+    if "upstream_account_pause_holds" in tables:
+        rows = (
+            await conn.execute(text("SELECT * FROM upstream_account_pause_holds ORDER BY id"))
+        ).mappings()
+        for row_view in rows:
+            row = dict(row_view)
+            values = _renamed_row(
+                row,
+                {
+                    "account_config_id": "api_account_id",
+                    "scope_channel_id": "scope_upstream_id",
+                },
+            )
+            if row.get("scope_channel_id") is not None:
+                values["scope_upstream_id"] = await archived_upstream(
+                    row.get("scope_channel_id"), None
+                )
+            await _insert_dict(conn, "api_account_pause_holds", values)
+
+    daily_segments: dict[tuple[str, object], int] = {}
+    channel_history_count = 0
+    if "upstream_channel_daily_usages" in tables:
+        rows = (
+            await conn.execute(text("SELECT * FROM upstream_channel_daily_usages ORDER BY id"))
+        ).mappings()
+        for row_view in rows:
+            row = dict(row_view)
+            upstream_id = await archived_upstream(
+                row.get("channel_id"), row.get("channel_identity"), row.get("channel_name")
+            )
+            key = (upstream_id, row.get("usage_date"))
+            segment = daily_segments.get(key, 0)
+            daily_segments[key] = segment + 1
+            values = _renamed_row(
+                row,
+                {
+                    "channel_name": "upstream_name",
+                    "balance_used": "upstream_wallet_cost_usd",
+                    "balance_used_adjusted": "upstream_actual_cost_cny",
+                    "recharge_multiplier": "upstream_recharge_multiplier",
+                    "sub2api_cost": "management_account_cost_usd",
+                    "sub2api_cost_cny": "management_account_cost_cny",
+                    "sub2api_user_cost": "management_user_charge_usd",
+                    "income_recharge_multiplier": "management_recharge_multiplier",
+                    "income": "actual_income_cny",
+                },
+            )
+            values["upstream_id"] = upstream_id
+            values["source_segment"] = segment
+            values["management_user_charge_usd"] = values.get(
+                "management_user_charge_usd", row.get("sub2api_actual_cost")
+            )
+            values.pop("channel_id", None)
+            values.pop("channel_identity", None)
+            values.pop("sub2api_actual_cost", None)
+            await _insert_dict(conn, "upstream_daily_usages", values)
+            channel_history_count += 1
+
+    account_segments: dict[tuple[int, str, object], int] = {}
+    account_history_count = 0
+    if "upstream_account_daily_usages" in tables:
+        rows = (
+            await conn.execute(text("SELECT * FROM upstream_account_daily_usages ORDER BY id"))
+        ).mappings()
+        for row_view in rows:
+            row = dict(row_view)
+            upstream_id = await archived_upstream(
+                row.get("channel_id"), row.get("channel_identity"), row.get("account_name")
+            )
+            management_id = int(row["sub2api_account_id"])
+            key = (management_id, upstream_id, row.get("usage_date"))
+            segment = account_segments.get(key, 0)
+            account_segments[key] = segment + 1
+            upstream_multiplier = row.get("upstream_recharge_multiplier")
+            management_multiplier = row.get("local_recharge_multiplier")
+            if management_multiplier is None:
+                management_multiplier = row.get("management_recharge_multiplier")
+            upstream_cost = row.get("upstream_usage")
+            management_cost = row.get("sub2api_cost")
+            user_charge = row.get("sub2api_user_cost")
+            values = _renamed_row(
+                row,
+                {
+                    "sub2api_account_id": "management_account_id",
+                    "upstream_api_key_record_id": "remote_upstream_api_key_id",
+                    "upstream_usage": "upstream_wallet_cost_usd",
+                    "sub2api_cost": "management_account_cost_usd",
+                    "sub2api_user_cost": "management_user_charge_usd",
+                    "local_recharge_multiplier": "management_recharge_multiplier",
+                    "income": "actual_income_cny",
+                },
+            )
+            values.update(
+                {
+                    "upstream_id": upstream_id,
+                    "source_segment": segment,
+                    "upstream_actual_cost_cny": (
+                        float(upstream_cost) * float(upstream_multiplier)
+                        if upstream_cost is not None and upstream_multiplier is not None
+                        else None
+                    ),
+                    "management_account_cost_cny": (
+                        float(management_cost) * float(management_multiplier)
+                        if management_cost is not None and management_multiplier is not None
+                        else None
+                    ),
+                    "management_user_charge_usd": user_charge
+                    if user_charge is not None
+                    else row.get("sub2api_actual_cost"),
+                }
+            )
+            if values.get("api_account_id") not in api_account_ids:
+                values["api_account_id"] = None
+            if values.get("upstream_api_key_id") not in upstream_api_key_ids:
+                values["upstream_api_key_id"] = None
+            values.pop("channel_id", None)
+            values.pop("channel_identity", None)
+            values.pop("sub2api_actual_cost", None)
+            await _insert_dict(conn, "api_account_daily_usages", values)
+            account_history_count += 1
+
+    if "upstream_channel_usage_totals" in tables:
+        rows = (
+            await conn.execute(text("SELECT * FROM upstream_channel_usage_totals"))
+        ).mappings()
+        for row_view in rows:
+            row = dict(row_view)
+            upstream_id = await archived_upstream(
+                row.get("channel_id"), row.get("channel_identity"), row.get("channel_name")
+            )
+            values = _renamed_row(
+                row,
+                {
+                    "channel_name": "upstream_name",
+                    "total_balance_used": "total_upstream_wallet_cost_usd",
+                    "total_balance_used_adjusted": "total_upstream_actual_cost_cny",
+                    "total_sub2api_cost": "total_management_account_cost_usd",
+                    "total_sub2api_cost_cny": "total_management_account_cost_cny",
+                    "total_sub2api_user_cost": "total_management_user_charge_usd",
+                    "total_income": "total_actual_income_cny",
+                },
+            )
+            values["upstream_id"] = upstream_id
+            values.pop("channel_id", None)
+            values.pop("channel_identity", None)
+            await _insert_dict(conn, "upstream_usage_totals", values)
+
+    log_mappings = {
+        "sub2api_account_id": "management_account_id",
+        "channel_name": "upstream_name",
+        "local_recharge_multiplier": "management_recharge_multiplier",
+        "old_target_rate": "old_expected_management_billing_multiplier",
+        "new_target_rate": "new_expected_management_billing_multiplier",
+        "old_current_rate": "old_management_billing_multiplier",
+        "new_current_rate": "new_management_billing_multiplier",
+    }
+    for source, target, mapping in (
+        ("legacy_upstream_rate_change_logs_v1", "upstream_rate_change_logs", log_mappings),
+        (
+            "legacy_account_scheduling_change_logs_v1",
+            "account_scheduling_change_logs",
+            {"sub2api_account_id": "management_account_id", "channel_name": "upstream_name"},
+        ),
+        (
+            "upstream_account_data_archives",
+            "api_account_data_archives",
+            {"sub2api_account_id": "management_account_id", "channel_name": "upstream_name"},
+        ),
+        (
+            "upstream_channel_change_events",
+            "upstream_change_events",
+            {"channel_name": "upstream_name"},
+        ),
+    ):
+        if source not in tables:
+            continue
+        rows = (await conn.execute(text(f'SELECT * FROM "{source}" ORDER BY id'))).mappings()
+        for row_view in rows:
+            row = dict(row_view)
+            values = _renamed_row(row, mapping)
+            values["upstream_id"] = (
+                await archived_upstream(row.get("channel_id"), None, row.get("channel_name"))
+                if row.get("channel_id") is not None
+                else None
+            )
+            values.pop("channel_id", None)
+            if values.get("reason") == "channel_monitor_unavailable":
+                values["reason"] = "upstream_monitor_unavailable"
+            if values.get("event_type") == "channel_multiplier_changed":
+                values["event_type"] = "upstream_recharge_multiplier_changed"
+            await _insert_dict(conn, target, values)
+
+    expected_accounts = len(account_rows)
+    actual_accounts = int(await conn.scalar(text("SELECT COUNT(*) FROM api_accounts")) or 0)
+    actual_channel_history = int(
+        await conn.scalar(text("SELECT COUNT(*) FROM upstream_daily_usages")) or 0
+    )
+    actual_account_history = int(
+        await conn.scalar(text("SELECT COUNT(*) FROM api_account_daily_usages")) or 0
+    )
+    if (
+        actual_accounts != expected_accounts
+        or actual_channel_history != channel_history_count
+        or actual_account_history != account_history_count
+    ):
+        raise RuntimeError("upstream domain v2 migration row-count validation failed")
+    foreign_key_errors = (await conn.execute(text("PRAGMA foreign_key_check"))).fetchall()
+    if foreign_key_errors:
+        raise RuntimeError(f"upstream domain v2 migration foreign-key validation failed: {foreign_key_errors!r}")
+    old_wallet_total = await conn.scalar(
+        text("SELECT COALESCE(SUM(balance_used), 0) FROM upstream_channel_daily_usages")
+    )
+    new_wallet_total = await conn.scalar(
+        text("SELECT COALESCE(SUM(upstream_wallet_cost_usd), 0) FROM upstream_daily_usages")
+    )
+    if abs(float(old_wallet_total or 0) - float(new_wallet_total or 0)) > 1e-8:
+        raise RuntimeError("upstream domain v2 migration amount validation failed")
+
+    drop_order = (
+        "upstream_account_pause_holds",
+        "upstream_account_daily_usages",
+        "upstream_channel_daily_usages",
+        "upstream_channel_usage_totals",
+        "upstream_account_data_archives",
+        "legacy_upstream_rate_change_logs_v1",
+        "legacy_account_scheduling_change_logs_v1",
+        "upstream_channel_change_events",
+        "upstream_account_configs",
+        "legacy_upstream_api_keys_v1",
+        "legacy_upstream_groups_v1",
+        "upstream_channels",
+    )
+    for table_name in drop_order:
+        if table_name in await _sqlite_table_names(conn):
+            await conn.execute(text(f'DROP TABLE "{table_name}"'))
+
+
+async def _migrate_management_site_setting_keys(conn: AsyncConnection) -> None:
+    """Move persisted v1 setting names to the one-time management-site contract."""
+
+    key_map = {
+        "sub2api_base_url": "management_site_base_url",
+        "sub2api_base_url_source": "management_site_base_url_source",
+        "sub2api_x_api_key": "management_site_x_api_key",
+        "sub2api_auto_recover_state": "management_site_auto_recover_state",
+        "sub2api_last_scan_at": "management_site_last_scan_at",
+        "sub2api_last_scan_status": "management_site_last_scan_status",
+        "sub2api_last_scan_message": "management_site_last_scan_message",
+    }
+    for old_key, new_key in key_map.items():
+        await conn.execute(
+            text(
+                "INSERT OR IGNORE INTO app_settings (key, value, updated_at) "
+                "SELECT :new_key, value, updated_at FROM app_settings WHERE key = :old_key"
+            ),
+            {"old_key": old_key, "new_key": new_key},
+        )
+        await conn.execute(
+            text("DELETE FROM app_settings WHERE key = :old_key"),
+            {"old_key": old_key},
+        )
+
+
 async def init_db() -> None:
     from app import models  # noqa: F401
 
     async with engine.begin() as conn:
+        legacy_upstream_domain = False
         if is_sqlite:
             await conn.execute(text("PRAGMA journal_mode=WAL"))
+            legacy_upstream_domain = "upstream_channels" in await _sqlite_table_names(conn)
+            if legacy_upstream_domain:
+                await _migrate_upstream_channels(conn)
+                await _migrate_upstream_usage_history(conn)
+                await _migrate_upstream_rate_change_logs(conn)
+                await _migrate_legacy_rate_logs_to_change_events(conn)
+                await _migrate_recharge_multiplier_change_baselines(conn)
+                await _migrate_duplicate_group_deletion_events(conn)
+                await _migrate_upstream_priority_intervals(conn)
+                await _scrub_upstream_plaintext_secret_copies(conn)
+                await _prepare_upstream_domain_v2(conn)
+            await _rename_upstream_domain_v2_columns(conn)
+            await _rename_management_account_columns(conn)
         await conn.run_sync(Base.metadata.create_all)
         if is_sqlite:
-            await _migrate_upstream_channels(conn)
-            await _migrate_upstream_usage_history(conn)
-            await _migrate_upstream_rate_change_logs(conn)
-            await _migrate_legacy_rate_logs_to_change_events(conn)
-            await _migrate_recharge_multiplier_change_baselines(conn)
-            await _migrate_duplicate_group_deletion_events(conn)
+            upstream_columns = await _table_columns(conn, "upstreams")
+            for column in (
+                "encrypted_login_username",
+                "encrypted_login_password",
+            ):
+                if column not in upstream_columns:
+                    await conn.execute(
+                        text(f'ALTER TABLE "upstreams" ADD COLUMN "{column}" TEXT')
+                    )
+                    upstream_columns.add(column)
+            await _migrate_persisted_domain_values(conn)
+            await _migrate_management_site_setting_keys(conn)
+            if legacy_upstream_domain:
+                await _migrate_upstream_domain_v2(conn)
             await _migrate_notification_outbox(conn)
             await _migrate_upstream_priority_intervals(conn)
-            await _scrub_upstream_plaintext_secret_copies(conn)
             result = await conn.execute(text("PRAGMA table_info(mailbox_credentials)"))
             columns = {str(row[1]) for row in result.fetchall()}
             if "encrypted_access_token" not in columns:
@@ -1627,7 +2689,7 @@ async def init_db() -> None:
                     "id INTEGER NOT NULL PRIMARY KEY, "
                     "fingerprint VARCHAR(384) NOT NULL, "
                     "email VARCHAR(320), "
-                    "sub2api_account_id VARCHAR(64), "
+                    "management_account_id VARCHAR(64), "
                     "source VARCHAR(32) NOT NULL, "
                     "status VARCHAR(32) NOT NULL, "
                     "message TEXT NOT NULL, "
@@ -1643,7 +2705,7 @@ async def init_db() -> None:
             account_exception_missing_columns = {
                 "fingerprint": "VARCHAR(384)",
                 "email": "VARCHAR(320)",
-                "sub2api_account_id": "VARCHAR(64)",
+                "management_account_id": "VARCHAR(64)",
                 "source": "VARCHAR(32) NOT NULL DEFAULT 'account'",
                 "status": "VARCHAR(32) NOT NULL DEFAULT 'error'",
                 "message": "TEXT NOT NULL DEFAULT ''",
@@ -1659,7 +2721,7 @@ async def init_db() -> None:
             )
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_account_exception_records_email ON account_exception_records (email)"))
             await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS ix_account_exception_records_sub2api_account_id ON account_exception_records (sub2api_account_id)")
+                text("CREATE INDEX IF NOT EXISTS ix_account_exception_records_management_account_id ON account_exception_records (management_account_id)")
             )
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_account_exception_records_source ON account_exception_records (source)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_account_exception_records_status ON account_exception_records (status)"))
@@ -1721,7 +2783,7 @@ async def init_db() -> None:
                     "id INTEGER NOT NULL PRIMARY KEY, "
                     "account_key VARCHAR(384) NOT NULL, "
                     "email VARCHAR(320), "
-                    "sub2api_account_id VARCHAR(64), "
+                    "management_account_id VARCHAR(64), "
                      "window_key VARCHAR(32) NOT NULL, "
                      "baseline_spent FLOAT, "
                      "estimate_uses_spent_delta BOOLEAN DEFAULT 0, "
@@ -1738,7 +2800,7 @@ async def init_db() -> None:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_window_states_account_key ON usage_window_states (account_key)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_window_states_email ON usage_window_states (email)"))
             await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS ix_usage_window_states_sub2api_account_id ON usage_window_states (sub2api_account_id)")
+                text("CREATE INDEX IF NOT EXISTS ix_usage_window_states_management_account_id ON usage_window_states (management_account_id)")
             )
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_window_states_window_key ON usage_window_states (window_key)"))
             result = await conn.execute(text("PRAGMA table_info(usage_window_states)"))
@@ -1753,7 +2815,7 @@ async def init_db() -> None:
                     "id INTEGER NOT NULL PRIMARY KEY, "
                     "account_key VARCHAR(384) NOT NULL, "
                     "email VARCHAR(320), "
-                    "sub2api_account_id VARCHAR(64), "
+                    "management_account_id VARCHAR(64), "
                     "plan_cohort VARCHAR(32) NOT NULL DEFAULT 'unknown', "
                     "window_key VARCHAR(32) NOT NULL, "
                     "reset_key VARCHAR(256) NOT NULL, "
@@ -1770,7 +2832,7 @@ async def init_db() -> None:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_limit_samples_account_key ON usage_limit_samples (account_key)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_limit_samples_email ON usage_limit_samples (email)"))
             await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS ix_usage_limit_samples_sub2api_account_id ON usage_limit_samples (sub2api_account_id)")
+                text("CREATE INDEX IF NOT EXISTS ix_usage_limit_samples_management_account_id ON usage_limit_samples (management_account_id)")
             )
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_limit_samples_window_key ON usage_limit_samples (window_key)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_limit_samples_reset_key ON usage_limit_samples (reset_key)"))
@@ -1858,7 +2920,7 @@ async def init_db() -> None:
                     "id INTEGER NOT NULL PRIMARY KEY, "
                     "account_key VARCHAR(384) NOT NULL, "
                     "email VARCHAR(320), "
-                    "sub2api_account_id VARCHAR(64), "
+                    "management_account_id VARCHAR(64), "
                     "window_key VARCHAR(32) NOT NULL, "
                     "window_reset_key VARCHAR(256) NOT NULL, "
                     "window_start_at VARCHAR(128), "
@@ -1876,7 +2938,7 @@ async def init_db() -> None:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_token_windows_account_key ON usage_token_windows (account_key)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_token_windows_email ON usage_token_windows (email)"))
             await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS ix_usage_token_windows_sub2api_account_id ON usage_token_windows (sub2api_account_id)")
+                text("CREATE INDEX IF NOT EXISTS ix_usage_token_windows_management_account_id ON usage_token_windows (management_account_id)")
             )
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_token_windows_window_key ON usage_token_windows (window_key)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_usage_token_windows_window_reset_key ON usage_token_windows (window_reset_key)"))

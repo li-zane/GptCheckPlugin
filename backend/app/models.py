@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -24,12 +26,16 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def new_upstream_id() -> str:
+    return str(uuid4())
+
+
 class AccountSnapshot(Base):
     __tablename__ = "account_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(320), index=True, unique=True)
-    sub2api_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
     platform: Mapped[str | None] = mapped_column(String(64), index=True)
     account_type: Mapped[str | None] = mapped_column(String(64), index=True)
     status: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -131,7 +137,7 @@ class RefreshJob(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(320), index=True)
-    sub2api_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     reason: Mapped[str | None] = mapped_column(Text)
     access_token_tail: Mapped[str | None] = mapped_column(String(16))
@@ -159,7 +165,7 @@ class AccountExceptionRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     fingerprint: Mapped[str] = mapped_column(String(384), index=True)
     email: Mapped[str | None] = mapped_column(String(320), index=True)
-    sub2api_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
     source: Mapped[str] = mapped_column(String(32), index=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     message: Mapped[str] = mapped_column(Text)
@@ -175,7 +181,7 @@ class UsageWindowState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_key: Mapped[str] = mapped_column(String(384), index=True)
     email: Mapped[str | None] = mapped_column(String(320), index=True)
-    sub2api_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
     window_key: Mapped[str] = mapped_column(String(32), index=True)
     baseline_spent: Mapped[float | None] = mapped_column(Float)
     estimate_uses_spent_delta: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -194,7 +200,7 @@ class UsageLimitSample(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_key: Mapped[str] = mapped_column(String(384), index=True)
     email: Mapped[str | None] = mapped_column(String(320), index=True)
-    sub2api_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
     plan_cohort: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False, index=True)
     window_key: Mapped[str] = mapped_column(String(32), index=True)
     reset_key: Mapped[str] = mapped_column(String(256), index=True)
@@ -213,7 +219,7 @@ class UsageTokenWindow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_key: Mapped[str] = mapped_column(String(384), index=True)
     email: Mapped[str | None] = mapped_column(String(320), index=True)
-    sub2api_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_account_id: Mapped[str | None] = mapped_column(String(64), index=True)
     window_key: Mapped[str] = mapped_column(String(32), index=True)
     window_reset_key: Mapped[str] = mapped_column(String(256), index=True)
     window_start_at: Mapped[str | None] = mapped_column(String(128))
@@ -243,27 +249,38 @@ class UsageEstimateCache(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
-class UpstreamChannel(Base):
-    __tablename__ = "upstream_channels"
+class Upstream(Base):
+    __tablename__ = "upstreams"
+    __table_args__ = (
+        Index(
+            "uq_upstreams_active_api_endpoint_url",
+            "api_endpoint_url",
+            unique=True,
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_upstream_id)
     display_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    canonical_base_url: Mapped[str] = mapped_column(String(500), unique=True, index=True, nullable=False)
-    management_base_url: Mapped[str | None] = mapped_column(String(500))
-    upstream_type: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
+    api_endpoint_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    archived_api_endpoint_url: Mapped[str | None] = mapped_column(String(500))
+    management_url: Mapped[str | None] = mapped_column(String(500))
+    platform_type: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
     probe_enabled: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
         server_default="1",
         nullable=False,
     )
-    resolved_upstream_type: Mapped[str | None] = mapped_column(String(32))
+    resolved_platform_type: Mapped[str | None] = mapped_column(String(32))
     encrypted_access_token: Mapped[str | None] = mapped_column(Text)
     encrypted_refresh_token: Mapped[str | None] = mapped_column(Text)
+    encrypted_login_username: Mapped[str | None] = mapped_column(Text)
+    encrypted_login_password: Mapped[str | None] = mapped_column(Text)
     upstream_user_id: Mapped[str | None] = mapped_column(String(128))
-    manual_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    discovered_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    effective_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_recharge_multiplier_override: Mapped[float | None] = mapped_column(Float)
+    discovered_upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     last_known_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     recharge_multiplier_source: Mapped[str | None] = mapped_column(String(128))
     recharge_multiplier_status: Mapped[str | None] = mapped_column(String(32))
@@ -275,19 +292,19 @@ class UpstreamChannel(Base):
     pending_group_removal_checked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
-    balance_remaining: Mapped[float | None] = mapped_column(Float)
-    balance_total: Mapped[float | None] = mapped_column(Float)
-    balance_used: Mapped[float | None] = mapped_column(Float)
+    wallet_balance_usd: Mapped[float | None] = mapped_column(Float)
+    wallet_total_usd: Mapped[float | None] = mapped_column(Float)
+    wallet_used_usd: Mapped[float | None] = mapped_column(Float)
     balance_unit: Mapped[str | None] = mapped_column(String(32))
     balance_status: Mapped[str | None] = mapped_column(String(32))
     balance_source: Mapped[str | None] = mapped_column(String(64))
     balance_message: Mapped[str | None] = mapped_column(Text)
     balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    today_balance_used: Mapped[float | None] = mapped_column(Float)
+    today_upstream_wallet_cost_usd: Mapped[float | None] = mapped_column(Float)
     today_balance_unit: Mapped[str | None] = mapped_column(String(32))
     today_balance_status: Mapped[str | None] = mapped_column(String(32))
     today_balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    yesterday_balance_used: Mapped[float | None] = mapped_column(Float)
+    yesterday_upstream_wallet_cost_usd: Mapped[float | None] = mapped_column(Float)
     yesterday_balance_unit: Mapped[str | None] = mapped_column(String(32))
     yesterday_balance_status: Mapped[str | None] = mapped_column(String(32))
     yesterday_balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -301,68 +318,129 @@ class UpstreamChannel(Base):
     balance_guard_paused_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
-    channel_monitors: Mapped[list[dict] | None] = mapped_column(JSON)
-    channel_monitor_test_models: Mapped[dict | None] = mapped_column(JSON)
-    channel_monitor_count: Mapped[int] = mapped_column(
+    upstream_monitors: Mapped[list[dict] | None] = mapped_column(JSON)
+    upstream_monitor_test_models: Mapped[dict | None] = mapped_column(JSON)
+    upstream_monitor_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
-    channel_monitor_status: Mapped[str] = mapped_column(
+    upstream_monitor_status: Mapped[str] = mapped_column(
         String(32), default="not_checked", server_default="not_checked", nullable=False
     )
-    channel_monitor_message: Mapped[str | None] = mapped_column(Text)
-    channel_monitor_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    channel_monitor_guard_state: Mapped[str] = mapped_column(
+    upstream_monitor_message: Mapped[str | None] = mapped_column(Text)
+    upstream_monitor_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    upstream_monitor_guard_state: Mapped[str] = mapped_column(
         String(32), default="not_checked", server_default="not_checked", nullable=False
     )
-    channel_monitor_unavailable_count: Mapped[int] = mapped_column(
+    upstream_monitor_unavailable_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
-    channel_monitor_recovery_count: Mapped[int] = mapped_column(
+    upstream_monitor_recovery_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
-    channel_monitor_guard_checked_at: Mapped[datetime | None] = mapped_column(
+    upstream_monitor_guard_checked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
     last_error: Mapped[str | None] = mapped_column(Text)
     last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
-class UpstreamChannelDailyUsage(Base):
-    """A durable per-day upstream balance and linked account revenue snapshot."""
-
-    __tablename__ = "upstream_channel_daily_usages"
+class UpstreamGroup(Base):
+    __tablename__ = "upstream_groups"
     __table_args__ = (
         UniqueConstraint(
-            "channel_identity",
-            "usage_date",
-            name="uq_upstream_channel_daily_usage_identity_date",
+            "upstream_id",
+            "remote_group_id",
+            name="uq_upstream_group_upstream_remote_id",
         ),
-        Index("ix_upstream_channel_daily_usage_identity_date", "channel_identity", "usage_date"),
-        Index("ix_upstream_channel_daily_usage_channel_date", "channel_id", "usage_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
-    # Channel database IDs can be reused by SQLite after deletion. The
-    # canonical URL identifies the upstream that actually produced this row.
-    channel_identity: Mapped[str] = mapped_column(String(500), index=True, nullable=False)
-    channel_name: Mapped[str | None] = mapped_column(String(200))
+    upstream_id: Mapped[str] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="RESTRICT"),
+        index=True,
+        nullable=False,
+    )
+    remote_group_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    multiplier: Mapped[float | None] = mapped_column(Float)
+    available: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1", nullable=False
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class UpstreamApiKey(Base):
+    __tablename__ = "upstream_api_keys"
+    __table_args__ = (
+        UniqueConstraint(
+            "upstream_id",
+            "remote_key_id",
+            name="uq_upstream_api_key_upstream_remote_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    upstream_id: Mapped[str] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="RESTRICT"),
+        index=True,
+        nullable=False,
+    )
+    remote_key_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    remote_name: Mapped[str | None] = mapped_column(String(200))
+    group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstream_groups.id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), default="not_checked", server_default="not_checked", nullable=False
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class UpstreamDailyUsage(Base):
+    """A durable per-day upstream balance and linked account revenue snapshot."""
+
+    __tablename__ = "upstream_daily_usages"
+    __table_args__ = (
+        UniqueConstraint(
+            "upstream_id",
+            "usage_date",
+            "source_segment",
+            name="uq_upstream_daily_usage_upstream_date_segment",
+        ),
+        Index("ix_upstream_daily_usage_upstream_date", "upstream_id", "usage_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    upstream_id: Mapped[str] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    upstream_name: Mapped[str | None] = mapped_column(String(200))
     usage_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
-    balance_used: Mapped[float | None] = mapped_column(Float)
-    balance_used_adjusted: Mapped[float | None] = mapped_column(Float)
+    source_segment: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    upstream_wallet_cost_usd: Mapped[float | None] = mapped_column(Float)
+    upstream_actual_cost_cny: Mapped[float | None] = mapped_column(Float)
     balance_unit: Mapped[str | None] = mapped_column(String(32))
-    recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    upstream_api_key_usage: Mapped[float | None] = mapped_column(Float)
-    upstream_api_key_cost_cny: Mapped[float | None] = mapped_column(Float)
-    sub2api_cost: Mapped[float | None] = mapped_column(Float)
-    sub2api_cost_cny: Mapped[float | None] = mapped_column(Float)
-    sub2api_user_cost: Mapped[float | None] = mapped_column(Float)
-    # Legacy alias for sub2api_user_cost retained for database compatibility.
-    sub2api_actual_cost: Mapped[float | None] = mapped_column(Float)
-    income: Mapped[float | None] = mapped_column(Float)
-    income_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    management_account_cost_usd: Mapped[float | None] = mapped_column(Float)
+    management_account_cost_cny: Mapped[float | None] = mapped_column(Float)
+    management_user_charge_usd: Mapped[float | None] = mapped_column(Float)
+    management_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    actual_income_cny: Mapped[float | None] = mapped_column(Float)
     income_unit: Mapped[str | None] = mapped_column(String(32))
     profit_cny: Mapped[float | None] = mapped_column(Float)
     finalized: Mapped[bool] = mapped_column(
@@ -376,46 +454,58 @@ class UpstreamChannelDailyUsage(Base):
     )
 
 
-class UpstreamAccountDailyUsage(Base):
+class ApiAccountDailyUsage(Base):
     """Per API key usage/revenue retained for filtering channel history."""
 
-    __tablename__ = "upstream_account_daily_usages"
+    __tablename__ = "api_account_daily_usages"
     __table_args__ = (
         UniqueConstraint(
-            "sub2api_account_id",
+            "management_account_id",
+            "upstream_id",
             "usage_date",
-            name="uq_upstream_account_daily_usage_account_date",
+            "source_segment",
+            name="uq_api_account_daily_usage_account_upstream_date_segment",
         ),
         Index(
-            "ix_upstream_account_daily_usage_identity_date",
-            "channel_identity",
+            "ix_api_account_daily_usage_upstream_date",
+            "upstream_id",
             "usage_date",
         ),
         Index(
-            "ix_upstream_account_daily_usage_account_date",
-            "sub2api_account_id",
+            "ix_api_account_daily_usage_account_date",
+            "management_account_id",
             "usage_date",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
-    channel_identity: Mapped[str] = mapped_column(String(500), index=True, nullable=False)
-    sub2api_account_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
-    upstream_api_key_record_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    upstream_id: Mapped[str] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    management_account_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    api_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("api_accounts.id", ondelete="RESTRICT"), index=True
+    )
+    upstream_api_key_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstream_api_keys.id", ondelete="RESTRICT"), index=True
+    )
+    remote_upstream_api_key_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     account_name: Mapped[str | None] = mapped_column(String(200))
     remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
     usage_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
-    upstream_usage: Mapped[float | None] = mapped_column(Float)
+    source_segment: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    upstream_wallet_cost_usd: Mapped[float | None] = mapped_column(Float)
+    upstream_actual_cost_cny: Mapped[float | None] = mapped_column(Float)
     upstream_usage_unit: Mapped[str | None] = mapped_column(String(32))
     upstream_usage_source: Mapped[str | None] = mapped_column(String(64))
     upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    sub2api_cost: Mapped[float | None] = mapped_column(Float)
-    sub2api_user_cost: Mapped[float | None] = mapped_column(Float)
-    # Legacy alias for sub2api_user_cost retained for database compatibility.
-    sub2api_actual_cost: Mapped[float | None] = mapped_column(Float)
-    local_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    income: Mapped[float | None] = mapped_column(Float)
+    management_account_cost_usd: Mapped[float | None] = mapped_column(Float)
+    management_account_cost_cny: Mapped[float | None] = mapped_column(Float)
+    management_user_charge_usd: Mapped[float | None] = mapped_column(Float)
+    management_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    actual_income_cny: Mapped[float | None] = mapped_column(Float)
     income_unit: Mapped[str | None] = mapped_column(String(32))
     finalized: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False, index=True
@@ -427,29 +517,23 @@ class UpstreamAccountDailyUsage(Base):
     )
 
 
-class UpstreamChannelUsageTotal(Base):
+class UpstreamUsageTotal(Base):
     """Lifetime aggregates which deliberately survive daily-detail pruning."""
 
-    __tablename__ = "upstream_channel_usage_totals"
+    __tablename__ = "upstream_usage_totals"
 
-    channel_identity: Mapped[str] = mapped_column(String(500), primary_key=True)
-    channel_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
-    channel_name: Mapped[str | None] = mapped_column(String(200))
-    total_balance_used: Mapped[float] = mapped_column(Float, default=0, nullable=False)
-    total_balance_used_adjusted: Mapped[float] = mapped_column(
+    upstream_id: Mapped[str] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="RESTRICT"), primary_key=True
+    )
+    upstream_name: Mapped[str | None] = mapped_column(String(200))
+    total_upstream_wallet_cost_usd: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    total_upstream_actual_cost_cny: Mapped[float] = mapped_column(
         Float, default=0, nullable=False
     )
-    total_upstream_api_key_usage: Mapped[float] = mapped_column(
-        Float, default=0, nullable=False
-    )
-    total_upstream_api_key_cost_cny: Mapped[float] = mapped_column(
-        Float, default=0, nullable=False
-    )
-    total_sub2api_cost: Mapped[float] = mapped_column(Float, default=0, nullable=False)
-    total_sub2api_cost_cny: Mapped[float] = mapped_column(Float, default=0, nullable=False)
-    total_sub2api_user_cost: Mapped[float] = mapped_column(Float, default=0, nullable=False)
-    total_sub2api_actual_cost: Mapped[float] = mapped_column(Float, default=0, nullable=False)
-    total_income: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    total_management_account_cost_usd: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    total_management_account_cost_cny: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    total_management_user_charge_usd: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    total_actual_income_cny: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     total_profit_cny: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -487,26 +571,31 @@ class UpstreamPriorityInterval(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
-class UpstreamAccountConfig(Base):
-    __tablename__ = "upstream_account_configs"
+class ApiAccount(Base):
+    __tablename__ = "api_accounts"
     __table_args__ = (
         Index(
-            "uq_upstream_account_configs_channel_record_id",
-            "channel_id",
-            "upstream_api_key_record_id",
+            "uq_api_accounts_upstream_remote_key_id",
+            "upstream_id",
+            "remote_upstream_api_key_id",
             unique=True,
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    sub2api_account_id: Mapped[int] = mapped_column(
+    management_account_id: Mapped[int] = mapped_column(
         BigInteger,
         unique=True,
         index=True,
         nullable=False,
     )
     remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
-    upstream_api_key_record_id: Mapped[int | None] = mapped_column(BigInteger)
+    remote_upstream_api_key_id: Mapped[int | None] = mapped_column(BigInteger)
+    upstream_api_key_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstream_api_keys.id", ondelete="SET NULL"),
+        unique=True,
+        index=True,
+    )
     upstream_identity_rebind_required: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -518,11 +607,11 @@ class UpstreamAccountConfig(Base):
         default=False,
         nullable=False,
     )
-    channel_id: Mapped[int | None] = mapped_column(
-        ForeignKey("upstream_channels.id", ondelete="SET NULL"),
+    upstream_id: Mapped[str | None] = mapped_column(
+        ForeignKey("upstreams.id", ondelete="SET NULL"),
         index=True,
     )
-    channel_auto_assign_disabled: Mapped[bool] = mapped_column(
+    upstream_auto_assign_disabled: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
         nullable=False,
@@ -559,11 +648,13 @@ class UpstreamAccountConfig(Base):
         Boolean, default=True, server_default="1", nullable=False, index=True
     )
     remote_missing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    base_url: Mapped[str | None] = mapped_column(String(500))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    api_endpoint_url: Mapped[str | None] = mapped_column(String(500))
     encrypted_api_key: Mapped[str | None] = mapped_column(Text)
     encrypted_access_token: Mapped[str | None] = mapped_column(Text)
-    upstream_type: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
-    resolved_upstream_type: Mapped[str | None] = mapped_column(String(32))
+    platform_type: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
+    resolved_platform_type: Mapped[str | None] = mapped_column(String(32))
     upstream_user_id: Mapped[str | None] = mapped_column(String(128))
     selected_group_id: Mapped[str | None] = mapped_column(String(128))
     selected_group_name: Mapped[str | None] = mapped_column(String(200))
@@ -588,7 +679,7 @@ class UpstreamAccountConfig(Base):
     upstream_key_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     upstream_group_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     availability_check_mode: Mapped[str] = mapped_column(
-        String(32), default="channel_monitor", server_default="channel_monitor", nullable=False
+        String(32), default="upstream_monitor", server_default="upstream_monitor", nullable=False
     )
     availability_monitor_id: Mapped[int | None] = mapped_column(Integer)
     availability_test_model: Mapped[str | None] = mapped_column(String(160))
@@ -614,56 +705,56 @@ class UpstreamAccountConfig(Base):
     balance_guard_restore_eligible: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
     )
-    balance_guard_channel_id: Mapped[int | None] = mapped_column(Integer)
+    balance_guard_upstream_id: Mapped[str | None] = mapped_column(String(36))
     balance_guard_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     balance_guard_operation: Mapped[str | None] = mapped_column(String(32))
     auto_pause_episode_id: Mapped[str | None] = mapped_column(String(64))
     pause_owned_by_plugin: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
     )
-    auto_pause_channel_id: Mapped[int | None] = mapped_column(Integer)
+    auto_pause_upstream_id: Mapped[str | None] = mapped_column(String(36))
     auto_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pause_operation: Mapped[str | None] = mapped_column(String(32))
-    manual_group_multiplier: Mapped[float | None] = mapped_column(Float)
-    manual_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_group_multiplier_override: Mapped[float | None] = mapped_column(Float)
+    upstream_recharge_multiplier_override: Mapped[float | None] = mapped_column(Float)
     group_options: Mapped[list[dict] | None] = mapped_column(JSON)
-    discovered_group_multiplier: Mapped[float | None] = mapped_column(Float)
-    effective_group_multiplier: Mapped[float | None] = mapped_column(Float)
+    discovered_upstream_group_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_group_multiplier: Mapped[float | None] = mapped_column(Float)
     group_multiplier_source: Mapped[str | None] = mapped_column(String(128))
     group_multiplier_status: Mapped[str | None] = mapped_column(String(32))
-    discovered_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    effective_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    discovered_upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     recharge_multiplier_source: Mapped[str | None] = mapped_column(String(128))
     recharge_multiplier_status: Mapped[str | None] = mapped_column(String(32))
-    local_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    local_recharge_source: Mapped[str | None] = mapped_column(String(32))
-    local_recharge_status: Mapped[str | None] = mapped_column(String(32))
-    target_rate: Mapped[float | None] = mapped_column(Float)
-    current_rate: Mapped[float | None] = mapped_column(Float)
-    balance_remaining: Mapped[float | None] = mapped_column(Float)
-    balance_total: Mapped[float | None] = mapped_column(Float)
-    balance_used: Mapped[float | None] = mapped_column(Float)
+    management_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    management_recharge_source: Mapped[str | None] = mapped_column(String(32))
+    management_recharge_status: Mapped[str | None] = mapped_column(String(32))
+    expected_management_billing_multiplier: Mapped[float | None] = mapped_column(Float)
+    management_billing_multiplier: Mapped[float | None] = mapped_column(Float)
+    wallet_balance_usd: Mapped[float | None] = mapped_column(Float)
+    wallet_total_usd: Mapped[float | None] = mapped_column(Float)
+    wallet_used_usd: Mapped[float | None] = mapped_column(Float)
     balance_unit: Mapped[str | None] = mapped_column(String(32))
     balance_status: Mapped[str | None] = mapped_column(String(32))
     balance_source: Mapped[str | None] = mapped_column(String(64))
     balance_message: Mapped[str | None] = mapped_column(Text)
     balance_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    upstream_usage_amount: Mapped[float | None] = mapped_column(Float)
+    upstream_wallet_cost_usd: Mapped[float | None] = mapped_column(Float)
     upstream_usage_unit: Mapped[str | None] = mapped_column(String(32))
     upstream_usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    today_upstream_usage_amount: Mapped[float | None] = mapped_column(Float)
+    today_upstream_wallet_cost_usd: Mapped[float | None] = mapped_column(Float)
     today_upstream_usage_unit: Mapped[str | None] = mapped_column(String(32))
     today_upstream_usage_status: Mapped[str] = mapped_column(
         String(32), default="not_checked", server_default="not_checked", nullable=False
     )
     today_upstream_usage_source: Mapped[str | None] = mapped_column(String(64))
     today_upstream_usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    today_sub2api_cost_amount: Mapped[float | None] = mapped_column(Float)
-    today_sub2api_user_cost_amount: Mapped[float | None] = mapped_column(Float)
-    today_sub2api_stats_status: Mapped[str] = mapped_column(
+    today_management_account_cost_usd: Mapped[float | None] = mapped_column(Float)
+    today_management_user_charge_usd: Mapped[float | None] = mapped_column(Float)
+    today_management_site_stats_status: Mapped[str] = mapped_column(
         String(32), default="not_checked", server_default="not_checked", nullable=False
     )
-    today_sub2api_stats_checked_at: Mapped[datetime | None] = mapped_column(
+    today_management_site_stats_checked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -671,27 +762,27 @@ class UpstreamAccountConfig(Base):
     last_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-    pause_holds: Mapped[list["UpstreamAccountPauseHold"]] = relationship(
-        back_populates="account_config",
+    pause_holds: Mapped[list["ApiAccountPauseHold"]] = relationship(
+        back_populates="api_account",
         cascade="all, delete-orphan",
         lazy="selectin",
-        order_by="UpstreamAccountPauseHold.id",
+        order_by="ApiAccountPauseHold.id",
     )
 
 
-class UpstreamAccountPauseHold(Base):
-    __tablename__ = "upstream_account_pause_holds"
+class ApiAccountPauseHold(Base):
+    __tablename__ = "api_account_pause_holds"
     __table_args__ = (
         UniqueConstraint(
-            "account_config_id",
+            "api_account_id",
             "reason",
-            name="uq_upstream_account_pause_hold_reason",
+            name="uq_api_account_pause_hold_reason",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    account_config_id: Mapped[int] = mapped_column(
-        ForeignKey("upstream_account_configs.id", ondelete="CASCADE"),
+    api_account_id: Mapped[int] = mapped_column(
+        ForeignKey("api_accounts.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
     )
@@ -699,7 +790,7 @@ class UpstreamAccountPauseHold(Base):
     active: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1", index=True, nullable=False
     )
-    scope_channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    scope_upstream_id: Mapped[str | None] = mapped_column(String(36), index=True)
     triggered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -710,7 +801,7 @@ class UpstreamAccountPauseHold(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
-    account_config: Mapped["UpstreamAccountConfig"] = relationship(
+    api_account: Mapped["ApiAccount"] = relationship(
         back_populates="pause_holds"
     )
 
@@ -719,10 +810,10 @@ class UpstreamRateChangeLog(Base):
     __tablename__ = "upstream_rate_change_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    sub2api_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    management_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
     account_name: Mapped[str | None] = mapped_column(String(200))
-    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
-    channel_name: Mapped[str | None] = mapped_column(String(200))
+    upstream_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    upstream_name: Mapped[str | None] = mapped_column(String(200))
     group_id: Mapped[str | None] = mapped_column(String(128))
     group_name: Mapped[str | None] = mapped_column(String(200))
     old_group_id: Mapped[str | None] = mapped_column(String(128))
@@ -736,11 +827,11 @@ class UpstreamRateChangeLog(Base):
     old_upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     new_upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
     upstream_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    local_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
-    old_target_rate: Mapped[float | None] = mapped_column(Float)
-    new_target_rate: Mapped[float | None] = mapped_column(Float)
-    old_current_rate: Mapped[float | None] = mapped_column(Float)
-    new_current_rate: Mapped[float | None] = mapped_column(Float)
+    management_recharge_multiplier: Mapped[float | None] = mapped_column(Float)
+    old_expected_management_billing_multiplier: Mapped[float | None] = mapped_column(Float)
+    new_expected_management_billing_multiplier: Mapped[float | None] = mapped_column(Float)
+    old_management_billing_multiplier: Mapped[float | None] = mapped_column(Float)
+    new_management_billing_multiplier: Mapped[float | None] = mapped_column(Float)
     old_upstream_key_status: Mapped[str | None] = mapped_column(String(32))
     new_upstream_key_status: Mapped[str | None] = mapped_column(String(32))
     old_upstream_group_status: Mapped[str | None] = mapped_column(String(32))
@@ -753,17 +844,17 @@ class UpstreamRateChangeLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
-class UpstreamAccountDataArchive(Base):
+class ApiAccountDataArchive(Base):
     """Last trustworthy API Key data retained before an identity reset."""
 
-    __tablename__ = "upstream_account_data_archives"
+    __tablename__ = "api_account_data_archives"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    sub2api_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    management_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
     remote_identity_fingerprint: Mapped[str | None] = mapped_column(String(64))
     account_name: Mapped[str | None] = mapped_column(String(200))
-    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
-    channel_name: Mapped[str | None] = mapped_column(String(200))
+    upstream_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    upstream_name: Mapped[str | None] = mapped_column(String(200))
     reason: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
     observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -772,12 +863,12 @@ class UpstreamAccountDataArchive(Base):
     )
 
 
-class UpstreamChannelChangeEvent(Base):
-    __tablename__ = "upstream_channel_change_events"
+class UpstreamChangeEvent(Base):
+    __tablename__ = "upstream_change_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
-    channel_name: Mapped[str | None] = mapped_column(String(200))
+    upstream_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    upstream_name: Mapped[str | None] = mapped_column(String(200))
     event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     group_id: Mapped[str | None] = mapped_column(String(128), index=True)
     group_name: Mapped[str | None] = mapped_column(String(200))
@@ -798,10 +889,10 @@ class AccountSchedulingChangeLog(Base):
     __tablename__ = "account_scheduling_change_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    sub2api_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    management_account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
     account_name: Mapped[str | None] = mapped_column(String(200))
-    channel_id: Mapped[int | None] = mapped_column(Integer, index=True)
-    channel_name: Mapped[str | None] = mapped_column(String(200))
+    upstream_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    upstream_name: Mapped[str | None] = mapped_column(String(200))
     event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     reason: Mapped[str | None] = mapped_column(String(64), index=True)
     active_reasons: Mapped[list[str] | None] = mapped_column(JSON)

@@ -1,4 +1,4 @@
-import type { Account } from "./types";
+import type { Account } from "./domain";
 
 export type AccountTableSortField = "account" | "imported_at";
 export type AccountTableSortDirection = "asc" | "desc";
@@ -15,8 +15,8 @@ export function sortAccountsForTable(
     .map((account, index) => ({ account, index }))
     .sort((left, right) => {
       if (field === "imported_at") {
-        const leftTime = parsedTime(left.account.sub2api_imported_at);
-        const rightTime = parsedTime(right.account.sub2api_imported_at);
+        const leftTime = parsedTime(left.account.management_site_imported_at);
+        const rightTime = parsedTime(right.account.management_site_imported_at);
         if (leftTime === null && rightTime !== null) return 1;
         if (leftTime !== null && rightTime === null) return -1;
         if (leftTime !== null && rightTime !== null && leftTime !== rightTime) {
@@ -35,8 +35,8 @@ export function sortAccountsForTable(
         return (left.account.duplicate_rank - right.account.duplicate_rank) * multiplier;
       }
       const idComparison = accountCollator.compare(
-        left.account.sub2api_account_id || "",
-        right.account.sub2api_account_id || "",
+        left.account.management_account_id || "",
+        right.account.management_account_id || "",
       );
       return idComparison !== 0 ? idComparison * multiplier : left.index - right.index;
     })

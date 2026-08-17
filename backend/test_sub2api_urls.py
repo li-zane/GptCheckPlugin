@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from app.core.sub2api_urls import (
     is_loopback_sub2api_url,
-    normalize_sub2api_base_url,
+    normalize_management_site_base_url,
     replace_sub2api_port,
 )
 from app.schemas import AppSettingsUpdate
@@ -23,7 +23,7 @@ class Sub2ApiUrlTests(unittest.TestCase):
         }
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
-                self.assertEqual(normalize_sub2api_base_url(raw), expected)
+                self.assertEqual(normalize_management_site_base_url(raw), expected)
 
     def test_only_strict_loopback_addresses_may_use_http(self) -> None:
         allowed = (
@@ -45,7 +45,7 @@ class Sub2ApiUrlTests(unittest.TestCase):
         )
         for value in rejected:
             with self.subTest(value=value), self.assertRaises(ValueError):
-                normalize_sub2api_base_url(value)
+                normalize_management_site_base_url(value)
 
     def test_rejects_credentials_non_http_schemes_and_invalid_authorities(self) -> None:
         rejected = (
@@ -66,17 +66,17 @@ class Sub2ApiUrlTests(unittest.TestCase):
         )
         for value in rejected:
             with self.subTest(value=value), self.assertRaises(ValueError):
-                normalize_sub2api_base_url(value)
+                normalize_management_site_base_url(value)
 
     def test_runtime_schema_and_port_replacement_share_the_policy(self) -> None:
-        payload = AppSettingsUpdate(sub2api_base_url="127.0.0.1:8001")
-        self.assertEqual(payload.sub2api_base_url, "http://127.0.0.1:8001/api/v1")
+        payload = AppSettingsUpdate(management_site_base_url="127.0.0.1:8001")
+        self.assertEqual(payload.management_site_base_url, "http://127.0.0.1:8001/api/v1")
         self.assertEqual(
             replace_sub2api_port("https://example.com/prefix", 8443),
             "https://example.com:8443/prefix/api/v1",
         )
         with self.assertRaises(ValidationError):
-            AppSettingsUpdate(sub2api_base_url="http://example.com:8001")
+            AppSettingsUpdate(management_site_base_url="http://example.com:8001")
 
 
 if __name__ == "__main__":

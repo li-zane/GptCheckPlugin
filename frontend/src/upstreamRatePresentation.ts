@@ -1,4 +1,4 @@
-import type { UpstreamChangeLog, UpstreamChannelChangeEvent } from "./types";
+import type { UpstreamChangeLog, UpstreamChangeEvent } from "./domain";
 
 export type RateChangeDirection = "increase" | "decrease" | "unchanged" | "unknown";
 
@@ -52,7 +52,7 @@ export function multiplierChange(oldValue: unknown, newValue: unknown): Upstream
 }
 
 export function upstreamGroupRatePresentation(
-  log: UpstreamChannelChangeEvent,
+  log: UpstreamChangeEvent,
   fallbackRechargeMultiplier?: unknown,
 ): UpstreamGroupRatePresentation {
   const oldGroupMultiplier = finiteNumber(log.old_value);
@@ -105,9 +105,9 @@ export function groupRateChange(log: UpstreamChangeLog) {
 }
 
 export function accountBillingRateChange(log: UpstreamChangeLog) {
-  const target = multiplierChange(log.old_target_rate, log.new_target_rate);
+  const target = multiplierChange(log.old_expected_management_billing_multiplier, log.new_expected_management_billing_multiplier);
   if (target.direction === "increase" || target.direction === "decrease") return target;
-  const current = multiplierChange(log.old_current_rate, log.new_current_rate);
+  const current = multiplierChange(log.old_management_billing_multiplier, log.new_management_billing_multiplier);
   if (current.direction === "increase" || current.direction === "decrease") return current;
   return target.newValue !== null || target.oldValue !== null ? target : current;
 }

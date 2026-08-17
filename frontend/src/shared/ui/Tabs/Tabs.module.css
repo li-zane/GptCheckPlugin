@@ -1,0 +1,4 @@
+.tabs { border-bottom: 1px solid var(--line); display: flex; gap: 4px; overflow-x: auto; }
+.tab { align-items: center; background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); display: inline-flex; flex: 0 0 auto; gap: 6px; min-height: 40px; padding: 8px 10px; }
+.tab:hover:not(:disabled) { color: var(--ink); }
+.active { border-bottom-color: var(--primary); color: var(--primary); font-weight: 650; }

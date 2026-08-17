@@ -8,8 +8,8 @@ from app.core.database import Base
 from app.models import (
     AppSetting,
     AccountSchedulingChangeLog,
-    UpstreamAccountDataArchive,
-    UpstreamChannelChangeEvent,
+    ApiAccountDataArchive,
+    UpstreamChangeEvent,
     utcnow,
 )
 from app.services.change_logs import (
@@ -39,8 +39,8 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         observed_at = datetime(2026, 7, 21, 4, 0, tzinfo=timezone.utc)
         changes = record_upstream_channel_changes(
             self.db,
-            channel_id=9,
-            channel_name="Example",
+            upstream_id="00000000-0000-4000-8000-000000000009",
+            upstream_name="Example",
             previous_recharge_multiplier=1.0,
             current_recharge_multiplier=None,
             previous_groups=[
@@ -79,8 +79,8 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         events = list(
             (
                 await self.db.scalars(
-                    select(UpstreamChannelChangeEvent).order_by(
-                        UpstreamChannelChangeEvent.id
+                    select(UpstreamChangeEvent).order_by(
+                        UpstreamChangeEvent.id
                     )
                 )
             ).all()
@@ -120,8 +120,8 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_channel_multiplier_baseline_does_not_create_a_change_event(self) -> None:
         changes = record_upstream_channel_changes(
             self.db,
-            channel_id=9,
-            channel_name="Example",
+            upstream_id="00000000-0000-4000-8000-000000000009",
+            upstream_name="Example",
             previous_recharge_multiplier=None,
             current_recharge_multiplier=1.0,
             previous_groups=[],
@@ -131,14 +131,14 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
 
         self.assertEqual(changes, [])
-        events = list((await self.db.scalars(select(UpstreamChannelChangeEvent))).all())
+        events = list((await self.db.scalars(select(UpstreamChangeEvent))).all())
         self.assertEqual(events, [])
 
     async def test_group_events_preserve_recharge_multiplier_snapshots(self) -> None:
         record_upstream_channel_changes(
             self.db,
-            channel_id=9,
-            channel_name="Example",
+            upstream_id="00000000-0000-4000-8000-000000000009",
+            upstream_name="Example",
             previous_recharge_multiplier=0.25,
             current_recharge_multiplier=0.25,
             previous_groups=[{"id": "changed", "name": "Changed", "multiplier": 2.0}],
@@ -150,7 +150,7 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.db.commit()
 
-        events = list((await self.db.scalars(select(UpstreamChannelChangeEvent))).all())
+        events = list((await self.db.scalars(select(UpstreamChangeEvent))).all())
         self.assertEqual(
             {event.event_type for event in events},
             {"group_added", "group_multiplier_changed"},
@@ -164,17 +164,17 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_identity_reset_archives_follow_the_configured_retention(self) -> None:
         self.db.add_all(
             [
-                UpstreamAccountDataArchive(
-                    sub2api_account_id=7,
+                ApiAccountDataArchive(
+                    management_account_id=7,
                     account_name="old",
                     reason="remote_identity_mismatch",
                     snapshot={"upstream": {"today_usage_amount": 1.25}},
                     created_at=utcnow() - timedelta(days=91),
                 ),
-                UpstreamAccountDataArchive(
-                    sub2api_account_id=8,
+                ApiAccountDataArchive(
+                    management_account_id=8,
                     account_name="recent",
-                    reason="channel_identity_changed",
+                    reason="upstream_identity_changed",
                     snapshot={"upstream": {"today_usage_amount": 2.5}},
                     created_at=utcnow() - timedelta(days=89),
                 ),
@@ -186,16 +186,16 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
 
         archives = list(
-            (await self.db.scalars(select(UpstreamAccountDataArchive))).all()
+            (await self.db.scalars(select(ApiAccountDataArchive))).all()
         )
-        self.assertEqual([item.sub2api_account_id for item in archives], [8])
+        self.assertEqual([item.management_account_id for item in archives], [8])
 
     async def test_unread_cursors_are_independent_monotonic_and_cannot_hide_future_rows(self) -> None:
         self.db.add_all(
             [
-                UpstreamChannelChangeEvent(
-                    channel_id=1,
-                    channel_name="Channel",
+                UpstreamChangeEvent(
+                    upstream_id="00000000-0000-4000-8000-000000000001",
+                    upstream_name="Upstream",
                     event_type="group_added",
                     group_id=f"group-{index}",
                 )
@@ -203,7 +203,7 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
             ]
             + [
                 AccountSchedulingChangeLog(
-                    sub2api_account_id=10 + index,
+                    management_account_id=10 + index,
                     event_type="paused",
                     reason="upstream_balance_negative",
                     status="success",
@@ -245,9 +245,9 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await change_log_unread_counts(self.db), (0, 0, 2))
 
         self.db.add(
-            UpstreamChannelChangeEvent(
-                channel_id=1,
-                channel_name="Channel",
+            UpstreamChangeEvent(
+                upstream_id="00000000-0000-4000-8000-000000000001",
+                upstream_name="Upstream",
                 event_type="group_removed",
                 group_id="future-group",
             )
@@ -256,11 +256,11 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await change_log_unread_counts(self.db), (1, 0, 2))
 
         self.assertEqual(await mark_upstream_changes_read(self.db, 999_999), 4)
-        await self.db.execute(delete(UpstreamChannelChangeEvent))
+        await self.db.execute(delete(UpstreamChangeEvent))
         await self.db.commit()
-        replacement = UpstreamChannelChangeEvent(
-            channel_id=1,
-            channel_name="Channel",
+        replacement = UpstreamChangeEvent(
+            upstream_id="00000000-0000-4000-8000-000000000001",
+            upstream_name="Upstream",
             event_type="group_added",
             group_id="replacement-after-prune",
         )
@@ -284,13 +284,13 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_account_rate_cursor_never_falls_back_to_upstream_cursor(self) -> None:
         self.db.add_all(
             [
-                UpstreamChannelChangeEvent(
-                    channel_id=1,
+                UpstreamChangeEvent(
+                    upstream_id="00000000-0000-4000-8000-000000000001",
                     event_type="group_added",
                     group_id="group-1",
                 ),
-                UpstreamChannelChangeEvent(
-                    channel_id=1,
+                UpstreamChangeEvent(
+                    upstream_id="00000000-0000-4000-8000-000000000001",
                     event_type="account_rate_changed",
                     old_value=1.0,
                     new_value=1.5,
@@ -316,16 +316,16 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_imported_history_is_visible_in_time_order_but_not_unread(self) -> None:
         self.db.add_all(
             [
-                UpstreamChannelChangeEvent(
-                    channel_id=1,
+                UpstreamChangeEvent(
+                    upstream_id="00000000-0000-4000-8000-000000000001",
                     event_type="account_rate_changed",
                     old_value=1.0,
                     new_value=1.5,
                     legacy_imported=True,
                     created_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
                 ),
-                UpstreamChannelChangeEvent(
-                    channel_id=1,
+                UpstreamChangeEvent(
+                    upstream_id="00000000-0000-4000-8000-000000000001",
                     event_type="account_rate_changed",
                     old_value=1.5,
                     new_value=2.0,
@@ -354,8 +354,8 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(older_total, 2)
 
     async def test_read_paths_do_not_prune_history_or_repair_persisted_cursors(self) -> None:
-        old_event = UpstreamChannelChangeEvent(
-            channel_id=1,
+        old_event = UpstreamChangeEvent(
+            upstream_id="00000000-0000-4000-8000-000000000001",
             event_type="group_added",
             group_id="old-group",
             created_at=utcnow() - timedelta(days=60),
@@ -374,21 +374,21 @@ class ChangeLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event.id for event in page], [old_event.id])
         self.assertEqual((cursor, unread), (0, 1))
         self.assertEqual(total, 1)
-        self.assertIsNotNone(await self.db.get(UpstreamChannelChangeEvent, old_event.id))
+        self.assertIsNotNone(await self.db.get(UpstreamChangeEvent, old_event.id))
         cursor_setting = await self.db.get(AppSetting, "upstream_change_event_last_read_id")
         self.assertEqual(cursor_setting.value, "999")
         self.assertEqual(
             await change_log_unread_counts(self.db, retention_days=1),
             (1, 0, 0),
         )
-        self.assertIsNotNone(await self.db.get(UpstreamChannelChangeEvent, old_event.id))
+        self.assertIsNotNone(await self.db.get(UpstreamChangeEvent, old_event.id))
         self.assertEqual(cursor_setting.value, "999")
 
     async def test_numbered_pages_use_offset_and_return_filtered_total(self) -> None:
         self.db.add_all(
             [
-                UpstreamChannelChangeEvent(
-                    channel_id=1,
+                UpstreamChangeEvent(
+                    upstream_id="00000000-0000-4000-8000-000000000001",
                     event_type="group_added" if index < 4 else "account_rate_changed",
                     group_id=f"group-{index}",
                     created_at=datetime(2026, 7, index + 1, tzinfo=timezone.utc),

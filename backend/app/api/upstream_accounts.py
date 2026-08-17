@@ -3,10 +3,12 @@ from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import require_admin
+from app.models import Upstream
 from app.schemas import (
     MessageResponse,
     AccountSchedulingChangeLogOut,
@@ -19,18 +21,18 @@ from app.schemas import (
     PriorityIntervalUpdate,
     PriorityRebalanceOut,
     PriorityTieMoveRequest,
-    UpstreamAccountEnabledUpdate,
-    UpstreamAccountAvailabilityTestOut,
-    UpstreamAccountConnectionTestOut,
-    UpstreamAccountOut,
-    UpstreamAccountUpdate,
+    ApiAccountEnabledUpdate,
+    ApiAccountAvailabilityTestOut,
+    ApiAccountConnectionTestOut,
+    ApiAccountOut,
+    ApiAccountUpdate,
     UpstreamApplyRequest,
-    UpstreamDiscoverAllOut,
+    ApiAccountDiscoverAllOut,
     UpstreamIdentityRequest,
     UpstreamRateChangeLogOut,
-    UpstreamChannelChangeEventOut,
-    UpstreamChannelChangePageOut,
-    UpstreamRemoteDeleteRequest,
+    UpstreamChangeEventOut,
+    UpstreamChangePageOut,
+    ApiAccountRemoteDeleteRequest,
 )
 from app.services.runtime_config import get_runtime_config_service
 from app.services.change_logs import (
@@ -41,14 +43,14 @@ from app.services.change_logs import (
     mark_upstream_changes_read,
 )
 from app.services.upstream_accounts import (
-    UpstreamAccountService,
-    UpstreamAccountServiceError,
-    get_upstream_account_service,
+    ApiAccountService,
+    ApiAccountServiceError,
+    get_api_account_service,
 )
 from app.services.upstream_rate_logs import list_upstream_rate_change_logs
 from app.services.upstream_channels import (
-    UpstreamChannelService,
-    get_upstream_channel_service,
+    UpstreamService,
+    get_upstream_service,
 )
 from app.services.upstream_priorities import (
     UpstreamPriorityService,
@@ -61,7 +63,7 @@ AccountId = Annotated[int, Path(ge=1, le=9_007_199_254_740_991)]
 IntervalId = Annotated[int, Path(ge=1, le=9_007_199_254_740_991)]
 
 
-def _http_error(exc: UpstreamAccountServiceError) -> HTTPException:
+def _http_error(exc: ApiAccountServiceError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=exc.public_message)
 
 
@@ -93,32 +95,31 @@ def _rate_log_date_bounds(
     return start_at, end_at
 
 
-@router.get("", response_model=list[UpstreamAccountOut])
+@router.get("", response_model=list[ApiAccountOut])
 async def list_upstream_accounts(
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
-) -> list[UpstreamAccountOut]:
+    service: ApiAccountService = Depends(get_api_account_service),
+) -> list[ApiAccountOut]:
     try:
         return await service.list_accounts(db, use_cache=True)
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.post("/discover-all", response_model=UpstreamDiscoverAllOut)
+@router.post("/discover-all", response_model=ApiAccountDiscoverAllOut)
 async def discover_all_upstream_accounts(
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
-) -> UpstreamDiscoverAllOut:
+    service: ApiAccountService = Depends(get_api_account_service),
+) -> ApiAccountDiscoverAllOut:
     try:
         return await service.discover_all(db)
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
 @router.get("/upstream-change-logs", response_model=list[UpstreamRateChangeLogOut])
-@router.get("/rate-change-logs", response_model=list[UpstreamRateChangeLogOut])
 async def list_upstream_rate_logs(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     before_id: Annotated[int | None, Query(ge=1)] = None,
@@ -141,7 +142,7 @@ async def list_upstream_rate_logs(
     return [UpstreamRateChangeLogOut.model_validate(item) for item in logs]
 
 
-@router.get("/channel-change-events", response_model=UpstreamChannelChangePageOut)
+@router.get("/upstream-change-events", response_model=UpstreamChangePageOut)
 async def list_channel_change_events(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     page: Annotated[int, Query(ge=1)] = 1,
@@ -155,7 +156,7 @@ async def list_channel_change_events(
     ] = "all",
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-) -> UpstreamChannelChangePageOut:
+) -> UpstreamChangePageOut:
     start_at, end_at = _rate_log_date_bounds(start_date, end_date, time_zone)
     retention_days = await get_runtime_config_service().get_upstream_rate_log_retention_days()
     rows, last_read_id, unread_count, total_count = await list_upstream_channel_changes(
@@ -170,10 +171,10 @@ async def list_channel_change_events(
     )
     items = []
     for row in rows:
-        item = UpstreamChannelChangeEventOut.model_validate(row)
+        item = UpstreamChangeEventOut.model_validate(row)
         item.unread = not row.legacy_imported and row.id > last_read_id
         items.append(item)
-    return UpstreamChannelChangePageOut(
+    return UpstreamChangePageOut(
         items=items,
         unread_count=unread_count,
         last_read_id=last_read_id,
@@ -236,7 +237,7 @@ async def get_change_log_unread_counts(
     )
 
 
-@router.post("/channel-change-events/mark-read", response_model=MessageResponse)
+@router.post("/upstream-change-events/mark-read", response_model=MessageResponse)
 async def mark_channel_change_events_read(
     payload: ChangeLogMarkReadRequest,
     category: Annotated[
@@ -278,7 +279,7 @@ async def create_priority_interval(
 ) -> PriorityIntervalOut:
     try:
         return await service.create_interval(db, payload)
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
@@ -301,7 +302,7 @@ async def update_priority_interval(
 ) -> PriorityIntervalOut:
     try:
         return await service.update_interval(db, interval_id, payload)
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
@@ -319,19 +320,30 @@ async def delete_priority_interval(
     )
 
 
-@router.put("/{sub2api_account_id}", response_model=UpstreamAccountOut)
+@router.put("/{management_account_id}", response_model=ApiAccountOut)
 async def upsert_upstream_account(
-    sub2api_account_id: AccountId,
-    payload: UpstreamAccountUpdate,
+    management_account_id: AccountId,
+    payload: ApiAccountUpdate,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
-) -> UpstreamAccountOut:
+    service: ApiAccountService = Depends(get_api_account_service),
+) -> ApiAccountOut:
     try:
+        if "upstream_id" in payload.model_fields_set and payload.upstream_id is not None:
+            result = await db.execute(
+                select(Upstream.id).where(
+                    Upstream.id == payload.upstream_id.lower(),
+                    Upstream.deleted_at.is_(None),
+                )
+            )
+            internal_upstream_id = result.scalar_one_or_none()
+            if internal_upstream_id is None:
+                raise HTTPException(status_code=404, detail="Upstream not found.")
+            payload = payload.model_copy(update={"upstream_id": internal_upstream_id})
         rate_reconcile_fields = {
-            "channel_id",
+            "upstream_id",
             "api_key",
-            "manual_group_multiplier",
+            "upstream_group_multiplier_override",
         }
         rate_reconcile_requested = bool(
             payload.model_fields_set & rate_reconcile_fields
@@ -351,50 +363,50 @@ async def upsert_upstream_account(
         reconcile_requested = rate_reconcile_requested or priority_reconcile_requested
         account = await service.upsert_account(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload,
             defer_priority_rebalance=reconcile_requested,
         )
         should_reconcile_in_background = bool(
-            account.channel_id
+            account.upstream_id
             and (rate_reconcile_requested or availability_reconcile_requested)
         )
-        if should_reconcile_in_background and account.channel_id is not None:
-            get_upstream_channel_service().queue_discover_channel(account.channel_id)
+        if should_reconcile_in_background and account.upstream_id is not None:
+            get_upstream_service().queue_discover_channel(account.upstream_id)
             return account
-        if reconcile_requested and isinstance(service, UpstreamAccountService):
+        if reconcile_requested and isinstance(service, ApiAccountService):
             await service._rebalance_priorities_best_effort(db)
             refreshed = await service.list_accounts(db)
             return next(
                 (
                     item
                     for item in refreshed
-                    if item.sub2api_account_id == sub2api_account_id
+                    if item.management_account_id == management_account_id
                 ),
                 account,
             )
         return account
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.put("/{sub2api_account_id}/priority-interval", response_model=UpstreamAccountOut)
+@router.put("/{management_account_id}/priority-interval", response_model=ApiAccountOut)
 async def assign_priority_interval(
-    sub2api_account_id: AccountId,
+    management_account_id: AccountId,
     payload: PriorityIntervalAssignment,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     service: UpstreamPriorityService = Depends(get_upstream_priority_service),
-) -> UpstreamAccountOut:
+) -> ApiAccountOut:
     try:
-        return await service.assign_interval(db, sub2api_account_id, payload)
-    except UpstreamAccountServiceError as exc:
+        return await service.assign_interval(db, management_account_id, payload)
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.put("/{sub2api_account_id}/priority-order", response_model=PriorityRebalanceOut)
+@router.put("/{management_account_id}/priority-order", response_model=PriorityRebalanceOut)
 async def move_equal_multiplier_priority(
-    sub2api_account_id: AccountId,
+    management_account_id: AccountId,
     payload: PriorityTieMoveRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
@@ -403,148 +415,148 @@ async def move_equal_multiplier_priority(
     try:
         return await service.move_equal_multiplier_priority(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.delete("/{sub2api_account_id}", response_model=MessageResponse)
+@router.delete("/{management_account_id}", response_model=MessageResponse)
 async def delete_upstream_account(
-    sub2api_account_id: AccountId,
+    management_account_id: AccountId,
     payload: UpstreamIdentityRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
+    service: ApiAccountService = Depends(get_api_account_service),
 ) -> MessageResponse:
     try:
         removed = await service.delete_account(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload.expected_identity_fingerprint,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
     if removed:
-        return MessageResponse(message=f"Removed local upstream configuration for account #{sub2api_account_id}.")
-    return MessageResponse(message=f"Account #{sub2api_account_id} was not locally managed.")
+        return MessageResponse(message=f"Removed local upstream configuration for account #{management_account_id}.")
+    return MessageResponse(message=f"Account #{management_account_id} was not locally managed.")
 
 
-@router.patch("/{sub2api_account_id}/enabled", response_model=UpstreamAccountOut)
+@router.patch("/{management_account_id}/enabled", response_model=ApiAccountOut)
 async def set_upstream_account_enabled(
-    sub2api_account_id: AccountId,
-    payload: UpstreamAccountEnabledUpdate,
+    management_account_id: AccountId,
+    payload: ApiAccountEnabledUpdate,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
-) -> UpstreamAccountOut:
+    service: ApiAccountService = Depends(get_api_account_service),
+) -> ApiAccountOut:
     try:
         return await service.set_account_enabled(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload.enabled,
             payload.expected_identity_fingerprint,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
 @router.post(
-    "/{sub2api_account_id}/connection-test",
-    response_model=UpstreamAccountConnectionTestOut,
+    "/{management_account_id}/connection-test",
+    response_model=ApiAccountConnectionTestOut,
 )
 async def force_upstream_account_connection_test(
-    sub2api_account_id: AccountId,
+    management_account_id: AccountId,
     payload: UpstreamIdentityRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
-) -> UpstreamAccountConnectionTestOut:
+    service: UpstreamService = Depends(get_upstream_service),
+) -> ApiAccountConnectionTestOut:
     try:
         return await service.test_account_connection(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload.expected_identity_fingerprint,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
 @router.post(
-    "/{sub2api_account_id}/availability-test",
-    response_model=UpstreamAccountAvailabilityTestOut,
+    "/{management_account_id}/availability-test",
+    response_model=ApiAccountAvailabilityTestOut,
 )
 async def test_upstream_account_availability(
-    sub2api_account_id: AccountId,
+    management_account_id: AccountId,
     payload: UpstreamIdentityRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamChannelService = Depends(get_upstream_channel_service),
-) -> UpstreamAccountAvailabilityTestOut:
+    service: UpstreamService = Depends(get_upstream_service),
+) -> ApiAccountAvailabilityTestOut:
     try:
         return await service.test_account_availability(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload.expected_identity_fingerprint,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.delete("/{sub2api_account_id}/remote", response_model=MessageResponse)
+@router.delete("/{management_account_id}/remote", response_model=MessageResponse)
 async def delete_remote_upstream_account(
-    sub2api_account_id: AccountId,
-    payload: UpstreamRemoteDeleteRequest,
+    management_account_id: AccountId,
+    payload: ApiAccountRemoteDeleteRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
+    service: ApiAccountService = Depends(get_api_account_service),
 ) -> MessageResponse:
-    if payload.confirmed_account_id != sub2api_account_id:
+    if payload.confirmed_account_id != management_account_id:
         raise HTTPException(status_code=409, detail="The account deletion confirmation is stale.")
     try:
         await service.delete_remote_account(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload.expected_identity_fingerprint,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
-    return MessageResponse(message=f"Deleted sub2api API key account #{sub2api_account_id}.")
+    return MessageResponse(message=f"Deleted management-site API account #{management_account_id}.")
 
 
-@router.post("/{sub2api_account_id}/discover", response_model=UpstreamAccountOut)
+@router.post("/{management_account_id}/discover", response_model=ApiAccountOut)
 async def discover_upstream_account(
-    sub2api_account_id: AccountId,
+    management_account_id: AccountId,
     payload: UpstreamIdentityRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
-) -> UpstreamAccountOut:
+    service: ApiAccountService = Depends(get_api_account_service),
+) -> ApiAccountOut:
     try:
         return await service.discover_account(
             db,
-            sub2api_account_id,
+            management_account_id,
             payload.expected_identity_fingerprint,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None
 
 
-@router.post("/{sub2api_account_id}/apply", response_model=UpstreamAccountOut)
+@router.post("/{management_account_id}/apply", response_model=ApiAccountOut)
 async def apply_upstream_account_rate(
-    sub2api_account_id: AccountId,
+    management_account_id: AccountId,
     payload: UpstreamApplyRequest,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    service: UpstreamAccountService = Depends(get_upstream_account_service),
-) -> UpstreamAccountOut:
+    service: ApiAccountService = Depends(get_api_account_service),
+) -> ApiAccountOut:
     try:
         return await service.apply_account(
             db,
-            sub2api_account_id,
-            payload.confirmed_target_rate,
+            management_account_id,
+            payload.confirmed_expected_management_billing_multiplier,
             payload.expected_identity_fingerprint,
         )
-    except UpstreamAccountServiceError as exc:
+    except ApiAccountServiceError as exc:
         raise _http_error(exc) from None

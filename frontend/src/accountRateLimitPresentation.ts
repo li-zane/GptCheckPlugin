@@ -1,4 +1,4 @@
-import type { Account, AccountUsageEstimate } from "./types";
+import type { Account, AccountUsageEstimate } from "./domain";
 
 type CurrentAccountRateLimit = Pick<Account, "deactive" | "rate_limited" | "rate_limited_windows">;
 type CachedAccountRateLimit = Pick<

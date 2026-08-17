@@ -1,0 +1,18 @@
+.button {
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  gap: 8px;
+  justify-content: center;
+  min-height: 36px;
+  padding: 8px 12px;
+}
+
+.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-ink); }
+.primary:hover:not(:disabled) { background: var(--primary-hover); }
+.secondary { background: var(--surface); color: var(--ink); }
+.secondary:hover:not(:disabled), .ghost:hover:not(:disabled) { background: var(--panel-2); }
+.danger { background: var(--danger-bg); border-color: var(--danger-line); color: var(--danger-ink); }
+.danger:hover:not(:disabled) { background: var(--danger-bg-hover); }
+.ghost { background: transparent; border-color: transparent; color: inherit; }

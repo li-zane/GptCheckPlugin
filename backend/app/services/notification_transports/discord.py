@@ -33,12 +33,12 @@ _REASON_LABELS = {
     "manual_apply": "手动应用倍率",
     "automatic_apply": "自动应用倍率",
     "external_observed": "检测到外部修改倍率",
-    "upstream_balance_negative": "上游渠道余额低于配置阈值",
+    "upstream_balance_negative": "上游余额低于配置阈值",
     "upstream_key_unavailable": "上游 API Key 不可用",
     "upstream_group_unavailable": "上游分组不可用",
-    "channel_monitor_unavailable": "上游渠道监控异常",
+    "upstream_monitor_unavailable": "上游监控异常",
     "upstream_rate_increase": "上游倍率涨幅超过停用阈值",
-    "upstream_channel_token_invalid": "上游登录 Token 已失效",
+    "upstream_token_invalid": "上游登录 Token 已失效",
     "Account state changed manually.": "手动修改账号状态",
     "All automatic pause conditions cleared.": "所有自动暂停条件均已解除",
     "Sub2API reported the OAuth account as disabled.": "Sub2API 检测到 OAuth 账号已停用",
@@ -159,7 +159,7 @@ def _build_embed(notification: NotificationEnvelope) -> dict[str, Any]:
         fields = _account_state_fields(details, enabled=True)
     elif event_type == "api_key_rate_changed":
         title = "倍率变化"
-        description = _rate_description(details, "API Key 账号倍率已变化")
+        description = _rate_description(details, "API 账号倍率已变化")
         color = _rate_color(details)
         fields = _rate_fields(details, include_group=False)
     elif event_type == "upstream_group_changed":
@@ -177,12 +177,12 @@ def _build_embed(notification: NotificationEnvelope) -> dict[str, Any]:
         description = "上游余额低于安全阈值"
         color = COLOR_RED
         fields = _balance_fields(details)
-    elif event_type == "upstream_channel_token_invalid":
+    elif event_type == "upstream_token_invalid":
         title = "Token 失效"
         description = "上游拒绝登录凭据，自动刷新未能恢复"
         color = COLOR_RED
         fields = [
-            _field("上游渠道", _channel_label(details) or "未知渠道"),
+            _field("上游", _upstream_label(details) or "未知上游"),
             _field("当前状态", "🔴 Token 失效"),
         ]
     elif event_type == "notification_test":
@@ -200,7 +200,7 @@ def _build_embed(notification: NotificationEnvelope) -> dict[str, Any]:
         "title": _trim(title, DISCORD_EMBED_TITLE_LIMIT),
         "description": _trim(description, DISCORD_EMBED_DESCRIPTION_LIMIT),
         "color": color,
-        "footer": {"text": "sub2api · 自动通知"},
+        "footer": {"text": "管理站点 · 自动通知"},
         "timestamp": _event_timestamp(details),
     }
     if fields:
@@ -222,9 +222,9 @@ def _account_state_fields(details: dict[str, Any], *, enabled: bool) -> list[dic
         _field("类型", type_label),
         _field("当前状态", "🟢 已启用" if enabled else "🔴 已停用"),
     ]
-    channel = _channel_label(details)
-    if channel:
-        fields.append(_field("关联渠道", channel))
+    upstream = _upstream_label(details)
+    if upstream:
+        fields.append(_field("关联上游", upstream))
     reason = _reason_label(details.get("reason"))
     if reason:
         fields.append(_field("恢复说明" if enabled else "触发原因", reason, inline=False))
@@ -250,9 +250,9 @@ def _rate_fields(details: dict[str, Any], *, include_group: bool) -> list[dict[s
     new_value = _number(details.get(new_key))
     fields: list[dict[str, Any]] = []
 
-    channel = _channel_label(details)
-    if channel:
-        fields.append(_field("上游渠道", channel))
+    upstream = _upstream_label(details)
+    if upstream:
+        fields.append(_field("上游", upstream))
     if include_group:
         group = _first_text(
             details.get("group_name"),
@@ -266,7 +266,7 @@ def _rate_fields(details: dict[str, Any], *, include_group: bool) -> list[dict[s
             _id_label("账号", details.get("account_id")),
             "未知账号",
         )
-        fields.append(_field("API Key 账号", account))
+        fields.append(_field("API 账号", account))
 
     fields.extend(
         [
@@ -311,7 +311,7 @@ def _affected_account_fields(value: Any) -> list[dict[str, Any]]:
 
 
 def _group_change_description(details: dict[str, Any]) -> str:
-    channel = _channel_label(details)
+    upstream = _upstream_label(details)
     group = _first_text(details.get("group_name"), details.get("group_id"), "未知分组")
     change_type = {
         "added": "新增",
@@ -319,14 +319,14 @@ def _group_change_description(details: dict[str, Any]) -> str:
         "renamed": "名称变化",
         "multiplier": "倍率变化",
     }.get(str(details.get("change_type") or "").strip().lower(), "状态变化")
-    if channel:
-        return f"检测到 **{_escape_markdown(channel)}** 的上游分组 **{_escape_markdown(group)}** 发生{change_type}。"
+    if upstream:
+        return f"检测到 **{_escape_markdown(upstream)}** 的上游分组 **{_escape_markdown(group)}** 发生{change_type}。"
     return f"检测到上游分组 **{_escape_markdown(group)}** 发生{change_type}。"
 
 
 def _group_change_fields(details: dict[str, Any]) -> list[dict[str, Any]]:
     fields = [
-        _field("上游渠道", _channel_label(details) or "未知渠道"),
+        _field("上游", _upstream_label(details) or "未知上游"),
         _field("上游分组", _first_text(details.get("group_name"), details.get("group_id"), "未知分组")),
         _field("变化类型", {
             "added": "新增",
@@ -352,7 +352,7 @@ def _group_change_fields(details: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _balance_fields(details: dict[str, Any]) -> list[dict[str, Any]]:
     return [
-        _field("上游渠道", _channel_label(details) or "未知渠道"),
+        _field("上游", _upstream_label(details) or "未知上游"),
         *_balance_detail_fields(details),
     ]
 
@@ -380,11 +380,11 @@ def _balance_detail_fields(details: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _rate_description(details: dict[str, Any], fallback: str) -> str:
-    channel = _channel_label(details)
-    if not channel:
+    upstream = _upstream_label(details)
+    if not upstream:
         return fallback
     group = _first_text(details.get("group_name"), details.get("group_id"))
-    return " · ".join(item for item in (channel, group) if item)
+    return " · ".join(item for item in (upstream, group) if item)
 
 
 def _rate_color(
@@ -421,10 +421,10 @@ def _field(name: str, value: Any, *, inline: bool = True) -> dict[str, Any]:
     }
 
 
-def _channel_label(details: dict[str, Any]) -> str:
+def _upstream_label(details: dict[str, Any]) -> str:
     return _first_text(
-        details.get("channel_name"),
-        _id_label("渠道", details.get("channel_id")),
+        details.get("upstream_name"),
+        _id_label("上游", details.get("upstream_id")),
     )
 
 

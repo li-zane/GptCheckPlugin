@@ -424,7 +424,7 @@ class MonitorService:
             )
         if remote_healthy or effective_deactive:
             snapshot.auto_refresh_locked = False
-        snapshot.sub2api_account_id = self.sub2api.account_id(account)
+        snapshot.management_account_id = self.sub2api.account_id(account)
         snapshot.platform = self.sub2api.account_platform(account)
         snapshot.account_type = self.sub2api.account_type(account)
         snapshot.status = self.sub2api.account_status(account)
@@ -646,10 +646,10 @@ class MonitorService:
                 await read_db.execute(
                     select(
                         AccountSnapshot.id,
-                        AccountSnapshot.sub2api_account_id,
+                        AccountSnapshot.management_account_id,
                         AccountSnapshot.available_models,
                         AccountSnapshot.available_models_checked_at,
-                    ).where(AccountSnapshot.sub2api_account_id.in_(remote_by_id))
+                    ).where(AccountSnapshot.management_account_id.in_(remote_by_id))
                 )
             ).all()
         targets = [
@@ -707,7 +707,7 @@ class MonitorService:
                 snapshot = current_by_id.get(snapshot_id)
                 if (
                     snapshot is None
-                    or str(snapshot.sub2api_account_id or "") != account_id
+                    or str(snapshot.management_account_id or "") != account_id
                     or snapshot.available_models_checked_at != baseline_checked_at
                     or (not force and snapshot.available_models is not None)
                 ):
@@ -821,7 +821,7 @@ class MonitorService:
                 status="missing_mailbox",
                 message=reason,
                 email=email,
-                sub2api_account_id=snapshot.sub2api_account_id,
+                management_account_id=snapshot.management_account_id,
                 details={"reason": "missing_mailbox"},
                 commit=False,
             )
@@ -858,7 +858,7 @@ class MonitorService:
                 status="recovery_disabled",
                 message=reason,
                 email=email,
-                sub2api_account_id=snapshot.sub2api_account_id,
+                management_account_id=snapshot.management_account_id,
                 details={"reason": "recovery_disabled"},
                 commit=False,
             )
@@ -901,7 +901,7 @@ class MonitorService:
             status=status if reason is None else reason,
             message=message,
             email=email,
-            sub2api_account_id=account_id,
+            management_account_id=account_id,
             details={
                 "reason": reason,
                 "status": account_status,
@@ -915,7 +915,7 @@ class MonitorService:
     async def _clear_account_exceptions(
         self,
         email: str,
-        sub2api_account_id: str | None,
+        management_account_id: str | None,
         *,
         db: AsyncSession | None = None,
     ) -> None:
@@ -923,7 +923,7 @@ class MonitorService:
             async with AsyncSessionLocal() as owned_db:
                 await self._clear_account_exceptions(
                     email,
-                    sub2api_account_id,
+                    management_account_id,
                     db=owned_db,
                 )
                 await owned_db.commit()
@@ -932,7 +932,7 @@ class MonitorService:
             db,
             source="sync",
             email=email,
-            sub2api_account_id=sub2api_account_id,
+            management_account_id=management_account_id,
             commit=False,
         )
 

@@ -4,13 +4,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import require_admin
-from app.models import AccountSnapshot, UpstreamAccountConfig
+from app.models import AccountSnapshot, ApiAccount
 from app.schemas import (
     AppSettingsOut,
     AppSettingsUpdate,
     MessageResponse,
     SiteLogoUpdateResult,
-    Sub2ApiPortScanResult,
+    ManagementSiteScanResult,
 )
 from app.services.monitor import get_monitor_service
 from app.services.notification_dispatcher import get_notification_dispatcher
@@ -30,7 +30,7 @@ async def _available_test_models(db: AsyncSession) -> list[dict[str, str]]:
         (await db.execute(select(AccountSnapshot.available_models))).scalars().all()
     )
     api_key_lists = list(
-        (await db.execute(select(UpstreamAccountConfig.available_models))).scalars().all()
+        (await db.execute(select(ApiAccount.available_models))).scalars().all()
     )
     models: dict[str, str] = {}
     for raw_list in (*oauth_lists, *api_key_lists):
@@ -138,13 +138,13 @@ async def update_settings(
         if previous_settings.get(key) != settings.get(key)
     }
     credential_changed = bool(
-        str(changes.get("sub2api_x_api_key") or "").strip()
+        str(changes.get("management_site_x_api_key") or "").strip()
         or (
-            changes.get("clear_sub2api_x_api_key")
-            and previous_settings.get("sub2api_x_api_key_set")
+            changes.get("clear_management_site_x_api_key")
+            and previous_settings.get("management_site_x_api_key_set")
         )
     )
-    connection_changed = credential_changed or "sub2api_base_url" in changed_fields
+    connection_changed = credential_changed or "management_site_base_url" in changed_fields
     automation_pause_changed = "automation_paused" in changed_fields
     inventory_changed = bool(changed_fields & {
         "api_key_account_sync_enabled",
@@ -155,14 +155,13 @@ async def update_settings(
         & {
             "account_model_whitelist_sync_enabled",
             "account_model_whitelist_sync_interval_seconds",
-            # Keep legacy clients able to switch the compatibility fallback.
             "account_model_whitelist_sync_each_time",
         }
     )
     priority_changed = bool(changed_fields & {
         "upstream_priority_sync_enabled",
         "priority_assign_disabled_api_key_accounts",
-        "priority_share_same_composite_multiplier",
+        "priority_share_same_upstream_actual_multiplier",
     })
     upstream_changed = bool(changed_fields & {
         "upstream_sync_enabled",
@@ -172,20 +171,20 @@ async def update_settings(
         "manual_upstream_sync_rate_enabled",
         "manual_upstream_sync_priority_enabled",
         "manual_upstream_sync_upstream_health_enabled",
-        "manual_upstream_sync_channel_monitors_enabled",
+        "manual_upstream_monitor_sync_enabled",
         "manual_upstream_sync_account_availability_enabled",
         "manual_upstream_sync_balance_guard_enabled",
         "manual_upstream_sync_rate_pause_enabled",
         "api_key_auto_disable_on_upstream_unavailable",
-        "api_key_auto_pause_on_channel_monitor_unavailable_enabled",
+        "api_account_auto_pause_on_upstream_monitor_unavailable_enabled",
         "api_key_availability_all_tests_must_succeed",
-        "channel_monitor_auto_probe_enabled",
-        "channel_monitor_fallback_without_monitor_enabled",
-        "channel_monitor_fallback_test_models",
-        "channel_monitor_fallback_test_model",
-        "channel_monitor_fallback_test_attempts",
-        "channel_monitor_recovery_test_attempts",
-        "channel_monitor_test_attempt_interval_seconds",
+        "upstream_monitor_auto_probe_enabled",
+        "upstream_monitor_fallback_without_monitor_enabled",
+        "upstream_monitor_fallback_test_models",
+        "upstream_monitor_fallback_test_model",
+        "upstream_monitor_fallback_test_attempts",
+        "upstream_monitor_recovery_test_attempts",
+        "upstream_monitor_test_attempt_interval_seconds",
         "api_key_auto_pause_on_negative_balance_enabled",
         "upstream_negative_balance_basis",
         "upstream_balance_pause_threshold",
@@ -256,12 +255,12 @@ async def update_settings(
     return AppSettingsOut(**settings)
 
 
-@router.post("/scan-sub2api", response_model=Sub2ApiPortScanResult)
-async def scan_sub2api(_: dict = Depends(require_admin)) -> Sub2ApiPortScanResult:
-    result = await get_runtime_config_service().scan_sub2api_ports(apply=True)
+@router.post("/scan-management-site", response_model=ManagementSiteScanResult)
+async def scan_management_site(_: dict = Depends(require_admin)) -> ManagementSiteScanResult:
+    result = await get_runtime_config_service().scan_management_site(apply=True)
     get_monitor_service().wake()
     get_upstream_rate_sync_service().wake()
-    return Sub2ApiPortScanResult(**result)
+    return ManagementSiteScanResult(**result)
 
 
 @router.post("/notifications/test", response_model=MessageResponse)

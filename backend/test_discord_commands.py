@@ -6,7 +6,7 @@ import httpx
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.database import Base
-from app.models import UpstreamAccountConfig, UpstreamChannel
+from app.models import ApiAccount, Upstream
 from app.services.discord_commands import (
     DiscordCommandService,
     build_balance_command_embed,
@@ -26,41 +26,41 @@ class DiscordCommandEmbedTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_balance_omits_empty_categories_and_groups_disabled_accounts(self) -> None:
         async with self.sessions() as db:
-            active = UpstreamChannel(
+            active = Upstream(
                 display_name="有账号上游",
-                canonical_base_url="https://active.example",
-                balance_remaining=12.5,
+                api_endpoint_url="https://active.example",
+                wallet_balance_usd=12.5,
                 balance_unit="USD",
-                effective_recharge_multiplier=2.0,
+                upstream_recharge_multiplier=2.0,
                 balance_guard_state="healthy",
             )
-            disabled = UpstreamChannel(
+            disabled = Upstream(
                 display_name="无启用上游",
-                canonical_base_url="https://disabled.example",
-                balance_remaining=3.0,
+                api_endpoint_url="https://disabled.example",
+                wallet_balance_usd=3.0,
                 balance_unit="USD",
-                effective_recharge_multiplier=1.5,
+                upstream_recharge_multiplier=1.5,
                 balance_guard_state="insufficient",
             )
             db.add_all([active, disabled])
             await db.flush()
             db.add_all(
                 [
-                    UpstreamAccountConfig(
-                        sub2api_account_id=1,
-                        channel_id=active.id,
+                    ApiAccount(
+                        management_account_id=1,
+                        upstream_id=active.id,
                         remote_name="Active",
                         remote_schedulable=True,
                         remote_present=True,
-                        upstream_type="auto",
+                        platform_type="auto",
                     ),
-                    UpstreamAccountConfig(
-                        sub2api_account_id=2,
-                        channel_id=disabled.id,
+                    ApiAccount(
+                        management_account_id=2,
+                        upstream_id=disabled.id,
                         remote_name="Disabled",
                         remote_schedulable=False,
                         remote_present=True,
-                        upstream_type="auto",
+                        platform_type="auto",
                     ),
                 ]
             )
@@ -71,8 +71,8 @@ class DiscordCommandEmbedTests(unittest.IsolatedAsyncioTestCase):
 
         fields = {field["name"]: field["value"] for field in embed["fields"]}
         self.assertEqual(set(fields), {"有账号", "无启用"})
-        self.assertIn("原 $12.50 · 综 ¥25.00", fields["有账号"])
-        self.assertIn("原 $3.00 · 综 ¥4.50", fields["无启用"])
+        self.assertIn("钱包 $12.50 · 实际 ¥25.00", fields["有账号"])
+        self.assertIn("钱包 $3.00 · 实际 ¥4.50", fields["无启用"])
         self.assertEqual(embed["color"], 0xED4245)
 
     async def test_quota_uses_cached_composite_windows(self) -> None:

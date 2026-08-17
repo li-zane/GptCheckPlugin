@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -31,6 +33,7 @@ from app.services.usage_estimate import (
     _window_reset_detected,
 )
 from app.services.sub2api import Sub2ApiClient
+from app.api.accounts import usage_estimate as usage_estimate_route
 
 
 class UsageEstimateTests(unittest.TestCase):
@@ -62,7 +65,6 @@ class UsageEstimateTests(unittest.TestCase):
 
         self.assertEqual(row["account_name"], "Campus Plus Account")
         self.assertEqual(row["email"], "student@example.edu")
-
     def test_small_reset_at_drift_does_not_count_as_reset(self) -> None:
         self.assertFalse(
             _window_reset_detected(
@@ -893,7 +895,7 @@ class UsageEstimateTests(unittest.TestCase):
                         UsageLimitSample(
                             account_key="id:x1-weekly",
                             email="pinnate.1.plasmid+bzbquv@icloud.com",
-                            sub2api_account_id="x1-weekly",
+                            management_account_id="x1-weekly",
                             plan_cohort="team",
                             window_key="monthly",
                             reset_key=f"reset:{reset_at}",
@@ -907,7 +909,7 @@ class UsageEstimateTests(unittest.TestCase):
                         UsageTokenWindow(
                             account_key="id:x1-weekly",
                             email="pinnate.1.plasmid+bzbquv@icloud.com",
-                            sub2api_account_id="x1-weekly",
+                            management_account_id="x1-weekly",
                             window_key="monthly",
                             window_reset_key=f"reset_date:{reset_at[:10]}",
                             reset_at=reset_at,
@@ -919,7 +921,7 @@ class UsageEstimateTests(unittest.TestCase):
                         UsageLimitSample(
                             account_key="id:x1-weekly",
                             email="pinnate.1.plasmid+bzbquv@icloud.com",
-                            sub2api_account_id="x1-weekly",
+                            management_account_id="x1-weekly",
                             plan_cohort="team",
                             window_key="monthly",
                             reset_key=f"reset:{other_reset_at}",
@@ -933,7 +935,7 @@ class UsageEstimateTests(unittest.TestCase):
                         UsageTokenWindow(
                             account_key="id:x1-weekly",
                             email="pinnate.1.plasmid+bzbquv@icloud.com",
-                            sub2api_account_id="x1-weekly",
+                            management_account_id="x1-weekly",
                             window_key="monthly",
                             window_reset_key=f"reset_date:{other_reset_at[:10]}",
                             reset_at=other_reset_at,
@@ -1044,7 +1046,7 @@ class UsageEstimateTests(unittest.TestCase):
                     {
                         "account_key": f"id:old-{index}",
                         "email": f"old-{index}@example.com",
-                        "sub2api_account_id": f"old-{index}",
+                        "management_account_id": f"old-{index}",
                         "plan_cohort": "team",
                         "window_key": "seven_day",
                         "reset_key": f"reset:{index}",
@@ -1082,7 +1084,7 @@ class UsageEstimateTests(unittest.TestCase):
                 first_sample = {
                     "account_key": "id:1",
                     "email": "example@example.com",
-                    "sub2api_account_id": "1",
+                    "management_account_id": "1",
                     "plan_cohort": "plus",
                     "window_key": "five_hour",
                     "reset_key": "reset:2099-01-01T05:00:00Z",
@@ -1407,6 +1409,35 @@ class UsageEstimateTests(unittest.TestCase):
         self.assertEqual(samples[0]["window_key"], "monthly")
         self.assertEqual(samples[0]["plan_cohort"], "team")
         self.assertAlmostEqual(samples[0]["observed_limit"], 250.0)
+
+
+class UsageEstimateRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_cached_contract_is_deleted_and_rebuilt(self) -> None:
+        rebuilt = {"contract": "rebuilt"}
+        usage_service = SimpleNamespace(latest_usage_snapshot=lambda: {})
+        with (
+            patch(
+                "app.api.accounts.get_usage_refresh_service",
+                return_value=usage_service,
+            ),
+            patch(
+                "app.api.accounts.get_cached_usage_estimate",
+                AsyncMock(return_value={"accounts": [{"sub2api_account_id": "7"}]}),
+            ),
+            patch(
+                "app.api.accounts.delete_cached_usage_estimate",
+                AsyncMock(),
+            ) as delete_cache,
+            patch(
+                "app.api.accounts.build_usage_estimate",
+                AsyncMock(return_value=rebuilt),
+            ) as rebuild,
+        ):
+            result = await usage_estimate_route(refresh=False, _={})
+
+        self.assertIs(result, rebuilt)
+        delete_cache.assert_awaited_once_with()
+        rebuild.assert_awaited_once_with(refresh=False, usage_by_account_id=None)
 
 
 if __name__ == "__main__":

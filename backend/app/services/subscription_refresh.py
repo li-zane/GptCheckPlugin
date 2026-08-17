@@ -281,7 +281,7 @@ async def _save_subscription_metadata(
             snapshot.usage_estimate_enabled = not sub2api.is_deactive_account(account)
             db.add(snapshot)
         was_deactive = bool(snapshot.deactive)
-        snapshot.sub2api_account_id = sub2api.account_id(account)
+        snapshot.management_account_id = sub2api.account_id(account)
         snapshot.platform = sub2api.account_platform(account)
         snapshot.account_type = sub2api.account_type(account)
         snapshot.status = sub2api.account_status(account)
@@ -298,7 +298,7 @@ async def _save_subscription_metadata(
                 db,
                 email,
                 "Subscription refresh observed the OAuth account enabled again.",
-                account_id=snapshot.sub2api_account_id,
+                account_id=snapshot.management_account_id,
             )
         _set_if_present(snapshot, "subscription_starts_at", metadata.get("subscription_starts_at"))
         _set_if_present(snapshot, "subscription_expires_at", metadata.get("subscription_expires_at"))

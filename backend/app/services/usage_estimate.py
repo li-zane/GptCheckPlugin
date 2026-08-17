@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.core.database import AsyncSessionLocal
 from app.models import (
@@ -215,6 +215,12 @@ async def get_cached_usage_estimate() -> dict[str, Any] | None:
         return dict(row.payload)
 
 
+async def delete_cached_usage_estimate() -> None:
+    async with AsyncSessionLocal() as db:
+        await db.execute(delete(UsageEstimateCache).where(UsageEstimateCache.key == "latest"))
+        await db.commit()
+
+
 async def save_usage_estimate_cache(payload: dict[str, Any]) -> None:
     encoded = jsonable_encoder(payload)
     async with AsyncSessionLocal() as db:
@@ -320,8 +326,8 @@ async def _load_usage_estimate_preferences() -> dict[str, bool]:
         for snapshot in result.scalars().all():
             enabled = snapshot.usage_estimate_enabled is not False
             preferences[f"email:{snapshot.email.lower()}"] = enabled
-            if snapshot.sub2api_account_id:
-                preferences[f"id:{snapshot.sub2api_account_id}"] = enabled
+            if snapshot.management_account_id:
+                preferences[f"id:{snapshot.management_account_id}"] = enabled
     return preferences
 
 
@@ -333,7 +339,7 @@ async def _load_usage_window_states() -> dict[tuple[str, str], dict[str, Any]]:
             states[(state.account_key, state.window_key)] = {
                 "account_key": state.account_key,
                 "email": state.email,
-                "sub2api_account_id": state.sub2api_account_id,
+                "management_account_id": state.management_account_id,
                 "window_key": state.window_key,
                 "baseline_spent": state.baseline_spent,
                 "estimate_uses_spent_delta": bool(state.estimate_uses_spent_delta),
@@ -365,7 +371,7 @@ async def _save_usage_window_states(states: dict[tuple[str, str], dict[str, Any]
                 state = UsageWindowState(account_key=account_key, window_key=window_key)
                 db.add(state)
             state.email = state_data.get("email")
-            state.sub2api_account_id = state_data.get("sub2api_account_id")
+            state.management_account_id = state_data.get("management_account_id")
             state.baseline_spent = state_data.get("baseline_spent")
             state.estimate_uses_spent_delta = bool(state_data.get("estimate_uses_spent_delta", False))
             state.last_raw_spent = state_data.get("last_raw_spent")
@@ -391,7 +397,7 @@ async def _load_usage_token_window_history(
             .order_by(UsageLimitSample.account_key, UsageLimitSample.updated_at.desc(), UsageLimitSample.id.desc())
         )
         if allowed_account_ids is not None:
-            sample_query = sample_query.where(UsageLimitSample.sub2api_account_id.in_(allowed_account_ids))
+            sample_query = sample_query.where(UsageLimitSample.management_account_id.in_(allowed_account_ids))
         sample_result = await db.execute(sample_query)
         limit_samples_by_account: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for row in sample_result.scalars().all():
@@ -411,7 +417,7 @@ async def _load_usage_token_window_history(
             .order_by(UsageTokenWindow.account_key, UsageTokenWindow.last_observed_at.desc(), UsageTokenWindow.id.desc())
         )
         if allowed_account_ids is not None:
-            history_query = history_query.where(UsageTokenWindow.sub2api_account_id.in_(allowed_account_ids))
+            history_query = history_query.where(UsageTokenWindow.management_account_id.in_(allowed_account_ids))
         result = await db.execute(history_query)
         for row in result.scalars().all():
             first_observed_at = row.first_observed_at or row.created_at or row.updated_at or utcnow()
@@ -471,7 +477,7 @@ async def _save_usage_token_windows(
                 row.first_observed_at = now
                 db.add(row)
             row.email = observation.get("email")
-            row.sub2api_account_id = observation.get("sub2api_account_id")
+            row.management_account_id = observation.get("management_account_id")
             row.window_start_at = observation.get("window_start_at")
             row.reset_at = observation.get("reset_at")
             row.spent = max(float(row.spent or 0), float(observation.get("spent") or 0))
@@ -706,7 +712,7 @@ def _usage_token_window_observations(
             {
                 "account_key": _account_state_key(account_id, email),
                 "email": email,
-                "sub2api_account_id": account_id,
+                "management_account_id": account_id,
                 "window_key": history_window_key,
                 "window_reset_key": reset_key,
                 "window_start_at": window_start_at,
@@ -866,7 +872,7 @@ async def _save_usage_limit_samples(
                 )
                 db.add(row)
             row.email = sample.get("email")
-            row.sub2api_account_id = sample.get("sub2api_account_id")
+            row.management_account_id = sample.get("management_account_id")
             row.plan_cohort = _normalize_plan_cohort(sample.get("plan_cohort"))
             row.reset_key = sample["reset_key"]
             row.reset_at = sample.get("reset_at")
@@ -1096,7 +1102,7 @@ def _add_usage_limit_sample(
     samples[(account_key, sample_window_key, reset_key)] = {
         "account_key": account_key,
         "email": email,
-        "sub2api_account_id": account_id,
+        "management_account_id": account_id,
         "plan_cohort": plan_cohort,
         "window_key": sample_window_key,
         "reset_key": reset_key,
@@ -1319,7 +1325,7 @@ def _account_estimate(
     return {
         "email": email,
         "account_name": account_name,
-        "sub2api_account_id": account_id,
+        "management_account_id": account_id,
         "platform": sub2api.account_platform(account),
         "account_type": sub2api.account_type(account),
         "subscription_plan": _account_subscription_plan(account, plan_cohort),
@@ -2113,7 +2119,7 @@ def _update_state(
 ) -> None:
     updates = {
         "email": email,
-        "sub2api_account_id": account_id,
+        "management_account_id": account_id,
         "baseline_spent": baseline_spent,
         "estimate_uses_spent_delta": estimate_uses_spent_delta,
         "last_raw_spent": raw_spent,
