@@ -4393,6 +4393,7 @@ class UpstreamService:
                 reason=str(rate_event.get("reason") or "changed"),
                 upstream_id=rate_event.get("upstream_id"),
                 upstream_name=rate_event.get("upstream_name"),
+                runtime_config=runtime_config,
             )
 
     @staticmethod
