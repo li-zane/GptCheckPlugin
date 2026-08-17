@@ -3330,6 +3330,12 @@ class UpstreamServiceTests(unittest.IsolatedAsyncioTestCase):
         runtime = SimpleNamespace(
             get_upstream_rate_sync_enabled=AsyncMock(return_value=True),
             get_automation_paused=AsyncMock(return_value=False),
+            get_notification_config=AsyncMock(
+                return_value={
+                    "enabled": True,
+                    "api_key_rate_changed_enabled": True,
+                }
+            ),
         )
         with (
             patch(
