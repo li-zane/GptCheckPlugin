@@ -7686,7 +7686,7 @@ button.api-key-group-chip--more {
   align-items: stretch;
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(4, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
   justify-content: stretch;
   min-width: 0;
   padding-top: 10px;
@@ -8300,18 +8300,6 @@ button.api-key-group-chip--more {
 
 .api-key-channel-form {
   max-width: 100%;
-}
-
-@media (max-width: 1180px) {
-  .api-key-channel-grid {
-    grid-template-columns: repeat(2, minmax(300px, 1fr));
-  }
-}
-
-@media (max-width: 900px) {
-  .api-key-channel-grid {
-    grid-template-columns: repeat(2, minmax(280px, 1fr));
-  }
 }
 
 @media (max-width: 760px) {
