@@ -953,7 +953,13 @@ class UpstreamClient:
                 {
                     account_id: key
                     for account_id, key in normalized_account_api_keys.items()
-                    if account_id not in cached_api_key_records_by_account
+                    if (
+                        account_id not in cached_api_key_records_by_account
+                        and (
+                            active_type != "newapi"
+                            or account_id not in normalized_account_api_key_record_ids
+                        )
+                    )
                 },
                 revealed_api_key_records,
                 available_group_refs,
@@ -969,7 +975,13 @@ class UpstreamClient:
                 {
                     account_id: key
                     for account_id, key in normalized_account_api_keys.items()
-                    if account_id not in cached_api_key_records_by_account
+                    if (
+                        account_id not in cached_api_key_records_by_account
+                        and (
+                            active_type != "newapi"
+                            or account_id not in normalized_account_api_key_record_ids
+                        )
+                    )
                 },
                 revealed_api_key_records,
                 available_group_refs,
@@ -3573,10 +3585,20 @@ def _match_account_upstream_states(
     available_groups: _AvailableGroupRefs,
 ) -> dict[int, AccountUpstreamState]:
     matches: dict[int, AccountUpstreamState] = {}
+    masked_records = (
+        _unique_masked_api_key_records(
+            upstream_type,
+            payloads,
+            set(account_api_keys.values()),
+        )
+        if upstream_type == "newapi"
+        else {}
+    )
     for account_id, api_key in account_api_keys.items():
         record = (
             revealed_records.get(api_key)
             or _find_unique_api_key_record(upstream_type, payloads, api_key)
+            or masked_records.get(api_key)
         )
         state = _account_upstream_state_from_record(
             upstream_type,
@@ -3597,10 +3619,20 @@ def _match_account_groups(
     available_groups: _AvailableGroupRefs,
 ) -> dict[int, AccountGroupMatch]:
     matches: dict[int, AccountGroupMatch] = {}
+    masked_records = (
+        _unique_masked_api_key_records(
+            upstream_type,
+            payloads,
+            set(account_api_keys.values()),
+        )
+        if upstream_type == "newapi"
+        else {}
+    )
     for account_id, api_key in account_api_keys.items():
         record = (
             revealed_records.get(api_key)
             or _find_unique_api_key_record(upstream_type, payloads, api_key)
+            or masked_records.get(api_key)
         )
         if record is None:
             continue

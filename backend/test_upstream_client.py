@@ -12,6 +12,7 @@ import httpx
 from app.services.upstream_client import (
     UPSTREAM_MONITOR_DETAIL_CONCURRENCY,
     DiscoveryResult,
+    GroupOption,
     MAX_DOH_RESPONSE_BYTES,
     MAX_UPSTREAM_MONITORS,
     MAX_UPSTREAM_MONITOR_EXTRA_MODELS,
@@ -31,6 +32,9 @@ from app.services.upstream_client import (
     _default_resolver,
     _doh_resolver,
     _invalidate_dns_cache,
+    _available_group_refs,
+    _match_account_groups,
+    _match_account_upstream_states,
     _newapi_today_usage_params,
     _newapi_yesterday_usage_params,
     _scrub_discovery_result,
@@ -844,6 +848,57 @@ class UpstreamClientTests(unittest.TestCase):
         )
 
         self.assertEqual(matches, {})
+
+    def test_newapi_unique_masked_records_bind_accounts_without_reveal(self) -> None:
+        payloads = {
+            "/api/token/?p=1&page_size=200": {
+                "success": True,
+                "data": {
+                    "items": [
+                        {"id": 2299, "key": "sk**********-pro", "group": "GPT pro", "status": 1},
+                        {"id": 2300, "key": "sk**********-pro2", "group": "GPT PRO尊享", "status": 1},
+                    ]
+                },
+            },
+            "/api/user/self/groups": {
+                "success": True,
+                "data": {
+                    "GPT pro": {"ratio": 0.1},
+                    "GPT PRO尊享": {"ratio": 0.169},
+                },
+            },
+        }
+        account_keys = {
+            2731: "sk-local-pro",
+            2732: "sk-local-pro2",
+        }
+        groups = [
+            GroupOption(id="GPT pro", name="GPT pro", multiplier=0.1),
+            GroupOption(id="GPT PRO尊享", name="GPT PRO尊享", multiplier=0.169),
+        ]
+        available = _available_group_refs("newapi", payloads)
+
+        matches = _match_account_groups(
+            "newapi",
+            payloads,
+            groups,
+            account_keys,
+            {},
+            available,
+        )
+        states = _match_account_upstream_states(
+            "newapi",
+            payloads,
+            account_keys,
+            {},
+            available,
+        )
+
+        self.assertEqual(set(matches), {2731, 2732})
+        self.assertEqual(matches[2731].name, "GPT pro")
+        self.assertEqual(matches[2732].name, "GPT PRO尊享")
+        self.assertEqual(states[2731].key_record_id, 2299)
+        self.assertEqual(states[2732].key_record_id, 2300)
 
     def test_newapi_balance_uses_dynamic_quota_unit_and_explicit_totals(self) -> None:
         seen_headers: dict[str, tuple[str | None, str | None]] = {}
