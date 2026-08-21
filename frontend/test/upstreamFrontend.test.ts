@@ -1449,6 +1449,8 @@ test("upstream channel cards keep URLs and daily usage compact", () => {
   assert.match(styles, /\.api-key-channel-stat-value \.api-key-channel-usage-chip > span\s*\{[^}]*font-size: 13px;/s);
   assert.match(styles, /\.api-key-channel-stat-value \.api-key-channel-usage-chip > b\s*\{[^}]*font-size: 13px;/s);
   assert.match(dailyBalanceFormatter, /value:\s*adjustedValue,/);
+  assert.match(dailyBalanceFormatter, /const label = yesterday \? "昨日" : "今日";/);
+  assert.match(dailyBalanceFormatter, /const detailLabel = yesterday \? "昨日实际消耗" : "今日实际消耗";/);
   assert.doesNotMatch(dailyBalanceFormatter, /value:\s*`原 /);
   assert.match(
     dailyBalanceFormatter,

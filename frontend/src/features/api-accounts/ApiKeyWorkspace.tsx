@@ -6684,7 +6684,8 @@ function formatDailyBalanceUsed(
     ? formatRechargeAdjustedBalance(adjustedAmount, amount, upstream.upstream_recharge_multiplier)
     : "-";
   const staleDetail = stale ? "；上游本次探测失败，显示当天最后一次有效值" : "";
-  const label = yesterday ? "昨日实际消耗" : "今日实际消耗";
+  const label = yesterday ? "昨日" : "今日";
+  const detailLabel = yesterday ? "昨日实际消耗" : "今日实际消耗";
   return {
     label,
     stale,
@@ -6699,7 +6700,7 @@ function formatDailyBalanceUsed(
             : "muted",
     adjustedValue,
     value: adjustedValue,
-    detail: `${label}：${adjustedValue}（已考虑充值倍率）${staleDetail}`,
+    detail: `${detailLabel}：${adjustedValue}（已考虑充值倍率）${staleDetail}`,
   };
 }
 
