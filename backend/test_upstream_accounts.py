@@ -1984,6 +1984,20 @@ class ApiAccountServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.recharge_multiplier_source, "manual")
         self.assertEqual(account.expected_management_billing_multiplier, 4.5)
 
+    async def test_manual_recharge_overrides_discovered_recharge(self) -> None:
+        await self._manage(api_key="sk-manual-recharge", upstream_recharge_multiplier_override=1.0)
+
+        with patch(
+            "app.services.upstream_accounts.discover_upstream",
+            new=AsyncMock(return_value=discovery_result(group=1.0, recharge=7.3)),
+        ):
+            account = await self._discover()
+
+        self.assertEqual(account.discovered_upstream_recharge_multiplier, 7.3)
+        self.assertEqual(account.upstream_recharge_multiplier, 1.0)
+        self.assertEqual(account.recharge_multiplier_source, "manual")
+        self.assertEqual(account.recharge_multiplier_status, "manual")
+
     async def test_balance_failure_preserves_last_successful_values(self) -> None:
         secret = "sk-never-leak-balance"
         await self._manage(upstream_group_multiplier_override=1.0)

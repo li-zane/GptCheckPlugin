@@ -3664,14 +3664,18 @@ class ApiAccountService:
         config.upstream_group_multiplier = float(effective_group) if effective_group is not None else None
 
         manual_recharge = _decimal_multiplier(config.upstream_recharge_multiplier_override)
-        if fresh_recharge is not None:
+        if manual_recharge is not None:
+            effective_recharge = manual_recharge
+            config.recharge_multiplier_source = "manual"
+            config.recharge_multiplier_status = (
+                "manual"
+                if fresh_recharge is not None
+                else ("fallback_manual" if upstream_attempted else "manual")
+            )
+        elif fresh_recharge is not None:
             effective_recharge = fresh_recharge
             config.recharge_multiplier_source = fresh_recharge_source or "auto"
             config.recharge_multiplier_status = "ok"
-        elif manual_recharge is not None:
-            effective_recharge = manual_recharge
-            config.recharge_multiplier_source = "manual"
-            config.recharge_multiplier_status = "fallback_manual" if upstream_attempted else "manual"
         elif discovery_succeeded and not recharge_invalid and not recharge_failed:
             effective_recharge = Decimal("1")
             config.recharge_multiplier_source = "default"

@@ -2267,20 +2267,20 @@ class UpstreamService:
                 "Credentials may only be sent to an HTTPS upstream URL.", status_code=422
             )
         if status != "ok":
-            cached_recharge = _decimal_multiplier(channel.upstream_recharge_multiplier)
-            if cached_recharge is None:
-                cached_recharge = _decimal_multiplier(channel.last_known_recharge_multiplier)
-                if cached_recharge is not None:
-                    channel.upstream_recharge_multiplier = float(cached_recharge)
-                    channel.recharge_multiplier_source = channel.recharge_multiplier_source or "cached"
-                    channel.recharge_multiplier_status = "stale"
-            if cached_recharge is None:
-                manual_recharge = _decimal_multiplier(channel.upstream_recharge_multiplier_override)
-                if manual_recharge is not None:
-                    channel.upstream_recharge_multiplier = float(manual_recharge)
-                    channel.recharge_multiplier_source = "manual"
-                    channel.recharge_multiplier_status = "fallback_manual"
-                else:
+            manual_recharge = _decimal_multiplier(channel.upstream_recharge_multiplier_override)
+            if manual_recharge is not None:
+                channel.upstream_recharge_multiplier = float(manual_recharge)
+                channel.recharge_multiplier_source = "manual"
+                channel.recharge_multiplier_status = "fallback_manual"
+            else:
+                cached_recharge = _decimal_multiplier(channel.upstream_recharge_multiplier)
+                if cached_recharge is None:
+                    cached_recharge = _decimal_multiplier(channel.last_known_recharge_multiplier)
+                    if cached_recharge is not None:
+                        channel.upstream_recharge_multiplier = float(cached_recharge)
+                        channel.recharge_multiplier_source = channel.recharge_multiplier_source or "cached"
+                        channel.recharge_multiplier_status = "stale"
+                if cached_recharge is None:
                     channel.recharge_multiplier_status = "discovery_failed"
             channel.balance_status = (
                 TOKEN_INVALID_STATUS
@@ -2329,7 +2329,13 @@ class UpstreamService:
         )
         recharge_probe_status = str(_value(result, "recharge_discovery_status") or "unknown").lower()
         manual_recharge = _decimal_multiplier(channel.upstream_recharge_multiplier_override)
-        if discovered_recharge is not None:
+        if manual_recharge is not None:
+            if discovered_recharge is not None:
+                channel.discovered_upstream_recharge_multiplier = float(discovered_recharge)
+            channel.upstream_recharge_multiplier = float(manual_recharge)
+            channel.recharge_multiplier_source = "manual"
+            channel.recharge_multiplier_status = "manual"
+        elif discovered_recharge is not None:
             channel.discovered_upstream_recharge_multiplier = float(discovered_recharge)
             channel.upstream_recharge_multiplier = float(discovered_recharge)
             channel.recharge_multiplier_source = _safe_text(
@@ -2337,11 +2343,6 @@ class UpstreamService:
                 limit=128,
             ) or "auto"
             channel.recharge_multiplier_status = "ok"
-        elif manual_recharge is not None:
-            channel.discovered_upstream_recharge_multiplier = None
-            channel.upstream_recharge_multiplier = float(manual_recharge)
-            channel.recharge_multiplier_source = "manual"
-            channel.recharge_multiplier_status = "fallback_manual"
         elif recharge_probe_status == "missing":
             channel.discovered_upstream_recharge_multiplier = None
             channel.upstream_recharge_multiplier = 1.0

@@ -2328,6 +2328,28 @@ class UpstreamServiceTests(unittest.IsolatedAsyncioTestCase):
         for secret in (alpha_key, beta_key, by_id[7].encrypted_api_key or ""):
             self.assertNotIn(secret, serialized)
 
+    async def test_channel_manual_recharge_overrides_discovered_recharge(self) -> None:
+        upstream_id = (await self.service.overview(self.db)).upstreams[0].upstream_id
+        await self.service.update_channel(
+            self.db,
+            upstream_id,
+            UpstreamUpdate(upstream_recharge_multiplier_override=1.0),
+        )
+        result = self._discovery_result()
+        result.discovered_upstream_recharge_multiplier = 7.3
+        result.discovered_upstream_recharge_multiplier_source = "status.price"
+
+        with patch(
+            "app.services.upstream_channels.discover_upstream",
+            new=AsyncMock(return_value=result),
+        ):
+            channel = await self.service.discover_channel(self.db, upstream_id)
+
+        self.assertEqual(channel.discovered_upstream_recharge_multiplier, 7.3)
+        self.assertEqual(channel.upstream_recharge_multiplier, 1.0)
+        self.assertEqual(channel.recharge_multiplier_source, "manual")
+        self.assertEqual(channel.recharge_multiplier_status, "manual")
+
     async def test_channel_discovery_uses_configured_display_timezone(self) -> None:
         upstream_id = (await self.service.overview(self.db)).upstreams[0].upstream_id
         self.runtime_config.get_upstream_monitor_auto_probe_enabled.return_value = False
