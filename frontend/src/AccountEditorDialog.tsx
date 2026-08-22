@@ -131,6 +131,7 @@ export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: 
   const invalidProxy = Boolean(form?.proxy_id && !editor?.proxies.some((proxy) => proxy.id === form.proxy_id));
   const supportsOpenAISettings = form?.platform === "openai" && ["oauth", "setup-token", "apikey"].includes(form.account_type);
   const supportsCodexCLISettings = form?.platform === "openai" && ["oauth", "setup-token"].includes(form.account_type);
+  const accountTypeLabel = form?.account_type === "apikey" ? "API key" : form?.account_type === "oauth" ? "OAuth GPT" : form?.account_type || "账号";
   const normalizedModelSearch = modelSearch.trim().toLowerCase();
   const visibleModels = useMemo(
     () => (editor?.model_candidates || []).filter((model) => (
@@ -188,7 +189,7 @@ export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: 
         await onUpdated("");
         throw new Error(`已写入 ${results.length - failed.length}/${results.length} 个账号，${failed.length} 个失败：${failed.map((result) => result.reason instanceof Error ? result.reason.message : "未知错误").join("；")}`);
       }
-      await onUpdated(batchMode ? `已批量更新 ${results.length} 个 OAuth GPT 账号。` : "账号配置已写入管理站点并完成回读校验。");
+      await onUpdated(batchMode ? `已批量更新 ${results.length} 个 ${accountTypeLabel} 账号。` : "账号配置已写入管理站点并完成回读校验。");
       onClose();
     });
   };
@@ -297,7 +298,7 @@ export function AccountEditorDialog({ accounts, onClose, onNotice, onUpdated }: 
       >
         <header className="mail-dialog-head">
           <div>
-            <p className="eyebrow">{batchMode ? `${accountIds.length} 个 OAuth GPT 账号` : `管理站点 #${accountId || "-"}`}</p>
+            <p className="eyebrow">{batchMode ? `${accountIds.length} 个 ${accountTypeLabel} 账号` : `管理站点 #${accountId || "-"}`}</p>
             <h2 id="account-editor-title">{batchMode ? "批量编辑账号" : "编辑账号"}</h2>
           </div>
           <div className="account-editor-head-actions">

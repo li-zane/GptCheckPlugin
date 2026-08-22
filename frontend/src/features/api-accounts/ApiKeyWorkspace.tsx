@@ -41,6 +41,8 @@ import {
 } from "lucide-react";
 import {
   FormEvent,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useId,
@@ -155,6 +157,10 @@ import type {
   UpstreamUsageHistory,
   UpstreamUsageHistoryFilters,
 } from "../../domain";
+
+const AccountEditorDialog = lazy(async () => ({
+  default: (await import("../../AccountEditorDialog")).AccountEditorDialog,
+}));
 
 type UpstreamStatusFilter = "all" | "pending" | "attention" | "undiscovered";
 type AccountStatusFilter = UpstreamStatusFilter | "enabled" | "disabled";
@@ -359,6 +365,8 @@ export function ApiKeyAccountsView({
   const [upstreamCredentialVisibility, setUpstreamCredentialVisibility] = useState<UpstreamCredentialVisibility>(hiddenUpstreamCredentials);
   const [loadingUpstreamCredential, setLoadingUpstreamCredential] = useState<UpstreamCredentialField | null>(null);
   const [editingAccount, setEditingAccount] = useState<ApiAccount | null>(null);
+  const [editingSub2ApiAccounts, setEditingSub2ApiAccounts] = useState<ApiAccount[] | null>(null);
+  const [selectedAccountKeys, setSelectedAccountKeys] = useState<Record<string, boolean>>({});
   const [accountForm, setAccountForm] = useState<AccountForm>(emptyAccountForm);
   const [priorityIntervalDialogOpen, setPriorityIntervalDialogOpen] = useState(false);
   const [editingPriorityInterval, setEditingPriorityInterval] = useState<PriorityInterval | null>(null);
@@ -1070,6 +1078,7 @@ export function ApiKeyAccountsView({
     lastFocusedElementRef.current = null;
     setEditingUpstream(null);
     setEditingAccount(null);
+    setEditingSub2ApiAccounts(null);
     setPriorityIntervalDialogOpen(false);
     setEditingPriorityInterval(null);
     setPriorityIntervalForm(emptyPriorityIntervalForm);
@@ -1101,6 +1110,7 @@ export function ApiKeyAccountsView({
     if (
       !editingUpstream
       && !editingAccount
+      && !editingSub2ApiAccounts
       && !priorityIntervalDialogOpen
       && !accountCollectionDialog
       && !accountUpstreamDialog
@@ -1154,6 +1164,7 @@ export function ApiKeyAccountsView({
     upstreamUsageHistoryDialog,
     closeDialog,
     editingAccount,
+    editingSub2ApiAccounts,
     editingUpstream,
     priorityIntervalDialogOpen,
     savingDialog,
@@ -1161,6 +1172,13 @@ export function ApiKeyAccountsView({
 
   const allAccountEntries = useMemo(() => flattenApiAccounts(data), [data]);
   const allAccounts = useMemo(() => allAccountEntries.map(({ account }) => account), [allAccountEntries]);
+  useEffect(() => {
+    const validKeys = new Set(allAccounts.map(accountKey));
+    setSelectedAccountKeys((current) => {
+      const next = Object.fromEntries(Object.entries(current).filter(([key, selected]) => selected && validKeys.has(key)));
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+  }, [allAccounts]);
   const priorityTieMoves = useMemo(
     () => shareSameCompositePriority ? new Map() : priorityTieMoveOptions(allAccounts),
     [allAccounts, shareSameCompositePriority],
@@ -1187,6 +1205,30 @@ export function ApiKeyAccountsView({
     }).filter(({ account }) => upstreamAccountMatchesStatus(account, accountStatusFilter));
     return sortApiAccountEntries(filtered, accountTieSort);
   }, [accountSearch, accountStatusFilter, accountTieSort, accountUpstreamFilter, allAccountEntries, platformFilter, priorityIntervalFilter]);
+  const selectedApiAccounts = useMemo(
+    () => allAccounts.filter((account) => selectedAccountKeys[accountKey(account)]),
+    [allAccounts, selectedAccountKeys],
+  );
+  const selectedApiAccountPlatforms = useMemo(
+    () => new Set(selectedApiAccounts.map((account) => String(account.remote_platform || "").trim().toLowerCase())),
+    [selectedApiAccounts],
+  );
+  const selectedApiAccountsHaveConsistentPlatform = selectedApiAccounts.length >= 2
+    && selectedApiAccounts.every((account) => String(account.remote_platform || "").trim())
+    && selectedApiAccountPlatforms.size === 1;
+  const batchEditDisabledReason = selectedApiAccounts.length < 2
+    ? "请至少选择 2 个 API key 账号"
+    : !selectedApiAccountsHaveConsistentPlatform
+      ? "批量编辑要求所选账号的平台一致且已识别"
+      : "";
+  const filteredApiAccountKeys = useMemo(
+    () => filteredAccountEntries.map(({ account }) => accountKey(account)),
+    [filteredAccountEntries],
+  );
+  const allFilteredApiAccountsSelected = Boolean(
+    filteredApiAccountKeys.length
+    && filteredApiAccountKeys.every((key) => selectedAccountKeys[key]),
+  );
   const viewPriorityIntervalAccounts = useCallback((interval: PriorityInterval) => {
     setAccountSearch("");
     setAccountStatusFilter("all");
@@ -1352,6 +1394,36 @@ export function ApiKeyAccountsView({
         ? ""
         : String(account.availability_monitor_id),
       availabilityTestModel: account.availability_test_model || "",
+    });
+  };
+
+  const openSub2ApiAccountEditor = (account: ApiAccount) => {
+    rememberDialogTrigger();
+    setAccountCollectionDialog(null);
+    setAccountUpstreamDialog(null);
+    setUpstreamMonitorDialog(null);
+    setEditingAccount(null);
+    setEditingSub2ApiAccounts([account]);
+  };
+
+  const toggleSelectedApiAccount = (account: ApiAccount, selected: boolean) => {
+    const key = accountKey(account);
+    setSelectedAccountKeys((current) => {
+      if (selected) return { ...current, [key]: true };
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  };
+
+  const toggleFilteredApiAccounts = (selected: boolean) => {
+    setSelectedAccountKeys((current) => {
+      const next = { ...current };
+      for (const key of filteredApiAccountKeys) {
+        if (selected) next[key] = true;
+        else delete next[key];
+      }
+      return next;
     });
   };
 
@@ -2240,9 +2312,48 @@ export function ApiKeyAccountsView({
               <h2>API 账号</h2>
               <p>按上游实际倍率从低到高排列；上游实际倍率不可用的账号显示在末尾。</p>
             </div>
+            <div className="api-key-toolbar-actions">
+              <button
+                className="api-key-button api-key-button--secondary"
+                disabled={mutationControlsDisabled || anyBusy || !selectedApiAccountsHaveConsistentPlatform}
+                onClick={() => {
+                  rememberDialogTrigger();
+                  setEditingSub2ApiAccounts(selectedApiAccounts);
+                }}
+                title={batchEditDisabledReason || `批量编辑 ${selectedApiAccounts.length} 个 API key 账号`}
+                type="button"
+              >
+                <Pencil size={16} />
+                <span>批量编辑{selectedApiAccounts.length ? ` (${selectedApiAccounts.length})` : ""}</span>
+              </button>
+              {selectedApiAccounts.length >= 2 && !selectedApiAccountsHaveConsistentPlatform ? (
+                <span className="api-key-batch-edit-hint" role="status">{batchEditDisabledReason}</span>
+              ) : null}
+              {selectedApiAccounts.length ? (
+                <button
+                  className="api-key-button api-key-button--secondary"
+                  disabled={anyBusy}
+                  onClick={() => setSelectedAccountKeys({})}
+                  type="button"
+                >
+                  <X size={16} />
+                  <span>清空选择 ({selectedApiAccounts.length})</span>
+                </button>
+              ) : null}
+            </div>
           </div>
 
           <div className="api-key-filters api-key-account-filters">
+            <label className="api-key-select-all">
+              <input
+                aria-label="选择当前筛选结果中的 API key 账号"
+                checked={allFilteredApiAccountsSelected}
+                disabled={anyBusy || !filteredApiAccountKeys.length}
+                onChange={(event) => toggleFilteredApiAccounts(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>全选当前结果</span>
+            </label>
             <label className="api-key-search">
               <Search size={16} />
               <span className="api-key-sr-only">搜索 API 账号</span>
@@ -2339,6 +2450,7 @@ export function ApiKeyAccountsView({
                   globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
                   key={accountKey(entry.account)}
                   onConfigure={() => openAccountConfig(entry.account, entry.upstream || undefined)}
+                  onRemoteConfigure={() => openSub2ApiAccountEditor(entry.account)}
                   onDelete={() => deleteRemoteAccount(entry.account)}
                   onPriorityIntervalChange={(intervalId) => void setAccountPriorityInterval(entry.account, intervalId)}
                   onPriorityTieMove={(direction) => void moveAccountPriority(entry.account, direction)}
@@ -2349,6 +2461,8 @@ export function ApiKeyAccountsView({
                   onTestAvailability={() => void testAccountAvailability(entry.account)}
                   onForceConnectionTest={() => void forceAccountConnectionTest(entry.account)}
                   onToggle={() => toggleAccountEnabled(entry.account)}
+                  selected={Boolean(selectedAccountKeys[accountKey(entry.account)])}
+                  onToggleSelected={(selected) => toggleSelectedApiAccount(entry.account, selected)}
                   priorityIntervals={priorityIntervals}
                   priorityTieMove={priorityTieMoves.get(String(entry.account.management_account_id))}
                   rateWritesEnabled={rateWritesEnabled}
@@ -2506,6 +2620,7 @@ export function ApiKeyAccountsView({
                   globallyDisabled={mutationControlsDisabled || bulkDiscovering || globallyBusy}
                   key={accountKey(entry.account)}
                   onConfigure={() => openAccountConfig(entry.account, entry.upstream || undefined)}
+                  onRemoteConfigure={() => openSub2ApiAccountEditor(entry.account)}
                   onDelete={() => void deleteRemoteAccount(entry.account)}
                   onPriorityIntervalChange={(intervalId) => void setAccountPriorityInterval(entry.account, intervalId)}
                   onPriorityTieMove={(direction) => void moveAccountPriority(entry.account, direction)}
@@ -3238,6 +3353,22 @@ export function ApiKeyAccountsView({
             />
           </form>
         </Modal>
+      ) : null}
+      {editingSub2ApiAccounts ? (
+        <Suspense fallback={null}>
+          <AccountEditorDialog
+            accounts={editingSub2ApiAccounts.map((account) => ({
+              management_account_id: String(account.management_account_id),
+              account_name: account.remote_name || "",
+            } as unknown as import("../../domain").Account))}
+            onClose={closeDialog}
+            onNotice={setNotice}
+            onUpdated={async (message) => {
+              await loadData(true);
+              if (message) setNotice(message);
+            }}
+          />
+        </Suspense>
       ) : null}
       </> : subview === "rate-log" || subview === "account-rate-log" ? (
         <RateChangeLogView
@@ -4174,6 +4305,7 @@ function AccountCard({
   displayTimeZone,
   globallyDisabled,
   onConfigure,
+  onRemoteConfigure,
   onDelete,
   onPriorityIntervalChange,
   onPriorityTieMove,
@@ -4182,6 +4314,8 @@ function AccountCard({
   onTestAvailability,
   onForceConnectionTest,
   onToggle,
+  selected,
+  onToggleSelected,
   priorityIntervals,
   priorityTieMove,
   rateWritesEnabled,
@@ -4193,6 +4327,7 @@ function AccountCard({
   displayTimeZone: string;
   globallyDisabled: boolean;
   onConfigure: () => void;
+  onRemoteConfigure: () => void;
   onDelete: () => void;
   onPriorityIntervalChange: (intervalId: number | string | null) => void;
   onPriorityTieMove: (direction: "up" | "down") => void;
@@ -4201,6 +4336,8 @@ function AccountCard({
   onTestAvailability: () => void;
   onForceConnectionTest: () => void;
   onToggle: () => void;
+  selected?: boolean;
+  onToggleSelected?: (selected: boolean) => void;
   priorityIntervals: PriorityInterval[];
   priorityTieMove?: PriorityTieMoveState;
   rateWritesEnabled: boolean;
@@ -4273,6 +4410,15 @@ function AccountCard({
       <header className="api-key-account-card-head">
         <div className="api-key-account-title-line">
           <div className="api-key-account-name">
+            {onToggleSelected ? (
+              <input
+                aria-label={`选择 ${accountDisplayName(account)}`}
+                checked={Boolean(selected)}
+                disabled={busy || identityBlocked}
+                onChange={(event) => onToggleSelected(event.currentTarget.checked)}
+                type="checkbox"
+              />
+            ) : null}
             <strong title={accountDisplayName(account)}>{accountDisplayName(account)}</strong>
             <span className="api-key-mono">#{account.management_account_id}</span>
           </div>
@@ -4464,6 +4610,16 @@ function AccountCard({
           type="button"
         >
           <Settings2 size={15} />
+        </button>
+        <button
+          aria-label={"编辑 sub2api 设置 " + accountDisplayName(account)}
+          className="api-key-icon-button"
+          disabled={busy}
+          onClick={onRemoteConfigure}
+          title="编辑 sub2api 设置"
+          type="button"
+        >
+          <Pencil size={15} />
         </button>
         <button
           aria-label={(enabled ? "禁用 " : "启用 ") + accountDisplayName(account)}

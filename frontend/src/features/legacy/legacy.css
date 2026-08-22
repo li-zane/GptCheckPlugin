@@ -5766,6 +5766,13 @@ fieldset.api-key-field {
   border-top: 1px solid var(--line);
 }
 
+.api-key-batch-edit-hint {
+  color: var(--danger-ink);
+  font-size: 12px;
+  line-height: 1.35;
+  max-width: 240px;
+}
+
 .automation-setting-row:nth-child(odd) {
   background: color-mix(in srgb, var(--panel-2) 30%, transparent);
 }

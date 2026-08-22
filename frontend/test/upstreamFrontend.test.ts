@@ -590,6 +590,16 @@ test("automatic pause settings keep balance controls while multiplier policy bel
   assert.doesNotMatch(appSource, /aria-disabled=\{!apiKeyUpstreamMonitorPauseEnabled\}/);
 });
 
+test("API key batch editing requires a consistent recognized remote platform", () => {
+  const source = readFileSync(new URL("../src/features/api-accounts/ApiKeyWorkspace.tsx", import.meta.url), "utf8");
+  assert.match(source, /selectedApiAccountPlatforms = useMemo/);
+  assert.match(source, /String\(account\.remote_platform \|\| ""\)\.trim\(\)\.toLowerCase\(\)/);
+  assert.match(source, /selectedApiAccountsHaveConsistentPlatform = selectedApiAccounts\.length >= 2/);
+  assert.match(source, /selectedApiAccountPlatforms\.size === 1/);
+  assert.match(source, /批量编辑要求所选账号的平台一致且已识别/);
+  assert.match(source, /disabled=\{mutationControlsDisabled \|\| anyBusy \|\| !selectedApiAccountsHaveConsistentPlatform\}/);
+});
+
 test("API key availability settings preserve unbound monitor mode and support explicit disabling", () => {
   const appSource = readFileSync(new URL("../src/app/dashboard/DashboardController.tsx", import.meta.url), "utf8");
   const accountSource = readFileSync(new URL("../src/features/api-accounts/ApiKeyWorkspace.tsx", import.meta.url), "utf8");
